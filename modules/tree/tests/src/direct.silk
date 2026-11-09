@@ -1,0 +1,416 @@
+//! The `Tree` API used directly: typed handles, plain methods, event records as a union,
+//! queries that answer with `Option`, and errors that say what went wrong.
+import ui_tree.lib {
+  Tree,
+  TreeError,
+  ProtocolError,
+  Viewport,
+  NodeId,
+  BoxNode,
+  InputNode,
+  Input,
+  Event,
+  EventKind,
+  EventRecord,
+  InputType,
+  Selection,
+  Batch,
+  Mutation,
+  Property,
+  Length,
+  Side,
+  Display,
+  FlexDirection,
+  Overflow,
+  NodeKind,
+  StyleState,
+  Attribute,
+  DescribeOptions,
+  ListItem,
+  VirtualRange,
+  VirtualOptions
+}
+import ui_fixtures.fixtures as fixtures
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+fn noRange() -> VirtualRange {
+  return VirtualRange { count: 0, first: 0, end: 0, pinned: Option<ListItem>.None }
+}
+
+fn viewport() -> Viewport {
+  return Viewport { width: 400.0, height: 300.0, scale: 1.0 }
+}
+
+effect fn messageOf(error: TreeError) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return run error.message()
+}
+
+effect fn buildsAndDescribes() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run Tree.make(&fonts)
+  let sans = run tree.fontFamily("Noto Sans, sans-serif")
+  let root = run tree.box(
+    &[
+      Property.FontFamily { family: sans.raw() },
+      Property.Padding { side: Side.Top, value: Length.px(16.0) },
+    ],
+  )
+  let title = run tree.text("Hello")
+  let strong = run tree.span(&[Property.FontWeight { value: 700.0 }])
+  let word = run tree.text(" world")
+  run tree.append(root, title)
+  run tree.append(root, strong)
+  run tree.append(strong, word)
+  run tree.setRoot(root)
+  run tree.setTestId(root, "page")
+
+  run Testing.expect(tree.nodeCount() == 4, "four nodes were made")
+  run Testing.expect(tree.root().isSome(), "the tree has a root")
+  run Testing.expect(tree.parent(root).isNone(), "the root has no parent")
+  match tree.parent(word) {
+    Option.Some { value } => run Testing.expect(value.is(strong), "the word is in the span")
+    Option.None => run Testing.expect(false, "the word has a parent")
+  }
+  let children = run tree.children(root)
+  run Testing.expect(children.length() == 2, "the root has the text and the span")
+  run Testing.expect(children.get(0).is(title), "children come in order")
+
+  run Testing.expect(tree.needsFrame(), "a changed tree wants a frame")
+  let frame = run tree.frame(viewport(), 0.0)
+  run Testing.expect(frame.stats.nodes == 4, "the frame saw every node")
+  run Testing.expect(frame.wakeAt.isNone(), "nothing blinks without a focused input")
+  tree.clearUploads()
+
+  match run tree.bounds(root) {
+    Option.Some { value } => {
+      run Testing.expect(value.xMax - value.xMin == 400.0, "the root fills the viewport width")
+    }
+    Option.None => run Testing.expect(false, "the root was laid out")
+  }
+  let found = run tree.find("page")
+  run Testing.expect(found.length() == 1 && found.get(0).is(root), "find reads test ids")
+  let text = run tree.describe(DescribeOptions.plain())
+  run Testing.expect(String.byteLength(String.view(&text)) != 0, "describe writes the tree")
+
+  match run tree.view(strong) {
+    Option.Some { value } => {
+      run Testing.expect(value.kind == NodeKind.Box, "a span is a box")
+      run Testing.expect(value.base.length() == 2, "the view lists the style the client set")
+      run Testing.expect(value.computed.display == Display.Inline, "and the resolved style")
+      run Testing.expect(!value.listens(EventKind.Click), "nothing listens yet")
+    }
+    Option.None => run Testing.expect(false, "the span has a view")
+  }
+}
+
+effect fn staleHandlesFail() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run Tree.make(&fonts)
+  let root = run tree.box(&[])
+  let child = run tree.box(&[])
+  run tree.append(root, child)
+  run tree.setRoot(root)
+  run tree.destroy(child)
+  run Testing.expect(!tree.contains(child), "a destroyed node is gone")
+  run Testing.expect((run tree.view(child)).isNone(), "and has no view")
+  run Testing.expect((run tree.bounds(child)).isNone(), "and no bounds")
+
+  let message = run Effect.catch<TreeError>(appendStale(&mut tree, root, child), messageOf)
+  run Testing.expect(
+    String.view(&message) == "node #2 does not exist (it was destroyed, or never created)",
+    "a stale handle fails with a sentence",
+  )
+  let cycle = run Effect.catch<TreeError>(appendStale(&mut tree, root, root), messageOf)
+  run Testing.expect(
+    String.view(&cycle)
+      == "node #1 cannot move there: it would be inside itself, or it is the root",
+    "a node cannot go inside itself",
+  )
+
+  // A fresh node never takes the number of a destroyed one, so old handles stay stale.
+  let next = run tree.box(&[])
+  run Testing.expect(!next.id().is(child), "ids are not reused")
+}
+
+effect fn appendStale(tree: &mut Tree<'_>, parent: BoxNode, child: BoxNode) -> String
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  run tree.append(parent, child)
+  return String.make()
+}
+
+effect fn eventsAreAUnion() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run Tree.make(&fonts)
+  let root = run tree.box(&[])
+  let button = run tree.box(
+    &[Property.Width { value: Length.px(100.0) }, Property.Height { value: Length.px(40.0) }],
+  )
+  run tree.append(root, button)
+  run tree.setRoot(root)
+  run tree.listen(button, &[EventKind.Click, EventKind.PointerDown])
+  drop run tree.frame(viewport(), 0.0)
+
+  match tree.hitTest(10.0, 10.0) {
+    Option.Some { value } => run Testing.expect(value.is(button), "the button is hit")
+    Option.None => run Testing.expect(false, "a point over the button hits it")
+  }
+  run Testing.expect(tree.hitTest(900.0, 900.0).isNone(), "outside the viewport nothing is hit")
+
+  run tree.dispatch(Input.moveTo(10.0, 10.0))
+  run tree.dispatch(Input.press(10.0, 10.0))
+  run tree.dispatch(Input.release(10.0, 10.0))
+  let records = run tree.events()
+  run Testing.expect(records.length() == 2, "a press and a click were recorded")
+  let all = records.asSlice()
+  run Testing.expect(all[0].target.is(button), "the target is the button")
+  run Testing.expect(all[0].hits(root.id()), "the path runs through the root")
+  run Testing.expect(all[0].path.length() == 2, "from the root to the target")
+  match &all[0].event {
+    Event.PointerDown { pointer, count, .. } => {
+      run Testing.expect(pointer.x == 10.0 && pointer.y == 10.0, "the press has its position")
+      run Testing.expect(count == 1, "and its click count")
+      run Testing.expect(pointer.modifiers.isEmpty(), "and no modifiers")
+    }
+    _ => run Testing.expect(false, "the first record is the press")
+  }
+  match &all[1].event {
+    Event.Click { .. } => {}
+    _ => run Testing.expect(false, "the second record is the click")
+  }
+  run Testing.expect((run tree.events()).length() == 0, "taking events empties the queue")
+
+  run tree.listen(button, &[])
+  run tree.dispatch(Input.press(10.0, 10.0))
+  run tree.dispatch(Input.release(10.0, 10.0))
+  run Testing.expect((run tree.events()).length() == 0, "an empty list stops listening")
+}
+
+effect fn inputsReportChanges() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run Tree.make(&fonts)
+  let root = run tree.box(&[])
+  let field = run tree.input(&[Property.Width { value: Length.px(200.0) }])
+  run tree.append(root, field)
+  run tree.setRoot(root)
+  run tree.listen(field, &[EventKind.Input])
+  run tree.setText(field, "abc")
+  run tree.focus(field)
+  drop run tree.frame(viewport(), 0.0)
+
+  match tree.focused() {
+    Option.Some { value } => run Testing.expect(value.is(field), "the field has focus")
+    Option.None => run Testing.expect(false, "something has focus")
+  }
+  run Testing.expect(tree.selection(root).isNone(), "a box has no selection")
+  run tree.select(field, Selection.range(3, 1))
+  match tree.selection(field) {
+    Option.Some { value } => {
+      run Testing.expect(value.anchor == 3 && value.focus == 1, "the selection keeps its direction")
+      run Testing.expect(value.start() == 1 && value.end() == 3, "and reads as start and end")
+    }
+    Option.None => run Testing.expect(false, "an input has a selection")
+  }
+
+  run tree.dispatch(run Input.text("X"))
+  let records = run tree.events()
+  run Testing.expect(records.length() == 1, "typing queues one input record")
+  match &records.asSlice()[0].event {
+    Event.Input { change } => {
+      run Testing.expect(String.view(&change.value) == "aX", "the selection was replaced")
+      run Testing.expect(change.inputType == InputType.InsertText, "by inserted text")
+      run Testing.expect(change.selection.isCaret(), "leaving a caret")
+      run Testing.expect(change.selection.start() == 2, "after the new text")
+    }
+    _ => run Testing.expect(false, "the record is an input change")
+  }
+  let frame = run tree.frame(viewport(), 0.0)
+  run Testing.expect(frame.ime.enabled, "a focused input turns the input method on")
+  run Testing.expect(frame.wakeAt.isSome(), "and its caret blinks")
+}
+
+effect fn protocolNamesTheMutation() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run Tree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(7, NodeKind.Box)
+  run batch.root(7)
+  run batch.text(7, 8, "from a remote host")
+  run batch.setText(99, "nobody")
+  let failure = run Effect.catch<ProtocolError>(
+    applied(&mut tree, run batch.take()),
+    protocolMessage,
+  )
+  run Testing.expect(
+    String.view(&failure)
+      == "mutation 5: node #99 does not exist (it was destroyed, or never created)",
+    "a batch fails with the index of the bad mutation",
+  )
+  run Testing.expect(tree.contains(NodeId.of(8)), "the mutations before it stay applied")
+
+  // Direct calls and protocol ids share one tree: a new node takes a number not in use.
+  let extra = run tree.box(&[])
+  run Testing.expect(extra.id().raw() != 7 && extra.id().raw() != 8, "fresh ids skip the client's")
+  run tree.append(BoxNode.of(NodeId.of(7)), extra)
+  run Testing.expect((run tree.children(NodeId.of(7))).length() == 2, "and they mix")
+}
+
+effect fn applied(tree: &mut Tree<'_>, batch: List<Mutation>) -> String
+  ! ProtocolError | OutOfMemoryError
+  ? &mut Allocator {
+  run tree.apply(move batch)
+  return String.make()
+}
+
+effect fn protocolMessage(error: ProtocolError) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return run error.message()
+}
+
+effect fn virtualListsUseHandles() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run Tree.make(&fonts)
+  let list = run tree.box(
+    &[
+      Property.Display { value: Display.Flex },
+      Property.FlexDirection { value: FlexDirection.Column },
+      Property.Height { value: Length.px(200.0) },
+      Property.OverflowY { value: Overflow.Scroll },
+    ],
+  )
+  run tree.setRoot(list)
+  run Testing.expect(tree.virtualRange(list).isNone(), "a plain box has no range")
+  run tree.setVirtualList(
+    list,
+    1000,
+    VirtualOptions { estimatedHeight: 40.0, overscan: 0.0, gap: 0.0, revision: 1 },
+  )
+  drop run tree.frame(viewport(), 0.0)
+  let range = tree.virtualRange(list).unwrapOr(noRange())
+  run Testing.expect(range.count == 1000 && range.first == 0, "the list asks for its first items")
+  run Testing.expect(range.end > 0, "it wants something")
+  run Testing.expect(range.end < 100, "and far from all of them")
+  run Testing.expect(range.pinned.isNone(), "nothing is pinned without focus")
+
+  let mut items = List<ListItem>.make()
+  let mut i = range.first
+  while i < range.end {
+    let row = run tree.box(
+      &[Property.Height { value: Length.px(40.0) }, Property.FlexShrink { value: 0.0 }],
+    )
+    run tree.append(list, row)
+    run items.append(ListItem { index: i, node: row.id() })
+    i = i + 1
+  }
+  run tree.setVirtualItems(list, items.asSlice())
+  drop run tree.frame(viewport(), 0.0)
+  run tree.scrollTo(list, 0.0, 4000.0)
+  drop run tree.frame(viewport(), 0.0)
+  let later = tree.virtualRange(list).unwrapOr(noRange())
+  run Testing.expect(later.first > 50, "scrolling moves the wanted range")
+  match tree.scrollOffset(list) {
+    Option.Some { value } => run Testing.expect(
+      value.y == 4000.0,
+      "the offset is the one asked for",
+    )
+    Option.None => run Testing.expect(false, "a live node has a scroll offset")
+  }
+}
+
+effect fn stateStylesApply() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run Tree.make(&fonts)
+  let root = run tree.box(&[])
+  let button = run tree.box(
+    &[Property.Width { value: Length.px(100.0) }, Property.Height { value: Length.px(40.0) }],
+  )
+  run tree.append(root, button)
+  run tree.setRoot(root)
+  run tree.setStyleFor(button, StyleState.Hover, &[Property.Opacity { value: 0.5 }])
+  run tree.setAttribute(button, Attribute.TabIndex { value: 0 })
+  drop run tree.frame(viewport(), 0.0)
+  run tree.dispatch(Input.moveTo(10.0, 10.0))
+  drop run tree.frame(viewport(), 0.0)
+  match run tree.view(button) {
+    Option.Some { value: view } => {
+      run Testing.expect(view.state.hovered, "the pointer is over the button")
+      run Testing.expect(view.computed.opacity == 0.5, "so its hover look applies")
+      run Testing.expect(
+        view.hover.length() == 1 && view.base.length() == 2,
+        "the looks stay apart",
+      )
+      run Testing.expect(view.tabIndex == 0, "attributes read back")
+    }
+    Option.None => run Testing.expect(false, "the button has a view")
+  }
+  run tree.clearStyle(button, StyleState.Hover)
+  drop run tree.frame(viewport(), 0.0)
+  match run tree.view(button) {
+    Option.Some { value: view } => run Testing.expect(view.computed.opacity == 1.0, "until cleared")
+    Option.None => run Testing.expect(false, "the button has a view")
+  }
+}
+
+test effect fn directTreeBuildsAndDescribes() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run buildsAndDescribes() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn directTreeStaleHandlesFail() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run staleHandlesFail() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn directTreeEventsAreAUnion() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run eventsAreAUnion() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn directTreeInputsReportChanges() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run inputsReportChanges() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn directTreeProtocolNamesTheMutation() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run protocolNamesTheMutation() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn directTreeVirtualListsUseHandles() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run virtualListsUseHandles() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn directTreeStateStylesApply() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run stateStylesApply() |> Effect.provideMut<Allocator>(&mut allocator)
+}
