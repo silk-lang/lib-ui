@@ -19,6 +19,12 @@ On Windows the repository runners invoke the installed `silkc.exe` directly (ove
 cache parser rejects. Direct compiler invocation preserves native `SILK_HOME` overrides and
 the default `USERPROFILE` cache location.
 
+Cold Git dependency resolution on Windows is still blocked by the pinned compiler:
+`GitCheckouts.silk` passes extended `\\?\C:\...` filesystem paths to Git, which rejects them
+with `git init failed: ... Invalid argument`. Upstream must pass ordinary command-line paths
+to Git. Direct compiler invocation does not fix this second issue; Windows CI remains
+enabled, and Git's NTFS path protection must not be disabled as a workaround.
+
 Golden images include the corrected graphics border rasterization: underline-only tabs no
 longer paint phantom side edges, and rounded border corners use opposite-winding contours.
 Layout/text references and pixel tolerances are unchanged.
