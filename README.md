@@ -6,7 +6,7 @@ Standalone retained UI, application framework, components, native/browser hosts,
 
 Extracted without removing UI packages, fixtures, goldens, demos, inspector tools, or browser surfaces from `silk-lang/nonstd` commit `7d6c3693a9ad1fec24127985626ab4224f9f1995`. The original `ui/...` package paths are preserved. Applications such as Notes, Studio, Scroll Lab, Showcase, and Graphics Demo remain in their application repository; they are consumers, not dependencies of this repository.
 
-Use Silk **0.1.0-dev.61+91f335268900**, LLVM **22.1.8**, and Node **22+**. `toolchains.lock.json` pins downloadable toolchains and their checksums. Silk performs compilation, package resolution, native archive preparation, and package generation directly. Node orchestrates processes, HTTP/browser fixtures, and inspection protocols; Windows native preparation uses PowerShell from the pinned `lib-native` payload. No normal build, test, or run command invokes Python.
+Use Silk **0.1.0-dev.63+657e3c900f65**, LLVM **22.1.8**, and Node **22+**. `toolchains.lock.json` pins downloadable toolchains and their checksums. Silk performs compilation, package resolution, native archive preparation, and package generation directly. Node orchestrates processes, HTTP/browser fixtures, and inspection protocols; Windows native preparation uses PowerShell from the pinned `lib-native` payload. No normal build, test, or run command invokes Python.
 
 For hosted CI, `node scripts/install-silk.mjs` installs the pinned compiler and adds its bin directory to `GITHUB_PATH` (locally it prints the directory to add to `PATH`). Then `node scripts/setup-ci.mjs` resolves the native dependency and provisions its pinned tools. `--linux-gpu` provisions lavapipe; `--browser` selects an existing Chromium and installs pinned Playwright JavaScript without downloading a browser. Local browser runners use `PLAYWRIGHT_MODULE`, `PLAYWRIGHT_CHROMIUM_EXECUTABLE`, and `CHROME_PATH` when supplied. Set `SILK` to override the Silk executable and `SILK_CLANG` for LLVM 22 clang.
 
@@ -14,16 +14,11 @@ WebAssembly builds require `SILK_CLANG` (set by `setup-ci.mjs`). The generated s
 
 Linux native compilation needs X11, xkbcommon, Wayland, and wayland-protocols development headers; window checks additionally need Xvfb, xauth, Weston, and Vulkan/lavapipe. Windows requires the x64 Visual Studio 2026 developer environment, Windows SDK and PowerShell 7. macOS requires Apple Silicon macOS 26+ and `SDKROOT` set to `xcrun --sdk macosx --show-sdk-path`. The checked-in CI exercises native package checks and rendering/inspection on Linux, macOS, and Windows, plus browser checks on Linux.
 
-On Windows the repository runners invoke the installed `silkc.exe` directly (override with
-`SILK`). The pinned `silk.exe` launcher exports `SILK_HOME` in an encoding its compiler's Git
-cache parser rejects. Direct compiler invocation preserves native `SILK_HOME` overrides and
-the default `USERPROFILE` cache location.
-
-Cold Git dependency resolution on Windows is still blocked by the pinned compiler:
-`GitCheckouts.silk` passes extended `\\?\C:\...` filesystem paths to Git, which rejects them
-with `git init failed: ... Invalid argument`. Upstream must pass ordinary command-line paths
-to Git. Direct compiler invocation does not fix this second issue; Windows CI remains
-enabled, and Git's NTFS path protection must not be disabled as a workaround.
+Silk **0.1.0-dev.63+657e3c900f65** fixes Windows Git command paths and the launcher's
+`SILK_HOME` representation ([silk#3025](https://github.com/silk-lang/silk/issues/3025)).
+Repository runners use `silk` on every platform (override with `SILK`), including cold Git
+dependency resolution on Windows. No direct compiler bypass or relaxed Git NTFS protection
+is required.
 
 Golden images include the corrected graphics border rasterization: underline-only tabs no
 longer paint phantom side edges, and rounded border corners use opposite-winding contours.
