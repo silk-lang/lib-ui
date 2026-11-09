@@ -5,7 +5,7 @@ import { delimiter, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { repositoryRoot } from './dependency-root.mjs';
 export const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-export const silk = process.env.SILK || 'silk';
+export const silk = process.env.SILK || (process.platform === 'win32' ? 'silkc' : 'silk');
 export function run(command, args = [], options = {}) {
   console.error('+', command, ...args);
   const result = spawnSync(command, args, { cwd: root, stdio: 'inherit', timeout: 1200000, ...options });
