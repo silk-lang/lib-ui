@@ -41,6 +41,7 @@ and LLVM 22; set `$env:SILK_CLANG` to the LLVM clang executable before launching
 | --- | --- |
 | Todo application | `node modules/app/demo/scripts/demo` |
 | Components gallery | `node modules/components/demo/scripts/demo` |
+| Retained tree inbox | `node modules/tree/demo/scripts/demo` |
 | Retained tree editor | `node modules/tree/demo/scripts/demo --editor` |
 | Small window/counter | `node modules/tree/window/demo/run` |
 | Todo with inspector/devtools | `node modules/inspect/devtools/scripts/devtools todo` |
@@ -58,8 +59,30 @@ an invalid explicit override fails rather than silently choosing another compile
 `silk build` builds all 31 packages, including CLI tools and test executables; it does
 **not** launch a demo. Commands containing `check`/`test` are automated verification.
 `scripts/setup-ci.mjs` is hosted-CI provisioning, not local shell setup.
-For Notes, Studio, Scroll Lab, Showcase or Graphics Demo, use the
-[nonstd application quickstart](https://github.com/silk-lang/nonstd#run-an-application-locally).
+
+### Applications in nonstd
+
+The full applications live in [silk-lang/nonstd](https://github.com/silk-lang/nonstd),
+not in this repository. Open or clone that repository, follow its
+[local setup](https://github.com/silk-lang/nonstd#run-an-application-locally), and run
+these commands from the **nonstd repository root**:
+
+| Application | Native launch command |
+| --- | --- |
+| [Studio design editor](https://github.com/silk-lang/nonstd/tree/main/examples/studio) | `node examples/studio/scripts/studio --release` |
+| [Notes](https://github.com/silk-lang/nonstd/tree/main/examples/notes) | `node examples/notes/scripts/notes` |
+| [Scroll Lab](https://github.com/silk-lang/nonstd/tree/main/examples/scroll-demo) | `node examples/scroll-demo/scripts/run` |
+| [Silk Loom showcase](https://github.com/silk-lang/nonstd/tree/main/examples/showcase) | `node examples/showcase/scripts/app` |
+| [Graphics Demo](https://github.com/silk-lang/nonstd/tree/main/examples/graphics-demo) | `node examples/graphics-demo/scripts/app` |
+
+For **Studio in a browser**, also from the nonstd root:
+
+```sh
+node examples/browser serve examples/studio/browser
+```
+
+Open <http://127.0.0.1:8050/> in Chrome/Edge 137+ and leave the server running.
+Browser builds discover LLVM 22+ automatically, as described above.
 
 ### Remaining compiler warnings
 
