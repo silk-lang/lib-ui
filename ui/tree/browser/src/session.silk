@@ -1,0 +1,290 @@
+//! One fixture tree drawn on the GPU without blocking: request the adapter and device, build the
+//! tree and run a frame, render its scene and copy the target to a buffer, then map it, polling
+//! between steps. The CPU reference is the same frame through `CpuSnapshot`.
+import webgpu.runtime {
+  AdapterRequest,
+  Device,
+  DeviceRequest,
+  GpuError,
+  Instance,
+  MapReadRequest,
+  RequestAdapterOptions
+}
+import webgpu.runtime as runtime
+import webgpu.resources as gpu
+import webgpu.descriptors {
+  BufferDescriptor,
+  DeviceDescriptor,
+  TexelCopyBufferInfo,
+  TexelCopyBufferLayout,
+  TexelCopyTextureInfo,
+  TextureDescriptor,
+  TextureViewDescriptor,
+}
+import webgpu_sys.generated_webgpu as flags
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.usize
+import atlas.atlas { AtlasError }
+import vector.geometry_error { GeometryError }
+import ui_scene.color as color
+import ui_renderer.atlas_textures { GpuAtlas }
+import ui_renderer.renderer { UiRenderer }
+import ui_renderer.text { TextSettings }
+import ui_fixtures.fixtures as fixtures
+import ui_fixtures.fixtures { COUNT }
+import ui_tree.lib { Batch, CpuSnapshot, TreeError, UiTree, Input }
+import gpu_scene.renderer { extent }
+import silk.num.f32
+
+/// Bytes per readback row, aligned to 256.
+fn strideOf(width: u32) -> u32 {
+  return (width * 4 + 255) / 256 * 256
+}
+
+/// Fixture `index`'s device size.
+fn sizeOf(index: u32) -> [u32; 2] {
+  let input = fixtures.viewport(index % COUNT)
+  return [
+    f32.toU32(f32.ceil(input.width * input.scale)),
+    f32.toU32(f32.ceil(input.height * input.scale)),
+  ]
+}
+
+struct Failed {}
+
+struct FindingAdapter {
+  request: AdapterRequest<'static>
+}
+
+struct FindingDevice {
+  request: DeviceRequest
+}
+
+struct Reading {
+  device: Device,
+  request: MapReadRequest,
+  cpu: List<u8>
+}
+
+struct Complete {
+  device: Device,
+  gpu: List<u8>,
+  cpu: List<u8>
+}
+
+pub struct Session {
+  index: u32,
+  stage: Failed | FindingAdapter | FindingDevice | Reading | Complete,
+}
+
+impl Session {
+  pub effect fn start(index: u32) -> Session
+    ! GpuError | OutOfMemoryError {
+    if index >= COUNT * 2 {
+      fail GpuError.status(0xffffffff)
+    }
+    let instance = run Instance.create()
+    let request = run instance.requestAdapterStart(&RequestAdapterOptions.default())
+    return Session { index: index, stage: FindingAdapter { request: move request } }
+  }
+
+  /// Advances the session; true once the pixels are read.
+  pub effect fn poll(self: &mut Self) -> bool
+    ! GpuError | OutOfMemoryError | AtlasError | GeometryError | TreeError
+    ? &mut Allocator {
+    let previous = Intrinsic.replace(self.stage, Failed {})
+    match move previous {
+      Failed failed => {
+        fail GpuError.status(0xffffffff)
+      }
+      FindingAdapter { request } => {
+        let mut pending = move request
+        if pending.poll() {
+          let adapter = run pending.finish()
+          let next = run adapter.requestDeviceStart(&DeviceDescriptor.default())
+          self.stage = FindingDevice { request: move next }
+        } else {
+          self.stage = FindingAdapter { request: move pending }
+        }
+      }
+      FindingDevice { request } => {
+        let mut pending = move request
+        if pending.poll() {
+          let device = run pending.finish()
+          device.pushErrorScope(flags.WGPUErrorFilter_Validation)
+          let reading = run render(move device, self.index)
+          self.stage = move reading
+        } else {
+          self.stage = FindingDevice { request: move pending }
+        }
+      }
+      Reading { device, request, cpu } => {
+        let mut pending = move request
+        run device.checkErrors()
+        if pending.poll() {
+          let padded = run pending.finish()
+          let gpu = run unpad(padded.asSlice(), self.index >= COUNT, sizeOf(self.index))
+          self.stage = Complete { device: move device, gpu: move gpu, cpu: move cpu }
+          return true
+        }
+        self.stage = Reading { device: move device, request: move pending, cpu: move cpu }
+      }
+      Complete { device, gpu, cpu } => {
+        run device.checkErrors()
+        self.stage = Complete { device: move device, gpu: move gpu, cpu: move cpu }
+        return true
+      }
+    }
+    return false
+  }
+
+  /// The width and height, as two little-endian u32s.
+  pub fn size(self: &Self) -> [u8; 8] {
+    let size = sizeOf(self.index)
+    return [
+      u32.toU8(size[0] & 255),
+      u32.toU8(u32.shiftRight(size[0], 8) & 255),
+      0,
+      0,
+      u32.toU8(size[1] & 255),
+      u32.toU8(u32.shiftRight(size[1], 8) & 255),
+      0,
+      0,
+    ]
+  }
+
+  /// The GPU pixels, RGBA, once complete.
+  pub fn gpu(self: &Self) -> &[u8] {
+    return match &self.stage {
+      Complete complete => complete.gpu.asSlice()
+      _ => b""
+    }
+  }
+
+  /// The CPU reference pixels, once complete.
+  pub fn cpu(self: &Self) -> &[u8] {
+    return match &self.stage {
+      Complete complete => complete.cpu.asSlice()
+      _ => b""
+    }
+  }
+}
+
+effect fn render(device: Device, index: u32) -> Reading
+  ! GpuError | OutOfMemoryError | AtlasError | GeometryError | TreeError
+  ? &mut Allocator {
+  let size = sizeOf(index)
+  let width = size[0]
+  let height = size[1]
+  let stride = strideOf(width)
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  let mut batch = Batch.make()
+  run fixtures.build(index % COUNT, &mut batch)
+  run tree.apply(run batch.take())
+  run tree.frame(fixtures.viewport(index % COUNT))
+  if index % COUNT == 2 {
+    // Exercise fractional retained scroll placement through the real hit/input path.
+    run tree.dispatch(Input.Wheel { x: 340.0, y: 112.0, deltaX: 0.0, deltaY: 60.25, modifiers: 0 })
+    run tree.frame(fixtures.viewport(index % COUNT))
+  }
+  let bgra = index >= COUNT
+  let format = if bgra {
+    flags.WGPUTextureFormat_BGRA8Unorm
+  } else {
+    flags.WGPUTextureFormat_RGBA8Unorm
+  }
+  let queue = run gpu.getQueue(&device)
+  let mut renderer = run UiRenderer.make(&device, format)
+  renderer.setTextSettings(TextSettings.none())
+  let mut atlas = GpuAtlas.make()
+  run atlas.sync(&device, &tree.atlas)
+  let pending = tree.pendingUploads()
+  let uploads = pending.entries()
+  let mut u: usize = 0
+  while u < uploads.length {
+    atlas.write(&queue, uploads[u].tile, pending.pixels(uploads[u]))
+    u = u + 1
+  }
+  let mut descriptor = TextureDescriptor.default().withLabel(b"ui tree browser target")
+  descriptor.setSize(extent(width, height))
+  descriptor.setFormat(format)
+  descriptor.setDimension(flags.WGPUTextureDimension_2D)
+  descriptor.setMipLevelCount(1)
+  descriptor.setSampleCount(1)
+  descriptor.setUsage(flags.WGPUTextureUsage_RenderAttachment | flags.WGPUTextureUsage_CopySrc)
+  let texture = run gpu.createTexture(&device, &descriptor)
+  let view = run texture.createView(&TextureViewDescriptor.default())
+  let bytes = u32.toUsize(stride * height)
+  let readback = run gpu.createBuffer(
+    &device,
+    &BufferDescriptor.make(
+      b"ui tree readback",
+      usize.toU64(bytes),
+      flags.WGPUBufferUsage_CopyDst | flags.WGPUBufferUsage_MapRead,
+      false,
+    ),
+  )
+  let mut encoder = run gpu.createCommandEncoder(&device, b"ui tree browser frame")
+  run renderer.encode(
+    &device,
+    &queue,
+    &mut encoder,
+    tree.scene(),
+    &atlas,
+    &view,
+    width,
+    height,
+    color.transparent(),
+  )
+  let source = TexelCopyTextureInfo.default().withTexture(&texture)
+  let mut layout: TexelCopyBufferLayout = TexelCopyBufferLayout.default()
+  layout.setBytesPerRow(stride)
+  layout.setRowsPerImage(height)
+  let mut destination = TexelCopyBufferInfo.default().withBuffer(&readback)
+  destination.setLayout(layout)
+  encoder.copyTextureToBuffer(&source, &destination, &extent(width, height))
+  drop destination
+  drop source
+  let commands = run encoder.finish(b"ui tree browser frame")
+  queue.submit(&[commands.reference()])
+  let request = run runtime.mapReadStart(&device, &readback, 0, bytes)
+  let mut snapshot = CpuSnapshot.make()
+  run snapshot.sync(&mut tree)
+  let reference = run snapshot.render(&tree)
+  let mut cpu = List<u8>.make()
+  run cpu.appendSlice(reference.data())
+  return Reading { device: move device, request: move request, cpu: move cpu }
+}
+
+effect fn unpad(bytes: &[u8], bgra: bool, size: [u32; 2]) -> List<u8>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let width = size[0]
+  let height = size[1]
+  let stride = strideOf(width)
+  let mut out = List<u8>.make()
+  run out.reserve(u32.toUsize(width * height * 4))
+  let mut y: u32 = 0
+  while y < height {
+    let mut x: u32 = 0
+    while x < width {
+      let at = u32.toUsize(y * stride + x * 4)
+      if bgra {
+        run out.append(bytes[at + 2])
+        run out.append(bytes[at + 1])
+        run out.append(bytes[at])
+      } else {
+        run out.append(bytes[at])
+        run out.append(bytes[at + 1])
+        run out.append(bytes[at + 2])
+      }
+      run out.append(bytes[at + 3])
+      x = x + 1
+    }
+    y = y + 1
+  }
+  return move out
+}

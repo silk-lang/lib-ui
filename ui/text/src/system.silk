@@ -1,0 +1,175 @@
+//! [`TextSystem`]: css-layout's `TextMeasure` over a font collection, plus the font metrics
+//! its `Measure.font` needs and the glyph runs behind each text fragment.
+import fonts { FontState, TextStyle, KeyInfo }
+import glyphs { GlyphStore, GlyphRun, PositionedGlyph }
+import analysis { Analyzer, analyze }
+import shaping { Shaping, shapeLine }
+import font_collection.lib { FontCollection }
+import layout.lib {
+  TextMeasure,
+  TextContext,
+  TextBreak,
+  TextAnalysis,
+  TextShapeRequest,
+  TextRun,
+  TextError,
+  FontRequest,
+  FontMetrics,
+  Measure,
+  MeasureRequest,
+  Measured,
+  NaturalDimensions,
+  ScrollbarRequest,
+  ScrollbarMetrics,
+  Size,
+  Rect,
+  BaselineSet
+}
+import raster.face { FontFace }
+import read_fonts.lib { FontRef }
+import font_types.lib { F2Dot14 }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.usize
+
+/// Text measurement and shaping for css-layout over the fonts of a [`FontCollection`].
+///
+/// Register each text style with [`TextSystem.addStyle`] and put the returned key in
+/// `Style.fontKey`. Pass the system (or a provider that forwards to it) to `compute`;
+/// forward `Measure.font` to [`TextSystem.font`]. After layout, each `TextFragment.shapeKey`
+/// names a run in [`TextSystem.glyphs`].
+pub struct TextSystem<'a> {
+  pub fonts: FontState<'a>,
+  pub glyphs: GlyphStore,
+  analyzer: Analyzer,
+  shaping: Shaping,
+  /// Provider calls, for tests and benchmarks.
+  pub analyzeCalls: usize,
+  pub shapeCalls: usize,
+}
+
+impl<'a> TextSystem<'a> {
+  pub fn make(collection: &'a FontCollection) -> TextSystem<'a> {
+    return TextSystem {
+      fonts: FontState.make(collection),
+      glyphs: GlyphStore.make(),
+      analyzer: Analyzer.make(),
+      shaping: Shaping.make(),
+      analyzeCalls: 0,
+      shapeCalls: 0,
+    }
+  }
+
+  /// Adds a text style and returns its font key.
+  pub effect fn addStyle(self: &mut Self, style: TextStyle) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run self.fonts.addStyle(move style)
+  }
+
+  /// The metrics of `request.key`, for `Measure.font`. Unknown keys get zero metrics.
+  pub fn font(self: &Self, request: FontRequest) -> FontMetrics {
+    if request.key >= self.fonts.keyCount() {
+      return FontMetrics.zero()
+    }
+    return self.fonts.metricsOf(request.key)
+  }
+
+  /// What font key `key` stands for: its style, face and size.
+  pub fn keyInfo(self: &Self, key: usize) -> KeyInfo {
+    return self.fonts.key(key)
+  }
+
+  /// The run behind a fragment's `shapeKey`.
+  pub fn glyphRun(self: &Self, shapeKey: usize) -> GlyphRun {
+    return self.glyphs.glyphRun(shapeKey)
+  }
+
+  /// The glyphs behind a fragment's `shapeKey`, positioned from the fragment's left edge and
+  /// its baseline.
+  pub fn runGlyphs(self: &Self, shapeKey: usize) -> &[PositionedGlyph] {
+    return self.glyphs.glyphsOf(shapeKey)
+  }
+
+  /// The face of font key `key` at its variation coordinates, for a `font-raster` glyph
+  /// cache. Its id identifies the face and variation coordinates in this text system.
+  pub effect fn rasterFace(self: &Self, key: usize) -> Option<FontFace<'a>>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let info = self.fonts.key(key)
+    if info.face == usize.MAX {
+      return Option<FontFace<'a>>.None
+    }
+    if let Option<FontRef<'a>>.Some { value: font } = self.fonts.matcher.fonts().font(info.face) {
+      let face = run FontFace.make(
+        usize.toU32(self.fonts.instanceOf(key)),
+        font,
+        self.fonts.coords(key),
+      )
+      return Option<FontFace<'a>>.Some { value: move face }
+    }
+    return Option<FontFace<'a>>.None
+  }
+}
+
+impl<'a> TextMeasure for TextSystem<'a> {
+  fn beginTextLayout(provider: &mut Self) {}
+
+  effect fn analyze(
+    provider: &mut Self,
+    context: TextContext<'_, '_>,
+    output: &mut List<TextBreak>,
+  ) -> TextAnalysis
+    ! OutOfMemoryError | TextError
+    ? &mut Allocator {
+    provider.analyzeCalls = provider.analyzeCalls + 1
+    return run analyze(&mut provider.analyzer, context, &mut output)
+  }
+
+  effect fn shape(
+    provider: &mut Self,
+    request: TextShapeRequest<'_, '_>,
+    output: &mut List<TextRun>,
+  )
+    ! OutOfMemoryError | TextError
+    ? &mut Allocator {
+    provider.shapeCalls = provider.shapeCalls + 1
+    run shapeLine(
+      &mut provider.shaping,
+      &mut provider.fonts,
+      &mut provider.glyphs,
+      request,
+      &mut output,
+    )
+  }
+}
+
+/// A `Measure` for trees whose only content is text: fonts come from the system, and there
+/// are no scrollbars, opaque measurements or replaced resources. Wrap the system in your own
+/// provider when the tree has those.
+impl<'a> Measure for TextSystem<'a> {
+  fn measure(provider: &mut Self, key: usize, request: MeasureRequest<'_>) -> Measured {
+    return Measured {
+      size: Size { width: 0.0, height: 0.0 },
+      contentBlockSize: 0.0,
+      firstBaselines: BaselineSet.zero(),
+      lastBaselines: BaselineSet.zero(),
+      hasBaseline: false,
+      hasLineBoxes: false,
+      scrollableOverflow: Rect.zero(),
+    }
+  }
+
+  fn natural(provider: &mut Self, key: usize) -> NaturalDimensions {
+    return NaturalDimensions.none()
+  }
+
+  fn scrollbars(provider: &mut Self, request: ScrollbarRequest) -> ScrollbarMetrics {
+    return ScrollbarMetrics.zero()
+  }
+
+  fn font(provider: &mut Self, request: FontRequest) -> FontMetrics {
+    return TextSystem.font(&provider.*, request)
+  }
+}

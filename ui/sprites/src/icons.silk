@@ -1,0 +1,375 @@
+//! SVG icons rasterized by svg_render into atlas tiles at the size they are drawn.
+//!
+//! [`IconCache.register`] parses an icon once. [`IconCache.icon`] returns its tile for a device
+//! pixel size and style, rendering it on a miss and queueing the pixels in
+//! [`IconCache.uploads`] for the renderer to copy into its texture, as the glyph cache does. The
+//! atlas is borrowed per call, so glyphs, icons and images share it.
+//!
+//! An animated icon (SMIL elements, or a `@keyframes` rule for CSS Animations) is cached per
+//! frame: the time is rounded to [`IconOptions.framesPerSecond`], each frame number gets its own
+//! tile, and the atlas evicts frames that stop being drawn. This suits small animated icons such
+//! as spinners. Large animated SVGs should go through the display list lowering into gpu_scene
+//! instead, which does not keep a texture per frame.
+import uploads { Upload, Uploads }
+import atlas.atlas { Atlas, AtlasTile, AtlasError, Kind }
+import svg_render.lib { Animated, RenderOptions, RenderError, Pixmap, Environment }
+import svg_render.lib as renderer
+import svg_core.resources { Resolver }
+import silk.collections.hash { Hash, HashKey, HashSeed }
+import silk.collections.hash_map { HashMap }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f64
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+
+/// A registered icon.
+pub struct IconId {
+  pub index: u32,
+}
+
+impl Copy for IconId {}
+
+/// How an icon's pixels are kept.
+pub union IconStyle {
+  /// Coverage only, one byte per pixel (the rendering's alpha), in a monochrome texture. Draw it
+  /// as a `GlyphSprite`, tinted with the sprite's color, as GPUI draws its icons.
+  Mask,
+  /// Premultiplied RGBA in a polychrome texture, the icon's own colors. Draw it as an
+  /// `ImageSprite`.
+  Color,
+}
+
+impl Copy for IconStyle {}
+
+impl IconStyle {
+  /// The atlas texture kind tiles of this style live in.
+  pub fn kind(self: &Self) -> Kind {
+    return match &self.* {
+      IconStyle.Mask => Kind.Monochrome
+      IconStyle.Color => Kind.Polychrome
+    }
+  }
+
+  fn color(self: &Self) -> bool {
+    return match &self.* {
+      IconStyle.Mask => false
+      IconStyle.Color => true
+    }
+  }
+}
+
+pub struct IconOptions {
+  /// Animation frames per second: an animated icon's time is rounded to a multiple of
+  /// `1 / framesPerSecond` and each multiple is its own tile. Must be positive.
+  pub framesPerSecond: f64,
+}
+
+impl Copy for IconOptions {}
+
+impl IconOptions {
+  pub fn default() -> IconOptions {
+    return IconOptions { framesPerSecond: 60.0 }
+  }
+}
+
+/// How many lookups hit, missed, or found their tile evicted, since the cache was made.
+pub struct IconStats {
+  pub hits: u64,
+  pub misses: u64,
+  pub rerendered: u64,
+}
+
+impl Copy for IconStats {}
+
+struct IconKey {
+  icon: u32,
+  width: u32,
+  height: u32,
+  frame: u32,
+  color: bool,
+}
+
+impl Copy for IconKey {}
+
+impl HashKey for IconKey {
+  fn equals(left: &Self, right: &Self) -> bool {
+    return left.icon == right.icon && left.width == right.width && left.height == right.height
+      && left.frame == right.frame
+      && left.color == right.color
+  }
+
+  fn hash(value: &Self, seed: &HashSeed) -> u64 {
+    let mut hashed = Hash.mix(seed, u32.toU64(value.icon))
+    hashed = Hash.combine(hashed, u32.toU64(value.width))
+    hashed = Hash.combine(hashed, u32.toU64(value.height))
+    hashed = Hash.combine(hashed, u32.toU64(value.frame))
+    return Hash.combine(
+      hashed,
+      if value.color {
+        1
+      } else {
+        0
+      },
+    )
+  }
+}
+
+struct Source {
+  document: Animated,
+  moves: bool,
+}
+
+pub struct IconCache {
+  options: IconOptions,
+  sources: List<Option<Source>>,
+  entries: HashMap<IconKey, AtlasTile>,
+  pending: Uploads,
+  mask: List<u8>,
+  counters: IconStats,
+  scratchKeys: List<IconKey>,
+}
+
+fn contains(data: &[u8], needle: &[u8]) -> bool {
+  if needle.length == 0 || data.length < needle.length {
+    return needle.length == 0
+  }
+  let mut i: usize = 0
+  while i + needle.length <= data.length {
+    let mut j: usize = 0
+    while j < needle.length && data[i + j] == needle[j] {
+      j = j + 1
+    }
+    if j == needle.length {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+impl IconCache {
+  pub fn make(options: IconOptions) -> IconCache {
+    return IconCache {
+      options: options,
+      sources: List<Option<Source>>.make(),
+      entries: HashMap<IconKey, AtlasTile>.make(Hash.seed(0x69636f6e)),
+      pending: Uploads.make(),
+      mask: List<u8>.make(),
+      counters: IconStats { hits: 0, misses: 0, rerendered: 0 },
+      scratchKeys: List<IconKey>.make(),
+    }
+  }
+
+  /// Parses an SVG icon once. Every later [`IconCache.icon`] call for it must pass the same
+  /// `host`, which also decides whether the document animates (an animated processing mode).
+  pub effect fn register(self: &mut Self, data: &[u8], host: &Environment<'_, '_>) -> IconId
+    ! RenderError | OutOfMemoryError
+    ? &mut Resolver | &mut Allocator {
+    let document = run renderer.parseAnimated(data, host)
+    let moves = document.animated() || contains(data, b"@keyframes")
+    let id = IconId { index: u64.toU32(usize.toU64(self.sources.length())) }
+    run self.sources.append(Option<Source>.some(Source { document: move document, moves: moves }))
+    return id
+  }
+
+  /// The number of registered icons.
+  pub fn iconCount(self: &Self) -> usize {
+    let mut count: usize = 0
+    let mut i: usize = 0
+    while i < self.sources.length() {
+      if self.sources.asSlice()[i].isSome() {
+        count = count + 1
+      }
+      i = i + 1
+    }
+    return count
+  }
+
+  /// Whether `icon` changes over time, so that [`IconCache.icon`] keys it by frame.
+  pub fn animated(self: &Self, icon: IconId) -> bool {
+    if u32.toUsize(icon.index) >= self.sources.length() {
+      return false
+    }
+    return match &self.sources.asSlice()[u32.toUsize(icon.index)] {
+      Option<Source>.Some { value } => value.moves
+      Option<Source>.None => false
+    }
+  }
+
+  /// The frame number `time` (seconds) rounds to for `icon`: zero for a still icon.
+  pub fn frameOf(self: &Self, icon: IconId, time: f64) -> u32 {
+    if !self.animated(icon) || !(time > 0.0) {
+      return 0
+    }
+    let frame = f64.floor(time * self.options.framesPerSecond + 0.5)
+    return if frame >= 4294967295.0 {
+      4294967295
+    } else {
+      f64.toU32(frame)
+    }
+  }
+
+  /// The number of cached tiles.
+  pub fn length(self: &Self) -> usize {
+    return self.entries.length()
+  }
+
+  pub fn stats(self: &Self) -> IconStats {
+    return self.counters
+  }
+
+  /// The tile of `icon` rendered at `width` x `height` device pixels in `style`, at `time`
+  /// seconds for an animated icon. A hit touches the tile so the atlas keeps it; a miss
+  /// renders the icon with svg_render (the same pixels as `svg_render.lib.render` at that size
+  /// and the rounded time) and queues them in [`IconCache.uploads`].
+  ///
+  /// Fails with `AtlasError.EmptyTile` for a zero size, and with `AtlasError.Full` when the
+  /// atlas has no room after evicting what earlier frames used; nothing is cached then.
+  pub effect fn icon(
+    self: &mut Self,
+    atlas: &mut Atlas,
+    host: &Environment<'_, '_>,
+    icon: IconId,
+    width: u32,
+    height: u32,
+    style: IconStyle,
+    time: f64,
+  ) -> AtlasTile
+    ! RenderError | AtlasError | OutOfMemoryError
+    ? &mut Resolver | &mut Allocator {
+    if width == 0 || height == 0 || u32.toUsize(icon.index) >= self.sources.length()
+      || self.sources.asSlice()[u32.toUsize(icon.index)].isNone() {
+      fail AtlasError.EmptyTile
+    }
+    let key = IconKey {
+      icon: icon.index,
+      width: width,
+      height: height,
+      frame: self.frameOf(icon, time),
+      color: style.color(),
+    }
+    if let Option<AtlasTile>.Some { value } = self.entries.get(key) {
+      if atlas.touch(value.id) {
+        self.counters.hits = self.counters.hits + 1
+        return value
+      }
+      self.counters.rerendered = self.counters.rerendered + 1
+    } else {
+      self.counters.misses = self.counters.misses + 1
+    }
+    let pixmap = run self.render(host, key)
+    let tile = run atlas.allocate(style.kind(), pixmap.width(), pixmap.height())
+    let rgba = pixmap.data()
+    match &style {
+      IconStyle.Color => {
+        run self.pending.push(tile, rgba, pixmap.width() * 4)
+      }
+      IconStyle.Mask => {
+        self.mask.clear()
+        let mut i: usize = 3
+        while i < rgba.length {
+          run self.mask.append(rgba[i])
+          i = i + 4
+        }
+        run self.pending.push(tile, self.mask.asSlice(), pixmap.width())
+      }
+    }
+    drop run self.entries.insert(key, tile)
+    return tile
+  }
+
+  /// The rendering of `key`: `svg_render.lib.render` of the icon at its size and frame time.
+  effect fn render(self: &mut Self, host: &Environment<'_, '_>, key: IconKey) -> Pixmap
+    ! RenderError | OutOfMemoryError
+    ? &mut Resolver | &mut Allocator {
+    let mut options = RenderOptions.make()
+    options.width = key.width
+    options.height = key.height
+    options.time = u32.toF64(key.frame) / self.options.framesPerSecond
+    let source = &mut self.sources.asMutSlice()[u32.toUsize(key.icon)]
+    return match &mut source.* {
+      Option<Source>.Some { value } => {
+        let list = run value.document.frame(&options, host)
+        run renderer.renderDisplayList(&list)
+      }
+      Option<Source>.None => Intrinsic.trap("render of unregistered icon")
+    }
+  }
+
+  /// Tiles rendered since the last [`IconCache.clearUploads`], in allocation order. Mask tiles
+  /// hold one byte per pixel, color tiles four (premultiplied RGBA).
+  pub fn uploads(self: &Self) -> &[Upload] {
+    return self.pending.list()
+  }
+
+  /// The pixel bytes [`Upload.offset`] points into.
+  pub fn uploadBytes(self: &Self) -> &[u8] {
+    return self.pending.bytes()
+  }
+
+  /// Forgets the queued uploads once the renderer has copied them.
+  pub fn clearUploads(self: &mut Self) -> () {
+    self.pending.clear()
+  }
+
+  /// Releases an icon's document and cached tiles. Its id is never reused.
+  pub effect fn unregister(self: &mut Self, atlas: &mut Atlas, icon: IconId) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if u32.toUsize(icon.index) >= self.sources.length() {
+      return ()
+    }
+    self.scratchKeys.clear()
+    let mut i: usize = 0
+    while i < self.entries.bucketCount() {
+      if self.entries.occupiedAt(i) && self.entries.keyAt(i).icon == icon.index {
+        run self.scratchKeys.append(self.entries.keyAt(i))
+      }
+      i = i + 1
+    }
+    let keys = self.scratchKeys.asSlice()
+    i = 0
+    while i < keys.length {
+      if let Option<AtlasTile>.Some { value } = self.entries.remove(keys[i]) {
+        drop atlas.free(value.id)
+      }
+      i = i + 1
+    }
+    let sources = self.sources.asMutSlice()
+    sources[u32.toUsize(icon.index)] = Option<Source>.None
+  }
+
+  /// Drops every entry whose tile `atlas` no longer holds (evicted frames of an animation, for
+  /// example), and returns how many were dropped.
+  pub effect fn prune(self: &mut Self, atlas: &Atlas) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.scratchKeys.clear()
+    let mut i: usize = 0
+    while i < self.entries.bucketCount() {
+      if self.entries.occupiedAt(i) {
+        if let Option<AtlasTile>.None = atlas.get(self.entries.valueAt(i).id) {
+          run self.scratchKeys.append(self.entries.keyAt(i))
+        }
+      }
+      i = i + 1
+    }
+    let stale = self.scratchKeys.asSlice()
+    let mut j: usize = 0
+    while j < stale.length {
+      drop self.entries.remove(stale[j])
+      j = j + 1
+    }
+    return stale.length
+  }
+
+  /// Drops every cached tile entry, for example when the scale factor changes. Registered
+  /// icons stay; tiles stay allocated until the atlas evicts them.
+  pub fn clear(self: &mut Self) -> () {
+    self.entries.clear()
+  }
+}

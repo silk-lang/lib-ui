@@ -1,0 +1,770 @@
+//! ui-components tests: the gallery driven through the real tree with synthetic input, one
+//! test per component, and one that uses the keyboard only. Run from the repository root.
+import ui_gallery.lib { Gallery, Message, SANS, ROWS }
+import ui_components.lib { NO_SELECTION, visibleRows, snap, valueAt }
+import ui_app.app { NoCommand }
+import ui_app.runtime { Runtime }
+import ui_app.harness {
+  click,
+  clickAt,
+  clickRole,
+  drag,
+  hover,
+  moveTo,
+  wheel,
+  press,
+  typeText,
+  locate,
+  locateRole,
+  focusedId,
+  snapshot
+}
+import ui_fixtures.fixtures as fixtures
+import ui_tree.lib { UiTree, TreeError, Batch, FrameInput, NodeInfo, Role, MOD_SHIFT }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String, InvalidUtf8 }
+import silk.collections.slice { Slice }
+import silk.core.result { Result }
+import silk.num.u32
+
+pub fn viewport() -> FrameInput {
+  return FrameInput { width: 880.0, height: 680.0, scale: 1.0, time: 0.0 }
+}
+
+effect fn fonts(tree: &mut UiTree<'_>) -> ()
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut batch = Batch.make()
+  run batch.fontFamily(SANS, "Noto Sans, sans-serif")
+  run tree.apply(run batch.take())
+}
+
+/// The tree id of the first node with role `accessRole` named `name`, or 0.
+effect fn roleId(tree: &mut UiTree<'_>, accessRole: Role, name: string) -> u32
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  return match run locateRole(&mut tree, viewport(), accessRole, name) {
+    Option<NodeInfo>.Some { value: node } => node.id
+    Option<NodeInfo>.None => 0
+  }
+}
+
+/// The tree id of the first node whose test id, label or text is `value`, or 0.
+effect fn idOf(tree: &mut UiTree<'_>, value: string) -> u32
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  return match run locate(&mut tree, viewport(), value) {
+    Option<NodeInfo>.Some { value: node } => node.id
+    Option<NodeInfo>.None => 0
+  }
+}
+
+/// The layout box of the first node with role `accessRole` named `name`.
+effect fn boxOf(tree: &mut UiTree<'_>, accessRole: Role, name: string) -> NodeInfo
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  return match run locateRole(&mut tree, viewport(), accessRole, name) {
+    Option<NodeInfo>.Some { value: node } => node
+    Option<NodeInfo>.None => {
+      run Testing.expect(false, "the node is there")
+      return Intrinsic.trap("unreachable")
+    }
+  }
+}
+
+/// Whether `text` contains `part`.
+fn contains(text: string, part: string) -> bool {
+  let a = String.utf8Bytes(text)
+  let b = String.utf8Bytes(part)
+  if b.length > a.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i + b.length <= a.length {
+    let mut j: usize = 0
+    while j < b.length && a[i + j] == b[j] {
+      j = j + 1
+    }
+    if j == b.length {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+/// The describe line of the node with id `id` holds `part`.
+effect fn lineHas(tree: &mut UiTree<'_>, id: u32, part: string) -> bool
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let text = run snapshot(&mut tree, viewport())
+  let bytes = String.utf8Bytes(String.view(&text))
+
+  // Find "#<id> " and check the rest of its line.
+  let mut marker = run String.copy("#")
+  run appendNumber(&mut marker, id)
+  run marker.append(" ")
+  let m = String.utf8Bytes(String.view(&marker))
+  let mut i: usize = 0
+  while i + m.length <= bytes.length {
+    let mut j: usize = 0
+    while j < m.length && bytes[i + j] == m[j] {
+      j = j + 1
+    }
+    if j == m.length {
+      let mut end = i
+      while end < bytes.length && bytes[end] != 10 {
+        end = end + 1
+      }
+      let line = String.fromUtf8(Slice.view(bytes, i, end - i))
+        |> Result<string, InvalidUtf8>.unwrapOr("")
+      return contains(line, part)
+    }
+    i = i + 1
+  }
+  return false
+}
+
+effect fn appendNumber(out: &mut String, value: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if value >= 10 {
+    run appendNumber(&mut out, value / 10)
+  }
+  let digit = value % 10
+  let digits: [string<'static>; 10] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+  run out.append(digits[u32.toUsize(digit)])
+}
+
+// Buttons and the tooltip.
+
+effect fn buttonsBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  run fonts(&mut tree)
+  let mut app = Runtime<Gallery, Message, NoCommand>.make(Gallery.make())
+  run app.start(&mut tree, 0.0)
+
+  run Testing.expect(
+    run clickRole(&mut app, &mut tree, viewport(), Role.Button, "Save"),
+    "Save is a button",
+  )
+  run Testing.expect(app.model.saves == 1, "a click presses it")
+  run Testing.expect(String.view(&app.model.status) == "Saved", "the status says so")
+  run Testing.expect((run idOf(&mut tree, "Saved")) != 0, "the tree shows the status")
+
+  // The disabled button takes no clicks and no focus.
+  drop run clickRole(&mut app, &mut tree, viewport(), Role.Button, "Disabled")
+  run Testing.expect(String.view(&app.model.status) == "Saved", "a disabled button does nothing")
+  let disabled = run roleId(&mut tree, Role.Button, "Disabled")
+  run Testing.expect(run lineHas(&mut tree, disabled, "disabled"), "describe marks it disabled")
+
+  drop run clickRole(&mut app, &mut tree, viewport(), Role.Button, "Reset")
+  run Testing.expect(app.model.saves == 0, "Reset resets")
+
+  // Enter and Space press the focused button.
+  drop run click(&mut app, &mut tree, viewport(), "Components")
+  run press(&mut app, &mut tree, viewport(), "Tab", 0)
+  let save = run roleId(&mut tree, Role.Button, "Save")
+  run Testing.expect(focusedId(&tree) == save, "Tab focuses Save first")
+  run press(&mut app, &mut tree, viewport(), "Enter", 0)
+  run Testing.expect(app.model.saves == 1, "Enter presses it")
+  run press(&mut app, &mut tree, viewport(), " ", 0)
+  run Testing.expect(app.model.saves == 2, "Space presses it")
+}
+
+test effect fn buttonsPressByPointerAndKeys() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run buttonsBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn tooltipBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  run fonts(&mut tree)
+  let mut app = Runtime<Gallery, Message, NoCommand>.make(Gallery.make())
+  run app.start(&mut tree, 0.0)
+
+  run Testing.expect(
+    (run roleId(&mut tree, Role.Tooltip, "Saves the draft")) == 0,
+    "hidden at first",
+  )
+  run Testing.expect(run hover(&mut app, &mut tree, viewport(), "Save"), "Save is there")
+  let tip = run boxOf(&mut tree, Role.Tooltip, "Saves the draft")
+  let save = run boxOf(&mut tree, Role.Button, "Save")
+  run Testing.expect(tip.bounds.yMin >= save.bounds.yMax, "the tooltip shows under the button")
+  run Testing.expect(tip.paintIndex > save.paintIndex, "it is drawn above the page")
+  drop run hover(&mut app, &mut tree, viewport(), "Components")
+  run Testing.expect(
+    (run roleId(&mut tree, Role.Tooltip, "Saves the draft")) == 0,
+    "leaving hides it",
+  )
+
+  // Keyboard focus shows it too.
+  drop run click(&mut app, &mut tree, viewport(), "Components")
+  run press(&mut app, &mut tree, viewport(), "Tab", 0)
+  run Testing.expect(
+    (run roleId(&mut tree, Role.Tooltip, "Saves the draft")) != 0,
+    "focus shows it",
+  )
+  run press(&mut app, &mut tree, viewport(), "Tab", 0)
+  run Testing.expect((run roleId(&mut tree, Role.Tooltip, "Saves the draft")) == 0, "blur hides it")
+}
+
+test effect fn tooltipFollowsHoverAndFocus() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run tooltipBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Checkbox and switch.
+
+effect fn choicesBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  run fonts(&mut tree)
+  let mut app = Runtime<Gallery, Message, NoCommand>.make(Gallery.make())
+  run app.start(&mut tree, 0.0)
+
+  let agree = run roleId(&mut tree, Role.Checkbox, "I agree")
+  run Testing.expect(agree != 0, "the checkbox is there")
+  run Testing.expect(!(run lineHas(&mut tree, agree, "checked")), "unchecked at first")
+  drop run clickRole(&mut app, &mut tree, viewport(), Role.Checkbox, "I agree")
+  run Testing.expect(app.model.agree, "a click checks it")
+  run Testing.expect(run lineHas(&mut tree, agree, "checked"), "describe says checked")
+  drop run click(&mut app, &mut tree, viewport(), "I agree")
+  run Testing.expect(!app.model.agree, "a click on the label unchecks it")
+  run Testing.expect(focusedId(&tree) == agree, "the click focused it")
+  run press(&mut app, &mut tree, viewport(), " ", 0)
+  run Testing.expect(app.model.agree, "Space checks the focused checkbox")
+
+  drop run clickRole(&mut app, &mut tree, viewport(), Role.Checkbox, "Locked")
+  run Testing.expect(app.model.agree, "a disabled checkbox sends nothing")
+
+  let notify = run roleId(&mut tree, Role.Switch, "Notifications")
+  run Testing.expect(run lineHas(&mut tree, notify, "checked"), "the switch starts on")
+  drop run clickRole(&mut app, &mut tree, viewport(), Role.Switch, "Notifications")
+  run Testing.expect(!app.model.notify, "a click turns it off")
+  run Testing.expect(!(run lineHas(&mut tree, notify, "checked")), "describe follows")
+  run press(&mut app, &mut tree, viewport(), " ", 0)
+  run Testing.expect(app.model.notify, "Space turns it on")
+}
+
+test effect fn checkboxAndSwitchToggle() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run choicesBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Slider.
+
+test effect fn sliderMath() -> ()
+  ! AssertionError<'static> {
+  run Testing.expect(snap(42.0, 0.0, 100.0, 5.0) == 40.0, "snaps down to a step")
+  run Testing.expect(snap(43.0, 0.0, 100.0, 5.0) == 45.0, "snaps up to a step")
+  run Testing.expect(snap(120.0, 0.0, 100.0, 5.0) == 100.0, "clamps above")
+  run Testing.expect(snap(-3.0, 0.0, 100.0, 5.0) == 0.0, "clamps below")
+  run Testing.expect(valueAt(150.0, 100.0, 200.0, 0.0, 100.0, 1.0) == 25.0, "a quarter in")
+}
+
+effect fn sliderBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  run fonts(&mut tree)
+  let mut app = Runtime<Gallery, Message, NoCommand>.make(Gallery.make())
+  run app.start(&mut tree, 0.0)
+
+  let track = run boxOf(&mut tree, Role.Slider, "Volume")
+  let left = track.bounds.xMin + 8.0
+  let width = track.bounds.xMax - track.bounds.xMin - 16.0
+  let y = (track.bounds.yMin + track.bounds.yMax) * 0.5
+  run clickAt(&mut app, &mut tree, viewport(), left + width * 0.8, y)
+  run Testing.expect(app.model.volume == 80.0, "a click on the track jumps there")
+  let range = tree.node(tree.slotOf(track.id))
+  run Testing.expect(
+    range.hasValueRange && range.valueNow == 80.0 && range.valueMin == 0.0
+      && range.valueMax == 100.0,
+    "slider accessibility range follows the actual controlled value",
+  )
+  run Testing.expect(focusedId(&tree) == track.id, "and focuses the slider")
+  run Testing.expect((run idOf(&mut tree, "80")) != 0, "the value shows")
+
+  run drag(&mut app, &mut tree, viewport(), left + width * 0.8, y, left + width * 0.2, y, 4)
+  run Testing.expect(app.model.volume == 20.0, "dragging follows the pointer")
+  run drag(&mut app, &mut tree, viewport(), left + width * 0.2, y, left - 50.0, y, 2)
+  run Testing.expect(app.model.volume == 0.0, "dragging past the end stops at the minimum")
+
+  // Pointer moves without a press change nothing.
+  run clickAt(&mut app, &mut tree, viewport(), left + width * 0.5, y)
+  run Testing.expect(app.model.volume == 50.0, "click to the middle")
+  drop run hover(&mut app, &mut tree, viewport(), "Volume")
+  run Testing.expect(app.model.volume == 50.0, "hovering is not dragging")
+
+  run press(&mut app, &mut tree, viewport(), "ArrowRight", 0)
+  run Testing.expect(app.model.volume == 55.0, "ArrowRight is one step up")
+  run press(&mut app, &mut tree, viewport(), "ArrowDown", 0)
+  run press(&mut app, &mut tree, viewport(), "ArrowDown", 0)
+  run Testing.expect(app.model.volume == 45.0, "ArrowDown is one step down")
+  run press(&mut app, &mut tree, viewport(), "PageUp", 0)
+  run Testing.expect(app.model.volume == 95.0, "PageUp is ten steps")
+  run press(&mut app, &mut tree, viewport(), "End", 0)
+  run Testing.expect(app.model.volume == 100.0, "End is the maximum")
+  run press(&mut app, &mut tree, viewport(), "ArrowUp", 0)
+  run Testing.expect(app.model.volume == 100.0, "and it stays there")
+  run press(&mut app, &mut tree, viewport(), "Home", 0)
+  run Testing.expect(app.model.volume == 0.0, "Home is the minimum")
+}
+
+test effect fn sliderFollowsPointerAndKeys() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run sliderBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Text field and text area.
+
+effect fn fieldsBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  run fonts(&mut tree)
+  let mut app = Runtime<Gallery, Message, NoCommand>.make(Gallery.make())
+  run app.start(&mut tree, 0.0)
+
+  run Testing.expect(run click(&mut app, &mut tree, viewport(), "name"), "the name field is there")
+  let name = run idOf(&mut tree, "name")
+  run Testing.expect(focusedId(&tree) == name, "a click focuses it")
+  run Testing.expect(run lineHas(&mut tree, name, "placeholder=\"Your name\""), "the placeholder")
+  run typeText(&mut app, &mut tree, viewport(), "Ada")
+  run Testing.expect(String.view(&app.model.name) == "Ada", "typing reaches the model")
+  run typeText(&mut app, &mut tree, viewport(), " L")
+  run Testing.expect(String.view(&app.model.name) == "Ada L", "each edit does")
+  run press(&mut app, &mut tree, viewport(), "Backspace", 0)
+  run Testing.expect(String.view(&app.model.name) == "Ada ", "deleting does")
+  run Testing.expect(run lineHas(&mut tree, name, "\"Ada \""), "the input shows the model's value")
+  run press(&mut app, &mut tree, viewport(), "Enter", 0)
+  run Testing.expect(String.view(&app.model.submitted) == "Ada ", "Enter submits")
+  run Testing.expect((run idOf(&mut tree, "Submitted")) != 0, "the status says so")
+
+  run Testing.expect(run click(&mut app, &mut tree, viewport(), "notes"), "the notes area is there")
+  run typeText(&mut app, &mut tree, viewport(), "one")
+  run press(&mut app, &mut tree, viewport(), "Enter", 0)
+  run typeText(&mut app, &mut tree, viewport(), "two")
+  run Testing.expect(String.view(&app.model.notes) == "one\ntwo", "Enter starts a new line")
+  run Testing.expect(String.view(&app.model.submitted) == "Ada ", "and submits nothing")
+}
+
+test effect fn textFieldAndAreaEdit() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run fieldsBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Dialog.
+
+effect fn dialogBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  run fonts(&mut tree)
+  let mut app = Runtime<Gallery, Message, NoCommand>.make(Gallery.make())
+  run app.start(&mut tree, 0.0)
+
+  drop run click(&mut app, &mut tree, viewport(), "name")
+  run typeText(&mut app, &mut tree, viewport(), "Ada")
+  run Testing.expect((run roleId(&mut tree, Role.Dialog, "Delete the draft?")) == 0, "closed")
+  drop run clickRole(&mut app, &mut tree, viewport(), Role.Button, "Delete draft")
+  let box = run boxOf(&mut tree, Role.Dialog, "Delete the draft?")
+  let cancel = run roleId(&mut tree, Role.Button, "Cancel")
+  run Testing.expect(focusedId(&tree) == cancel, "Cancel takes focus when it opens")
+
+  // Tab stays inside.
+  run press(&mut app, &mut tree, viewport(), "Tab", 0)
+  let delete = run roleId(&mut tree, Role.Button, "Delete")
+  run Testing.expect(focusedId(&tree) == delete, "Tab goes to Delete")
+  run press(&mut app, &mut tree, viewport(), "Tab", 0)
+  run Testing.expect(focusedId(&tree) == cancel, "and wraps back to Cancel")
+
+  // Escape closes it, and focus goes back to its button.
+  run press(&mut app, &mut tree, viewport(), "Escape", 0)
+  run Testing.expect(!app.model.confirm.open, "Escape closes it")
+  run Testing.expect((run roleId(&mut tree, Role.Dialog, "Delete the draft?")) == 0, "it is gone")
+  let opener = run roleId(&mut tree, Role.Button, "Delete draft")
+  run Testing.expect(focusedId(&tree) == opener, "focus is back on the button")
+  run Testing.expect(String.view(&app.model.name) == "Ada", "nothing was deleted")
+
+  // A click inside does not close it; a click on the scrim does.
+  run press(&mut app, &mut tree, viewport(), "Enter", 0)
+  run Testing.expect(app.model.confirm.open, "Enter on the button opens it again")
+  run clickAt(&mut app, &mut tree, viewport(), box.bounds.xMin + 10.0, box.bounds.yMin + 10.0)
+  run Testing.expect(app.model.confirm.open, "a click inside keeps it open")
+  run clickAt(&mut app, &mut tree, viewport(), 5.0, 5.0)
+  run Testing.expect(!app.model.confirm.open, "a click on the scrim closes it")
+
+  drop run clickRole(&mut app, &mut tree, viewport(), Role.Button, "Delete draft")
+  drop run clickRole(&mut app, &mut tree, viewport(), Role.Button, "Delete")
+  run Testing.expect(app.model.deleted == 1 && !app.model.confirm.open, "Delete acts and closes")
+  run Testing.expect(String.view(&app.model.name) == "", "the draft is cleared")
+}
+
+test effect fn dialogTrapsFocusAndCloses() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run dialogBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Menu and select.
+
+effect fn menuBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  run fonts(&mut tree)
+  let mut app = Runtime<Gallery, Message, NoCommand>.make(Gallery.make())
+  run app.start(&mut tree, 0.0)
+
+  let file = run roleId(&mut tree, Role.Button, "File")
+  drop run clickRole(&mut app, &mut tree, viewport(), Role.Button, "File")
+  run Testing.expect(app.model.fileMenu.open, "a click opens it")
+  run Testing.expect(run lineHas(&mut tree, file, "expanded"), "the button says expanded")
+  let list = run boxOf(&mut tree, Role.Menu, "File")
+  let button = run boxOf(&mut tree, Role.Button, "File")
+  run Testing.expect(list.bounds.yMin >= button.bounds.yMax, "it opens under the button")
+  run Testing.expect(list.paintIndex > button.paintIndex, "above the page")
+  run Testing.expect(focusedId(&tree) == list.id, "it takes focus")
+  run press(&mut app, &mut tree, viewport(), "ArrowDown", 0)
+  run Testing.expect(app.model.fileMenu.active == 1, "ArrowDown highlights the next item")
+  run press(&mut app, &mut tree, viewport(), "ArrowUp", 0)
+  run press(&mut app, &mut tree, viewport(), "ArrowUp", 0)
+  run Testing.expect(app.model.fileMenu.active == 3, "ArrowUp wraps to the last")
+  run press(&mut app, &mut tree, viewport(), "Enter", 0)
+  run Testing.expect(!app.model.fileMenu.open, "Enter chooses and closes")
+  run Testing.expect(String.view(&app.model.status) == "Close", "the chosen command ran")
+  run Testing.expect(focusedId(&tree) == file, "focus is back on the button")
+
+  // The pointer: hover highlights, a click chooses, a press outside closes.
+  drop run clickRole(&mut app, &mut tree, viewport(), Role.Button, "File")
+  let save = run boxOf(&mut tree, Role.MenuItem, "Save")
+  let x = (save.bounds.xMin + save.bounds.xMax) * 0.5
+  let y = (save.bounds.yMin + save.bounds.yMax) * 0.5
+  run moveTo(&mut app, &mut tree, viewport(), x, y)
+  run Testing.expect(app.model.fileMenu.active == 2, "hover highlights")
+  drop run clickRole(&mut app, &mut tree, viewport(), Role.MenuItem, "Open")
+  run Testing.expect(String.view(&app.model.status) == "Open", "a click chooses")
+  drop run clickRole(&mut app, &mut tree, viewport(), Role.Button, "File")
+  run clickAt(&mut app, &mut tree, viewport(), 860.0, 660.0)
+  run Testing.expect(!app.model.fileMenu.open, "a press outside closes it")
+  run Testing.expect(String.view(&app.model.status) == "Open", "without choosing")
+
+  // Down on the button opens it; Escape closes it.
+  run press(&mut app, &mut tree, viewport(), "ArrowDown", 0)
+  run Testing.expect(app.model.fileMenu.open, "ArrowDown on the button opens it")
+  run press(&mut app, &mut tree, viewport(), "Escape", 0)
+  run Testing.expect(!app.model.fileMenu.open, "Escape closes it")
+}
+
+test effect fn menuOpensChoosesAndCloses() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run menuBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn selectBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  run fonts(&mut tree)
+  let mut app = Runtime<Gallery, Message, NoCommand>.make(Gallery.make())
+  run app.start(&mut tree, 0.0)
+
+  drop run clickRole(&mut app, &mut tree, viewport(), Role.Button, "Size")
+  run Testing.expect(app.model.sizeMenu.active == 1, "it opens on the selected option")
+  let medium = run roleId(&mut tree, Role.Option, "Medium")
+  run Testing.expect(run lineHas(&mut tree, medium, "selected"), "which is marked selected")
+  run press(&mut app, &mut tree, viewport(), "ArrowDown", 0)
+  run press(&mut app, &mut tree, viewport(), "Enter", 0)
+  run Testing.expect(app.model.size == 2, "ArrowDown and Enter choose Large")
+  run Testing.expect((run idOf(&mut tree, "Large")) != 0, "the button shows it")
+  drop run clickRole(&mut app, &mut tree, viewport(), Role.Button, "Size")
+  drop run clickRole(&mut app, &mut tree, viewport(), Role.Option, "Small")
+  run Testing.expect(app.model.size == 0, "a click chooses Small")
+}
+
+test effect fn selectChoosesAnOption() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run selectBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Popover.
+
+effect fn popoverBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  run fonts(&mut tree)
+  let mut app = Runtime<Gallery, Message, NoCommand>.make(Gallery.make())
+  run app.start(&mut tree, 0.0)
+
+  let info = run roleId(&mut tree, Role.Button, "Info")
+  drop run clickRole(&mut app, &mut tree, viewport(), Role.Button, "Info")
+  let panel = run boxOf(&mut tree, Role.Dialog, "Info")
+  run Testing.expect(focusedId(&tree) == panel.id, "the panel takes focus")
+  run Testing.expect((run idOf(&mut tree, "About this gallery")) != 0, "with its content")
+  run press(&mut app, &mut tree, viewport(), "Escape", 0)
+  run Testing.expect(!app.model.info.open, "Escape closes it")
+  run Testing.expect(focusedId(&tree) == info, "focus is back on the button")
+  drop run clickRole(&mut app, &mut tree, viewport(), Role.Button, "Info")
+  drop run clickRole(&mut app, &mut tree, viewport(), Role.Button, "Close")
+  run Testing.expect(!app.model.info.open, "a button inside can close it")
+  drop run clickRole(&mut app, &mut tree, viewport(), Role.Button, "Info")
+  drop run clickRole(&mut app, &mut tree, viewport(), Role.Button, "Info")
+  run Testing.expect(!app.model.info.open, "a press on its button closes it")
+}
+
+test effect fn popoverOpensAndCloses() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run popoverBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Tabs and lists.
+
+effect fn tabsBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  run fonts(&mut tree)
+  let mut app = Runtime<Gallery, Message, NoCommand>.make(Gallery.make())
+  run app.start(&mut tree, 0.0)
+
+  let first = run roleId(&mut tree, Role.Tab, "List")
+  run Testing.expect(run lineHas(&mut tree, first, "selected"), "the first tab is selected")
+  run Testing.expect((run roleId(&mut tree, Role.TabPanel, "List")) != 0, "with its panel")
+  run Testing.expect((run roleId(&mut tree, Role.List, "Fruits")) != 0, "the plain list")
+  run Testing.expect((run roleId(&mut tree, Role.ListItem, "Mango")) != 0, "with its items")
+
+  drop run clickRole(&mut app, &mut tree, viewport(), Role.Tab, "Virtual")
+  run Testing.expect(app.model.tab == 2, "a click selects a tab")
+  run Testing.expect((run roleId(&mut tree, Role.TabPanel, "Virtual")) != 0, "its panel shows")
+  let tabList = run roleId(&mut tree, Role.TabList, "Lists")
+  run Testing.expect(focusedId(&tree) == tabList, "the tab list has focus")
+  run press(&mut app, &mut tree, viewport(), "ArrowRight", 0)
+  run Testing.expect(app.model.tab == 0, "ArrowRight wraps to the first tab")
+  run press(&mut app, &mut tree, viewport(), "ArrowLeft", 0)
+  run Testing.expect(app.model.tab == 2, "ArrowLeft wraps to the last")
+  run press(&mut app, &mut tree, viewport(), "Home", 0)
+  run Testing.expect(app.model.tab == 0, "Home selects the first")
+  run press(&mut app, &mut tree, viewport(), "End", 0)
+  run Testing.expect(app.model.tab == 2, "End selects the last")
+}
+
+test effect fn tabsSelectByPointerAndKeys() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run tabsBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn selectListBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  run fonts(&mut tree)
+  let mut app = Runtime<Gallery, Message, NoCommand>.make(Gallery.make())
+  run app.start(&mut tree, 0.0)
+
+  drop run clickRole(&mut app, &mut tree, viewport(), Role.Tab, "Select")
+  run Testing.expect(app.model.fruit == NO_SELECTION, "nothing selected at first")
+  drop run clickRole(&mut app, &mut tree, viewport(), Role.Option, "Cherry")
+  run Testing.expect(app.model.fruit == 2, "a click selects a row")
+  let cherry = run roleId(&mut tree, Role.Option, "Cherry")
+  run Testing.expect(run lineHas(&mut tree, cherry, "selected"), "describe marks it")
+  let listBox = run roleId(&mut tree, Role.ListBox, "Pick a fruit")
+  run Testing.expect(focusedId(&tree) == listBox, "the list has focus")
+  run press(&mut app, &mut tree, viewport(), "ArrowDown", 0)
+  run Testing.expect(app.model.fruit == 3, "ArrowDown moves down")
+  run press(&mut app, &mut tree, viewport(), "End", 0)
+  run press(&mut app, &mut tree, viewport(), "ArrowDown", 0)
+  run Testing.expect(app.model.fruit == 4, "and stops at the end")
+  run press(&mut app, &mut tree, viewport(), "Home", 0)
+  run Testing.expect(app.model.fruit == 0, "Home goes to the first")
+  run Testing.expect(!(run lineHas(&mut tree, cherry, "selected")), "Cherry is not selected now")
+}
+
+test effect fn selectListMovesWithKeys() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run selectListBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn visibleRowsWindow() -> ()
+  ! AssertionError<'static> {
+  let top = visibleRows(10000, 28.0, 196.0, 0.0, 4)
+  run Testing.expect(top.first == 0 && top.end == 11, "7 rows in view and 4 after")
+  let middle = visibleRows(10000, 28.0, 196.0, 2800.0, 4)
+  run Testing.expect(middle.first == 96 && middle.end == 111, "4 before row 100 and 4 after")
+  let bottom = visibleRows(10000, 28.0, 196.0, 279804.0, 4)
+  run Testing.expect(bottom.end == 10000, "never past the end")
+  let none = visibleRows(0, 28.0, 196.0, 0.0, 4)
+  run Testing.expect(none.first == 0 && none.end == 0, "an empty list")
+}
+
+effect fn virtualBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  run fonts(&mut tree)
+  let mut app = Runtime<Gallery, Message, NoCommand>.make(Gallery.make())
+  run app.start(&mut tree, 0.0)
+
+  drop run clickRole(&mut app, &mut tree, viewport(), Role.Tab, "Virtual")
+  let nodes = app.stats.nodes
+  run Testing.expect(nodes < 400, "ten thousand rows cost a few nodes")
+  run Testing.expect((run idOf(&mut tree, "Row ")) != 0, "rows are there")
+  run Testing.expect(run wheel(&mut app, &mut tree, viewport(), "Rows", 2800.0), "the list scrolls")
+  run Testing.expect(app.model.offset == 2800.0, "the model follows the scroll offset")
+  let rows = run boxOf(&mut tree, Role.List, "Rows")
+
+  // Row 101 starts at 2800: the first one in view.
+  let mut found = List<u32>.make()
+  let snapshotText = run snapshot(&mut tree, viewport())
+  run Testing.expect(contains(String.view(&snapshotText), "\"101\""), "row 101 exists")
+  run Testing.expect(!contains(String.view(&snapshotText), "\"1\" ["), "row 1 is gone")
+  run Testing.expect(app.stats.nodes < 400, "still a few nodes")
+  drop found
+  drop rows
+}
+
+test effect fn virtualListRendersOnlyRowsInView() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run virtualBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Keyboard only: every component reached with Tab and worked with keys.
+
+effect fn keyboardBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  run fonts(&mut tree)
+  let mut app = Runtime<Gallery, Message, NoCommand>.make(Gallery.make())
+  run app.start(&mut tree, 0.0)
+  let vp = viewport()
+
+  // Tab order: Save, Reset, Ghost (Disabled is skipped), I agree (Locked is skipped),
+  // Notifications, Volume, Name, Notes, Delete draft, File, Size, Info, the tab list, the list.
+  run press(&mut app, &mut tree, vp, "Tab", 0)
+  run press(&mut app, &mut tree, vp, "Enter", 0)
+  run Testing.expect(app.model.saves == 1, "Save with Enter")
+  run press(&mut app, &mut tree, vp, "Tab", 0)
+  run press(&mut app, &mut tree, vp, "Tab", 0)
+  run press(&mut app, &mut tree, vp, "Tab", 0)
+  run Testing.expect(
+    focusedId(&tree) == (run roleId(&mut tree, Role.Checkbox, "I agree")),
+    "the checkbox after the buttons",
+  )
+  run press(&mut app, &mut tree, vp, " ", 0)
+  run Testing.expect(app.model.agree, "check it with Space")
+  run press(&mut app, &mut tree, vp, "Tab", 0)
+  run press(&mut app, &mut tree, vp, " ", 0)
+  run Testing.expect(!app.model.notify, "switch it off with Space")
+  run press(&mut app, &mut tree, vp, "Tab", 0)
+  run press(&mut app, &mut tree, vp, "ArrowRight", 0)
+  run Testing.expect(app.model.volume == 45.0, "slide with ArrowRight")
+  run press(&mut app, &mut tree, vp, "Tab", 0)
+  run typeText(&mut app, &mut tree, vp, "Grace")
+  run press(&mut app, &mut tree, vp, "Enter", 0)
+  run Testing.expect(String.view(&app.model.submitted) == "Grace", "type a name and submit")
+  run press(&mut app, &mut tree, vp, "Tab", 0)
+  run typeText(&mut app, &mut tree, vp, "hi")
+  run Testing.expect(String.view(&app.model.notes) == "hi", "type a note")
+  run press(&mut app, &mut tree, vp, "Tab", 0)
+  run press(&mut app, &mut tree, vp, "Enter", 0)
+  run Testing.expect(app.model.confirm.open, "open the dialog with Enter")
+  run press(&mut app, &mut tree, vp, "Escape", 0)
+  run Testing.expect(!app.model.confirm.open, "close it with Escape")
+  run press(&mut app, &mut tree, vp, "Tab", 0)
+  run press(&mut app, &mut tree, vp, "Enter", 0)
+  run press(&mut app, &mut tree, vp, "ArrowDown", 0)
+  run press(&mut app, &mut tree, vp, "Enter", 0)
+  run Testing.expect(String.view(&app.model.status) == "Open", "choose Open from the menu")
+  run press(&mut app, &mut tree, vp, "Tab", 0)
+  run press(&mut app, &mut tree, vp, "ArrowDown", 0)
+  run press(&mut app, &mut tree, vp, "ArrowUp", 0)
+  run press(&mut app, &mut tree, vp, " ", 0)
+  run Testing.expect(app.model.size == 0, "choose Small from the select")
+  run Testing.expect(!app.model.sizeMenu.open, "and it stays closed")
+  run press(&mut app, &mut tree, vp, "Tab", 0)
+  run press(&mut app, &mut tree, vp, " ", 0)
+  run Testing.expect(app.model.info.open, "open the popover with Space")
+  run press(&mut app, &mut tree, vp, "Escape", 0)
+  run press(&mut app, &mut tree, vp, "Tab", 0)
+  run press(&mut app, &mut tree, vp, "ArrowRight", 0)
+  run Testing.expect(app.model.tab == 1, "next tab with ArrowRight")
+  run press(&mut app, &mut tree, vp, "Tab", 0)
+  run press(&mut app, &mut tree, vp, "ArrowDown", 0)
+  run press(&mut app, &mut tree, vp, "ArrowDown", 0)
+  run Testing.expect(app.model.fruit == 1, "pick Banana with the arrows")
+  run press(&mut app, &mut tree, vp, "Tab", MOD_SHIFT)
+  run Testing.expect(
+    focusedId(&tree) == (run roleId(&mut tree, Role.TabList, "Lists")),
+    "Shift+Tab goes back",
+  )
+}
+
+test effect fn keyboardOnlyReachesEveryComponent() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run keyboardBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+import ui_components.numeric { parse, commit, NumberOptions, NumberEvent }
+import ui_components.color { withChannel }
+
+test effect fn numericDraftsAndColorChannels() -> ()
+  ! AssertionError<'static> {
+  run Testing.expect(
+    parse(" -1.25e2 ").unwrapOr(0.0) == -125.0,
+    "numeric inputs accept signed fractional scientific notation",
+  )
+  run Testing.expect(
+    parse("-").isNone() && parse("1e").isNone() && parse("NaN").isNone() && parse("12px").isNone(),
+    "incomplete and invalid drafts do not silently commit a number",
+  )
+  let options = NumberOptions { min: 0.0, max: 100.0, step: 1.0 }
+  let result = commit("200", &options)
+  run Testing.expect(
+    match move result {
+      NumberEvent.Commit { value } => value == 100.0
+      _ => false
+    },
+    "commits honor the declared numeric range",
+  )
+  run Testing.expect(
+    withChannel(0x12345678, 1, 255.0) == 0x12ff5678,
+    "color controls update one channel without changing alpha",
+  )
+}

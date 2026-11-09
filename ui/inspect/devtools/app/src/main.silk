@@ -1,0 +1,225 @@
+//! `ui-devtools`: the devtools window for a running Silk UI. It shows the app's element tree,
+//! the selected node's styles and box model, the event log and the frame stats, and highlights
+//! the selected node in the app's window. See the README.
+//!
+//!   ui-devtools [--connect ADDRESS]
+//!
+//! ADDRESS is in the syntax of `SILK_UI_INSPECT` (`1`, `tcp:<port>` or a socket path) and names
+//! the app to inspect, which must be a debug build started with `SILK_UI_INSPECT` set. Without
+//! `--connect` it is `1`: the socket `silk-ui-inspect.sock` in the working directory. The app
+//! may start after the window; the status line says when it cannot be reached.
+//!
+//! The devtools are a ui-app app themselves, so a debug build of this window serves the
+//! inspector too when its own `SILK_UI_INSPECT` is set (to another address than the app's).
+import ui_devtools.lib { Devtools, Message, Command, Link }
+import ui_app.runtime { Runtime }
+import ui_app_window.lib { Launched, launch, RunOptions, runWindowWith, startInspector }
+import ui_inspect_server.server {
+  Address,
+  InspectorOptions,
+  parseAddress,
+  resolved,
+  describeAddress
+}
+import ui_inspect_server.client { request }
+import ui_fixtures.fixtures as fixtures
+import ui_tree.lib { TreeError, Batch }
+import atlas.atlas { AtlasError }
+import vector.geometry_error { GeometryError }
+import window.types { WindowError }
+import webgpu.runtime { GpuError }
+import silk.collections.bytes { Bytes }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.io.byte_duplex { ByteIoError }
+import silk.io.writer_native { StderrWriter }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.net.socket_native { NativeSocketError }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
+import silk.text.string { String, InvalidUtf8 }
+
+/// The inspector socket of the app, one connection per request.
+struct SocketLink {
+  address: Address,
+  clock: OsMonotonicClock,
+  reply: Bytes,
+}
+
+impl Link for SocketLink {
+  effect fn request(self: &mut Self, line: string, reply: &mut String) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    reply.clear()
+    let result = run Effect.result(request(&self.address, line, &mut self.reply))
+      |> Effect.provideMut<MonotonicClock>(&mut self.clock)
+    match move result {
+      Result<(), NativeSocketError | ByteIoError | OutOfMemoryError>.Success { value } => {}
+      Result<(), NativeSocketError | ByteIoError | OutOfMemoryError>.Failure { error } => {
+        drop error
+        run reply.append("nothing answers at ")
+        run describeAddress(&self.address, &mut reply)
+        return false
+      }
+    }
+    match String.fromUtf8(self.reply.asSlice()) {
+      Result<string, InvalidUtf8>.Success { value } => {
+        run reply.append(value)
+      }
+      Result<string, InvalidUtf8>.Failure { error } => {
+        run reply.append("the reply is not UTF-8")
+        return false
+      }
+    }
+    return true
+  }
+}
+
+fn same(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < a.length {
+    if a[i] != b[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+/// The `--connect` argument, or "1".
+effect fn connectArgument() -> String
+  ! HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator {
+  let count = run HostInput.argumentCount()
+  let mut i: usize = 1
+  while i + 1 < count {
+    if let Option<Bytes>.Some { value } = run HostInput.argument(i) {
+      if same(Bytes.asSlice(&value), b"--connect") {
+        if let Option<Bytes>.Some { value: next } = run HostInput.argument(i + 1) {
+          match String.fromUtf8(next.asSlice()) {
+            Result<string, InvalidUtf8>.Success { value: text } => {
+              return run String.copy(text)
+            }
+            Result<string, InvalidUtf8>.Failure { error } => {}
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  return run String.copy("1")
+}
+
+/// What `main` reads on the main thread for the app.
+struct Launch {
+  connect: String,
+  cwd: Bytes,
+}
+
+effect fn prepare() -> Launch
+  ! HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator {
+  let connect = run connectArgument()
+  let cwd = run HostInput.workingDirectory()
+  return Launch { connect: move connect, cwd: move cwd }
+}
+
+effect fn program(args: Launch, platform: Option<Launched>) -> i32
+  ! WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let Launch { connect, cwd } = move args
+  let parsed = match run parseAddress(String.view(&connect)) {
+    Option<Address>.Some { value } => move value
+    Option<Address>.None => {
+      StderrWriter.print("ui-devtools: --connect takes 1, tcp:<port> or a socket path\n", &())
+      return 2
+    }
+  }
+  let address = run resolved(move parsed, cwd.asSlice())
+  let mut target = String.make()
+  run describeAddress(&address, &mut target)
+
+  let collection = run fixtures.fonts()
+  let mut batch = Batch.make()
+  run batch.fontFamily(1, "Noto Sans, sans-serif")
+  let mut app = Runtime<Devtools, Message, Command>.make(run Devtools.make(String.view(&target)))
+  app.send(Message.Refresh)
+  let mut link = SocketLink {
+    address: move address,
+    clock: OsMonotonicClock.make(),
+    reply: Bytes.make(),
+  }
+  let options = RunOptions {
+    title: "Silk devtools",
+    width: 900.0,
+    height: 560.0,
+    check: false,
+    checkClick: "",
+    checkExpect: "",
+    lowestLatency: false,
+    platform: move platform,
+  }
+  let inspector = run startInspector(InspectorOptions.make())
+  return run runWindowWith(&mut app, &collection, run batch.take(), move options, move inspector)
+    |> Effect.provideMut<Link>(&mut link)
+}
+
+effect fn windowFailed(error: WindowError) -> i32 {
+  drop error
+  StderrWriter.print("ui-devtools: could not open a window (no display server?)\n", &())
+  return 2
+}
+
+effect fn gpuFailed(error: GpuError) -> i32 {
+  StderrWriter.print("ui-devtools: GPU error {}\n", &.(error.code))
+  return 2
+}
+
+effect fn failed<E>(error: E) -> i32 {
+  drop error
+  StderrWriter.print("ui-devtools: failed (tree, atlas, geometry or allocation)\n", &())
+  return 2
+}
+
+/// The app, on the UI thread `launch` made.
+fn runApp(args: Launch, platform: Option<Launched>) -> i32 {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(
+    Effect.catch<GpuError>(
+      Effect.catch<WindowError>(program(move args, move platform), windowFailed),
+      gpuFailed,
+    ),
+    failed,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+pub effect fn main() -> i32
+  ? &mut HostInput {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let prepared = run Effect.result(prepare()) |> Effect.provideMut<Allocator>(&mut allocator)
+  let args = match move prepared {
+    Result.Success { value } => move value
+    Result.Failure { error } => {
+      drop error
+      StderrWriter.print("ui-devtools: could not read the arguments\n", &())
+      return 2
+    }
+  }
+
+  // The main thread keeps the OS event loop; the app runs on its own thread.
+  return run Effect.catchAll(
+    launch(
+      fn(platform: Option<Launched>) -> i32 {
+        return runApp(move args, move platform)
+      },
+    ),
+    failed,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}

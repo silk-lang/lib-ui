@@ -1,0 +1,347 @@
+//! Writing protocol replies: one compact JSON object per line, built straight into a `String`,
+//! and reading request fields out of a parsed `silk.json` value.
+import ui_tree.inspect { writeInt, writeNumber }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.encoding.base64 { Base64, Base64Error }
+import silk.json.value { Json, JsonNumber, JsonNumberView, Value }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.i64
+import silk.num.u32
+import silk.num.u64
+import silk.num.u8
+import silk.text.format { Format }
+import silk.text.string { String }
+
+const HEX: [u8; 16] = [48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 97, 98, 99, 100, 101, 102]
+
+/// Appends `number` as JSON: integers in decimal, and other numbers as the shortest decimal that
+/// reads back to the same `f64`.
+pub effect fn appendNumber(out: &mut String, number: &JsonNumber) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut digits: [u8; 32] = [0; 32]
+  let length = match number.view() {
+    JsonNumberView.Integer { value } => Format.writeI64Display(value, &mut digits, 0)
+    JsonNumberView.Unsigned { value } => Format.writeU64Display(value, &mut digits, 0)
+    JsonNumberView.Float { value } => Format.writeF64Debug(value, &mut digits, 0)
+    JsonNumberView.Decimal { text } => {
+      // A decimal holds a validated JSON number spelling already.
+      return run out.append(text)
+    }
+  }
+
+  // The digit writers emit ASCII only.
+  run out.append(unsafe String.fromUtf8Unchecked(Slice.view<u8>(&digits, 0, length)))
+}
+
+/// Appends `value` as a JSON string: quotes, backslashes and control characters escaped.
+pub effect fn writeString(out: &mut String, value: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.append("\"")
+  let bytes = String.utf8Bytes(value)
+  let mut start: usize = 0
+  let mut i: usize = 0
+  while i < bytes.length {
+    let b = bytes[i]
+    if b == 34 || b == 92 || b < 32 {
+      run out.append(String.slice(value, start, i - start))
+      if b == 34 {
+        run out.append("\\\"")
+      } else if b == 92 {
+        run out.append("\\\\")
+      } else if b == 10 {
+        run out.append("\\n")
+      } else if b == 9 {
+        run out.append("\\t")
+      } else if b == 13 {
+        run out.append("\\r")
+      } else {
+        let escape: [u8; 6] = [92, 117, 48, 48, HEX[u8.toUsize(b / 16)], HEX[u8.toUsize(b % 16)]]
+        run out.append(unsafe String.fromUtf8Unchecked(&escape))
+      }
+      start = i + 1
+    }
+    i = i + 1
+  }
+  run out.append(String.slice(value, start, bytes.length - start))
+  run out.append("\"")
+}
+
+/// Appends `bytes` as Base64 text.
+pub effect fn writeBase64(out: &mut String, bytes: &[u8]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let length = match Base64.encodedLength(bytes.length) {
+    Result<usize, Base64Error>.Success { value } => value
+    Result<usize, Base64Error>.Failure { error } => 0
+  }
+  let mut buffer = run Bytes.zeroed(length)
+  let written = match Base64.encodeInto(buffer.asMutSlice(), bytes) {
+    Result<usize, Base64Error>.Success { value } => value
+    Result<usize, Base64Error>.Failure { error } => 0
+  }
+  buffer.truncate(written)
+  run out.append(unsafe String.fromUtf8Unchecked(buffer.asSlice()))
+}
+
+/// Writes the request's `id` member back (a number or a string), when it has one.
+effect fn writeId(out: &mut String, request: &Value) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match Json.field(request, "id") {
+    Option<&Value>.Some { value } => {
+      match &value.* {
+        Value.Number { value: number } => {
+          run out.append("\"id\":")
+          run appendNumber(&mut out, &number)
+          run out.append(",")
+        }
+        Value.String { text } => {
+          run out.append("\"id\":")
+          run writeString(&mut out, String.view(&text))
+          run out.append(",")
+        }
+        _ => {}
+      }
+    }
+    Option<&Value>.None => {}
+  }
+}
+
+/// Starts a successful reply to `request` in `out` (which it clears): `{"id":…,"ok":true`.
+/// The `put` functions add `,"key":value` members and [`finish`] closes it.
+pub effect fn begin(out: &mut String, request: &Value) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  run out.append("{")
+  run writeId(&mut out, request)
+  run out.append("\"ok\":true")
+}
+
+/// Writes a failed reply to `request` into `out` (which it clears).
+pub effect fn failure(out: &mut String, request: &Value, message: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  run out.append("{")
+  run writeId(&mut out, request)
+  run out.append("\"ok\":false,\"error\":")
+  run writeString(&mut out, message)
+  run out.append("}")
+}
+
+/// A failed reply to a line that is not a JSON object (so it has no id).
+pub effect fn malformed(out: &mut String, message: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  run out.append("{\"ok\":false,\"error\":")
+  run writeString(&mut out, message)
+  run out.append("}")
+}
+
+/// Starts member `key`; the caller appends the value.
+pub effect fn putKey(out: &mut String, key: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.append(",\"")
+  run out.append(key)
+  run out.append("\":")
+}
+
+pub effect fn putText(out: &mut String, key: string, value: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run putKey(&mut out, key)
+  run writeString(&mut out, value)
+}
+
+pub effect fn putInt(out: &mut String, key: string, value: u64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run putKey(&mut out, key)
+  run writeInt(&mut out, value)
+}
+
+/// A number rounded to hundredths, as `describe` writes them.
+pub effect fn putNumber(out: &mut String, key: string, value: f32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run putKey(&mut out, key)
+  run writeNumber(&mut out, value)
+}
+
+pub effect fn putFlag(out: &mut String, key: string, value: bool) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run putKey(&mut out, key)
+  run out.append(
+    if value {
+      "true"
+    } else {
+      "false"
+    },
+  )
+}
+
+/// A list of node ids.
+pub effect fn putIds(out: &mut String, key: string, values: &List<u32>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run putKey(&mut out, key)
+  run out.append("[")
+  let list = values.asSlice()
+  let mut i: usize = 0
+  while i < list.length {
+    if i > 0 {
+      run out.append(",")
+    }
+    run writeInt(&mut out, u32.toU64(list[i]))
+    i = i + 1
+  }
+  run out.append("]")
+}
+
+/// Closes the reply.
+pub effect fn finish(out: &mut String) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.append("}")
+}
+
+// Reading requests.
+
+/// Member `key` as text, or "" when it is missing or not a string.
+pub fn textField<'a>(request: &'a Value, key: string) -> string<'a> {
+  return match Json.asString(Json.field(request, key)) {
+    Option<string>.Some { value } => value
+    Option<string>.None => ""
+  }
+}
+
+pub fn has(request: &Value, key: string) -> bool {
+  return match Json.field(request, key) {
+    Option<&Value>.Some { value } => true
+    Option<&Value>.None => false
+  }
+}
+
+/// Member `key` as a boolean, or `fallback`.
+pub fn flagField(request: &Value, key: string, fallback: bool) -> bool {
+  return match Json.field(request, key) {
+    Option<&Value>.Some { value } => match &value.* {
+      Value.Bool { value: b } => b
+      _ => fallback
+    }
+    Option<&Value>.None => fallback
+  }
+}
+
+/// Member `key` as a number, or `fallback`.
+pub fn numberField(request: &Value, key: string, fallback: f32) -> f32 {
+  return match Json.asF32(Json.field(request, key)) {
+    Option<f32>.Some { value } => value
+    Option<f32>.None => fallback
+  }
+}
+
+/// Member `key` as a node id: a non-negative integer that fits in `u32`.
+pub fn idField(request: &Value, key: string) -> Option<u32> {
+  return match Json.asI64(Json.field(request, key)) {
+    Option<i64>.Some { value } => {
+      if value < 0 || value > 4294967294 {
+        return Option<u32>.None
+      }
+      return Option<u32>.Some { value: i64.toU32(value) }
+    }
+    Option<i64>.None => Option<u32>.None
+  }
+}
+
+/// Member `key` as a list of node ids (a single number counts as a list of one). Members that
+/// are not ids are skipped.
+pub effect fn idsField(request: &Value, key: string, out: &mut List<u32>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  match Json.field(request, key) {
+    Option<&Value>.Some { value } => {
+      match &value.* {
+        Value.Array { values } => {
+          let items = values.asSlice()
+          let mut i: usize = 0
+          while i < items.length {
+            match Json.asI64(Option<&Value>.Some { value: &items[i] }) {
+              Option<i64>.Some { value: n } => {
+                if n >= 0 && n <= 4294967294 {
+                  run out.append(i64.toU32(n))
+                }
+              }
+              Option<i64>.None => {}
+            }
+            i = i + 1
+          }
+        }
+        Value.Number { value: _ } => {
+          match idField(request, key) {
+            Option<u32>.Some { value: n } => {
+              run out.append(n)
+            }
+            Option<u32>.None => {}
+          }
+        }
+        _ => {}
+      }
+    }
+    Option<&Value>.None => {}
+  }
+}
+
+/// The strings of array member `key` (a single string counts as a list of one).
+pub effect fn stringsField<'a>(request: &'a Value, key: string, out: &mut List<string<'a>>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  match Json.field(request, key) {
+    Option<&Value>.Some { value } => {
+      match &value.* {
+        Value.Array { values } => {
+          let items = values.asSlice()
+          let mut i: usize = 0
+          while i < items.length {
+            match &items[i] {
+              Value.String { text } => {
+                run out.append(String.view(&text))
+              }
+              _ => {}
+            }
+            i = i + 1
+          }
+        }
+        Value.String { text } => {
+          run out.append(String.view(&text))
+        }
+        _ => {}
+      }
+    }
+    Option<&Value>.None => {}
+  }
+}
+
+/// The reply to a `wait` whose condition does not hold yet, on a connection that cannot wait
+/// for frames: the client asks again.
+pub effect fn notYet(out: &mut String, request: &Value) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  run out.append("{")
+  run writeId(&mut out, request)
+  run out.append("\"ok\":false,\"pending\":true,\"error\":\"not yet\"}")
+}

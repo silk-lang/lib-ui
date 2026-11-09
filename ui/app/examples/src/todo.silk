@@ -1,0 +1,320 @@
+//! The todo list: a keyed list with toggles and deletes, filters, a lazy footer, and a Save
+//! command performed by a `Store` service the host provides.
+import look { surface, button, buttonLook, rgb }
+import ui_app.app { App, Perform, Context, Subscriptions }
+import ui_app.ui { Ui }
+import ui_app.seq as seq
+import ui_tree.input { MOD_CONTROL }
+import ui_tree.mutation {
+  NodeKind,
+  Property,
+  Length,
+  Side,
+  Align,
+  Role,
+  Cursor,
+  BorderStyle,
+  DecorationLine
+}
+import silk.collections.list { List }
+import silk.geometry.corners { Corners }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u64
+import silk.num.usize
+import silk.text.string { String, InvalidUtf8 }
+import silk.core.result { Result }
+
+pub struct Item {
+  pub id: u64,
+  pub title: String,
+  pub done: bool,
+}
+
+pub enum Filter {
+  All,
+  Active,
+  Done,
+}
+
+pub struct Todo {
+  pub items: List<Item>,
+  pub nextId: u64,
+  pub filter: Filter,
+  /// The item count the store last confirmed.
+  pub saved: u64,
+  pub saving: bool,
+}
+
+pub union Message {
+  Add,
+  Toggle { pub id: u64 },
+  Delete { pub id: u64 },
+  Show { pub filter: Filter },
+  ClearDone,
+  Saved { pub count: u64 },
+}
+
+pub union Command {
+  Save { pub count: u64 },
+}
+
+/// Where the todo list saves to. The host provides it; tests provide one that records calls.
+pub service Store {
+  effect fn save(count: u64) -> u64 ? &mut Store
+}
+
+impl Perform<Message, never ? &mut Store> for Command {
+  effect fn perform(self: Self) -> Message
+    ? &mut Store {
+    return match move self {
+      Command.Save { count } => Message.Saved { count: run Store.save(count) }
+    }
+  }
+}
+
+/// "Task " and `number`.
+effect fn title(number: u64) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = run String.copy("Task ")
+  let mut digits: [u8; 20] = [0; 20]
+  let mut count: usize = 0
+  let mut value = number
+  while true {
+    digits[count] = u64.toU8(value % 10) + 48
+    count = count + 1
+    value = value / 10
+    if value == 0 {
+      break
+    }
+  }
+  while count > 0 {
+    count = count - 1
+    let one: [u8; 1] = [digits[count]]
+    run text.append(String.fromUtf8(&one) |> Result<string, InvalidUtf8>.unwrapOr(""))
+  }
+  return move text
+}
+
+fn shows(filter: Filter, item: &Item) -> bool {
+  return match filter {
+    Filter.All => true
+    Filter.Active => !item.done
+    Filter.Done => item.done
+  }
+}
+
+impl Todo {
+  pub effect fn make() -> Todo
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut items = List<Item>.make()
+    run items.append(Item { id: 1, title: run String.copy("Buy milk"), done: false })
+    run items.append(Item { id: 2, title: run String.copy("Write the F2 runtime"), done: true })
+    run items.append(Item { id: 3, title: run String.copy("Walk the dog"), done: false })
+    return Todo { items: move items, nextId: 4, filter: Filter.All, saved: 0, saving: false }
+  }
+
+  pub fn remaining(self: &Self) -> usize {
+    return seq.count(self.items.asSlice(), |item| !item.done)
+  }
+}
+
+fn filterButton(ui: &mut Ui<Message>, label: string, filter: Filter, current: Filter) -> () {
+  button(&mut ui, label, filter == current, || Message.Show { filter: filter })
+}
+
+impl App<Message, Command> for Todo {
+  fn view(self: &Self, ui: &mut Ui<Message>) -> () {
+    surface(&mut ui)
+    ui.row(
+      |ui| {
+        ui.gap(8.0)
+        ui.style(&[Property.AlignItems { value: Align.Center }])
+        ui.box(
+          |ui| {
+            ui.grow(1.0)
+            ui.fontSize(20.0)
+            ui.style(&[Property.FontWeight { value: 700.0 }])
+            ui.text("Todos")
+          },
+        )
+        button(&mut ui, "Add", false, || Message.Add)
+      },
+    )
+    ui.row(
+      |ui| {
+        ui.gap(6.0)
+        ui.accessRole(Role.TabList)
+        filterButton(&mut ui, "All", Filter.All, self.filter)
+        filterButton(&mut ui, "Active", Filter.Active, self.filter)
+        filterButton(&mut ui, "Done", Filter.Done, self.filter)
+      },
+    )
+    ui.column(
+      |ui| {
+        ui.testId("items")
+        ui.accessRole(Role.List)
+        ui.gap(4.0)
+        ui.each(
+          self.items.asSlice(),
+          |item| item.id,
+          |ui, item| {
+            if shows(self.filter, item) {
+              ui.row(
+                |ui| {
+                  ui.accessRole(Role.ListItem)
+                  ui.gap(8.0)
+                  ui.style(&[Property.AlignItems { value: Align.Center }])
+                  ui.node(
+                    NodeKind.Box,
+                    |ui| {
+                      ui.accessRole(Role.Checkbox)
+                      ui.label(String.view(&item.title))
+                      ui.tabIndex(0)
+                      ui.cursor(Cursor.Pointer)
+                      ui.onClick(|| Message.Toggle { id: item.id })
+                      let radius = Corners<f32> {
+                        topLeft: 4.0,
+                        topRight: 4.0,
+                        bottomRight: 4.0,
+                        bottomLeft: 4.0,
+                      }
+                      ui.style(
+                        &[
+                          Property.Width { value: Length.px(16.0) },
+                          Property.Height { value: Length.px(16.0) },
+                          Property.BorderWidth { side: Side.Top, value: 2.0 },
+                          Property.BorderWidth { side: Side.Right, value: 2.0 },
+                          Property.BorderWidth { side: Side.Bottom, value: 2.0 },
+                          Property.BorderWidth { side: Side.Left, value: 2.0 },
+                          Property.BorderStyle { value: BorderStyle.Solid },
+                          Property.BorderColor { color: rgb(0x2563EB) },
+                          Property.BorderRadius { value: radius },
+                        ],
+                      )
+                      if item.done {
+                        ui.background(rgb(0x2563EB))
+                      }
+                    },
+                  )
+                  ui.box(
+                    |ui| {
+                      ui.grow(1.0)
+                      if item.done {
+                        ui.color(rgb(0x9CA3AF))
+                        ui.style(
+                          &[
+                            Property.TextDecorationLine {
+                              value: DecorationLine {
+                                underline: false,
+                                overline: false,
+                                lineThrough: true,
+                              },
+                            },
+                          ],
+                        )
+                      }
+                      ui.text(String.view(&item.title))
+                    },
+                  )
+                  button(&mut ui, "Delete", false, || Message.Delete { id: item.id })
+                },
+              )
+            }
+          },
+        )
+      },
+    )
+
+    // The footer only changes when the counts do.
+    let remaining = self.remaining()
+    let total = self.items.length()
+    ui.lazy(
+      u64.bitXor(usize.toU64(remaining), u64.wrappingMultiply(usize.toU64(total), 0x100000001B3)),
+      |ui| {
+        ui.row(
+          |ui| {
+            ui.testId("footer")
+            ui.gap(8.0)
+            ui.style(&[Property.AlignItems { value: Align.Center }])
+            ui.box(
+              |ui| {
+                ui.grow(1.0)
+                ui.color(rgb(0x6B7280))
+                ui.number(usize.toI64(remaining))
+                ui.text(" left")
+              },
+            )
+            if remaining < total {
+              button(&mut ui, "Clear done", false, || Message.ClearDone)
+            }
+          },
+        )
+      },
+    )
+  }
+
+  fn update(self: &mut Self, message: Message, cx: &mut Context<Command>) -> () {
+    match move message {
+      Message.Add => {
+        let id = self.nextId
+        self.nextId = id + 1
+        let item = Item { id: id, title: cx.alloc(title(id)), done: false }
+        cx.alloc(self.items.append(move item))
+        self.save(&mut cx)
+      }
+      Message.Toggle { id } => {
+        let items = self.items.asMutSlice()
+        let mut i: usize = 0
+        while i < items.length {
+          if items[i].id == id {
+            items[i].done = !items[i].done
+          }
+          i = i + 1
+        }
+        self.save(&mut cx)
+      }
+      Message.Delete { id } => {
+        let mut i: usize = 0
+        while i < self.items.length() {
+          if self.items.asSlice()[i].id == id {
+            drop self.items.remove(i)
+          } else {
+            i = i + 1
+          }
+        }
+        self.save(&mut cx)
+      }
+      Message.Show { filter } => {
+        self.filter = filter
+      }
+      Message.ClearDone => {
+        let mut i: usize = 0
+        while i < self.items.length() {
+          if self.items.asSlice()[i].done {
+            drop self.items.remove(i)
+          } else {
+            i = i + 1
+          }
+        }
+        self.save(&mut cx)
+      }
+      Message.Saved { count } => {
+        self.saved = count
+        self.saving = false
+      }
+    }
+  }
+
+  fn subscriptions(self: &Self, subs: &mut Subscriptions<Message>) -> () {
+    subs.keyBinding(1, "n", MOD_CONTROL, || Message.Add)
+  }
+}
+
+impl Todo {
+  fn save(self: &mut Self, cx: &mut Context<Command>) -> () {
+    self.saving = true
+    cx.command(Command.Save { count: usize.toU64(self.items.length()) })
+  }
+}

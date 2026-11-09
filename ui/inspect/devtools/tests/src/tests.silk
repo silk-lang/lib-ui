@@ -1,0 +1,189 @@
+//! Devtools tests: the devtools app runs headless in one tree and inspects the todo example
+//! running in another, through the inspector protocol (`Protocol.handle` in place of the
+//! socket). Clicks on the devtools go through the tree's real input path. Run from the
+//! repository root (the fixtures read fonts from there).
+import inspected { Inspected, appViewport }
+import ui_devtools.lib { Devtools, Message, Command, Panel, Link, NO_PARENT }
+import ui_app.runtime { Runtime, drain }
+import ui_app.harness { click, press, snapshot }
+import ui_inspect.query { Query, queryFirst }
+import ui_fixtures.fixtures as fixtures
+import ui_tree.lib { UiTree, TreeError, Batch, FrameInput, Role }
+import ui_tree.inspect { writeInt }
+import font_collection.lib { FontCollection }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.json.scanner { JsonError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.usize
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+fn viewport() -> FrameInput {
+  return FrameInput { width: 900.0, height: 560.0, scale: 1.0, time: 0.0 }
+}
+
+effect fn devtoolsTree(collection: &FontCollection) -> UiTree<'_>
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut tree = run UiTree.make(collection)
+  let mut batch = Batch.make()
+  run batch.fontFamily(1, "Noto Sans, sans-serif")
+  run tree.apply(run batch.take())
+  return move tree
+}
+
+/// "element-<id>".
+effect fn rowId(id: u32) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = run String.copy("element-")
+  run writeInt(&mut text, u32.toU64(id))
+  return move text
+}
+
+effect fn highlighted(app: &Inspected<'_>, id: u32) -> bool {
+  let list = app.protocol.highlight.nodes.asSlice()
+  return list.length == 1 && list[0] == id
+}
+
+effect fn body() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut app = run Inspected.make(&collection)
+  let mut tree = run devtoolsTree(&collection)
+  let mut devtools = Runtime<Devtools, Message, Command>.make(run Devtools.make("todo (test)"))
+  run devtools.start(&mut tree, 0.0)
+
+  // The first refresh reads the whole app.
+  devtools.send(Message.Refresh)
+  run drain(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(devtools.model.syncs == 1, "the refresh reached the app")
+  run Testing.expect(devtools.model.error.ownedByteLength() == 0, "without an error")
+  run Testing.expect(
+    devtools.model.rows.length() == app.tree.nodeCount(),
+    "one row per node of the app",
+  )
+  run Testing.expect(devtools.model.rows.asSlice()[0].id == 1, "the app's root comes first")
+  run Testing.expect(devtools.model.rows.asSlice()[0].depth == 0, "at depth 0")
+  run Testing.expect(
+    String.contains(String.view(&devtools.model.status), "nodes"),
+    "the status line counts nodes",
+  )
+  run Testing.expect(devtools.model.stats.length() > 10, "the frame stats are listed")
+  let text = run snapshot(&mut tree, viewport())
+  run Testing.expect(String.contains(String.view(&text), "button \\\"Add\\\""), "the Add row shows")
+
+  // Clicking the Add button's row selects, inspects and highlights it in the app.
+  let add = run queryFirst(&app.tree, &run Query.byRoleNamed(Role.Button, "Add"))
+  run Testing.expect(add != 4294967295, "the todo app has an Add button")
+  let addRow = run rowId(add)
+  run Testing.expect(
+    run click(&mut devtools, &mut tree, viewport(), String.view(&addRow))
+      |> Effect.provideMut<Link>(&mut app),
+    "the row is there",
+  )
+  run Testing.expect(devtools.model.selected == add, "the row is selected")
+  run Testing.expect(run highlighted(&app, add), "the app highlights the node")
+  run Testing.expect(devtools.model.detail.id == add, "the node is inspected")
+  run Testing.expect(
+    String.view(&devtools.model.detail.title) == "button \"Add\"",
+    "titled by its role and name",
+  )
+  run Testing.expect(devtools.model.detail.lines.length() > 20, "with the node view's lines")
+  run Testing.expect(devtools.model.detail.hasBox, "and a box model")
+  run Testing.expect(devtools.model.detail.box.width > 10.0, "content width")
+  run Testing.expect(devtools.model.detail.box.padding.left == 10.0, "padding from the look")
+  run Testing.expect(devtools.model.detail.box.border.top == 1.0, "border from the look")
+  let styles = run snapshot(&mut tree, viewport())
+  run Testing.expect(
+    String.contains(String.view(&styles), "\"  padding-left\""),
+    "the styles panel shows the declarations",
+  )
+
+  // The box model tab.
+  drop run click(&mut devtools, &mut tree, viewport(), "Box model")
+    |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(devtools.model.panel == Panel.BoxModel, "the box model tab opens")
+  let boxes = run snapshot(&mut tree, viewport())
+  run Testing.expect(
+    String.contains(String.view(&boxes), "testId=\"content\""),
+    "content box drawn",
+  )
+  run Testing.expect(String.contains(String.view(&boxes), "testId=\"margin\""), "margin box drawn")
+
+  // Input to the app shows in the event log at the next refresh.
+  let mut reply = String.make()
+  run app.ask("{\"cmd\":\"click\",\"role\":\"button\",\"name\":\"Add\"}", &mut reply)
+  run Testing.expect(app.app.model.items.length() == 4, "the click reached the todo app")
+  drop run click(&mut devtools, &mut tree, viewport(), "Events")
+    |> Effect.provideMut<Link>(&mut app)
+  devtools.send(Message.Tick { time: 1.0 })
+  run drain(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(devtools.model.events.length() >= 1, "the event log has the click")
+  let log = run snapshot(&mut tree, viewport())
+  run Testing.expect(String.contains(String.view(&log), "\"click\""), "the log shows a click")
+  run Testing.expect(
+    devtools.model.rows.length() == app.tree.nodeCount(),
+    "the new item's nodes are in the tree",
+  )
+  let before = devtools.model.events.length()
+  devtools.send(Message.Refresh)
+  run drain(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(devtools.model.events.length() == before, "records are read once")
+
+  // Keys move the selection; Escape clears it and the highlight.
+  run press(&mut devtools, &mut tree, viewport(), "ArrowDown", 0)
+    |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(devtools.model.selected != add, "ArrowDown moves on")
+  run Testing.expect(run highlighted(&app, devtools.model.selected), "and highlights there")
+  run press(&mut devtools, &mut tree, viewport(), "Escape", 0) |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(devtools.model.selected == NO_PARENT, "Escape clears the selection")
+  run Testing.expect(app.protocol.highlight.nodes.length() == 0, "and the highlight")
+
+  // Folding the root hides everything below it.
+  drop run click(&mut devtools, &mut tree, viewport(), "-") |> Effect.provideMut<Link>(&mut app)
+  let mut visible: usize = 0
+  let rows = devtools.model.rows.asSlice()
+  let mut i: usize = 0
+  while i < rows.length {
+    if rows[i].visible {
+      visible = visible + 1
+    }
+    i = i + 1
+  }
+  run Testing.expect(visible == 1, "folding the root leaves one row")
+  drop run click(&mut devtools, &mut tree, viewport(), "+") |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(devtools.model.rows.asSlice()[1].visible, "unfolding shows them again")
+
+  // Live refreshes stop when Live is off.
+  let syncs = devtools.model.syncs
+  drop run click(&mut devtools, &mut tree, viewport(), "Live") |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(!devtools.model.live, "Live toggles off")
+  devtools.send(Message.Tick { time: 2.0 })
+  run drain(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(devtools.model.syncs == syncs, "no refresh while not live")
+
+  // An app that cannot be reached shows in the status line.
+  app.down = true
+  devtools.send(Message.Refresh)
+  run drain(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
+  let down = run snapshot(&mut tree, viewport())
+  run Testing.expect(
+    String.contains(String.view(&down), "cannot reach the app: connection refused"),
+    "the error is shown",
+  )
+  app.down = false
+  devtools.send(Message.Refresh)
+  run drain(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(devtools.model.error.ownedByteLength() == 0, "and cleared when it is back")
+}
+
+test effect fn devtoolsInspectTheTodoApp() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run body() |> Effect.provideMut<Allocator>(&mut allocator)
+}

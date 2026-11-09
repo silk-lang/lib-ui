@@ -1,0 +1,306 @@
+//! Scroll layers: scrolling without layout.
+//!
+//! css-layout lays the tree out with every scroll offset at 0 and sticky boxes at their normal
+//! position (`Tree.stickyDeferred`). The tree applies scroll offsets and sticky offsets itself:
+//! paint puts the content of each scroll container in a scroll group of the scene, and each
+//! sticky box in a group linked to its scrollport, so a scroll moves groups and repaints
+//! nothing it does not have to (a renderer can even scroll on its own); hit testing and the
+//! geometry queries move fragments by [`shiftOf`].
+//!
+//! A fragment's shift is the sum, over it and its ancestors, of the scroll of the scroll
+//! container it is a child of (negated) and of its own sticky offset. CSS-space offsets retain
+//! their fractional precision; rasterization, not geometry or hit testing, owns pixel quantization.
+import layout.lib { Fragment, FragmentKind, LayoutTree, Tree }
+import mutation { Length, NodeKind, Position }
+import node { NONE, NO_INDEX, Node }
+import style { Computed }
+import scrollbar { scrolls, usedOverflow }
+import ui_scene.scroll { ScrollAxis, UNBOUNDED }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.geometry.rect { Rect }
+import silk.geometry.vector { Vector2 }
+import silk.num.f32
+import silk.num.u32
+import silk.num.usize
+
+/// Whether a box styled `c` is a scroll container: its content moves by its scroll offset.
+pub fn scroller(c: &Computed) -> bool {
+  return scrolls(usedOverflow(c, true)) || scrolls(usedOverflow(c, false))
+}
+
+fn slotIn(slots: &List<u32>, index: usize) -> u32 {
+  if index < slots.length() {
+    return slots.get(index)
+  }
+  return NONE
+}
+
+/// The slot of the scroll container fragment `index` is a scrolled child of, or NONE.
+pub fn scrolledBy(output: &LayoutTree, slots: &List<u32>, nodes: &List<Node>, index: usize) -> u32 {
+  let values = output.fragments.values.asSlice()
+  let parent = values[index].parent
+  if parent == NO_INDEX {
+    return NONE
+  }
+  let p = &values[parent]
+  if p.kind != FragmentKind.Box || p.positioningShell {
+    return NONE
+  }
+  let slot = slotIn(slots, p.source)
+  if slot == NONE {
+    return NONE
+  }
+  let node = &nodes.asSlice()[u32.toUsize(slot)]
+  if node.kind == NodeKind.Text || !scroller(&node.computed) {
+    return NONE
+  }
+  return slot
+}
+
+/// A sticky box's offset, as a function of its scrollport's scroll: one [`ScrollAxis`] per axis
+/// in CSS pixels, of the scroll of node `port` (a slot, NONE when it sticks to the unscrolled
+/// viewport).
+pub struct Sticky {
+  pub port: u32,
+  pub x: ScrollAxis,
+  pub y: ScrollAxis,
+}
+
+impl Copy for Sticky {}
+
+impl Sticky {
+  /// The offset at scroll (`sx`, `sy`) of the port, in CSS pixels.
+  pub fn at(self: &Self, sx: f32, sy: f32) -> Vector2<f32> {
+    let x = self.x.at(sx)
+    let y = self.y.at(sy)
+    return Vector2<f32> { x: x, y: y }
+  }
+
+  /// How far the box can move from its normal position, as (low, high) on each axis.
+  pub fn reach(self: &Self) -> Rect<f32> {
+    return Rect<f32>.new(
+      f32.min(self.x.low, 0.0),
+      f32.min(self.y.low, 0.0),
+      f32.max(self.x.high, 0.0),
+      f32.max(self.y.high, 0.0),
+    )
+  }
+}
+
+/// The CSS pixels of an inset `value` against `base`, or None for `auto`.
+fn insetOf(value: Length, base: f32) -> Option<f32> {
+  return match value {
+    Length.Px { value: px } => Option<f32>.Some { value: px }
+    Length.Percent { value: percent } => Option<f32>.Some { value: base * percent / 100.0 }
+    Length.Calc { pixels, percent } => Option<f32>.Some { value: pixels + base * percent / 100.0 }
+    _ => Option<f32>.None
+  }
+}
+
+/// One axis of a sticky box: its normal start `at` and `size`, margins `before`/`after`, the
+/// containing block's content edges `cbMin`/`cbMax`, the scrollport `portMin`/`portMax`, and
+/// the start and end insets.
+fn stickyAxis(
+  at: f32,
+  size: f32,
+  before: f32,
+  after: f32,
+  cbMin: f32,
+  cbMax: f32,
+  portMin: f32,
+  portMax: f32,
+  start: Option<f32>,
+  end: Option<f32>,
+) -> ScrollAxis {
+  if let Option<f32>.Some { value: inset } = start {
+    // Pushed down to the port's start edge (plus the inset), never out of the containing block.
+    return ScrollAxis {
+      factor: 1.0,
+      base: portMin + inset - at,
+      low: 0.0,
+      high: f32.max(0.0, cbMax - after - at - size),
+    }
+  }
+  if let Option<f32>.Some { value: inset } = end {
+    return ScrollAxis {
+      factor: 1.0,
+      base: portMax - inset - at - size,
+      low: f32.min(0.0, cbMin + before - at),
+      high: 0.0,
+    }
+  }
+  return ScrollAxis.fixed()
+}
+
+/// The nearest box fragment above `index`.
+fn boxAbove(values: &[Fragment], index: usize) -> usize {
+  let mut at = values[index].parent
+  while at != NO_INDEX {
+    if values[at].kind == FragmentKind.Box && !values[at].positioningShell {
+      return at
+    }
+    at = values[at].parent
+  }
+  return NO_INDEX
+}
+
+/// The sticky offset of fragment `index`, when its box is `position: sticky`, against the
+/// scrollport of the nearest scroll container above it (or the viewport `width` by `height`).
+pub fn stickyOf(
+  output: &LayoutTree,
+  slots: &List<u32>,
+  css: &Tree,
+  nodes: &List<Node>,
+  index: usize,
+  width: f32,
+  height: f32,
+) -> Option<Sticky> {
+  let values = output.fragments.values.asSlice()
+  let f = &values[index]
+  if (f.kind != FragmentKind.Box && f.kind != FragmentKind.Inline) || f.positioningShell {
+    return Option<Sticky>.None
+  }
+  let slot = slotIn(slots, f.source)
+  if slot == NONE {
+    return Option<Sticky>.None
+  }
+  let c = &nodes.asSlice()[u32.toUsize(slot)].computed
+  if c.position != Position.Sticky {
+    return Option<Sticky>.None
+  }
+
+  // The scrollport: the padding box of the nearest scroll container above.
+  let mut port = NONE
+  let mut portRect = Rect<f32>.new(0.0, 0.0, width, height)
+  let mut at = values[index].parent
+  while at != NO_INDEX {
+    let a = &values[at]
+    if a.kind == FragmentKind.Box && !a.positioningShell {
+      let s = slotIn(slots, a.source)
+      if s != NONE && nodes.asSlice()[u32.toUsize(s)].kind != NodeKind.Text
+        && scroller(&nodes.asSlice()[u32.toUsize(s)].computed) {
+        port = s
+        let x = a.worldLocation.x + a.paddingRect.x
+        let y = a.worldLocation.y + a.paddingRect.y
+        portRect = Rect<f32>.new(x, y, x + a.paddingRect.width, y + a.paddingRect.height)
+        break
+      }
+    }
+    at = a.parent
+  }
+  let block = boxAbove(values, index)
+  let mut cb = Rect<f32>.new(-UNBOUNDED, -UNBOUNDED, UNBOUNDED, UNBOUNDED)
+  if block != NO_INDEX {
+    let b = &values[block]
+    let x = b.worldLocation.x + b.contentRect.x
+    let y = b.worldLocation.y + b.contentRect.y
+    cb = Rect<f32>.new(x, y, x + b.contentRect.width, y + b.contentRect.height)
+  }
+  let pw = portRect.xMax - portRect.xMin
+  let ph = portRect.yMax - portRect.yMin
+  let x = stickyAxis(
+    f.worldLocation.x,
+    f.size.width,
+    f.usedMargin.left,
+    f.usedMargin.right,
+    cb.xMin,
+    cb.xMax,
+    portRect.xMin,
+    portRect.xMax,
+    insetOf(c.inset.left, pw),
+    insetOf(c.inset.right, pw),
+  )
+  let y = stickyAxis(
+    f.worldLocation.y,
+    f.size.height,
+    f.usedMargin.top,
+    f.usedMargin.bottom,
+    cb.yMin,
+    cb.yMax,
+    portRect.yMin,
+    portRect.yMax,
+    insetOf(c.inset.top, ph),
+    insetOf(c.inset.bottom, ph),
+  )
+  drop css
+  return Option<Sticky>.Some { value: Sticky { port: port, x: x, y: y } }
+}
+
+/// The scroll offset of slot `slot` (NONE: the viewport, never scrolled).
+fn scrollAt(nodes: &List<Node>, slot: u32) -> Vector2<f32> {
+  if slot == NONE {
+    return Vector2<f32> { x: 0.0, y: 0.0 }
+  }
+  let node = &nodes.asSlice()[u32.toUsize(slot)]
+  return Vector2<f32> { x: node.scrollX, y: node.scrollY }
+}
+
+/// How far fragment `index` itself moves against its parent: minus the scroll of the scroll
+/// container it is a child of, plus its sticky offset.
+pub fn ownShift(
+  output: &LayoutTree,
+  slots: &List<u32>,
+  css: &Tree,
+  nodes: &List<Node>,
+  index: usize,
+  width: f32,
+  height: f32,
+) -> Vector2<f32> {
+  let mut dx: f32 = 0.0
+  let mut dy: f32 = 0.0
+  let by = scrolledBy(output, slots, nodes, index)
+  if by != NONE {
+    let s = scrollAt(nodes, by)
+    dx = dx - s.x
+    dy = dy - s.y
+  }
+  if let Option<Sticky>.Some { value } = stickyOf(output, slots, css, nodes, index, width, height) {
+    let s = scrollAt(nodes, value.port)
+    let o = value.at(s.x, s.y)
+    dx = dx + o.x
+    dy = dy + o.y
+  }
+  return Vector2<f32> { x: dx, y: dy }
+}
+
+/// Where fragment `index` draws against where the layout put it, in CSS pixels.
+pub fn shiftOf(
+  output: &LayoutTree,
+  slots: &List<u32>,
+  css: &Tree,
+  nodes: &List<Node>,
+  index: usize,
+  width: f32,
+  height: f32,
+) -> Vector2<f32> {
+  let mut dx: f32 = 0.0
+  let mut dy: f32 = 0.0
+  let mut at = index
+  while at != NO_INDEX {
+    let own = ownShift(output, slots, css, nodes, at, width, height)
+    dx = dx + own.x
+    dy = dy + own.y
+    at = output.fragments.values.asSlice()[at].parent
+  }
+  return Vector2<f32> { x: dx, y: dy }
+}
+
+/// `rect` moved by `shift`.
+pub fn moved(rect: Rect<f32>, shift: Vector2<f32>) -> Rect<f32> {
+  return Rect<f32>.new(
+    rect.xMin + shift.x,
+    rect.yMin + shift.y,
+    rect.xMax + shift.x,
+    rect.yMax + shift.y,
+  )
+}
+
+/// Fragment `f` (fragment `index`) moved to where it draws.
+pub fn visual(f: &Fragment, shift: Vector2<f32>) -> Fragment {
+  let mut out = f.*
+  out.worldLocation.x = f.worldLocation.x + shift.x
+  out.worldLocation.y = f.worldLocation.y + shift.y
+  return out
+}

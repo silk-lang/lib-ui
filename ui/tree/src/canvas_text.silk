@@ -1,0 +1,525 @@
+//! Text measurement and viewport-aware raster caching for custom GPU scenes.
+//! Keys identify immutable text content; change the key when that content changes. Family ids
+//! refer to font families registered on the scratch tree. Raster tiles live in the destination
+//! tree's atlas; call reset before discarding this cache or replacing its document keys.
+import lib { UiTree, TreeError, Batch, FrameInput, CpuSnapshot }
+import mutation { NodeKind, Property, Length, LineHeight, WhiteSpace, Position, Side, Overflow }
+import atlas.atlas { AtlasTile, AtlasError, Kind }
+import ui_scene.color as color
+import vector.geometry_error { GeometryError }
+import silk.collections.list { List }
+import silk.collections.hash_map { HashMap }
+import silk.collections.hash { Hash }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.core.effect { Effect }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.u32
+import silk.num.usize
+
+/// One immutable text value and its destination rectangle in document coordinates.
+pub struct TextRequest<'a> {
+  pub id: u32,
+  pub key: u32,
+  pub value: string<'a>,
+  pub size: f32,
+  pub weight: u32,
+  pub family: u32,
+  pub fill: u32,
+  pub x: f32,
+  pub y: f32,
+  pub width: f32,
+  pub height: f32,
+}
+
+impl<'a> Copy for TextRequest<'a> {}
+
+/// The visible document origin, logical viewport size and camera scale.
+pub struct TextViewport {
+  pub x: f32,
+  pub y: f32,
+  pub width: f32,
+  pub height: f32,
+  pub zoom: f32
+}
+
+impl Copy for TextViewport {}
+
+struct Measurement {
+  text: u32,
+  size: f32,
+  weight: u32,
+  family: u32,
+  dimensions: [f32; 3],
+  next: usize,
+}
+
+impl Copy for Measurement {}
+
+pub struct TextTile {
+  pub used: u64,
+  pub resident: bool,
+  pub cache: usize,
+  pub next: usize,
+  pub id: u32,
+  pub text: u32,
+  pub size: f32,
+  pub weight: u32,
+  pub fill: u32,
+  pub family: u32,
+  pub width: f32,
+  pub height: f32,
+  pub density: f32,
+  pub cropX: f32,
+  pub cropY: f32,
+  pub naturalWidth: f32,
+  pub naturalHeight: f32,
+  pub baseline: f32,
+  pub stretchX: f32,
+  pub stretchY: f32,
+  pub pixelsWidth: f32,
+  pub pixelsHeight: f32,
+  pub tile: AtlasTile
+}
+
+impl Copy for TextTile {}
+
+/// Owns measurements, density choices, crop coverage and atlas reclamation for canvas text.
+pub struct TextCache {
+  pub text: List<TextTile>,
+  textHeads: HashMap<u32, usize>,
+  measurements: List<Measurement>,
+  measureHeads: HashMap<u32, usize>,
+  pub textPixels: usize,
+  /// Increment for each scene rebuild, so currently used tiles are not evicted.
+  pub rasterFrame: u64,
+  /// Exports use the exact requested density instead of interactive buckets.
+  pub exporting: bool,
+  /// During an active zoom gesture, retain a covered tile and refine after the gesture settles.
+  pub deferDensity: bool,
+}
+
+impl TextCache {
+  pub fn make() -> TextCache {
+    return TextCache {
+      text: List<TextTile>.make(),
+      textHeads: HashMap<u32, usize>.make(Hash.seed(1307)),
+      measurements: List<Measurement>.make(),
+      measureHeads: HashMap<u32, usize>.make(Hash.seed(1309)),
+      textPixels: 0,
+      rasterFrame: 0,
+      exporting: false,
+      deferDensity: false,
+    }
+  }
+
+  pub fn reset(self: &mut Self, tree: &mut UiTree<'_>) -> () {
+    let mut i: usize = 0
+    while i < self.text.length() {
+      drop tree.atlas.free(self.text.get(i).tile.id)
+      i = i + 1
+    }
+    self.* = TextCache.make()
+  }
+
+  pub effect fn measurement(
+    self: &mut Self,
+    request: TextRequest<'_>,
+    tree: &mut UiTree<'_>,
+  ) -> [f32; 3]
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let head = self.measureHeads.get(request.key) |> Option<usize>.unwrapOr(usize.MAX)
+    let mut at = head
+    while at != usize.MAX {
+      let entry = self.measurements.get(at)
+      if entry.size == request.size && entry.weight == request.weight
+        && entry.family == request.family {
+        return entry.dimensions
+      }
+      at = entry.next
+    }
+    let dimensions = run measureText(request, &mut tree)
+    drop run self.measureHeads.insert(request.key, self.measurements.length())
+    run self.measurements.append(
+      Measurement {
+        text: request.key,
+        size: request.size,
+        weight: request.weight,
+        family: request.family,
+        dimensions: dimensions,
+        next: head,
+      },
+    )
+    return dimensions
+  }
+
+  pub effect fn raster(
+    self: &mut Self,
+    request: TextRequest<'_>,
+    viewport: TextViewport,
+    tree: &mut UiTree<'_>,
+    textTree: &mut UiTree<'_>,
+    snapshot: &mut CpuSnapshot,
+    scale: f32,
+  ) -> TextTile
+    ! TreeError | AtlasError | GeometryError | OutOfMemoryError
+    ? &mut Allocator {
+    let dimensions = run self.measurement(request, &mut textTree)
+    let naturalWidth = dimensions[0]
+    let naturalHeight = dimensions[1]
+    let baseline = dimensions[2]
+    let head = self.textHeads.get(request.key) |> Option<usize>.unwrapOr(usize.MAX)
+    let mut old = usize.MAX
+    let mut cursor = head
+    while cursor != usize.MAX {
+      let cached = self.text.get(cursor)
+      if cached.size == request.size && cached.weight == request.weight
+        && cached.family == request.family
+        && cached.fill == request.fill
+        && cached.width == request.width
+        && cached.height == request.height
+        && (cached.id == request.id
+          || cached.cropX == 0.0 && cached.cropY == 0.0
+            && cached.pixelsWidth == f32.ceil(cached.naturalWidth * cached.density)
+            && cached.pixelsHeight == f32.ceil(cached.naturalHeight * cached.density)) {
+        old = cursor
+        break
+      }
+      cursor = cached.next
+    }
+    let stretchX = request.width / naturalWidth
+    let stretchY = request.height / naturalHeight
+    let wanted = f32.max(0.001, viewport.zoom * scale * f32.max(stretchX, stretchY))
+    let small = request.size <= 12.0 && naturalWidth <= 256.0 && naturalHeight <= 32.0
+    let requested = if self.exporting {
+      wanted
+    } else {
+      f32.max(
+        if small && self.textPixels < 8000000 {
+          4.0
+        } else {
+          0.25
+        },
+        f32.ceil(wanted * 4.0) / 4.0,
+      )
+    }
+    let mut density = requested
+
+    // Coarse buckets amortize the small shared labels. Large text uses the
+    // requested density: doubling it can unnecessarily turn a full raster into
+    // a costly viewport crop (for example at 400% -> 401% on a Retina display).
+    if !self.exporting && small {
+      density = 0.25
+      while density < requested {
+        density = density * 2.0
+      }
+    }
+    let totalWidth = f32.max(1.0, f32.ceil(naturalWidth * density))
+    let totalHeight = f32.max(1.0, f32.ceil(naturalHeight * density))
+    let clipX = totalWidth > 4096.0
+    let clipY = totalHeight > 4096.0
+    let cropX: f32 = if clipX && !self.exporting {
+      f32.max(0.0, f32.floor((viewport.x - request.x) / stretchX * density) - 256.0)
+    } else {
+      0.0
+    }
+    let cropY: f32 = if clipY && !self.exporting {
+      f32.max(0.0, f32.floor((viewport.y - request.y) / stretchY * density) - 256.0)
+    } else {
+      0.0
+    }
+    let w = f32.max(
+      1.0,
+      f32.min(
+        totalWidth - cropX,
+        if clipX {
+          f32.min(4096.0, (viewport.width) * density / viewport.zoom / stretchX + 512.0)
+        } else {
+          4096.0
+        },
+      ),
+    )
+    let h = f32.max(
+      1.0,
+      f32.min(
+        totalHeight - cropY,
+        if clipY {
+          f32.min(4096.0, (viewport.height) * density / viewport.zoom / stretchY + 512.0)
+        } else {
+          4096.0
+        },
+      ),
+    )
+    if old != usize.MAX {
+      let mut cached = self.text.get(old)
+      if cached.text == request.key && cached.size == request.size
+        && cached.weight == request.weight
+        && cached.fill == request.fill
+        && cached.family == request.family
+        && cached.width == request.width
+        && cached.height == request.height
+        && (self.deferDensity
+          || cached.density >= density
+            && (cached.density <= density * 4.0 || small && self.textPixels < 16000000))
+        && (if self.exporting {
+          !croppedText(cached)
+        } else {
+          textCovered(cached, viewport, request)
+        })
+        && tree.atlas.touch(cached.tile.id) {
+        cached.used = self.rasterFrame
+        self.text.set(old, cached)
+        return cached
+      }
+    }
+
+    let mut batch = Batch.make()
+    run batch.setText(2, request.value)
+    run batch.style(
+      1,
+      &[
+        Property.Width { value: Length.px(w) },
+        Property.Height { value: Length.px(h) },
+        Property.WhiteSpace { value: WhiteSpace.Pre },
+        Property.FontFamily { family: request.family },
+        Property.FontSize { value: request.size * density },
+        Property.FontWeight { value: u32.toF32(request.weight) },
+        Property.Color { color: color.rgba(request.fill) },
+        Property.LineHeight { value: LineHeight.Number { value: 1.5 } },
+      ],
+    )
+    run batch.style(
+      3,
+      &[
+        Property.Position { value: Position.Absolute },
+        Property.Inset { side: Side.Left, value: Length.px(2.0 * density - cropX) },
+        Property.Inset {
+          side: Side.Top,
+          value: Length.px((request.size + 2.0 - baseline) * density - cropY),
+        },
+        Property.Width { value: Length.px(totalWidth) },
+        Property.Height { value: Length.px(totalHeight) },
+      ],
+    )
+    run textTree.apply(run batch.take())
+
+    // This scratch tree paints one label, then copies its pixels into the canvas
+    // atlas. Earlier labels no longer need their glyph tiles. Advance eviction
+    // and disable subtree replay so every glyph used now is touched again.
+    drop textTree.atlas.beginFrame()
+    textTree.invalidatePaint()
+    run textTree.frame(FrameInput { width: w, height: h, scale: 1.0, time: 0.0 })
+    if textTree.atlas.evicted().length > 0 {
+      drop run textTree.glyphs.prune(&textTree.atlas)
+      textTree.atlas.clearEvicted()
+    }
+    run snapshot.sync(&mut textTree)
+    let pixels = run snapshot.render(&textTree.*)
+    if old != usize.MAX {
+      let mut previous = self.text.get(old)
+      if previous.resident {
+        self.textPixels = self.textPixels
+          - f32.toUsize(previous.pixelsWidth * previous.pixelsHeight)
+        drop tree.atlas.free(previous.tile.id)
+        previous.resident = false
+        self.text.set(old, previous)
+      }
+    }
+    let tile = run self.allocateText(&mut tree, pixels.width(), pixels.height())
+    run tree.uploads.push(tile, pixels.data(), 0, pixels.width() * 4)
+    self.textPixels = self.textPixels + f32.toUsize(w * h)
+    let cached = TextTile {
+      used: self.rasterFrame,
+      resident: true,
+      cache: if old == usize.MAX {
+        self.text.length()
+      } else {
+        old
+      },
+      next: if old == usize.MAX {
+        head
+      } else {
+        self.text.get(old).next
+      },
+      id: request.id,
+      text: request.key,
+      size: request.size,
+      weight: request.weight,
+      fill: request.fill,
+      family: request.family,
+      width: request.width,
+      height: request.height,
+      density: density,
+      cropX: cropX,
+      cropY: cropY,
+      naturalWidth: naturalWidth,
+      naturalHeight: naturalHeight,
+      baseline: baseline,
+      stretchX: stretchX,
+      stretchY: stretchY,
+      pixelsWidth: w,
+      pixelsHeight: h,
+      tile: tile,
+    }
+    if old == usize.MAX {
+      drop run self.textHeads.insert(request.key, self.text.length())
+      run self.text.append(cached)
+    } else {
+      self.text.set(old, cached)
+    }
+    return cached
+  }
+
+  // UiTree retains its own paint caches, so advancing its atlas eviction frame
+  // would invalidate UI sprites. Reclaim only canvas text that this rebuild has
+  // not used; preserve every allocation already referenced by the new document.
+  effect fn allocateText(
+    self: &mut Self,
+    tree: &mut UiTree<'_>,
+    width: u32,
+    height: u32,
+  ) -> AtlasTile
+    ! AtlasError | OutOfMemoryError
+    ? &mut Allocator {
+    while true {
+      let allocated = run Effect.result(tree.atlas.allocate(Kind.Polychrome, width, height))
+      match move allocated {
+        Result<AtlasTile, AtlasError | OutOfMemoryError>.Success { value } => {
+          return value
+        }
+        Result<AtlasTile, AtlasError | OutOfMemoryError>.Failure { error } => {
+          match move error {
+            OutOfMemoryError failure => {
+              fail move failure
+            }
+            AtlasError failure => {
+              match failure {
+                AtlasError.Full => {}
+                _ => {
+                  fail failure
+                }
+              }
+            }
+          }
+        }
+      }
+      let mut oldest = usize.MAX
+      let mut used = self.rasterFrame
+      let mut i: usize = 0
+      while i < self.text.length() {
+        let candidate = self.text.get(i)
+        if candidate.resident && candidate.used < used {
+          oldest = i
+          used = candidate.used
+        }
+        i = i + 1
+      }
+      if oldest == usize.MAX {
+        fail AtlasError.Full
+      }
+      let mut entry = self.text.get(oldest)
+      drop tree.atlas.free(entry.tile.id)
+      self.textPixels = self.textPixels - f32.toUsize(entry.pixelsWidth * entry.pixelsHeight)
+      entry.resident = false
+      self.text.set(oldest, entry)
+    }
+  }
+}
+
+effect fn measureText(request: TextRequest<'_>, tree: &mut UiTree<'_>) -> [f32; 3]
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut width: f32 = 0.0
+  let mut height: f32 = 0.0
+  let mut baseline: f32 = 0.0
+  let mut measure = Batch.make()
+  run measure.setText(2, request.value)
+  run measure.style(
+    1,
+    &[
+      Property.Width { value: Length.px(1000000.0) },
+      Property.Height { value: Length.px(1.0) },
+      Property.WhiteSpace { value: WhiteSpace.Pre },
+      Property.FontFamily { family: request.family },
+      Property.FontSize { value: request.size },
+      Property.FontWeight { value: u32.toF32(request.weight) },
+      Property.LineHeight { value: LineHeight.Number { value: 1.5 } },
+    ],
+  )
+  run measure.style(
+    3,
+    &[
+      Property.Position { value: Position.Absolute },
+      Property.Inset { side: Side.Left, value: Length.px(0.0) },
+      Property.Inset { side: Side.Top, value: Length.px(0.0) },
+      Property.Width { value: Length.px(1000000.0) },
+      Property.Height { value: Length.px(request.size * 1.5) },
+    ],
+  )
+  run tree.apply(run measure.take())
+  run tree.layoutNow()
+  let css = tree.node(tree.slotOf(2)).css
+  let fragments = tree.output.fragments.values.asSlice()
+  let mut j: usize = 0
+  while j < fragments.length {
+    let f = fragments[j]
+    if f.source == css {
+      baseline = f32.max(baseline, f.worldLocation.y + f.firstBaselines.alphabetic)
+      width = f32.max(width, f.worldLocation.x + f.size.width)
+      height = f32.max(height, f.worldLocation.y + f.size.height)
+    }
+    j = j + 1
+  }
+  width = f32.ceil(f32.max(1.0, width) + 4.0)
+  height = f32.ceil(f32.max(request.size * 1.5, height) + 4.0)
+  return [width, height, baseline]
+}
+
+pub fn croppedText(tile: TextTile) -> bool {
+  return tile.cropX > 0.0 || tile.cropY > 0.0
+    || tile.pixelsWidth < f32.ceil(tile.naturalWidth * tile.density)
+    || tile.pixelsHeight < f32.ceil(tile.naturalHeight * tile.density)
+}
+
+// Compare viewport coverage in the cached raster's coordinates. Recomputing a
+// preferred crop origin is not an invalidation: its overscan is there for panning.
+pub fn textCovered(tile: TextTile, viewport: TextViewport, request: TextRequest<'_>) -> bool {
+  if !croppedText(tile) {
+    return true
+  }
+  let left = f32.max(0.0, (viewport.x - request.x) / tile.stretchX * tile.density)
+  let top = f32.max(0.0, (viewport.y - request.y) / tile.stretchY * tile.density)
+  let right = f32.min(
+    f32.ceil(tile.naturalWidth * tile.density),
+    (viewport.x + viewport.width / viewport.zoom - request.x) / tile.stretchX * tile.density,
+  )
+  let bottom = f32.min(
+    f32.ceil(tile.naturalHeight * tile.density),
+    (viewport.y + viewport.height / viewport.zoom - request.y) / tile.stretchY * tile.density,
+  )
+  if right <= left || bottom <= top {
+    return true
+  }
+  return tile.cropX <= f32.floor(left) && tile.cropY <= f32.floor(top)
+    && tile.cropX + tile.pixelsWidth >= f32.ceil(right)
+    && tile.cropY + tile.pixelsHeight >= f32.ceil(bottom)
+}
+
+/// Creates reusable text layout nodes in an empty scratch tree. Register family ids separately.
+pub effect fn setup(tree: &mut UiTree<'_>) -> ()
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.style(
+    1,
+    &[Property.OverflowX { value: Overflow.Hidden }, Property.OverflowY { value: Overflow.Hidden }],
+  )
+  run batch.box(1, 3, &[])
+  run batch.text(3, 2, "")
+  run tree.apply(run batch.take())
+}

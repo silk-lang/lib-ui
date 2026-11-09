@@ -1,0 +1,481 @@
+//! Inspector tests over the ui-tree fixtures: queries, hit paths and the picker, the
+//! highlight overlay, the node view, synthetic input, and sessions that replay to the same
+//! tree. Run from the repository root (the fixtures read fonts and icons from there).
+import ui_fixtures.fixtures as fixtures
+import ui_inspect.lib {
+  Query,
+  Highlight,
+  BoxModel,
+  InspectOptions,
+  Session,
+  ReplayReport,
+  textContent,
+  accessibleName,
+  queryAll,
+  queryFirst,
+  hitPath,
+  pick,
+  boxModels,
+  compose,
+  inspectNode,
+  pointOf,
+  click,
+  hover,
+  wheel,
+  tab,
+  dispatchAll
+}
+import ui_tree.lib {
+  UiTree,
+  TreeError,
+  Batch,
+  FrameInput,
+  CpuSnapshot,
+  DescribeOptions,
+  Role,
+  Mutation,
+  Event,
+  EventKind,
+  Input,
+  Property,
+  NONE,
+  describe
+}
+import ui_inspect.session { Step, copyBatch, copyInput, copyEvent }
+import ui_scene.scene { Scene }
+import font_collection.lib { FontCollection }
+import vector.geometry_error { GeometryError }
+import vector.pixmap { Pixmap }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.geometry.vector { Vector2 }
+import silk.io.writer { Writer }
+import silk.io.writer_native { StderrWriter }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.u32
+import silk.system.filesystem { FileError }
+import silk.system.host_input { HostInputError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+/// Writes `text` to stderr, for test failures that need the actual output.
+effect fn say(text: string) -> () {
+  let mut writer = StderrWriter.make()
+  drop Effect.result(Writer.writeString(text) |> Effect.provideMut<Writer>(&mut writer))
+}
+
+fn viewport() -> FrameInput {
+  return FrameInput { width: 360.0, height: 440.0, scale: 2.0, time: 0.0 }
+}
+
+effect fn inbox(collection: &FontCollection) -> UiTree<'_>
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut tree = run UiTree.make(collection)
+  let mut batch = Batch.make()
+  run fixtures.inbox(&mut batch)
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  return move tree
+}
+
+fn sameList(actual: &List<u32>, expected: &[u32]) -> bool {
+  let a = actual.asSlice()
+  if a.length != expected.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < a.length {
+    if a[i] != expected[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn sameText(a: &String, b: string) -> bool {
+  let x = a.ownedUtf8Bytes()
+  let y = String.utf8Bytes(b)
+  if x.length != y.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < x.length {
+    if x[i] != y[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn sameStrings(a: &String, b: &String) -> bool {
+  return sameText(a, String.view(b))
+}
+
+fn samePixels(a: &Pixmap, b: &Pixmap) -> bool {
+  let x = a.data()
+  let y = b.data()
+  if a.width() != b.width() || a.height() != b.height() || x.length != y.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < x.length {
+    if x[i] != y[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+/// Whether device pixel (`x`, `y`) differs between `a` and `b`.
+fn differsAt(a: &Pixmap, b: &Pixmap, x: u32, y: u32) -> bool {
+  let at = (u32.toUsize(y) * u32.toUsize(a.width()) + u32.toUsize(x)) * 4
+  let p = a.data()
+  let q = b.data()
+  return p[at] != q[at] || p[at + 1] != q[at + 1] || p[at + 2] != q[at + 2]
+    || p[at + 3] != q[at + 3]
+}
+
+effect fn queryBody() -> ()
+  ! AssertionError<'static> | TreeError | FileError | HostInputError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let tree = run inbox(&collection)
+  let mut found = List<u32>.make()
+
+  // Role and accessible name, as getByRole: the label attribute names the buttons.
+  run queryAll(&tree, &Query.byRole(Role.Button), &mut found)
+  run Testing.expect(
+    sameList(&found, &[fixtures.NEW_BUTTON, fixtures.ARCHIVE_BUTTON, fixtures.DELETE_BUTTON]),
+    "three buttons in tree order",
+  )
+  let archive = run queryFirst(&tree, &run Query.byRoleNamed(Role.Button, "  archive "))
+  run Testing.expect(archive == fixtures.ARCHIVE_BUTTON, "names match trimmed and ignoring case")
+  let mut exact = run Query.byRoleNamed(Role.Button, "archive")
+  exact.exact = true
+  let none = run queryFirst(&tree, &exact)
+  run Testing.expect(none == NONE, "exact names keep their case")
+
+  // Rows have no label: their name is their text content.
+  let mut name = String.make()
+  run accessibleName(&tree, fixtures.ROW, &mut name)
+  run Testing.expect(sameText(&name, "Welcome to the retained tree"), "a row is named by its text")
+  run textContent(&tree, fixtures.ROW + 30, &mut name)
+  run Testing.expect(
+    sameText(
+      &name,
+      "Nested scrolling A line inside the nested box A line inside the nested box A line inside the nested box A line inside the nested box A line inside the nested box A line inside the nested box",
+    ),
+    "text content joins descendant text with spaces",
+  )
+  let row = run queryFirst(&tree, &run Query.byRoleNamed(Role.ListItem, "tab moves"))
+  run Testing.expect(row == fixtures.ROW + 20, "a list item found by its text")
+
+  // Text queries find text nodes; `within` scopes a query to a subtree.
+  run queryAll(&tree, &run Query.byText("nested"), &mut found)
+  run Testing.expect(found.length() == 7, "the row title and six nested lines")
+  let mut inside = run Query.byText("nested")
+  inside.within = fixtures.NESTED
+  run queryAll(&tree, &inside, &mut found)
+  run Testing.expect(found.length() == 6, "only the nested lines")
+  run Testing.expect(found.get(0) == fixtures.NESTED + 11, "the first nested line's text")
+  run queryAll(&tree, &Query.byRole(Role.ListItem), &mut found)
+  run Testing.expect(found.length() == 10, "ten rows")
+  let byId = run queryFirst(&tree, &Query.byId(fixtures.TOOLBAR))
+  run Testing.expect(byId == fixtures.TOOLBAR, "by id")
+  let byTest = run queryFirst(&tree, &run Query.byTestId("nope"))
+  run Testing.expect(byTest == NONE, "no test ids")
+
+  // Hit paths: the button's text resolves to the button, as pointer input would target it.
+  let mut path = List<u32>.make()
+  run hitPath(&tree, 113.0, 27.0, &mut path)
+  run Testing.expect(
+    sameList(&path, &[fixtures.PANEL, fixtures.TOOLBAR, fixtures.ARCHIVE_BUTTON]),
+    "the hit path runs from the root to the archive button",
+  )
+  run hitPath(&tree, 400.0, 27.0, &mut path)
+  run Testing.expect(path.length() == 0, "nothing is hit outside the viewport")
+
+  // The picker goes one deeper, to the text, and respects clipping: the nested box's lines
+  // below its padding box are not picked.
+  run Testing.expect(pick(&tree, 113.0, 27.0) == fixtures.ARCHIVE_BUTTON + 1, "pick finds text")
+  run Testing.expect(pick(&tree, 300.0, 27.0) == fixtures.TOOLBAR, "pick finds the bare toolbar")
+  run Testing.expect(
+    pick(&tree, 60.0, 290.0) == fixtures.ROW + 40,
+    "a clipped nested line is not picked below its scroll box",
+  )
+}
+
+test effect fn queriesFindNodesByRoleNameTextAndPosition() -> ()
+  ! AssertionError<'static> | TreeError | FileError | HostInputError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run queryBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn highlightBody() -> ()
+  ! AssertionError<'static>
+    | TreeError
+    | GeometryError
+    | FileError
+    | HostInputError
+    | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run inbox(&collection)
+  let mut snapshot = CpuSnapshot.make()
+  run snapshot.sync(&mut tree)
+  let plain = run snapshot.render(&tree)
+  let mut models = List<BoxModel>.make()
+  run boxModels(&tree, fixtures.NESTED, &mut models)
+  run Testing.expect(models.length() == 1, "one box for the nested scroll box")
+  let m = models.get(0)
+  run Testing.expect(m.margin.yMin == m.border.yMin - 6.0, "its 6px top margin")
+  run Testing.expect(m.content.xMin == m.border.xMin + 4.0, "and 4px padding")
+
+  let mut scene = Scene.make()
+  let highlight = run Highlight.of(fixtures.NESTED)
+  run compose(&tree, &highlight, &mut scene)
+  let lit = run snapshot.renderScene(&tree, &scene)
+  run Testing.expect(!samePixels(&plain, &lit), "the overlay draws something")
+
+  // Device pixels (scale 2): inside the content box and the margin they change; far away
+  // nothing does.
+  let cx = f32.toU32((m.content.xMin + 5.0) * 2.0)
+  let cy = f32.toU32((m.content.yMin + 5.0) * 2.0)
+  run Testing.expect(differsAt(&plain, &lit, cx, cy), "the content box is tinted")
+  let my = f32.toU32((m.margin.yMin + 2.0) * 2.0)
+  run Testing.expect(differsAt(&plain, &lit, cx, my), "the margin is tinted")
+  run Testing.expect(!differsAt(&plain, &lit, 40, 40), "the toolbar is untouched")
+
+  // The tree itself is untouched: its next frame replays and draws what it drew before.
+  run tree.frame(viewport())
+  run snapshot.sync(&mut tree)
+  let again = run snapshot.render(&tree)
+  run Testing.expect(samePixels(&plain, &again), "the tree's frame is unchanged")
+  run Testing.expect(tree.stats.repaintedSubtrees == 0, "and nothing repaints")
+
+  // An empty highlight composes to the frame itself.
+  run compose(&tree, &Highlight.make(), &mut scene)
+  let none = run snapshot.renderScene(&tree, &scene)
+  run Testing.expect(samePixels(&plain, &none), "no nodes, no overlay")
+}
+
+test effect fn highlightDrawsTheBoxModelOverTheFrame() -> ()
+  ! AssertionError<'static>
+    | TreeError
+    | GeometryError
+    | FileError
+    | HostInputError
+    | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run highlightBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn viewBody() -> ()
+  ! AssertionError<'static> | TreeError | FileError | HostInputError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run inbox(&collection)
+  let mut inputs = List<Input>.make()
+  run Testing.expect(run hover(&tree, fixtures.ARCHIVE_BUTTON, &mut inputs), "archive is hoverable")
+  run dispatchAll(&mut tree, move inputs)
+  run tree.frame(viewport())
+  let mut out = String.make()
+  run inspectNode(
+    &tree,
+    fixtures.ARCHIVE_BUTTON,
+    InspectOptions { patches: true, computed: false },
+    &mut out,
+  )
+  let expected = "box #20 role=button label=\"Archive\" parent=#2 children=#21\nattributes: tabIndex=0 cursor=pointer\nlisteners: pointerdown pointerup click pointermove pointerenter pointerleave wheel keydown keyup focus blur input scroll\nstate: hovered\nbox model: margin [75.36,12 76.64x31] border [75.36,12 76.64x31] padding [75.36,12 76.64x31] content [87.36,18 52.64x19]\nstyle base {\n  background-color: rgba(229,231,235,1);\n  border-radius: 6px;\n  padding-top: 6px;\n  padding-bottom: 6px;\n  padding-left: 12px;\n  padding-right: 12px;\n  font-size: 14px;\n  font-weight: 700;\n}\nstyle hover {\n  background-color: rgba(209,213,219,1);\n}\nstyle active {\n  background-color: rgba(156,163,175,1);\n}\nstyle focus-visible {\n  box-shadow: 0px 0px 0px 2px rgba(37,99,235,1);\n}\n"
+  if !sameText(&out, expected) {
+    run say(String.view(&out))
+    run Testing.expect(false, "the node view matches")
+  }
+  out.clear()
+  run inspectNode(&tree, 9999, InspectOptions.all(), &mut out)
+  run Testing.expect(sameText(&out, "(no node #9999)\n"), "unknown ids say so")
+}
+
+test effect fn inspectNodeShowsAttributesStatesBoxModelAndStyles() -> ()
+  ! AssertionError<'static> | TreeError | FileError | HostInputError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run viewBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn synthBody() -> ()
+  ! AssertionError<'static> | TreeError | FileError | HostInputError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run inbox(&collection)
+  let mut inputs = List<Input>.make()
+
+  // The last row is below the list's scrollport: no point reaches it until it scrolls in.
+  let last = fixtures.ROW + 10 * (fixtures.ROWS - 1)
+  run Testing.expect(!run click(&tree, last, &mut inputs), "a scrolled-out row is not clickable")
+  run Testing.expect(inputs.length() == 0, "and nothing is appended")
+  let mut batch = Batch.make()
+  run batch.scrollIntoView(last)
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  run Testing.expect(run click(&tree, last, &mut inputs), "after scrolling it into view it is")
+  run dispatchAll(&mut tree, move inputs)
+  let mut events = List<Event>.make()
+  run tree.takeEvents(&mut events)
+  let mut clicked = false
+  let mut i: usize = 0
+  while i < events.length() {
+    let e = &events.asSlice()[i]
+    if e.kind == EventKind.Click && e.target == last {
+      clicked = true
+    }
+    i = i + 1
+  }
+  run Testing.expect(clicked, "the click reaches the row")
+
+  // The disabled button gets no click, but is still reachable by the pointer.
+  let reachable = match run pointOf(&tree, fixtures.DELETE_BUTTON) {
+    Option<Vector2<f32>>.Some { .. } => true
+    Option<Vector2<f32>>.None => false
+  }
+  run Testing.expect(reachable, "the disabled button is reachable")
+}
+
+test effect fn syntheticInputTargetsVisibleNodes() -> ()
+  ! AssertionError<'static> | TreeError | FileError | HostInputError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run synthBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// A session over the inbox: build, hover, click New, wheel the list, Tab twice, rename a
+/// row, with frames between and the records taken as a client would.
+effect fn record(tree: &mut UiTree<'_>, session: &mut Session) -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut events = List<Event>.make()
+  let mut batch = Batch.make()
+  run fixtures.inbox(&mut batch)
+  run session.apply(&mut tree, run batch.take())
+  run session.frame(&mut tree, viewport())
+  let mut inputs = List<Input>.make()
+  run Testing.expect(run click(&tree.*, fixtures.NEW_BUTTON, &mut inputs), "New is clickable")
+  run session.dispatchAll(&mut tree, move inputs)
+  run session.takeEvents(&mut tree, &mut events)
+  run session.frame(&mut tree, viewport())
+  inputs = List<Input>.make()
+  run Testing.expect(run wheel(&tree.*, fixtures.ROW + 50, 0.0, 120.0, &mut inputs), "rows wheel")
+  run session.dispatchAll(&mut tree, move inputs)
+  run session.frame(&mut tree, viewport())
+  inputs = List<Input>.make()
+  run tab(false, &mut inputs)
+  run tab(false, &mut inputs)
+  run session.dispatchAll(&mut tree, move inputs)
+  run session.takeEvents(&mut tree, &mut events)
+  run session.frame(&mut tree, viewport())
+  let mut change = Batch.make()
+  run change.setText(fixtures.ROW + 1, "Renamed while recording")
+  run change.style(fixtures.ROW, &[Property.BackgroundColor { color: fixtures.rgb(0xfef3c7) }])
+  run session.apply(&mut tree, run change.take())
+  run session.frame(&mut tree, viewport())
+  run session.takeEvents(&mut tree, &mut events)
+}
+
+effect fn replayBody() -> ()
+  ! AssertionError<'static>
+    | TreeError
+    | GeometryError
+    | FileError
+    | HostInputError
+    | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut recorded = run UiTree.make(&collection)
+  let mut session = Session.make()
+  run record(&mut recorded, &mut session)
+  let counts = session.counts()
+  run Testing.expect(counts[0] == 2 && counts[2] == 5 && counts[3] == 3, "steps by kind")
+  run Testing.expect(
+    counts[1] == 8,
+    "three pointer inputs for the click, a wheel and two Tabs (down and up)",
+  )
+  let mut expected = String.make()
+  run describe(&recorded, DescribeOptions.withStyles(), &mut expected)
+  run Testing.expect(recorded.focused != NONE, "the session moved focus")
+
+  // A fresh tree over the same fonts replays to the same snapshot, records and pixels.
+  let mut replayed = run UiTree.make(&collection)
+  let report = run session.replay(&mut replayed)
+  run Testing.expect(report.steps == session.length(), "every step ran")
+  run Testing.expect(report.eventMismatches == 0, "the records came out the same")
+  let mut actual = String.make()
+  run describe(&replayed, DescribeOptions.withStyles(), &mut actual)
+  if !sameStrings(&actual, &expected) {
+    run say(String.view(&expected))
+    run say(String.view(&actual))
+    run Testing.expect(false, "the replayed snapshot matches")
+  }
+  let mut a = CpuSnapshot.make()
+  let mut b = CpuSnapshot.make()
+  run a.sync(&mut recorded)
+  run b.sync(&mut replayed)
+  let pa = run a.render(&recorded)
+  let pb = run b.render(&replayed)
+  run Testing.expect(samePixels(&pa, &pb), "and draws the same pixels")
+
+  // Replaying a prefix stops early: before the rename, the row still has its first title.
+  let mut partial = run UiTree.make(&collection)
+  drop run session.replayInto(&mut partial, 3)
+  let mut text = String.make()
+  run textContent(&partial, fixtures.ROW, &mut text)
+  run Testing.expect(sameText(&text, "Welcome to the retained tree"), "a prefix replays part")
+
+  // A replay that diverges is reported: drop the first frame, so the click misses.
+  let mut broken = Session.make()
+  let steps = session.steps.asSlice()
+  let mut i: usize = 0
+  while i < steps.length {
+    if i != 1 {
+      run broken.steps.append(run copyStep(&steps[i]))
+    }
+    i = i + 1
+  }
+  let mut diverged = run UiTree.make(&collection)
+  let bad = run broken.replay(&mut diverged)
+  run Testing.expect(bad.eventMismatches != 0, "a diverging replay is reported")
+}
+
+effect fn copyStep(step: &Step) -> Step
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match &step.* {
+    Step.Apply { batch } => Step.Apply { batch: run copyBatch(&batch) }
+    Step.Dispatch { input } => Step.Dispatch { input: run copyInput(&input) }
+    Step.Frame { input } => Step.Frame { input: input }
+    Step.Events { events } => {
+      let mut copies = List<Event>.make()
+      let values = events.asSlice()
+      let mut k: usize = 0
+      while k < values.length {
+        run copies.append(run copyEvent(&values[k]))
+        k = k + 1
+      }
+      Step.Events { events: move copies }
+    }
+  }
+}
+
+test effect fn aRecordedSessionReplaysToTheSameTree() -> ()
+  ! AssertionError<'static>
+    | TreeError
+    | GeometryError
+    | FileError
+    | HostInputError
+    | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run replayBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}

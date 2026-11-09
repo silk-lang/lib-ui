@@ -1,0 +1,1668 @@
+//! Painting: a walk over css-layout's fragments that turns box decorations into quads and
+//! shadows, inline spans into per-line quads, text fragments into glyph sprites from the runs
+//! ui-text shaped during layout, image and icon nodes into sprites, and canvas commands into
+//! paths. Clips become content masks and opacity an isolated layer. A subtree whose paint inputs
+//! did not change since the previous frame is copied from the previous scene with
+//! `Scene.replay`.
+import layout.lib { WritingMode }
+import mutation { ObjectFit, Length, Overflow }
+import mutation { NodeKind, BorderStyle as StyleBorder, CanvasCommand, Position }
+import style { Computed, Fill }
+import node { NONE, NO_INDEX, Node, FaceSlot, FrameStats, PaintCache }
+import resources { Resources, Resource }
+import scrollbar { thumbOf, Thumb, rangeOf, ScrollRange, scrolls, usedOverflow }
+import layers
+import layers { Sticky }
+import edit
+import ui_text.system { TextSystem }
+import layout.lib { Tree, LayoutTree, Fragment, FragmentKind, TextFragmentKind }
+import font_raster.cache { GlyphCache, RasterGlyph }
+import font_raster.face { FontFace }
+import font_raster.key { GlyphKey, PenPosition }
+import font_raster.rasterize { GlyphRasterizer }
+import atlas.atlas { Atlas, AtlasTile, Kind }
+import ui_scene.primitives {
+  Background,
+  BorderStyle,
+  ContentMask,
+  GlyphSprite,
+  ImageSprite,
+  Isolation,
+  Quad,
+  Shadow,
+  Underline
+}
+import ui_scene.scene { Scene }
+import ui_scene.scroll { ScrollAxis, ScrollLink, ScrollPosition, UNBOUNDED as UNBOUNDED_OFFSET }
+import ui_scene.effects { LayerEffects }
+import ui_scene.path_cache { PathCache }
+import vector.geometry { Affine }
+import vector.path { Path as VectorPath }
+import vector.strips { NONZERO }
+import vector.stroke { Stroke }
+import silk.collections.hash { Hash, HashSeed }
+import silk.collections.list { List }
+import silk.color.rgba { Rgba }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.geometry.corners { Corners }
+import silk.geometry.insets { Insets }
+import silk.geometry.rect { Rect }
+import silk.geometry.vector { Vector2 }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.num.i32
+import silk.num.u32
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+import silk.text.string { String }
+
+/// Conservative local device-pixel ink bounds of a horizontal raster glyph run.
+/// Bounds contain no atlas references and remain useful when tiles are evicted.
+pub struct TextInk {
+  pub valid: bool,
+  pub present: bool,
+  pub font: u32,
+  pub shape: u64,
+  pub scale: f32,
+  pub bounds: Rect<f32>,
+}
+
+impl Copy for TextInk {}
+
+impl TextInk {
+  pub fn empty() -> TextInk {
+    return TextInk {
+      valid: false,
+      present: false,
+      font: 0,
+      shape: 0,
+      scale: 0.0,
+      bounds: Rect<f32>.new(0.0, 0.0, 0.0, 0.0),
+    }
+  }
+}
+
+/// Everything a frame's paint reads and writes, borrowed from the tree.
+pub struct Painter<'p, 'a> {
+  pub nodes: &'p mut List<Node>,
+  pub slotOfCss: &'p List<u32>,
+  pub css: &'p Tree,
+  pub output: &'p LayoutTree,
+  pub text: &'p TextSystem<'a>,
+  pub faces: &'p List<FaceSlot<'a>>,
+  pub atlas: &'p mut Atlas,
+  pub glyphs: &'p mut GlyphCache,
+  pub textInk: &'p mut List<TextInk>,
+  pub resources: &'p mut Resources,
+  pub paths: &'p mut PathCache,
+  pub scene: &'p mut Scene,
+  pub previous: &'p Scene,
+  pub replayable: bool,
+  /// Whether no scroll offset changed since the previous frame: then subtrees holding scroll
+  /// containers can be replayed too.
+  pub scrollsStill: bool,
+  pub hashes: &'p List<u64>,
+  /// Per fragment: the bounds of its subtree's ink, from [`inkFragments`].
+  pub ink: &'p List<Rect<f32>>,
+  /// Per fragment: whether its subtree holds a scroll container, which paint never replays.
+  pub scrollers: &'p List<bool>,
+  /// What paint keeps, in device pixels of the current scroll group: subtrees whose ink misses it
+  /// are skipped. Inside a scroll container it reaches `lead` past the scrollport, so a renderer
+  /// that scrolls on its own has content to show.
+  pub cull: Rect<f32>,
+  pub lead: f32,
+  /// The viewport in CSS pixels, for sticky boxes without a scroll container.
+  pub width: f32,
+  pub height: f32,
+  pub stats: &'p mut FrameStats,
+  pub order: &'p mut List<u32>,
+  pub frame: u64,
+  pub scale: f32,
+  pub time: f64,
+  pub seed: HashSeed,
+  /// When set, only the subtree of this slot is painted and nothing is cached.
+  pub only: u32,
+  pub inside: bool,
+}
+
+fn slotIn(slots: &List<u32>, index: usize) -> u32 {
+  if index < slots.length() {
+    return slots.get(index)
+  }
+  return NONE
+}
+
+/// The slot of the element whose style a fragment of css-layout node `source` paints with: the
+/// node itself, or for text, the nearest element above it.
+pub fn styleSlot(slots: &List<u32>, css: &Tree, nodes: &List<Node>, source: usize) -> u32 {
+  let mut at = source
+  while at != NO_INDEX && at < css.nodes.length() {
+    let slot = slotIn(slots, at)
+    if slot != NONE && nodes.asSlice()[u32.toUsize(slot)].kind != NodeKind.Text {
+      return slot
+    }
+    at = css.nodes.asSlice()[at].parent
+  }
+  return NONE
+}
+
+fn device(rect: Rect<f32>, scale: f32) -> Rect<f32> {
+  return Rect<f32>.new(rect.xMin * scale, rect.yMin * scale, rect.xMax * scale, rect.yMax * scale)
+}
+
+/// The border box of fragment `f` in CSS pixels of the viewport.
+pub fn borderBox(f: &Fragment) -> Rect<f32> {
+  return Rect<f32>.new(
+    f.worldLocation.x,
+    f.worldLocation.y,
+    f.worldLocation.x + f.size.width,
+    f.worldLocation.y + f.size.height,
+  )
+}
+
+pub fn paddingBox(f: &Fragment) -> Rect<f32> {
+  let x = f.worldLocation.x + f.paddingRect.x
+  let y = f.worldLocation.y + f.paddingRect.y
+  return Rect<f32>.new(x, y, x + f.paddingRect.width, y + f.paddingRect.height)
+}
+
+/// The actual per-axis overflow clip, shared by paint, ink pruning and pointer traversal.
+/// A visible axis remains unbounded (not the other axis's padding extent).
+pub fn overflowClip(c: &Computed, f: &Fragment) -> Rect<f32> {
+  let padding = paddingBox(f)
+  let clipX = usedOverflow(c, true) != Overflow.Visible
+  let clipY = usedOverflow(c, false) != Overflow.Visible
+  return Rect<f32>.new(
+    if clipX {
+      padding.xMin
+    } else {
+      -UNBOUNDED_INK
+    },
+    if clipY {
+      padding.yMin
+    } else {
+      -UNBOUNDED_INK
+    },
+    if clipX {
+      padding.xMax
+    } else {
+      UNBOUNDED_INK
+    },
+    if clipY {
+      padding.yMax
+    } else {
+      UNBOUNDED_INK
+    },
+  )
+}
+
+pub fn contentBox(f: &Fragment) -> Rect<f32> {
+  let x = f.worldLocation.x + f.contentRect.x
+  let y = f.worldLocation.y + f.contentRect.y
+  return Rect<f32>.new(x, y, x + f.contentRect.width, y + f.contentRect.height)
+}
+
+fn scaledCorners(radii: Corners<f32>, scale: f32) -> Corners<f32> {
+  return Corners<f32>.new(
+    radii.topLeft * scale,
+    radii.topRight * scale,
+    radii.bottomRight * scale,
+    radii.bottomLeft * scale,
+  )
+}
+
+fn backgroundOf(fill: Fill) -> Background {
+  return match fill {
+    Fill.None => Background.solid(Rgba<f32> { r: 0.0, g: 0.0, b: 0.0, a: 0.0 })
+    Fill.Solid { color } => Background.solid(color)
+    Fill.Gradient { angle, from, to } => Background.linear(angle, from, to)
+  }
+}
+
+fn hasEdge(edges: u8, bit: u8) -> bool {
+  return u8.bitAnd(edges, bit) != 0
+}
+
+/// Draws the shadow, background and border of a box with computed style `c` over `rect`
+/// (CSS pixels). `edges` says which edges are drawn (bits top 1, right 2, bottom 4, left 8),
+/// as a span split across lines draws only some.
+effect fn decorate(
+  p: &mut Painter<'_, '_>,
+  c: &Computed,
+  rect: Rect<f32>,
+  edges: u8,
+  mask: ContentMask,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let s = p.scale
+  let bounds = device(rect, s)
+  let mut radii = scaledCorners(c.radii, s)
+  if !hasEdge(edges, 1) {
+    radii.topLeft = 0.0
+    radii.topRight = 0.0
+  }
+  if !hasEdge(edges, 2) {
+    radii.topRight = 0.0
+    radii.bottomRight = 0.0
+  }
+  if !hasEdge(edges, 4) {
+    radii.bottomRight = 0.0
+    radii.bottomLeft = 0.0
+  }
+  if !hasEdge(edges, 8) {
+    radii.topLeft = 0.0
+    radii.bottomLeft = 0.0
+  }
+  if c.hasShadow && !c.shadow.inset && c.shadow.color.a > 0.0 {
+    drop run p.scene.shadow(
+      Shadow {
+        bounds: bounds,
+        mask: mask,
+        cornerRadii: radii,
+        color: c.shadow.color,
+        blurRadius: c.shadow.blur * s,
+        offset: Vector2<f32> { x: c.shadow.offsetX * s, y: c.shadow.offsetY * s },
+        spread: c.shadow.spread * s,
+        inset: false,
+      },
+    )
+  }
+  let mut widths = Insets<f32>.zero()
+  if c.borderStyle != StyleBorder.None {
+    if hasEdge(edges, 1) {
+      widths.top = c.border.top * s
+    }
+    if hasEdge(edges, 2) {
+      widths.right = c.border.right * s
+    }
+    if hasEdge(edges, 4) {
+      widths.bottom = c.border.bottom * s
+    }
+    if hasEdge(edges, 8) {
+      widths.left = c.border.left * s
+    }
+  }
+  let background = backgroundOf(c.background)
+  let bordered = (widths.top > 0.0 || widths.right > 0.0 || widths.bottom > 0.0
+    || widths.left > 0.0)
+    && c.borderColor.a > 0.0
+  if !background.isTransparent() || bordered {
+    let mut quad = Quad.fill(bounds, mask, background)
+    quad.cornerRadii = radii
+    if bordered {
+      quad.borderWidths = widths
+      quad.borderColor = c.borderColor
+      quad.borderStyle = if c.borderStyle == StyleBorder.Dashed {
+        BorderStyle.Dashed
+      } else {
+        BorderStyle.Solid
+      }
+    }
+    drop run p.scene.quad(quad)
+  }
+  if c.hasShadow && c.shadow.inset && c.shadow.color.a > 0.0 {
+    drop run p.scene.shadow(
+      Shadow {
+        bounds: bounds,
+        mask: mask,
+        cornerRadii: radii,
+        color: c.shadow.color,
+        blurRadius: c.shadow.blur * s,
+        offset: Vector2<f32> { x: c.shadow.offsetX * s, y: c.shadow.offsetY * s },
+        spread: c.shadow.spread * s,
+        inset: true,
+      },
+    )
+  }
+}
+
+effect fn noGlyph<E>(error: E) -> Option<RasterGlyph> {
+  drop error
+  return Option<RasterGlyph>.None
+}
+
+effect fn noPath<E>(error: E) -> u32 {
+  drop error
+  return 0
+}
+
+/// Paints a text fragment: its glyph run, as shaped during layout, and its decorations.
+effect fn paintText(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: ContentMask) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if f.textData == NO_INDEX {
+    return ()
+  }
+  let t = p.output.fragments.texts.get(f.textData)
+  if t.kind != TextFragmentKind.Glyphs {
+    return ()
+  }
+  let slot = styleSlot(&p.slotOfCss.*, &p.css.*, &p.nodes.*, f.source)
+  if slot == NONE {
+    return ()
+  }
+  let c = p.nodes.asSlice()[u32.toUsize(slot)].computed
+  let mut color = c.text.color
+
+  // An input's text ends where its value does: a filler after it has nothing to draw.
+  let mut limit = usize.MAX
+  if p.nodes.asSlice()[u32.toUsize(slot)].kind == NodeKind.Input {
+    let e = &p.nodes.asSlice()[u32.toUsize(slot)].edit
+    if e.showsPlaceholder {
+      color = c.text.placeholder()
+    }
+    if e.filler {
+      limit = String.byteLength(String.view(&e.display)) - 3
+    }
+  }
+  if !c.text.visible || color.a <= 0.0 && !c.text.decoration.underline {
+    return ()
+  }
+  let s = p.scale
+  let baseline = f.worldLocation.y + f.firstBaselines.alphabetic
+  let mode = c.text.writingMode
+  let vertical = mode != WritingMode.HorizontalTb
+  let reverse = mode == WritingMode.SidewaysLr
+  let baselineX = f.worldLocation.x
+    + (if mode == WritingMode.VerticalLr || reverse {
+      f.firstBaselines.alphabetic
+    } else {
+      f.size.width - f.firstBaselines.alphabetic
+    })
+  let shaped = p.text.glyphRun(t.shapeKey)
+  if t.fontKey < p.faces.length() {
+    if let Option<FontFace>.Some { value: face } = &p.faces.asSlice()[t.fontKey].face {
+      let cacheable = !vertical && shaped.size * s < 256.0
+        && p.nodes.asSlice()[u32.toUsize(slot)].kind != NodeKind.Input
+      let mut hidden = false
+      let mut ink = TextInk.empty()
+      ink.font = face.id
+      ink.shape = shaped.fingerprint()
+      ink.scale = s
+      ink.valid = cacheable
+      if cacheable && t.shapeKey < p.textInk.length() {
+        let cached = p.textInk.get(t.shapeKey)
+        if cached.valid && cached.font == ink.font && cached.shape == ink.shape
+          && cached.scale == s {
+          let x = f.worldLocation.x * s
+          let y = baseline * s
+
+          // Cover raster phase changes and rounding at very large document offsets.
+          let pad = 2.0 + (f32.abs(x) + f32.abs(y)) * 0.00000024
+          hidden = !cached.present || x + cached.bounds.xMax + pad < mask.bounds.xMin
+            || x + cached.bounds.xMin - pad > mask.bounds.xMax
+            || y + cached.bounds.yMax + pad < mask.bounds.yMin
+            || y + cached.bounds.yMin - pad > mask.bounds.yMax
+        }
+      }
+      if !hidden {
+        let glyphs = p.text.runGlyphs(t.shapeKey)
+        let mut outline = GlyphRasterizer.make()
+        let mut i: usize = 0
+        while i < glyphs.length {
+          let g = glyphs[i]
+          if g.cluster >= limit {
+            i = i + 1
+            continue
+          }
+          let turn: u32 = if !vertical || g.upright {
+            0
+          } else if reverse {
+            3
+          } else {
+            1
+          }
+          let originX = if !vertical {
+            f.worldLocation.x + g.x
+          } else if g.upright {
+            f.worldLocation.x + f.size.width * 0.5 + g.y
+          } else if reverse {
+            baselineX + g.y
+          } else {
+            baselineX - g.y
+          }
+          let originY = if !vertical {
+            baseline + g.y
+          } else if reverse {
+            f.worldLocation.y + f.size.height - g.x
+          } else {
+            f.worldLocation.y + g.x
+          }
+          let pen = PenPosition.of(f32.toF64(originX * s), f32.toF64(originY * s))
+
+          // Large monochrome glyphs use clipped vector coverage. This avoids both oversized
+          // atlas allocations and magnifying a capped bitmap at editor-style zoom levels.
+          if (vertical || shaped.size * s >= 256.0) && !face.colorTables().any() {
+            let drawn = run outline.outlinePath(
+              &face,
+              g.glyph,
+              f32.toF64(shaped.size * s),
+              0.0,
+              0.0,
+            )
+            if drawn {
+              let transform = Affine.new(
+                if turn == 0 {
+                  1.0
+                } else {
+                  0.0
+                },
+                if turn == 1 {
+                  1.0
+                } else if turn == 3 {
+                  -1.0
+                } else {
+                  0.0
+                },
+                if turn == 1 {
+                  -1.0
+                } else if turn == 3 {
+                  1.0
+                } else {
+                  0.0
+                },
+                if turn == 0 {
+                  1.0
+                } else {
+                  0.0
+                },
+                f32.toF64(originX * s),
+                f32.toF64(originY * s),
+              )
+              drop run Effect.catchAll(
+                p.paths.fill(
+                  &mut p.scene,
+                  0,
+                  outline.lastPath(),
+                  &transform,
+                  NONZERO,
+                  Background.solid(color),
+                  mask,
+                ),
+                noPath,
+              )
+              p.stats.glyphs = p.stats.glyphs + 1
+              i = i + 1
+              continue
+            }
+          }
+          let key = GlyphKey {
+            font: face.id,
+            glyph: g.glyph,
+            size: shaped.size,
+            scale: s,
+            subpixel: pen.subpixel,
+            color: true,
+          }
+          let found = run Effect.catchAll(p.glyphs.glyph(&mut p.atlas, &face, key), noGlyph)
+          if let Option<RasterGlyph>.Some { value } = found {
+            let left = i32.toF32(value.left)
+            let top = i32.toF32(value.top)
+            let w = u32.toF32(value.width())
+            let h = u32.toF32(value.height())
+            if cacheable {
+              let local = Rect<f32>.new(
+                g.x * s + left,
+                g.y * s + top,
+                g.x * s + left + w,
+                g.y * s + top + h,
+              )
+              if ink.present {
+                ink.bounds = Rect<f32>.new(
+                  f32.min(ink.bounds.xMin, local.xMin),
+                  f32.min(ink.bounds.yMin, local.yMin),
+                  f32.max(ink.bounds.xMax, local.xMax),
+                  f32.max(ink.bounds.yMax, local.yMax),
+                )
+              } else {
+                ink.bounds = local
+              }
+              ink.present = true
+            }
+            let px = i32.toF32(pen.x)
+            let py = i32.toF32(pen.y)
+            let bounds = if turn == 1 {
+              Rect<f32>.new(px - top - h, py + left, px - top, py + left + w)
+            } else if turn == 3 {
+              Rect<f32>.new(px + top, py - left - w, px + top + h, py - left)
+            } else {
+              Rect<f32>.new(px + left, py + top, px + left + w, py + top + h)
+            }
+            if &value.kind == &Kind.Polychrome {
+              drop run p.scene.image(
+                ImageSprite {
+                  quarterTurns: turn,
+                  clipBounds: bounds,
+                  bounds: bounds,
+                  mask: mask,
+                  tile: value.tile,
+                  opacity: color.a,
+                  cornerRadii: Corners<f32>.zero(),
+                  grayscale: false,
+                },
+              )
+            } else {
+              drop run p.scene.glyph(
+                GlyphSprite { bounds: bounds, mask: mask, tile: value.tile, color: color },
+              )
+            }
+            p.stats.glyphs = p.stats.glyphs + 1
+          } else {
+            ink.valid = false
+          }
+          i = i + 1
+        }
+        if cacheable {
+          while p.textInk.length() <= t.shapeKey {
+            run p.textInk.append(TextInk.empty())
+          }
+          p.textInk.set(t.shapeKey, ink)
+        }
+      }
+    }
+  }
+  let line = c.text.decoration
+  if line.underline || line.overline || line.lineThrough {
+    let size = shaped.size
+    let thickness = f32.max(1.0, size / 16.0 * s)
+    let x0 = f.worldLocation.x * s
+    let x1 = (f.worldLocation.x + f.size.width) * s
+    let color = c.text.lineColor()
+    if vertical {
+      let y0 = f.worldLocation.y * s
+      let y1 = (f.worldLocation.y + f.size.height) * s
+      if line.underline {
+        run verticalLine(
+          &mut p,
+          (f.worldLocation.x + size * 0.1) * s,
+          y0,
+          y1,
+          thickness,
+          color,
+          c.text.wavy,
+          mask,
+        )
+      }
+      if line.overline {
+        run verticalLine(
+          &mut p,
+          (f.worldLocation.x + f.size.width - size * 0.1) * s,
+          y0,
+          y1,
+          thickness,
+          color,
+          c.text.wavy,
+          mask,
+        )
+      }
+      if line.lineThrough {
+        run verticalLine(
+          &mut p,
+          (f.worldLocation.x + f.size.width * 0.5) * s,
+          y0,
+          y1,
+          thickness,
+          color,
+          c.text.wavy,
+          mask,
+        )
+      }
+      return ()
+    }
+    if line.underline {
+      run underline(
+        &mut p,
+        x0,
+        x1,
+        (baseline + size * 0.1) * s,
+        thickness,
+        color,
+        c.text.wavy,
+        mask,
+      )
+    }
+    if line.overline {
+      run underline(
+        &mut p,
+        x0,
+        x1,
+        (baseline - size * 0.9) * s,
+        thickness,
+        color,
+        c.text.wavy,
+        mask,
+      )
+    }
+    if line.lineThrough {
+      run underline(
+        &mut p,
+        x0,
+        x1,
+        (baseline - size * 0.3) * s,
+        thickness,
+        color,
+        c.text.wavy,
+        mask,
+      )
+    }
+  }
+}
+
+effect fn verticalLine(
+  p: &mut Painter<'_, '_>,
+  x: f32,
+  y0: f32,
+  y1: f32,
+  thickness: f32,
+  color: Rgba<f32>,
+  wavy: bool,
+  mask: ContentMask,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut y = y0
+  while y < y1 {
+    let end = if wavy {
+      f32.min(y1, y + thickness)
+    } else {
+      y1
+    }
+    let offset: f32 = if wavy {
+      f32.sin((y - y0) / thickness * 1.5707963) * thickness
+    } else {
+      0.0
+    }
+    drop run p.scene.quad(
+      Quad.fill(
+        Rect<f32>.new(x + offset, y, x + offset + thickness, end),
+        mask,
+        Background.solid(color),
+      ),
+    )
+    y = end
+  }
+}
+
+effect fn underline(
+  p: &mut Painter<'_, '_>,
+  x0: f32,
+  x1: f32,
+  y: f32,
+  thickness: f32,
+  color: Rgba<f32>,
+  wavy: bool,
+  mask: ContentMask,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let height = if wavy {
+    thickness * 3.0
+  } else {
+    thickness
+  }
+  drop run p.scene.underline(
+    Underline {
+      bounds: Rect<f32>.new(x0, y, x1, y + height),
+      mask: mask,
+      color: color,
+      thickness: thickness,
+      wavy: wavy,
+    },
+  )
+}
+
+/// Paints the content of an image, icon or canvas node over its content box.
+effect fn paintContent(p: &mut Painter<'_, '_>, slot: u32, f: &Fragment, mask: ContentMask) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let node = &p.nodes.asSlice()[u32.toUsize(slot)]
+  let kind = node.kind
+  let c = node.computed
+  let resource = node.resource
+  let s = p.scale
+  let content = device(contentBox(f), s)
+  if kind == NodeKind.Image {
+    if let Option<Resource>.Some { value } = p.resources.get(resource) {
+      if let Resource.Image { image, width, height } = value {
+        let tile = run p.resources.imageTile(&mut p.atlas, image)
+        if let Option<AtlasTile>.Some { value: placed } = tile {
+          drop run p.scene.image(
+            ImageSprite {
+              quarterTurns: 0,
+              clipBounds: content,
+              bounds: fittedImage(
+                content,
+                u32.toF32(width) * s,
+                u32.toF32(height) * s,
+                c.objectFit,
+                c.objectX,
+                c.objectY,
+                s,
+              ),
+              // clipBounds already clips content; a second mask would apply edge coverage twice.
+              mask: mask,
+              tile: placed,
+              opacity: 1.0,
+              cornerRadii: scaledCorners(c.radii, s),
+              grayscale: false,
+            },
+          )
+        }
+      }
+    }
+  } else if kind == NodeKind.Icon {
+    if let Option<Resource>.Some { value } = p.resources.get(resource) {
+      if let Resource.Icon { icon } = value {
+        let x = f32.floor(content.xMin + 0.5)
+        let y = f32.floor(content.yMin + 0.5)
+        let w = f32.floor(content.width() + 0.5)
+        let h = f32.floor(content.height() + 0.5)
+        if w >= 1.0 && h >= 1.0 {
+          let tile = run p.resources.iconTile(
+            &mut p.atlas,
+            icon,
+            f32.toU32(w),
+            f32.toU32(h),
+            p.time,
+          )
+          if let Option<AtlasTile>.Some { value: placed } = tile {
+            drop run p.scene.glyph(
+              GlyphSprite {
+                bounds: Rect<f32>.new(x, y, x + w, y + h),
+                mask: mask,
+                tile: placed,
+                color: c.text.color,
+              },
+            )
+          }
+        }
+      }
+    }
+  } else if kind == NodeKind.Canvas {
+    run paintCanvas(&mut p, slot, contentBox(f), mask)
+  }
+}
+
+effect fn paintCanvas(
+  p: &mut Painter<'_, '_>,
+  slot: u32,
+  origin: Rect<f32>,
+  mask: ContentMask,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let s = p.scale
+  let transform = Affine.new(
+    f32.toF64(s),
+    0.0,
+    0.0,
+    f32.toF64(s),
+    f32.toF64(origin.xMin * s),
+    f32.toF64(origin.yMin * s),
+  )
+  let mut path = VectorPath.make()
+  let count = p.nodes.asSlice()[u32.toUsize(slot)].canvas.length()
+  let content = p.nodes.asSlice()[u32.toUsize(slot)].content
+  let mut i: usize = 0
+  while i < count {
+    let command = p.nodes.asSlice()[u32.toUsize(slot)].canvas.get(i)
+    match command {
+      CanvasCommand.FillRect { x, y, width, height, radius, color } => {
+        let bounds = Rect<f32>.new(
+          (origin.xMin + x) * s,
+          (origin.yMin + y) * s,
+          (origin.xMin + x + width) * s,
+          (origin.yMin + y + height) * s,
+        )
+        let mut quad = Quad.fill(bounds, mask, Background.solid(color))
+        quad.cornerRadii = Corners<f32>.uniform(radius * s)
+        drop run p.scene.quad(quad)
+      }
+      CanvasCommand.MoveTo { x, y } => {
+        run path.moveTo(f32.toF64(x), f32.toF64(y))
+      }
+      CanvasCommand.LineTo { x, y } => {
+        run path.lineTo(f32.toF64(x), f32.toF64(y))
+      }
+      CanvasCommand.QuadTo { x1, y1, x, y } => {
+        run path.quadTo(f32.toF64(x1), f32.toF64(y1), f32.toF64(x), f32.toF64(y))
+      }
+      CanvasCommand.CubicTo { x1, y1, x2, y2, x, y } => {
+        run path.cubicTo(
+          f32.toF64(x1),
+          f32.toF64(y1),
+          f32.toF64(x2),
+          f32.toF64(y2),
+          f32.toF64(x),
+          f32.toF64(y),
+        )
+      }
+      CanvasCommand.Close => {
+        run path.close()
+      }
+      CanvasCommand.Fill { color } => {
+        let id = canvasKey(&p.*, slot, content, i, origin)
+        drop run Effect.catchAll(
+          p.paths.fill(&mut p.scene, id, &path, &transform, NONZERO, Background.solid(color), mask),
+          noPath,
+        )
+        path.clear()
+      }
+      CanvasCommand.Stroke { color, width } => {
+        let id = canvasKey(&p.*, slot, content, i, origin)
+        let stroke = Stroke.make(f32.toF64(width))
+        drop run Effect.catchAll(
+          p.paths.stroke(
+            &mut p.scene,
+            id,
+            &path,
+            &stroke,
+            &transform,
+            Background.solid(color),
+            mask,
+          ),
+          noPath,
+        )
+        path.clear()
+      }
+    }
+    i = i + 1
+  }
+}
+
+fn canvasKey(
+  p: &Painter<'_, '_>,
+  slot: u32,
+  content: u64,
+  command: usize,
+  origin: Rect<f32>,
+) -> u64 {
+  let mut h = Hash.mix(&p.seed, u32.toU64(slot))
+  h = Hash.combine(h, content)
+  h = Hash.combine(h, usize.toU64(command))
+  h = Hash.combine(h, u32.toU64(f32.toBits(p.scale)))
+  h = Hash.combine(h, u32.toU64(f32.toBits(origin.xMin)))
+  h = Hash.combine(h, u32.toU64(f32.toBits(origin.yMin)))
+  return h
+}
+
+effect fn paintChildren(p: &mut Painter<'_, '_>, index: usize, mask: ContentMask) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  // A zero-area inherited clip cannot expose any descendant, including overflow
+  // or positioned content. Skip the subtree before glyph processing and decoration.
+  if mask.bounds.xMax <= mask.bounds.xMin || mask.bounds.yMax <= mask.bounds.yMin {
+    return ()
+  }
+
+  // Sticky children paint after their siblings, as CSS paints positioned boxes after in-flow
+  // content: a stuck heading covers what scrolls under it.
+  let mut deferred = false
+  let mut child = p.output.fragments.values.asSlice()[index].firstChild
+  while child != NO_INDEX {
+    if isSticky(&p.*, child) {
+      deferred = true
+    } else {
+      run paintFragment(&mut p, child, mask)
+    }
+    child = p.output.fragments.values.asSlice()[child].nextSibling
+  }
+  if !deferred {
+    return ()
+  }
+  child = p.output.fragments.values.asSlice()[index].firstChild
+  while child != NO_INDEX {
+    if isSticky(&p.*, child) {
+      run paintFragment(&mut p, child, mask)
+    }
+    child = p.output.fragments.values.asSlice()[child].nextSibling
+  }
+}
+
+/// Whether fragment `index` is a sticky box.
+fn isSticky(p: &Painter<'_, '_>, index: usize) -> bool {
+  let f = &p.output.fragments.values.asSlice()[index]
+  if f.kind != FragmentKind.Box || f.positioningShell {
+    return false
+  }
+  let slot = slotIn(p.slotOfCss, f.source)
+  if slot == NONE {
+    return false
+  }
+  return p.nodes.asSlice()[u32.toUsize(slot)].computed.position == Position.Sticky
+}
+
+effect fn noteOrder(p: &mut Painter<'_, '_>, f: &Fragment) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !f.first {
+    return ()
+  }
+  let slot = slotIn(p.slotOfCss, f.source)
+  if slot != NONE {
+    run p.order.append(p.nodes.asSlice()[u32.toUsize(slot)].id)
+  }
+}
+
+/// Fragments whose ink cannot be bounded: canvas commands draw against the parent's mask.
+const UNBOUNDED_INK: f32 = 1.0e30
+
+fn unboundedInk() -> Rect<f32> {
+  return Rect<f32>.new(-UNBOUNDED_INK, -UNBOUNDED_INK, UNBOUNDED_INK, UNBOUNDED_INK)
+}
+
+fn grow(rect: Rect<f32>, by: f32) -> Rect<f32> {
+  return Rect<f32>.new(rect.xMin - by, rect.yMin - by, rect.xMax + by, rect.yMax + by)
+}
+
+fn unite(a: Rect<f32>, b: Rect<f32>) -> Rect<f32> {
+  return Rect<f32>.new(
+    f32.min(a.xMin, b.xMin),
+    f32.min(a.yMin, b.yMin),
+    f32.max(a.xMax, b.xMax),
+    f32.max(a.yMax, b.yMax),
+  )
+}
+
+/// Where fragment `index` itself may put ink, in CSS pixels of the viewport, not counting its
+/// descendants. Generous on purpose: text gets its line height again on every side for
+/// overhanging glyphs, and a shadow its offset, spread and twice its blur.
+fn ownInk(
+  output: &LayoutTree,
+  slots: &List<u32>,
+  css: &Tree,
+  nodes: &List<Node>,
+  index: usize,
+) -> Rect<f32> {
+  let f = output.fragments.values.asSlice()[index]
+  let box = borderBox(&f)
+  if f.kind == FragmentKind.Text {
+    return grow(box, f32.max(f.size.height, 16.0))
+  }
+  let slot = styleSlot(slots, css, nodes, f.source)
+  if slot == NONE {
+    return grow(box, 2.0)
+  }
+  let node = &nodes.asSlice()[u32.toUsize(slot)]
+  if node.kind == NodeKind.Canvas {
+    return unboundedInk()
+  }
+  let c = node.computed
+  let mut reach: f32 = 2.0
+  if c.hasShadow && !c.shadow.inset {
+    let offset = f32.max(f32.abs(c.shadow.offsetX), f32.abs(c.shadow.offsetY))
+    reach = reach + offset + f32.max(c.shadow.spread, 0.0) + 2.0 * c.shadow.blur
+  }
+  return grow(box, reach)
+}
+
+/// Bounds every fragment's ink together with its descendants', children before parents, in CSS
+/// pixels of the viewport. Child ink is intersected with per-axis overflow clips.
+/// [`paintFragment`] skips a subtree whose bounds miss the current clip.
+///
+/// A sticky box's bounds cover everywhere it can move. `scrollers` gets, per fragment, whether its
+/// subtree holds a scroll container. Ink is in layout coordinates: it does not change as
+/// anything scrolls.
+pub effect fn inkFragments(
+  output: &LayoutTree,
+  slots: &List<u32>,
+  css: &Tree,
+  nodes: &List<Node>,
+  width: f32,
+  height: f32,
+  out: &mut List<Rect<f32>>,
+  scrollers: &mut List<bool>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let count = output.fragments.values.length()
+  out.clear()
+  scrollers.clear()
+  let empty = Rect<f32>.new(UNBOUNDED_INK, UNBOUNDED_INK, -UNBOUNDED_INK, -UNBOUNDED_INK)
+  run out.appendRepeated(empty, count)
+  run scrollers.appendRepeated(false, count)
+  let mut index = count
+  while index > 0 {
+    index = index - 1
+    let f = &output.fragments.values.asSlice()[index]
+    let own = ownInk(output, slots, css, nodes, index)
+    let below = out.get(index)
+    let mut clips = false
+    let mut clippedBelow = below
+    let mut sticky = false
+    if (f.kind == FragmentKind.Box || f.kind == FragmentKind.Inline) && !f.positioningShell {
+      let slot = slotIn(slots, f.source)
+      if slot != NONE {
+        let c = &nodes.asSlice()[u32.toUsize(slot)].computed
+        clips = f.kind == FragmentKind.Box && c.clips()
+        if clips {
+          let clip = overflowClip(c, f)
+          clippedBelow = Rect<f32>.new(
+            f32.max(below.xMin, clip.xMin),
+            f32.max(below.yMin, clip.yMin),
+            f32.min(below.xMax, clip.xMax),
+            f32.min(below.yMax, clip.yMax),
+          )
+        }
+        sticky = c.position == Position.Sticky
+        if f.kind == FragmentKind.Box && layers.scroller(c) {
+          scrollers.set(index, true)
+        }
+      }
+    }
+    let mut total = if clippedBelow.xMax > clippedBelow.xMin
+      && clippedBelow.yMax > clippedBelow.yMin {
+      unite(own, clippedBelow)
+    } else {
+      own
+    }
+    if sticky {
+      if let Option<Sticky>.Some { value } = layers.stickyOf(
+        output,
+        slots,
+        css,
+        nodes,
+        index,
+        width,
+        height,
+      ) {
+        let reach = value.reach()
+        total = Rect<f32>.new(
+          total.xMin + reach.xMin,
+          total.yMin + reach.yMin,
+          total.xMax + reach.xMax,
+          total.yMax + reach.yMax,
+        )
+      }
+    }
+    out.set(index, total)
+    let parent = f.parent
+    if parent != NO_INDEX {
+      let above = out.get(parent)
+      out.set(parent, unite(above, total))
+      if scrollers.get(index) {
+        scrollers.set(parent, true)
+      }
+    }
+  }
+}
+
+/// Whether the subtree of fragment `index` can show inside `mask`.
+fn inkVisible(p: &Painter<'_, '_>, index: usize, mask: ContentMask) -> bool {
+  if index >= p.ink.length() {
+    return true
+  }
+  let ink = p.ink.get(index)
+  let s = p.scale
+  let cull = ContentMask.new(p.cull).intersect(mask).bounds
+  return ink.xMin * s < cull.xMax && ink.xMax * s > cull.xMin && ink.yMin * s < cull.yMax
+    && ink.yMax * s > cull.yMin
+}
+
+/// Whether the ink of fragment `index` lies inside `area` (device pixels).
+fn inkInside(p: &Painter<'_, '_>, index: usize, area: Rect<f32>) -> bool {
+  if index >= p.ink.length() {
+    return false
+  }
+  let ink = p.ink.get(index)
+  let s = p.scale
+  return ink.xMin * s >= area.xMin && ink.xMax * s <= area.xMax && ink.yMin * s >= area.yMin
+    && ink.yMax * s <= area.yMax
+}
+
+fn everywhere() -> Rect<f32> {
+  return Rect<f32>.new(-UNBOUNDED_INK, -UNBOUNDED_INK, UNBOUNDED_INK, UNBOUNDED_INK)
+}
+
+/// The id a scroll group links to for slot `slot`, NONE for the unscrolled viewport.
+fn linkNode(p: &Painter<'_, '_>, slot: u32) -> u32 {
+  if slot == NONE {
+    return NONE
+  }
+  return p.nodes.asSlice()[u32.toUsize(slot)].id
+}
+
+/// Paints fragment `index` and its descendants.
+pub effect fn paintFragment(p: &mut Painter<'_, '_>, index: usize, mask: ContentMask) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !inkVisible(&p.*, index, mask) {
+    p.stats.culledSubtrees = p.stats.culledSubtrees + 1
+    return ()
+  }
+  let sticky = layers.stickyOf(p.output, p.slotOfCss, p.css, &p.nodes.*, index, p.width, p.height)
+  if let Option<Sticky>.Some { value } = sticky {
+    // A sticky box draws in a group that follows its scrollport, over everywhere it can go.
+    let s = p.scale
+    let ink = if index < p.ink.length() {
+      device(p.ink.get(index), s)
+    } else {
+      everywhere()
+    }
+    let link = ScrollLink {
+      node: linkNode(&p.*, value.port),
+      x: value.x.inDevice(s),
+      y: value.y.inDevice(s),
+    }
+    drop run p.scene.pushScrollGroup(link, everywhere(), ink)
+    let saved = p.cull
+    p.cull = everywhere()
+    run paintFragmentIn(&mut p, index, mask)
+    p.cull = saved
+    run p.scene.popScrollGroup()
+    return ()
+  }
+  run paintFragmentIn(&mut p, index, mask)
+}
+
+effect fn paintFragmentIn(p: &mut Painter<'_, '_>, index: usize, mask: ContentMask) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let f = p.output.fragments.values.asSlice()[index]
+  if f.positioningShell {
+    run paintChildren(&mut p, index, mask)
+    return ()
+  }
+  if p.only != NONE && !p.inside {
+    let slot = slotIn(p.slotOfCss, f.source)
+    if slot == p.only {
+      p.inside = true
+      run paintFragmentIn(&mut p, index, mask)
+      p.inside = false
+      return ()
+    }
+
+    // Scroll containers above the subtree still move it.
+    if slot != NONE && f.kind == FragmentKind.Box
+      && p.nodes.asSlice()[u32.toUsize(slot)].kind != NodeKind.Text {
+      let c = p.nodes.asSlice()[u32.toUsize(slot)].computed
+      if layers.scroller(&c) {
+        let inner = mask.intersect(ContentMask.new(device(overflowClip(&c, &f), p.scale)))
+        let saved = p.cull
+        let content = run openScroller(&mut p, slot, &c, &f, inner)
+        run paintChildren(&mut p, index, content)
+        p.cull = saved
+        run p.scene.popScrollGroup()
+        return ()
+      }
+    }
+    run paintChildren(&mut p, index, mask)
+    return ()
+  }
+  p.stats.paintedFragments = p.stats.paintedFragments + 1
+  match f.kind {
+    FragmentKind.Line => {
+      run paintChildren(&mut p, index, mask)
+    }
+    FragmentKind.Text => {
+      run noteOrder(&mut p, &f)
+      run paintText(&mut p, index, f, mask)
+    }
+    FragmentKind.Inline => {
+      run noteOrder(&mut p, &f)
+      let slot = slotIn(p.slotOfCss, f.source)
+      if slot != NONE && !f.nonpainting {
+        let c = p.nodes.asSlice()[u32.toUsize(slot)].computed
+        if c.text.visible && c.decorated() {
+          run decorate(&mut p, &c, borderBox(&f), f.decorationEdges, mask)
+        }
+      }
+      run paintChildren(&mut p, index, mask)
+    }
+    FragmentKind.Box => {
+      run paintBox(&mut p, index, f, mask)
+    }
+  }
+}
+
+fn sameRect(a: Rect<f32>, b: Rect<f32>) -> bool {
+  return a.xMin == b.xMin && a.yMin == b.yMin && a.xMax == b.xMax && a.yMax == b.yMax
+}
+
+/// Moves the cache ranges of the nodes inside a replayed subtree to where the replay put them,
+/// and records their paint order.
+effect fn shiftCaches(
+  p: &mut Painter<'_, '_>,
+  index: usize,
+  from: usize,
+  to: usize,
+  mask: ContentMask,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let parent = p.output.fragments.values.asSlice()[index]
+  let parentSlot = slotIn(p.slotOfCss, parent.source)
+  let mut inner = mask
+  if parent.kind == FragmentKind.Box && !parent.positioningShell && parentSlot != NONE {
+    let c = p.nodes.asSlice()[u32.toUsize(parentSlot)].computed
+    if c.opacity <= 0.0 {
+      return ()
+    }
+    if c.clips() {
+      inner = mask.intersect(ContentMask.new(device(overflowClip(&c, &parent), p.scale)))
+    }
+  }
+
+  // Replay must expose the same paint order as the original clipped traversal.
+  if inner.bounds.xMax <= inner.bounds.xMin || inner.bounds.yMax <= inner.bounds.yMin {
+    return ()
+  }
+  let mut child = p.output.fragments.values.asSlice()[index].firstChild
+  while child != NO_INDEX {
+    let f = p.output.fragments.values.asSlice()[child]
+    run noteOrder(&mut p, &f)
+    let slot = slotIn(p.slotOfCss, f.source)
+    if slot != NONE && f.kind == FragmentKind.Box {
+      let node = &mut p.nodes.asMutSlice()[u32.toUsize(slot)]
+      if node.cache.frame + 1 == p.frame && node.cache.start >= from {
+        node.cache.start = node.cache.start - from + to
+        node.cache.end = node.cache.end - from + to
+        node.cache.frame = p.frame
+      }
+    }
+    run shiftCaches(&mut p, child, from, to, inner)
+    child = p.output.fragments.values.asSlice()[child].nextSibling
+  }
+}
+
+effect fn paintBox(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: ContentMask) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let slot = slotIn(p.slotOfCss, f.source)
+  if slot == NONE {
+    run paintChildren(&mut p, index, mask)
+    return ()
+  }
+  let holdsScroller = index < p.scrollers.length() && p.scrollers.get(index)
+  let cacheable = p.only == NONE && f.first && f.last && !f.repeated
+    && (!holdsScroller || p.scrollsStill)
+  let hash = if index < p.hashes.length() {
+    p.hashes.get(index)
+  } else {
+    0
+  }
+  if cacheable && p.replayable {
+    let cache = p.nodes.asSlice()[u32.toUsize(slot)].cache
+    let culledAlike = sameRect(cache.cull, p.cull)
+      || (inkInside(&p.*, index, cache.cull) && inkInside(&p.*, index, p.cull))
+    if cache.frame + 1 == p.frame && cache.hash == hash && sameRect(cache.mask, mask.bounds)
+      && cache.scale == p.scale
+      && culledAlike {
+      let start = p.scene.operationCount()
+      run p.scene.replay(p.previous, cache.start, cache.end)
+      let end = p.scene.operationCount()
+      run noteOrder(&mut p, &f)
+      run shiftCaches(&mut p, index, cache.start, start, mask)
+      let nodes = p.nodes.asMutSlice()
+      nodes[u32.toUsize(slot)].cache = PaintCache {
+        hash: hash,
+        start: start,
+        end: end,
+        frame: p.frame,
+        mask: mask.bounds,
+        scale: p.scale,
+        cull: p.cull,
+      }
+      p.stats.replayedSubtrees = p.stats.replayedSubtrees + 1
+      p.stats.replayedOperations = p.stats.replayedOperations + (end - start)
+      return ()
+    }
+  }
+  run noteOrder(&mut p, &f)
+  let start = p.scene.operationCount()
+  let c = p.nodes.asSlice()[u32.toUsize(slot)].computed
+  let kind = p.nodes.asSlice()[u32.toUsize(slot)].kind
+  if c.opacity > 0.0 {
+    let layered = c.opacity < 1.0 || c.backdropBlur > 0.0
+    if layered {
+      let mut effects = LayerEffects.none()
+      effects.backdropBlur = c.backdropBlur * p.scale
+      effects.clip = device(borderBox(&f), p.scale)
+      drop run p.scene.pushEffectLayer(
+        mask.bounds,
+        mask,
+        Isolation { opacity: c.opacity, blend: 0 },
+        effects,
+      )
+    }
+    if c.text.visible && !f.nonpainting {
+      if c.decorated() {
+        run decorate(&mut p, &c, borderBox(&f), f.decorationEdges, mask)
+      }
+      if kind == NodeKind.Image || kind == NodeKind.Icon || kind == NodeKind.Canvas {
+        run paintContent(&mut p, slot, &f, mask)
+      }
+    }
+    let mut inner = mask
+    if c.clips() {
+      inner = mask.intersect(ContentMask.new(device(overflowClip(&c, &f), p.scale)))
+    }
+    let input = kind == NodeKind.Input && c.text.visible
+    let scrolled = layers.scroller(&c)
+    let open = inner.bounds.xMax > inner.bounds.xMin && inner.bounds.yMax > inner.bounds.yMin
+    let saved = p.cull
+    if scrolled && open {
+      inner = run openScroller(&mut p, slot, &c, &f, inner)
+    }
+    if !scrolled || open {
+      if input {
+        run edit.paintSelection(&mut p, slot, index, inner)
+      }
+      run paintChildren(&mut p, index, inner)
+      if input {
+        run edit.paintCaret(&mut p, slot, index, inner)
+      }
+    }
+    if scrolled && open {
+      p.cull = saved
+      run p.scene.popScrollGroup()
+    }
+    if c.clips() && c.text.visible {
+      run paintThumbs(&mut p, slot, &c, &f, mask)
+    }
+    if layered {
+      run p.scene.popLayer()
+    }
+  }
+  let end = p.scene.operationCount()
+  if cacheable {
+    let nodes = p.nodes.asMutSlice()
+    nodes[u32.toUsize(slot)].cache = PaintCache {
+      hash: hash,
+      start: start,
+      end: end,
+      frame: p.frame,
+      mask: mask.bounds,
+      scale: p.scale,
+      cull: p.cull,
+    }
+    p.stats.repaintedSubtrees = p.stats.repaintedSubtrees + 1
+  }
+}
+
+/// The color of overlay scrollbar thumbs: a gray that shows on light and dark backgrounds.
+const THUMB_COLOR: Rgba<f32> = Rgba<f32> { r: 0.5, g: 0.5, b: 0.5, a: 0.6 }
+
+/// Draws the overlay scrollbar thumbs of a scroll container over its content.
+effect fn paintThumbs(
+  p: &mut Painter<'_, '_>,
+  slot: u32,
+  c: &Computed,
+  f: &Fragment,
+  mask: ContentMask,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let range = rangeOf(c, f)
+  let id = p.nodes.asSlice()[u32.toUsize(slot)].id
+  let port = device(paddingBox(f), p.scale)
+  run paintThumbIn(&mut p, id, thumbOf(c, f, range.minY, true), range.minY, port, true, mask)
+  run paintThumbIn(&mut p, id, thumbOf(c, f, range.minX, false), range.minX, port, false, mask)
+}
+
+/// Opens the scroll group of the content of scroll container `slot` (fragment `f`), cut to
+/// `inner`, records its scroll, and narrows the cull to its scrollport plus the lead. Returns the
+/// content mask inside: the content's extent, which does not move as it scrolls.
+effect fn openScroller(
+  p: &mut Painter<'_, '_>,
+  slot: u32,
+  c: &Computed,
+  f: &Fragment,
+  inner: ContentMask,
+) -> ContentMask
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let s = p.scale
+  let node = &p.nodes.asSlice()[u32.toUsize(slot)]
+  let id = node.id
+  let sx: f32 = node.scrollX * s
+  let sy: f32 = node.scrollY * s
+  let range = rangeOf(c, f)
+  run p.scene.setScroll(
+    ScrollPosition {
+      node: id,
+      x: sx,
+      y: sy,
+      minX: range.minX * s,
+      maxX: range.maxX * s,
+      minY: range.minY * s,
+      maxY: range.maxY * s,
+    },
+  )
+  drop run p.scene.pushScrollGroup(
+    ScrollLink { node: id, x: ScrollAxis.content(), y: ScrollAxis.content() },
+    inner.bounds,
+    inner.bounds,
+  )
+  let seen = ContentMask.new(p.cull).intersect(inner).bounds
+  let lead: f32 = p.lead
+  let leadX: f32 = if scrolls(usedOverflow(c, true)) {
+    lead
+  } else {
+    0.0
+  }
+  let leadY: f32 = if scrolls(usedOverflow(c, false)) {
+    lead
+  } else {
+    0.0
+  }
+  p.cull = Rect<f32>.new(
+    seen.xMin + sx - leadX,
+    seen.yMin + sy - leadY,
+    seen.xMax + sx + leadX,
+    seen.yMax + sy + leadY,
+  )
+  let box = borderBox(f)
+  let o = f.scrollableOverflow
+  let extent = Rect<f32>.new(
+    f32.min(box.xMin, box.xMin + o.x) - 1.0,
+    f32.min(box.yMin, box.yMin + o.y) - 1.0,
+    f32.max(box.xMax, box.xMin + o.x + o.width) + 1.0,
+    f32.max(box.yMax, box.yMin + o.y + o.height) + 1.0,
+  )
+  return ContentMask.new(device(extent, s))
+}
+
+/// Paints `thumb` (laid out at scroll `start`, the start of its range) in a group that follows
+/// the scroll of node `id` along the thumb's axis.
+effect fn paintThumbIn(
+  p: &mut Painter<'_, '_>,
+  id: u32,
+  thumb: Thumb,
+  start: f32,
+  port: Rect<f32>,
+  vertical: bool,
+  mask: ContentMask,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !thumb.visible {
+    return ()
+  }
+  let s = p.scale
+  let mut axis = ScrollAxis.fixed()
+  if thumb.ratio > 0.0 {
+    let rate = 1.0 / thumb.ratio
+    let travel = if vertical {
+      port.height() / s
+    } else {
+      port.width() / s
+    }
+    axis = ScrollAxis { factor: rate, base: -start * s * rate, low: 0.0, high: travel * s }
+  }
+  let link = if vertical {
+    ScrollLink { node: id, x: ScrollAxis.fixed(), y: axis }
+  } else {
+    ScrollLink { node: id, x: axis, y: ScrollAxis.fixed() }
+  }
+  drop run p.scene.pushScrollGroup(link, mask.bounds, port)
+  run paintThumb(&mut p, thumb, mask)
+  run p.scene.popScrollGroup()
+}
+
+effect fn paintThumb(p: &mut Painter<'_, '_>, thumb: Thumb, mask: ContentMask) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !thumb.visible {
+    return ()
+  }
+  let mut quad = Quad.fill(device(thumb.rect, p.scale), mask, Background.solid(THUMB_COLOR))
+  quad.cornerRadii = Corners<f32>.uniform(3.0 * p.scale)
+  drop run p.scene.quad(quad)
+}
+
+/// Paints every root fragment (the viewport and anything outside it) into `p.scene`.
+pub effect fn paintRoots(p: &mut Painter<'_, '_>, window: ContentMask) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let count = p.output.fragments.values.length()
+  let mut index: usize = 0
+  while index < count {
+    if p.output.fragments.values.asSlice()[index].parent == NO_INDEX {
+      run paintFragment(&mut p, index, window)
+    }
+    index = index + 1
+  }
+}
+
+fn floatHash(h: u64, value: f32) -> u64 {
+  return Hash.combine(h, u32.toU64(f32.toBits(value)))
+}
+
+fn kindIndex(kind: FragmentKind) -> u64 {
+  return match kind {
+    FragmentKind.Box => 1
+    FragmentKind.Inline => 2
+    FragmentKind.Text => 3
+    FragmentKind.Line => 4
+  }
+}
+
+/// The hash of everything fragment `index` paints from, not counting its descendants.
+fn ownHash(
+  seed: &HashSeed,
+  output: &LayoutTree,
+  slots: &List<u32>,
+  css: &Tree,
+  nodes: &List<Node>,
+  index: usize,
+) -> u64 {
+  let f = output.fragments.values.asSlice()[index]
+  let mut h = Hash.mix(seed, kindIndex(f.kind))
+  h = Hash.combine(h, usize.toU64(f.source))
+  h = floatHash(h, f.worldLocation.x)
+  h = floatHash(h, f.worldLocation.y)
+  h = floatHash(h, f.size.width)
+  h = floatHash(h, f.size.height)
+  h = floatHash(h, f.paddingRect.x)
+  h = floatHash(h, f.paddingRect.y)
+  h = floatHash(h, f.paddingRect.width)
+  h = floatHash(h, f.paddingRect.height)
+  h = floatHash(h, f.contentRect.x)
+  h = floatHash(h, f.contentRect.y)
+  h = floatHash(h, f.contentRect.width)
+  h = floatHash(h, f.contentRect.height)
+  h = floatHash(h, f.firstBaselines.alphabetic)
+  h = Hash.combine(h, u8.toU64(f.decorationEdges))
+  let mut flags: u64 = 0
+  if f.first {
+    flags = flags + 1
+  }
+  if f.last {
+    flags = flags + 2
+  }
+  if f.nonpainting {
+    flags = flags + 4
+  }
+  h = Hash.combine(h, flags)
+  if f.textData != NO_INDEX {
+    let t = output.fragments.texts.get(f.textData)
+    h = Hash.combine(h, usize.toU64(t.shapeKey))
+    h = Hash.combine(h, usize.toU64(t.fontKey))
+    h = Hash.combine(h, usize.toU64(t.sourceStart))
+    h = Hash.combine(h, usize.toU64(t.sourceEnd))
+    h = Hash.combine(h, u8.toU64(t.bidiLevel))
+  }
+  let slot = styleSlot(slots, css, nodes, f.source)
+  if slot != NONE {
+    let node = &nodes.asSlice()[u32.toUsize(slot)]
+    h = Hash.combine(h, node.paintHash)
+    if f.kind == FragmentKind.Box {
+      h = Hash.combine(h, node.content)
+      h = Hash.combine(h, u32.toU64(node.resource))
+    }
+  }
+  return h
+}
+
+/// Hashes every fragment's paint inputs together with its descendants', children before
+/// parents (css-layout stores parents before their children).
+pub effect fn hashFragments(
+  seed: &HashSeed,
+  output: &LayoutTree,
+  slots: &List<u32>,
+  css: &Tree,
+  nodes: &List<Node>,
+  out: &mut List<u64>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let count = output.fragments.values.length()
+  out.clear()
+  run out.appendRepeated(0, count)
+  let mut index = count
+  while index > 0 {
+    index = index - 1
+    let own = ownHash(seed, output, slots, css, nodes, index)
+    let below = out.get(index)
+    let combined = Hash.combine(own, below)
+    out.set(index, combined)
+    let parent = output.fragments.values.asSlice()[index].parent
+    if parent != NO_INDEX {
+      let previous = out.get(parent)
+      out.set(parent, Hash.combine(previous, combined))
+    }
+  }
+}
+
+/// The sampling rectangle; clipping remains on the content box, including its radii.
+fn fittedImage(
+  box: Rect<f32>,
+  width: f32,
+  height: f32,
+  fit: ObjectFit,
+  x: Length,
+  y: Length,
+  scale: f32,
+) -> Rect<f32> {
+  if fit == ObjectFit.Fill || width <= 0.0 || height <= 0.0 {
+    return box
+  }
+  let contain = f32.min(box.width() / width, box.height() / height)
+  let ratio: f32 = match fit {
+    ObjectFit.Fill => 1.0
+    ObjectFit.Contain => contain
+    ObjectFit.Cover => f32.max(box.width() / width, box.height() / height)
+    ObjectFit.None => 1.0
+    ObjectFit.ScaleDown => f32.min(1.0, contain)
+  }
+  let w = width * ratio
+  let h = height * ratio
+  let left = box.xMin + objectOffset(x, box.width() - w, scale)
+  let top = box.yMin + objectOffset(y, box.height() - h, scale)
+  return Rect<f32>.new(left, top, left + w, top + h)
+}
+
+fn objectOffset(value: Length, space: f32, scale: f32) -> f32 {
+  return match value {
+    Length.Px { value: px } => px * scale
+    Length.Percent { value: percent } => space * percent / 100.0
+    Length.Calc { pixels, percent } => pixels * scale + space * percent / 100.0
+    _ => space * 0.5
+  }
+}

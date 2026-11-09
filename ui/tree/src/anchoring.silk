@@ -1,0 +1,242 @@
+//! Tree-owned placement of a popup relative to an anchor node.
+//! Configure an anchor relationship with SetAnchor. Placement follows scrolling and layout
+//! without a client render. Put popup nodes after other content for painting and hit testing.
+import tree { UiTree, TreeError }
+import node { NONE }
+import inspect { info, NodeInfo }
+import mutation { NodeKind, Position, Length, Overflow, BoxSizing, Display }
+import style { Computed, Sides }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.geometry.rect { Rect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.usize
+
+/// Placement preferences for a popup in logical viewport pixels.
+pub struct AnchorOptions {
+  /// Distance between the anchor and popup.
+  pub gap: f32,
+  /// Height used to choose whether the popup opens above or below its anchor.
+  pub preferredHeight: f32,
+  /// Aligns the popup to the anchor's right edge.
+  pub alignEnd: bool,
+  /// Keeps the popup at least as wide as its anchor, within viewport limits.
+  pub matchWidth: bool,
+}
+
+impl Copy for AnchorOptions {}
+
+struct Placement {
+  edgeX: f32,
+  edgeY: f32,
+  width: f32,
+  height: f32,
+  anchorWidth: f32,
+  end: bool,
+  up: bool,
+}
+
+impl Copy for Placement {}
+
+/// One retained anchor relationship. Configure it through tree mutations.
+pub struct Anchored {
+  /// Popup node ID.
+  pub id: u32,
+  /// Anchor node ID.
+  pub target: u32,
+  /// Placement preferences.
+  pub options: AnchorOptions,
+  placement: Option<Placement>,
+}
+
+fn find(tree: &UiTree<'_>, id: u32) -> usize {
+  let mut i: usize = 0
+  while i < tree.anchors.length() {
+    if tree.anchors.asSlice()[i].id == id {
+      return i
+    }
+    i = i + 1
+  }
+  return usize.MAX
+}
+
+/// Installs a relationship after checking IDs, finite dimensions, and dependency cycles.
+pub effect fn configure(
+  tree: &mut UiTree<'_>,
+  index: usize,
+  id: u32,
+  target: u32,
+  options: AnchorOptions,
+) -> ()
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let slot = tree.slotOf(id)
+  if slot == NONE {
+    fail TreeError.UnknownNode { index: index, id: id }
+  }
+  let targetSlot = tree.slotOf(target)
+  if targetSlot == NONE {
+    fail TreeError.UnknownNode { index: index, id: target }
+  }
+  if tree.node(slot).kind != NodeKind.Box {
+    fail TreeError.WrongKind { index: index, id: id }
+  }
+  if !f32.isFinite(options.gap) || options.gap < 0.0 || !f32.isFinite(options.preferredHeight)
+    || options.preferredHeight < 0.0 {
+    fail TreeError.BadMove { index: index, id: id }
+  }
+  let mut ancestor = targetSlot
+  while ancestor != NONE {
+    if ancestor == slot {
+      fail TreeError.BadMove { index: index, id: id }
+    }
+    ancestor = tree.node(ancestor).parent
+  }
+  let mut next = target
+  let mut limit = tree.anchors.length() + 1
+  while limit > 0 {
+    if next == id {
+      fail TreeError.BadMove { index: index, id: id }
+    }
+    let at = find(&tree, next)
+    if at == usize.MAX {
+      break
+    }
+    next = tree.anchors.asSlice()[at].target
+    limit = limit - 1
+  }
+  let at = find(&tree, id)
+  if at == usize.MAX {
+    run tree.anchors.append(
+      Anchored { id: id, target: target, options: options, placement: Option<Placement>.None },
+    )
+  } else {
+    let entry = &mut tree.anchors.asMutSlice()[at]
+    entry.target = target
+    entry.options = options
+  }
+  tree.stylesDirty = true
+}
+
+/// Removes placement overrides. Client styles take effect at the next layout.
+pub fn clear(tree: &mut UiTree<'_>, id: u32) -> () {
+  let at = find(&tree, id)
+  if at != usize.MAX {
+    drop tree.anchors.remove(at)
+    tree.stylesDirty = true
+  }
+}
+
+fn place(anchor: Rect<f32>, width: f32, height: f32, options: AnchorOptions) -> Placement {
+  let left = f32.max(4.0, f32.min(width - 4.0, anchor.xMin))
+  let right = f32.max(4.0, f32.min(width - 4.0, width - anchor.xMax))
+  let above = f32.max(0.0, anchor.yMin - options.gap - 4.0)
+  let below = f32.max(0.0, height - anchor.yMax - options.gap - 4.0)
+  let up = below < options.preferredHeight && above > below
+  let end = options.alignEnd || left > width * 0.5
+  let x = if end {
+    right
+  } else {
+    left
+  }
+  return Placement {
+    edgeX: x,
+    edgeY: if up {
+      f32.max(4.0, height - anchor.yMin + options.gap)
+    } else {
+      f32.max(4.0, anchor.yMax + options.gap)
+    },
+    width: f32.max(0.0, width - x - 4.0),
+    height: if up {
+      above
+    } else {
+      below
+    },
+    anchorWidth: anchor.width(),
+    end: end,
+    up: up,
+  }
+}
+
+fn same(a: Option<Placement>, b: Option<Placement>) -> bool {
+  return match a {
+    Option<Placement>.None => b.isNone()
+    Option<Placement>.Some { value: x } => match b {
+      Option<Placement>.None => false
+      Option<Placement>.Some { value: y } => x.edgeX == y.edgeX && x.edgeY == y.edgeY
+        && x.width == y.width
+        && x.height == y.height
+        && x.anchorWidth == y.anchorWidth
+        && x.end == y.end
+        && x.up == y.up
+    }
+  }
+}
+
+/// Updates placement from current geometry and returns whether layout must run again.
+pub effect fn settle(tree: &mut UiTree<'_>) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut changed = false
+  let mut i: usize = 0
+  while i < tree.anchors.length() {
+    let target = tree.anchors.asSlice()[i].target
+    let options = tree.anchors.asSlice()[i].options
+    let mut next = Option<Placement>.None
+    if let Option<NodeInfo>.Some { value } = run info(&tree, target) {
+      if value.laidOut {
+        next = Option<Placement>.some(
+          place(value.bounds, tree.input.width, tree.input.height, options),
+        )
+      }
+    }
+    let entry = &mut tree.anchors.asMutSlice()[i]
+    if !same(entry.placement, next) {
+      entry.placement = next
+      changed = true
+    }
+    i = i + 1
+  }
+  if changed {
+    tree.stylesDirty = true
+  }
+  return changed
+}
+
+/// Applies placement after client styles. Missing or unlaid-out anchors hide their popups.
+pub fn apply(tree: &UiTree<'_>, id: u32, computed: &mut Computed) -> () {
+  let at = find(tree, id)
+  if at == usize.MAX {
+    return ()
+  }
+  let entry = &tree.anchors.asSlice()[at]
+  match entry.placement {
+    Option<Placement>.None => {
+      computed.display = Display.None
+    }
+    Option<Placement>.Some { value } => {
+      computed.position = Position.Fixed
+      computed.inset = Sides.all(Length.Auto)
+      if value.end {
+        computed.inset.right = Length.px(value.edgeX)
+      } else {
+        computed.inset.left = Length.px(value.edgeX)
+      }
+      if value.up {
+        computed.inset.bottom = Length.px(value.edgeY)
+      } else {
+        computed.inset.top = Length.px(value.edgeY)
+      }
+      computed.maxWidth = Length.px(value.width)
+      computed.maxHeight = Length.px(value.height)
+      if entry.options.matchWidth {
+        computed.minWidth = Length.px(f32.min(value.width, value.anchorWidth))
+      }
+      computed.boxSizing = BoxSizing.BorderBox
+      computed.overflowX = Overflow.Auto
+      computed.overflowY = Overflow.Auto
+    }
+  }
+}

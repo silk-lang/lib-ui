@@ -1,0 +1,122 @@
+//! The app the tests inspect: the todo example in its own tree, serving the inspector protocol
+//! in the same process. It is the devtools' [`Link`]: each request runs through
+//! `Protocol.handle`, and input a request dispatches is pumped to the app and drawn, as the
+//! window loop does with the socket server.
+import ui_devtools.link { Link }
+import ui_app_examples.todo { Todo, Message as TodoMessage, Command as TodoCommand, Store }
+import ui_app_examples.look { SANS }
+import ui_app.runtime { Runtime, pump }
+import ui_inspect_server.protocol { Protocol, Outcome }
+import ui_tree.lib { UiTree, TreeError, Batch, FrameInput, CpuSnapshot }
+import font_collection.lib { FontCollection }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.json.scanner { JsonError }
+import silk.json.value { Json, Value }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.string { String }
+
+pub struct NullStore {}
+
+impl Store for NullStore {
+  effect fn save(self: &mut Self, count: u64) -> u64 {
+    return count
+  }
+}
+
+pub fn appViewport() -> FrameInput {
+  return FrameInput { width: 360.0, height: 300.0, scale: 1.0, time: 0.0 }
+}
+
+/// The todo app, its tree and its inspector state.
+pub struct Inspected<'f> {
+  pub tree: UiTree<'f>,
+  pub app: Runtime<Todo, TodoMessage, TodoCommand>,
+  pub protocol: Protocol,
+  pub store: NullStore,
+  /// The atlas on the CPU, for pictures of the app.
+  pub pixels: CpuSnapshot,
+  /// Requests served.
+  pub requests: u64,
+  /// When set, every request fails as if the app were gone.
+  pub down: bool,
+}
+
+impl<'f> Inspected<'f> {
+  pub effect fn make(collection: &'f FontCollection) -> Inspected<'f>
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut tree = run UiTree.make(collection)
+    let mut batch = Batch.make()
+    run batch.fontFamily(SANS, "Noto Sans, sans-serif")
+    run tree.apply(run batch.take())
+    let mut app = Runtime<Todo, TodoMessage, TodoCommand>.make(run Todo.make())
+    run app.start(&mut tree, 0.0)
+    let mut inspected = Inspected<'f> {
+      tree: move tree,
+      app: move app,
+      protocol: Protocol.make(),
+      store: NullStore {},
+      pixels: CpuSnapshot.make(),
+      requests: 0,
+      down: false,
+    }
+    run inspected.frame()
+    return move inspected
+  }
+
+  /// Draws a frame and lets the protocol see it, as the window loop does.
+  pub effect fn frame(self: &mut Self) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    run self.tree.frame(appViewport())
+    run self.protocol.afterFrame(&self.tree)
+    run self.pixels.sync(&mut self.tree)
+  }
+
+  /// Runs one request line and writes the reply line.
+  pub effect fn ask(self: &mut Self, line: string, reply: &mut String) -> ()
+    ! JsonError | TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    self.requests = self.requests + 1
+    let request = run Json.parse(String.utf8Bytes(line))
+    reply.clear()
+    let outcome = run self.protocol.handle(&mut self.tree, &request, 0, &mut reply)
+    while run self.protocol.dispatchNext(&mut self.tree) {
+      run self.protocol.observe(&self.tree)
+      drop run pump(&mut self.app, &mut self.tree) |> Effect.provideMut<Store>(&mut self.store)
+    }
+    if outcome == Outcome.Pending {
+      run reply.append("{\"ok\":true,\"pending\":true}")
+    }
+    if self.protocol.dispatched {
+      run self.protocol.observe(&self.tree)
+      drop run pump(&mut self.app, &mut self.tree) |> Effect.provideMut<Store>(&mut self.store)
+      self.protocol.dispatched = false
+    }
+    self.protocol.repaint = false
+    run self.frame()
+  }
+}
+
+impl<'f> Link for Inspected<'f> {
+  effect fn request(self: &mut Self, line: string, reply: &mut String) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.down {
+      reply.clear()
+      run reply.append("connection refused")
+      return false
+    }
+    let result = run Effect.result(self.ask(line, &mut reply))
+    return match move result {
+      Result<(), JsonError | TreeError | OutOfMemoryError>.Success { value } => true
+      Result<(), JsonError | TreeError | OutOfMemoryError>.Failure { error } => {
+        drop error
+        reply.clear()
+        run reply.append("the request failed")
+        false
+      }
+    }
+  }
+}

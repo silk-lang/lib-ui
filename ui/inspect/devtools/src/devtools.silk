@@ -1,0 +1,1253 @@
+//! The devtools window as a ui-app app: the inspected app's element tree on the left, and on
+//! the right the selected node's styles, its box model, the event log and the frame stats. It
+//! talks to the app only through the inspector protocol (the same requests ui-inspect-cli and
+//! ui-inspect-mcp send), over a [`Link`] the host provides.
+//!
+//! Selecting a row inspects that node and highlights it in the app's window. While live (the
+//! default), the window refreshes every [`LIVE_INTERVAL`] seconds. Keys: ArrowDown and ArrowUp
+//! move the selection, Escape clears it, F5 refreshes.
+import data {
+  Row,
+  Detail,
+  LogRow,
+  Stat,
+  Snapshot,
+  BoxNumbers,
+  Sides,
+  NO_PARENT,
+  parseTree,
+  parseDetail,
+  parseEvents,
+  parseStats,
+  parseStatus,
+  writeSize
+}
+import link { Link }
+import ui_app.app { App, Perform, Context, Subscriptions }
+import ui_app.ui { Ui, Reply }
+import ui_inspect_server.reply { textField }
+import ui_tree.inspect { writeInt }
+import ui_tree.mutation {
+  Property,
+  Length,
+  Side,
+  Align,
+  Role,
+  Cursor,
+  BorderStyle,
+  Overflow,
+  WhiteSpace,
+  TextAlign
+}
+import ui_tree.node { EventKind }
+import silk.collections.list { List }
+import silk.color.rgba { Rgba }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.geometry.corners { Corners }
+import silk.json.scanner { JsonError }
+import silk.json.value { Json, Value }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.text.string { String }
+
+/// Seconds between refreshes while live.
+pub const LIVE_INTERVAL: f64 = 0.5
+
+/// How many event records the log keeps.
+pub const MAX_LOG: usize = 200
+
+/// The font family the host defines for the window (`Noto Sans, sans-serif` in the window and
+/// the tests).
+pub const FONT: u32 = 1
+
+/// The tabs of the side panel.
+pub enum Panel {
+  Styles,
+  BoxModel,
+  Events,
+  Stats,
+}
+
+pub union Message {
+  /// Read everything again.
+  Refresh,
+  /// The live timer.
+  Tick { pub time: f64 },
+  ToggleLive,
+  /// Inspect and highlight node `id`.
+  Select { pub id: u32 },
+  /// Fold or unfold the children of node `id`.
+  Collapse { pub id: u32 },
+  Show { pub panel: Panel },
+  SelectNext,
+  SelectPrevious,
+  ClearSelection,
+  ClearEvents,
+  Synced { pub snapshot: Snapshot },
+  Inspected { pub detail: Detail },
+  Failed { pub error: String },
+}
+
+pub union Command {
+  /// Status, tree, stats, the events after `since`, and node `selected` again.
+  Sync { pub since: u64, pub selected: u32 },
+  /// Highlight node `node` and inspect it.
+  Inspect { pub node: u32 },
+  /// Clear the highlight.
+  Unhighlight,
+}
+
+/// The devtools model.
+pub struct Devtools {
+  /// Where the app is, as the status line names it.
+  pub target: String,
+  pub live: bool,
+  pub panel: Panel,
+  pub rows: List<Row>,
+  /// Nodes whose children are folded.
+  pub collapsed: List<u32>,
+  /// The selected node, or NO_PARENT.
+  pub selected: u32,
+  pub detail: Detail,
+  pub stats: List<Stat>,
+  /// The newest [`MAX_LOG`] event records, oldest first.
+  pub events: List<LogRow>,
+  /// The `seq` of the last record read.
+  pub since: u64,
+  pub status: String,
+  /// Why the last request failed, or empty.
+  pub error: String,
+  /// Refreshes that reached the app.
+  pub syncs: u64,
+}
+
+impl Devtools {
+  /// A window looking at the app at `target` (shown in the status line).
+  pub effect fn make(target: string) -> Devtools
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return Devtools {
+      target: run String.copy(target),
+      live: true,
+      panel: Panel.Styles,
+      rows: List<Row>.make(),
+      collapsed: List<u32>.make(),
+      selected: NO_PARENT,
+      detail: Detail.none(),
+      stats: List<Stat>.make(),
+      events: List<LogRow>.make(),
+      since: 0,
+      status: run String.copy("connecting"),
+      error: String.make(),
+      syncs: 0,
+    }
+  }
+
+  fn isCollapsed(self: &Self, id: u32) -> bool {
+    let list = self.collapsed.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      if list[i] == id {
+        return true
+      }
+      i = i + 1
+    }
+    return false
+  }
+
+  /// Marks the rows under folded nodes hidden.
+  fn updateVisibility(self: &mut Self) -> () {
+    let mut hideBelow: u32 = 4294967295
+    let n = self.rows.length()
+    let mut i: usize = 0
+    while i < n {
+      let depth = self.rows.asSlice()[i].depth
+      let id = self.rows.asSlice()[i].id
+      let children = self.rows.asSlice()[i].children
+      let visible = hideBelow == 4294967295 || depth <= hideBelow
+      if visible {
+        hideBelow = 4294967295
+        if children > 0 && self.isCollapsed(id) {
+          hideBelow = depth
+        }
+      }
+      let rows = self.rows.asMutSlice()
+      rows[i].visible = visible
+      i = i + 1
+    }
+  }
+
+  /// The row label of node `id`, or "".
+  pub fn labelOf(self: &Self, id: u32) -> string {
+    let rows = self.rows.asSlice()
+    let mut i: usize = 0
+    while i < rows.length {
+      if rows[i].id == id {
+        return String.view(&rows[i].label)
+      }
+      i = i + 1
+    }
+    return ""
+  }
+
+  /// The index of the selected row among the visible ones, or the row count.
+  fn selectedIndex(self: &Self) -> usize {
+    let rows = self.rows.asSlice()
+    let mut i: usize = 0
+    while i < rows.length {
+      if rows[i].id == self.selected && rows[i].visible {
+        return i
+      }
+      i = i + 1
+    }
+    return rows.length
+  }
+
+  /// The id of the visible row after (or before) the selected one.
+  fn step(self: &Self, forward: bool) -> u32 {
+    let rows = self.rows.asSlice()
+    if rows.length == 0 {
+      return NO_PARENT
+    }
+    let at = self.selectedIndex()
+    if forward {
+      let mut i = if at == rows.length {
+        0
+      } else {
+        at + 1
+      }
+      while i < rows.length {
+        if rows[i].visible {
+          return rows[i].id
+        }
+        i = i + 1
+      }
+    } else {
+      let mut i = if at == rows.length {
+        rows.length
+      } else {
+        at
+      }
+      while i > 0 {
+        i = i - 1
+        if rows[i].visible {
+          return rows[i].id
+        }
+      }
+    }
+    return self.selected
+  }
+
+  fn sync(self: &Self, cx: &mut Context<Command>) -> () {
+    cx.command(Command.Sync { since: self.since, selected: self.selected })
+  }
+
+  fn select(self: &mut Self, id: u32, cx: &mut Context<Command>) -> () {
+    if id == NO_PARENT {
+      return ()
+    }
+    self.selected = id
+    cx.command(Command.Inspect { node: id })
+  }
+}
+
+// Commands.
+
+fn ok(reply: &Value) -> bool {
+  return match Json.field(reply, "ok") {
+    Option<&Value>.Some { value } => match &value.* {
+      Value.Bool { value: b } => b
+      _ => false
+    }
+    Option<&Value>.None => false
+  }
+}
+
+/// Sends `line` and returns the reply, or None with the reason in `error`.
+effect fn ask(line: string, error: &mut String) -> Option<Value>
+  ! OutOfMemoryError
+  ? &mut Link | &mut Allocator {
+  let mut reply = String.make()
+  if !run Link.request(line, &mut reply) {
+    error.clear()
+    run error.append("cannot reach the app: ")
+    run error.append(String.view(&reply))
+    return Option<Value>.None
+  }
+  let parsed = run Effect.result(Json.parse(reply.ownedUtf8Bytes()))
+  return match move parsed {
+    Result<Value, JsonError | OutOfMemoryError>.Success { value } => {
+      if ok(&value) {
+        return Option<Value>.Some { value: move value }
+      }
+      error.clear()
+      run error.append("the app answered: ")
+      run error.append(textField(&value, "error"))
+      Option<Value>.None
+    }
+    Result<Value, JsonError | OutOfMemoryError>.Failure { error: e } => {
+      drop e
+      error.clear()
+      run error.append("the app's reply is not JSON")
+      Option<Value>.None
+    }
+  }
+}
+
+/// `{"cmd":"<cmd>","<key>":<value>}`.
+effect fn requestLine(cmd: string, key: string, value: u64) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut line = run String.copy("{\"cmd\":\"")
+  run line.append(cmd)
+  run line.append("\",\"")
+  run line.append(key)
+  run line.append("\":")
+  run writeInt(&mut line, value)
+  run line.append("}")
+  return move line
+}
+
+effect fn inspectNode(node: u32) -> Option<Detail>
+  ! OutOfMemoryError
+  ? &mut Link | &mut Allocator {
+  let line = run requestLine("inspect", "node", u32.toU64(node))
+  let mut error = String.make()
+  return match run ask(String.view(&line), &mut error) {
+    Option<Value>.Some { value } => Option<Detail>.Some { value: run parseDetail(&value) }
+    Option<Value>.None => Option<Detail>.None
+  }
+}
+
+effect fn syncAll(since: u64, selected: u32) -> Message
+  ! OutOfMemoryError
+  ? &mut Link | &mut Allocator {
+  let mut error = String.make()
+  let mut snapshot = Snapshot {
+    status: String.make(),
+    rows: List<Row>.make(),
+    stats: List<Stat>.make(),
+    events: List<LogRow>.make(),
+    next: since,
+    detail: Option<Detail>.None,
+  }
+  match run ask("{\"cmd\":\"hello\"}", &mut error) {
+    Option<Value>.Some { value } => {
+      run parseStatus(&value, &mut snapshot.status)
+    }
+    Option<Value>.None => {
+      return Message.Failed { error: move error }
+    }
+  }
+  match run ask("{\"cmd\":\"tree\"}", &mut error) {
+    Option<Value>.Some { value } => {
+      run parseTree(&value, &mut snapshot.rows)
+    }
+    Option<Value>.None => {
+      return Message.Failed { error: move error }
+    }
+  }
+  match run ask("{\"cmd\":\"stats\"}", &mut error) {
+    Option<Value>.Some { value } => {
+      run parseStats(&value, &mut snapshot.stats)
+    }
+    Option<Value>.None => {
+      return Message.Failed { error: move error }
+    }
+  }
+  let events = run requestLine("events", "since", since)
+  match run ask(String.view(&events), &mut error) {
+    Option<Value>.Some { value } => {
+      snapshot.next = run parseEvents(&value, &mut snapshot.events)
+    }
+    Option<Value>.None => {
+      return Message.Failed { error: move error }
+    }
+  }
+  if selected != NO_PARENT {
+    snapshot.detail = run inspectNode(selected)
+  }
+  return Message.Synced { snapshot: move snapshot }
+}
+
+effect fn highlightAndInspect(node: u32) -> Message
+  ! OutOfMemoryError
+  ? &mut Link | &mut Allocator {
+  let mut error = String.make()
+  let mut line = run String.copy("{\"cmd\":\"highlight\",\"nodes\":[")
+  run writeInt(&mut line, u32.toU64(node))
+  run line.append("]}")
+  match run ask(String.view(&line), &mut error) {
+    Option<Value>.Some { value } => {}
+    Option<Value>.None => {
+      return Message.Failed { error: move error }
+    }
+  }
+  return match run inspectNode(node) {
+    Option<Detail>.Some { value } => Message.Inspected { detail: move value }
+    Option<Detail>.None => Message.Inspected { detail: Detail.none() }
+  }
+}
+
+effect fn unhighlight() -> Message
+  ! OutOfMemoryError
+  ? &mut Link | &mut Allocator {
+  let mut error = String.make()
+  return match run ask("{\"cmd\":\"highlight\"}", &mut error) {
+    Option<Value>.Some { value } => Message.Inspected { detail: Detail.none() }
+    Option<Value>.None => Message.Failed { error: move error }
+  }
+}
+
+impl Perform<Message, OutOfMemoryError ? &mut Link | &mut Allocator> for Command {
+  effect fn perform(self: Self) -> Message
+    ! OutOfMemoryError
+    ? &mut Link | &mut Allocator {
+    return match &self {
+      Command.Sync { since, selected } => run syncAll(since, selected)
+      Command.Inspect { node } => run highlightAndInspect(node)
+      Command.Unhighlight => run unhighlight()
+    }
+  }
+}
+
+// The look: Chrome's devtools, light.
+
+fn rgb(hex: u32) -> Rgba<f32> {
+  let r = u32.toF32(u32.bitAnd(u32.shiftRight(hex, 16), 255)) / 255.0
+  let g = u32.toF32(u32.bitAnd(u32.shiftRight(hex, 8), 255)) / 255.0
+  let b = u32.toF32(u32.bitAnd(hex, 255)) / 255.0
+  return Rgba<f32> { r: r, g: g, b: b, a: 1.0 }
+}
+
+const TEXT: u32 = 0x1F2937
+
+const MUTED: u32 = 0x6B7280
+
+const LINE: u32 = 0xD1D5DB
+
+const BAR: u32 = 0xF3F4F6
+
+const HOVER: u32 = 0xEEF2FF
+
+const SELECTED: u32 = 0xDBEAFE
+
+const ACCENT: u32 = 0x2563EB
+
+const TAG: u32 = 0x881280
+
+const ATTRIBUTE: u32 = 0xC80000
+
+const ERROR: u32 = 0xB91C1C
+
+const MARGIN: u32 = 0xF9CC9D
+
+const BORDER: u32 = 0xFDDD9B
+
+const PADDING: u32 = 0xC3D08B
+
+const CONTENT: u32 = 0x8CB6C0
+
+fn border(ui: &mut Ui<Message>, side: Side, hex: u32) -> () {
+  ui.style(
+    &[
+      Property.BorderWidth { side: side, value: 1.0 },
+      Property.BorderStyle { value: BorderStyle.Solid },
+      Property.BorderColor { color: rgb(hex) },
+    ],
+  )
+}
+
+fn paddings(ui: &mut Ui<Message>, vertical: f32, horizontal: f32) -> () {
+  ui.style(
+    &[
+      Property.Padding { side: Side.Top, value: Length.px(vertical) },
+      Property.Padding { side: Side.Bottom, value: Length.px(vertical) },
+      Property.Padding { side: Side.Left, value: Length.px(horizontal) },
+      Property.Padding { side: Side.Right, value: Length.px(horizontal) },
+    ],
+  )
+}
+
+/// A flat toolbar or tab button; `selected` underlines it in the accent color.
+fn barButton(ui: &mut Ui<Message>, label: string, selected: bool, onPress: fn() -> Message) -> () {
+  ui.pressable(
+    onPress,
+    |ui| {
+      paddings(&mut ui, 4.0, 10.0)
+      ui.style(
+        &[
+          Property.BorderWidth { side: Side.Bottom, value: 2.0 },
+          Property.BorderStyle { value: BorderStyle.Solid },
+          Property.BorderColor {
+            color: if selected {
+              rgb(ACCENT)
+            } else {
+              Rgba<f32> { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }
+            },
+          },
+        ],
+      )
+      if selected {
+        ui.color(rgb(ACCENT))
+      }
+      ui.hover(&[Property.BackgroundColor { color: rgb(0xE5E7EB) }])
+      ui.focusVisible(&[Property.BackgroundColor { color: rgb(SELECTED) }])
+      ui.text(label)
+    },
+  )
+}
+
+/// A scrolling region that fills what is left of its flex parent.
+fn scrolling(ui: &mut Ui<Message>) -> () {
+  ui.style(
+    &[
+      Property.FlexGrow { value: 1.0 },
+      Property.FlexShrink { value: 1.0 },
+      Property.FlexBasis { value: Length.px(0.0) },
+      Property.MinHeight { value: Length.px(0.0) },
+      Property.MinWidth { value: Length.px(0.0) },
+      Property.OverflowY { value: Overflow.Scroll },
+      Property.OverflowX { value: Overflow.Hidden },
+    ],
+  )
+}
+
+fn muted(ui: &mut Ui<Message>, text: string) -> () {
+  ui.box(
+    |ui| {
+      ui.color(rgb(MUTED))
+      ui.text(text)
+    },
+  )
+}
+
+/// "element-<id>", the test id of a row.
+effect fn rowTestId(id: u32) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = run String.copy("element-")
+  run writeInt(&mut text, u32.toU64(id))
+  return move text
+}
+
+effect fn sizeText(value: f32) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = String.make()
+  if value == 0.0 {
+    run text.append("-")
+  } else {
+    run writeSize(&mut text, value)
+  }
+  return move text
+}
+
+effect fn contentText(box: &BoxNumbers) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = String.make()
+  run writeSize(&mut text, box.width)
+  run text.append(" × ")
+  run writeSize(&mut text, box.height)
+  return move text
+}
+
+effect fn positionText(box: &BoxNumbers) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = run String.copy("position ")
+  run writeSize(&mut text, box.x)
+  run text.append(", ")
+  run writeSize(&mut text, box.y)
+  if box.fragments > 1 {
+    run text.append("  ·  first of ")
+    run writeInt(&mut text, u32.toU64(box.fragments))
+    run text.append(" fragments")
+  }
+  return move text
+}
+
+effect fn seqText(seq: u64) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = String.make()
+  run writeInt(&mut text, seq)
+  return move text
+}
+
+fn centered(ui: &mut Ui<Message>, text: string) -> () {
+  ui.box(
+    |ui| {
+      ui.style(&[Property.TextAlign { value: TextAlign.Center }])
+      ui.text(text)
+    },
+  )
+}
+
+/// One layer of the box model diagram: `name` in the corner, the side widths around `inner`.
+fn layer(
+  ui: &mut Ui<Message>,
+  name: string,
+  hex: u32,
+  sides: Sides,
+  dashed: bool,
+  inner: fn(&mut Ui<Message>) -> (),
+) -> () {
+  ui.column(
+    |ui| {
+      ui.testId(name)
+      ui.background(rgb(hex))
+      ui.style(
+        &[
+          Property.BorderWidth { side: Side.Top, value: 1.0 },
+          Property.BorderWidth { side: Side.Right, value: 1.0 },
+          Property.BorderWidth { side: Side.Bottom, value: 1.0 },
+          Property.BorderWidth { side: Side.Left, value: 1.0 },
+          Property.BorderStyle {
+            value: if dashed {
+              BorderStyle.Dashed
+            } else {
+              BorderStyle.Solid
+            },
+          },
+          Property.BorderColor { color: rgb(0x808080) },
+          Property.AlignItems { value: Align.Stretch },
+        ],
+      )
+      paddings(&mut ui, 2.0, 6.0)
+      ui.row(
+        |ui| {
+          ui.box(
+            |ui| {
+              ui.style(&[Property.FlexBasis { value: Length.px(0.0) }])
+              ui.grow(1.0)
+              ui.color(rgb(0x404040))
+              ui.text(name)
+            },
+          )
+          ui.box(
+            |ui| {
+              let text = ui.alloc(sizeText(sides.top))
+              ui.text(String.view(&text))
+            },
+          )
+          ui.box(
+            |ui| {
+              ui.style(&[Property.FlexBasis { value: Length.px(0.0) }])
+              ui.grow(1.0)
+            },
+          )
+        },
+      )
+      ui.row(
+        |ui| {
+          ui.style(&[Property.AlignItems { value: Align.Center }])
+          ui.gap(6.0)
+          ui.box(
+            |ui| {
+              let text = ui.alloc(sizeText(sides.left))
+              ui.text(String.view(&text))
+            },
+          )
+          ui.column(
+            |ui| {
+              ui.grow(1.0)
+              inner(&mut ui)
+            },
+          )
+          ui.box(
+            |ui| {
+              let text = ui.alloc(sizeText(sides.right))
+              ui.text(String.view(&text))
+            },
+          )
+        },
+      )
+      ui.row(
+        |ui| {
+          ui.style(&[Property.JustifyContent { value: Align.Center }])
+          ui.box(
+            |ui| {
+              let text = ui.alloc(sizeText(sides.bottom))
+              ui.text(String.view(&text))
+            },
+          )
+        },
+      )
+    },
+  )
+}
+
+impl Devtools {
+  fn toolbar(self: &Self, ui: &mut Ui<Message>) -> () {
+    ui.row(
+      |ui| {
+        ui.accessRole(Role.Toolbar)
+        ui.testId("toolbar")
+        ui.background(rgb(BAR))
+        border(&mut ui, Side.Bottom, LINE)
+        ui.style(&[Property.AlignItems { value: Align.Center }])
+        paddings(&mut ui, 2.0, 8.0)
+        ui.gap(8.0)
+        ui.box(
+          |ui| {
+            ui.style(&[Property.FontWeight { value: 700.0 }])
+            ui.text("Silk devtools")
+          },
+        )
+        ui.box(
+          |ui| {
+            ui.testId("status")
+            ui.grow(1.0)
+            ui.style(&[Property.WhiteSpace { value: WhiteSpace.NoWrap }])
+            if self.error.ownedByteLength() != 0 {
+              ui.color(rgb(ERROR))
+              ui.text(String.view(&self.error))
+            } else {
+              ui.color(rgb(MUTED))
+              ui.text(String.view(&self.target))
+              ui.text("  ·  ")
+              ui.text(String.view(&self.status))
+            }
+          },
+        )
+        barButton(&mut ui, "Refresh", false, || Message.Refresh)
+        barButton(&mut ui, "Live", self.live, || Message.ToggleLive)
+      },
+    )
+  }
+
+  fn elements(self: &Self, ui: &mut Ui<Message>) -> () {
+    ui.column(
+      |ui| {
+        ui.testId("elements")
+        ui.accessRole(Role.List)
+        ui.label("Elements")
+        ui.style(
+          &[
+            Property.FlexBasis { value: Length.percent(45.0) },
+            Property.FlexShrink { value: 0.0 },
+            Property.MinHeight { value: Length.px(0.0) },
+            Property.OverflowY { value: Overflow.Scroll },
+            Property.OverflowX { value: Overflow.Hidden },
+            Property.WhiteSpace { value: WhiteSpace.NoWrap },
+          ],
+        )
+        border(&mut ui, Side.Right, LINE)
+        paddings(&mut ui, 4.0, 0.0)
+        if self.rows.length() == 0 {
+          ui.box(
+            |ui| {
+              paddings(&mut ui, 4.0, 8.0)
+              muted(&mut ui, "No elements yet.")
+            },
+          )
+        }
+        ui.each(
+          self.rows.asSlice(),
+          |row| u32.toU64(row.id),
+          |ui, row| {
+            if row.visible {
+              self.elementRow(&mut ui, row)
+            }
+          },
+        )
+      },
+    )
+  }
+
+  fn elementRow(self: &Self, ui: &mut Ui<Message>, row: &Row) -> () {
+    let selected = row.id == self.selected
+    let folded = self.isCollapsed(row.id)
+    ui.row(
+      |ui| {
+        ui.accessRole(Role.ListItem)
+        ui.label(String.view(&row.label))
+        let testId = ui.alloc(rowTestId(row.id))
+        ui.testId(String.view(&testId))
+        ui.cursor(Cursor.Pointer)
+        ui.onClick(|| Message.Select { id: row.id })
+        ui.style(
+          &[
+            Property.AlignItems { value: Align.Center },
+            Property.ColumnGap { value: Length.px(6.0) },
+            Property.Padding { side: Side.Top, value: Length.px(1.0) },
+            Property.Padding { side: Side.Bottom, value: Length.px(1.0) },
+            Property.Padding {
+              side: Side.Left,
+              value: Length.px(4.0 + u32.toF32(row.depth) * 12.0),
+            },
+            Property.Padding { side: Side.Right, value: Length.px(8.0) },
+          ],
+        )
+        if selected {
+          ui.background(rgb(SELECTED))
+        } else {
+          ui.hover(&[Property.BackgroundColor { color: rgb(HOVER) }])
+        }
+        ui.box(
+          |ui| {
+            ui.style(
+              &[Property.Width { value: Length.px(10.0) }, Property.FlexShrink { value: 0.0 }],
+            )
+            ui.color(rgb(MUTED))
+            if row.children > 0 {
+              ui.on(
+                EventKind.Click,
+                |event| Reply<Message>.EmitAndStop { message: Message.Collapse { id: row.id } },
+              )
+              ui.text(
+                if folded {
+                  "+"
+                } else {
+                  "-"
+                },
+              )
+            }
+          },
+        )
+        ui.box(
+          |ui| {
+            ui.color(rgb(TAG))
+            ui.text(String.view(&row.label))
+          },
+        )
+        ui.box(
+          |ui| {
+            ui.color(rgb(MUTED))
+            ui.text(String.view(&row.detail))
+          },
+        )
+      },
+    )
+  }
+
+  fn side(self: &Self, ui: &mut Ui<Message>) -> () {
+    ui.column(
+      |ui| {
+        ui.grow(1.0)
+        ui.style(
+          &[
+            Property.FlexBasis { value: Length.px(0.0) },
+            Property.MinWidth { value: Length.px(0.0) },
+            Property.MinHeight { value: Length.px(0.0) },
+          ],
+        )
+        ui.row(
+          |ui| {
+            ui.accessRole(Role.TabList)
+            ui.background(rgb(BAR))
+            border(&mut ui, Side.Bottom, LINE)
+            barButton(
+              &mut ui,
+              "Styles",
+              self.panel == Panel.Styles,
+              || Message.Show { panel: Panel.Styles },
+            )
+            barButton(
+              &mut ui,
+              "Box model",
+              self.panel == Panel.BoxModel,
+              || Message.Show { panel: Panel.BoxModel },
+            )
+            barButton(
+              &mut ui,
+              "Events",
+              self.panel == Panel.Events,
+              || Message.Show { panel: Panel.Events },
+            )
+            barButton(
+              &mut ui,
+              "Stats",
+              self.panel == Panel.Stats,
+              || Message.Show { panel: Panel.Stats },
+            )
+          },
+        )
+        ui.column(
+          |ui| {
+            ui.accessRole(Role.TabPanel)
+            ui.testId("panel")
+            scrolling(&mut ui)
+            paddings(&mut ui, 6.0, 10.0)
+            match self.panel {
+              Panel.Styles => self.styles(&mut ui)
+              Panel.BoxModel => self.boxModel(&mut ui)
+              Panel.Events => self.eventLog(&mut ui)
+              Panel.Stats => self.statsPanel(&mut ui)
+            }
+          },
+        )
+      },
+    )
+  }
+
+  fn nothingSelected(self: &Self, ui: &mut Ui<Message>) -> bool {
+    if self.detail.id == NO_PARENT {
+      muted(&mut ui, "Select an element on the left, or press the down arrow.")
+      return true
+    }
+    return false
+  }
+
+  fn styles(self: &Self, ui: &mut Ui<Message>) -> () {
+    if self.nothingSelected(&mut ui) {
+      return ()
+    }
+    ui.box(
+      |ui| {
+        ui.testId("detail-title")
+        ui.style(&[Property.FontWeight { value: 700.0 }])
+        ui.color(rgb(TAG))
+        ui.text(String.view(&self.detail.title))
+      },
+    )
+    ui.enumerate(
+      self.detail.lines.asSlice(),
+      |line| 0,
+      |ui, index, line| {
+        let text = String.view(&line)
+        ui.key(usize.toU64(index))
+        ui.row(
+          |ui| {
+            ui.style(&[Property.WhiteSpace { value: WhiteSpace.Pre }])
+            if String.startsWith(text, "style ") {
+              ui.style(
+                &[
+                  Property.FontWeight { value: 700.0 },
+                  Property.Margin { side: Side.Top, value: Length.px(6.0) },
+                ],
+              )
+              ui.text(text)
+            } else if String.startsWith(text, "  ") {
+              match String.find(text, ": ") {
+                Option<usize>.Some { value: colon } => {
+                  ui.box(
+                    |ui| {
+                      ui.color(rgb(ATTRIBUTE))
+                      ui.text(String.slice(text, 0, colon))
+                    },
+                  )
+                  ui.text(String.slice(text, colon, String.byteLength(text) - colon))
+                }
+                Option<usize>.None => {
+                  ui.text(text)
+                }
+              }
+            } else if text == "}" {
+              ui.color(rgb(MUTED))
+              ui.text(text)
+            } else {
+              ui.color(rgb(MUTED))
+              ui.text(text)
+            }
+          },
+        )
+      },
+    )
+  }
+
+  fn boxModel(self: &Self, ui: &mut Ui<Message>) -> () {
+    if self.nothingSelected(&mut ui) {
+      return ()
+    }
+    if !self.detail.hasBox {
+      muted(&mut ui, "This node has no box (display: none, or not laid out).")
+      return ()
+    }
+    let b = self.detail.box
+    ui.column(
+      |ui| {
+        ui.testId("box-model")
+        ui.gap(8.0)
+        ui.style(&[Property.MaxWidth { value: Length.px(420.0) }])
+        layer(
+          &mut ui,
+          "margin",
+          MARGIN,
+          b.margin,
+          true,
+          |ui| {
+            layer(
+              &mut ui,
+              "border",
+              BORDER,
+              b.border,
+              false,
+              |ui| {
+                layer(
+                  &mut ui,
+                  "padding",
+                  PADDING,
+                  b.padding,
+                  true,
+                  |ui| {
+                    ui.box(
+                      |ui| {
+                        ui.testId("content")
+                        ui.background(rgb(CONTENT))
+                        ui.style(
+                          &[
+                            Property.BorderWidth { side: Side.Top, value: 1.0 },
+                            Property.BorderWidth { side: Side.Right, value: 1.0 },
+                            Property.BorderWidth { side: Side.Bottom, value: 1.0 },
+                            Property.BorderWidth { side: Side.Left, value: 1.0 },
+                            Property.BorderStyle { value: BorderStyle.Solid },
+                            Property.BorderColor { color: rgb(0x808080) },
+                            Property.TextAlign { value: TextAlign.Center },
+                          ],
+                        )
+                        paddings(&mut ui, 6.0, 6.0)
+                        let size = ui.alloc(contentText(&b))
+                        ui.text(String.view(&size))
+                      },
+                    )
+                  },
+                )
+              },
+            )
+          },
+        )
+        let position = ui.alloc(positionText(&b))
+        muted(&mut ui, String.view(&position))
+      },
+    )
+  }
+
+  fn eventLog(self: &Self, ui: &mut Ui<Message>) -> () {
+    ui.row(
+      |ui| {
+        ui.style(&[Property.AlignItems { value: Align.Center }])
+        ui.box(
+          |ui| {
+            ui.grow(1.0)
+            ui.color(rgb(MUTED))
+            ui.text("Records the app took from the tree, newest first")
+          },
+        )
+        barButton(&mut ui, "Clear", false, || Message.ClearEvents)
+      },
+    )
+    if self.events.length() == 0 {
+      muted(&mut ui, "No events yet. Use the app, then look here.")
+      return ()
+    }
+    ui.column(
+      |ui| {
+        ui.testId("event-log")
+        ui.accessRole(Role.List)
+        let rows = self.events.asSlice()
+        let mut i = rows.length
+        while i > 0 {
+          i = i - 1
+          let e = &rows[i]
+          ui.key(e.seq)
+          ui.row(
+            |ui| {
+              ui.accessRole(Role.ListItem)
+              ui.gap(8.0)
+              ui.style(&[Property.WhiteSpace { value: WhiteSpace.NoWrap }])
+              border(&mut ui, Side.Bottom, BAR)
+              paddings(&mut ui, 1.0, 0.0)
+              ui.box(
+                |ui| {
+                  ui.style(&[Property.Width { value: Length.px(36.0) }])
+                  ui.color(rgb(MUTED))
+                  let seq = ui.alloc(seqText(e.seq))
+                  ui.text(String.view(&seq))
+                },
+              )
+              ui.box(
+                |ui| {
+                  ui.style(&[Property.Width { value: Length.px(84.0) }])
+                  ui.color(rgb(ACCENT))
+                  ui.text(String.view(&e.kind))
+                },
+              )
+              ui.box(
+                |ui| {
+                  ui.color(rgb(TAG))
+                  ui.text(self.labelOf(e.target))
+                },
+              )
+              ui.box(
+                |ui| {
+                  ui.color(rgb(MUTED))
+                  ui.text(String.view(&e.text))
+                },
+              )
+            },
+          )
+        }
+      },
+    )
+  }
+
+  fn statsPanel(self: &Self, ui: &mut Ui<Message>) -> () {
+    if self.stats.length() == 0 {
+      muted(&mut ui, "No frame stats yet.")
+      return ()
+    }
+    ui.column(
+      |ui| {
+        ui.testId("stats")
+        ui.enumerate(
+          self.stats.asSlice(),
+          |stat| 0,
+          |ui, index, stat| {
+            ui.key(usize.toU64(index))
+            ui.row(
+              |ui| {
+                border(&mut ui, Side.Bottom, BAR)
+                paddings(&mut ui, 1.0, 0.0)
+                ui.box(
+                  |ui| {
+                    ui.style(&[Property.Width { value: Length.px(170.0) }])
+                    ui.color(rgb(MUTED))
+                    ui.text(String.view(&stat.name))
+                  },
+                )
+                ui.text(String.view(&stat.value))
+              },
+            )
+          },
+        )
+      },
+    )
+  }
+}
+
+impl App<Message, Command> for Devtools {
+  fn view(self: &Self, ui: &mut Ui<Message>) -> () {
+    ui.style(
+      &[
+        Property.FontFamily { family: FONT },
+        Property.FontSize { value: 12.0 },
+        Property.Color { color: rgb(TEXT) },
+        Property.BackgroundColor { color: rgb(0xFFFFFF) },
+      ],
+    )
+    self.toolbar(&mut ui)
+    ui.row(
+      |ui| {
+        scrolling(&mut ui)
+        ui.style(&[Property.OverflowY { value: Overflow.Hidden }])
+        self.elements(&mut ui)
+        self.side(&mut ui)
+      },
+    )
+  }
+
+  fn update(self: &mut Self, message: Message, cx: &mut Context<Command>) -> () {
+    match move message {
+      Message.Refresh => {
+        self.sync(&mut cx)
+      }
+      Message.Tick { time } => {
+        if self.live {
+          self.sync(&mut cx)
+        }
+      }
+      Message.ToggleLive => {
+        self.live = !self.live
+      }
+      Message.Select { id } => {
+        self.select(id, &mut cx)
+      }
+      Message.Collapse { id } => {
+        let mut i: usize = 0
+        let mut found = false
+        while i < self.collapsed.length() {
+          if self.collapsed.asSlice()[i] == id {
+            drop self.collapsed.remove(i)
+            found = true
+          } else {
+            i = i + 1
+          }
+        }
+        if !found {
+          cx.alloc(self.collapsed.append(id))
+        }
+        self.updateVisibility()
+      }
+      Message.Show { panel } => {
+        self.panel = panel
+      }
+      Message.SelectNext => {
+        let id = self.step(true)
+        self.select(id, &mut cx)
+      }
+      Message.SelectPrevious => {
+        let id = self.step(false)
+        self.select(id, &mut cx)
+      }
+      Message.ClearSelection => {
+        self.selected = NO_PARENT
+        self.detail = Detail.none()
+        cx.command(Command.Unhighlight)
+      }
+      Message.ClearEvents => {
+        self.events.clear()
+      }
+      Message.Synced { snapshot } => {
+        let mut s = move snapshot
+        self.syncs = self.syncs + 1
+        self.error.clear()
+        self.status = Intrinsic.replace(s.status, String.make())
+        self.rows = Intrinsic.replace(s.rows, List<Row>.make())
+        self.updateVisibility()
+        self.stats = Intrinsic.replace(s.stats, List<Stat>.make())
+        while s.events.length() != 0 {
+          let e = s.events.remove(0)
+          cx.alloc(self.events.append(move e))
+        }
+        while self.events.length() > MAX_LOG {
+          drop self.events.remove(0)
+        }
+
+        // `next` is the seq the next record gets; ask for the ones after the last.
+        self.since = if s.next > 0 {
+          s.next - 1
+        } else {
+          0
+        }
+        if self.selected != NO_PARENT {
+          match Intrinsic.replace(s.detail, Option<Detail>.None) {
+            Option<Detail>.Some { value } => {
+              self.detail = move value
+            }
+            Option<Detail>.None => {
+              // The node is gone.
+              self.selected = NO_PARENT
+              self.detail = Detail.none()
+            }
+          }
+        }
+      }
+      Message.Inspected { detail } => {
+        self.detail = move detail
+        if self.detail.id == NO_PARENT {
+          self.selected = NO_PARENT
+        }
+      }
+      Message.Failed { error } => {
+        self.error = move error
+      }
+    }
+  }
+
+  fn subscriptions(self: &Self, subs: &mut Subscriptions<Message>) -> () {
+    if self.live {
+      subs.every(1, LIVE_INTERVAL, |time| Message.Tick { time: time })
+    }
+    subs.keyBinding(2, "ArrowDown", 0, || Message.SelectNext)
+    subs.keyBinding(3, "ArrowUp", 0, || Message.SelectPrevious)
+    subs.keyBinding(4, "Escape", 0, || Message.ClearSelection)
+    subs.keyBinding(5, "F5", 0, || Message.Refresh)
+  }
+}

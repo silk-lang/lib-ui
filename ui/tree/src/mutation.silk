@@ -1,0 +1,704 @@
+//! The tree's public protocol: plain-data [`Mutation`]s in, [`Event`] records out.
+//!
+//! Everything here is plain data. Nodes are named by integer ids the client chooses, styles are
+//! patches of (property, value) pairs, and resources (font families, images, icons) are defined
+//! once under client ids and then referenced by them. A later wire protocol is a serialization of
+//! these unions; a Silk client builds them directly.
+import anchoring { AnchorOptions }
+import virtual_list { VirtualOptions, VirtualItem }
+import codec.image { Image }
+pub import layout.lib {
+  UnicodeBidi,
+  WritingMode,
+  TextOrientation,
+  VerticalAlign,
+  VerticalAlignKind,
+  BaselineSource,
+  TextWrap,
+  WhiteSpaceCollapse,
+  TextJustify,
+  TextIndent,
+  TabSize,
+  BoxDecorationBreak,
+  MarginBreak,
+  BreakBetween,
+  BreakInside,
+  OverflowAlignment,
+  ScrollbarWidth,
+  ScrollbarGutter,
+  Float,
+  Clear,
+  Visibility,
+  Dimension,
+  DimensionKind,
+  TextAlign as LayoutTextAlign
+}
+import grid { Grid }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.color.rgba { Rgba }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.geometry.corners { Corners }
+import silk.text.string { String }
+
+/// What a node is.
+pub enum NodeKind {
+  /// The `div` of the tree. Everything else styles a box.
+  Box,
+  /// A text leaf, laid out by the parent's inline formatting. Text takes its look from its
+  /// parent: wrap text in an inline box to style a span of it.
+  Text,
+  /// A decoded image, drawn over the content box ([`Mutation.SetSource`] names it).
+  Image,
+  /// An SVG icon drawn as a mask tinted with the text color. Its natural size is 1em square.
+  Icon,
+  /// An editable text field: one line, or several with the `Multiline` attribute. It owns
+  /// its caret, selection, undo history and input method composition, and queues `Input`
+  /// records when its value changes.
+  Input,
+  /// A box whose content the client paints with [`CanvasCommand`]s.
+  Canvas,
+}
+
+/// Which look a style patch sets: the base look, or a variant the tree switches to by itself.
+/// Variants apply over the base in this order: hover, active, focus, focus-visible.
+pub enum StyleState {
+  Base,
+  /// While the pointer is over the node or one of its descendants (CSS `:hover`).
+  Hover,
+  /// While the primary button went down on the node or a descendant and is not up yet
+  /// (CSS `:active`).
+  Active,
+  /// While the node has focus.
+  Focus,
+  /// While the node has focus that came from the keyboard, or from a `Focus` mutation after
+  /// keyboard use, as CSS `:focus-visible`. Inputs show it for any focus. Use it for focus rings.
+  FocusVisible,
+}
+
+/// A CSS length: `auto`, pixels, a percentage, or `none` (for max sizes).
+pub union Length {
+  Auto,
+  Px { pub value: f32 },
+  /// A percentage, `50.0` for `50%`.
+  Percent { pub value: f32 },
+  None,
+  /// `pixels + percent%` of the containing axis (percent uses 0–100).
+  Calc { pub pixels: f32, pub percent: f32 },
+  MinContent,
+  MaxContent,
+  FitContent,
+  Content,
+  Normal,
+}
+
+impl Copy for Length {}
+
+impl Length {
+  pub fn px(value: f32) -> Length {
+    return Length.Px { value: value }
+  }
+
+  pub fn calc(pixels: f32, percent: f32) -> Length {
+    return Length.Calc { pixels: pixels, percent: percent }
+  }
+
+  pub fn percent(value: f32) -> Length {
+    return Length.Percent { value: value }
+  }
+}
+
+/// One side of a box.
+pub enum Side {
+  Top,
+  Right,
+  Bottom,
+  Left,
+}
+
+pub enum Display {
+  None,
+  Block,
+  Inline,
+  InlineBlock,
+  Flex,
+  InlineFlex,
+  FlowRoot,
+  Grid,
+  InlineGrid,
+  Contents,
+}
+
+pub enum FlexDirection {
+  Row,
+  RowReverse,
+  Column,
+  ColumnReverse,
+}
+
+pub enum FlexWrap {
+  NoWrap,
+  Wrap,
+  WrapReverse,
+}
+
+/// Values of `justify-content`, `align-items`, `align-self` and `align-content`.
+pub enum Align {
+  Auto,
+  Normal,
+  Start,
+  End,
+  Center,
+  Stretch,
+  Baseline,
+  SpaceBetween,
+  SpaceAround,
+  SpaceEvenly,
+  FlexStart,
+  FlexEnd,
+  LastBaseline,
+  SelfStart,
+  SelfEnd,
+  Left,
+  Right,
+}
+
+pub enum Position {
+  Static,
+  Relative,
+  Absolute,
+  Fixed,
+  Sticky,
+}
+
+/// How an image's natural size fits its content box.
+pub enum ObjectFit {
+  Fill,
+  Contain,
+  Cover,
+  None,
+  ScaleDown
+}
+
+pub enum Overflow {
+  Visible,
+  Hidden,
+  Clip,
+  Scroll,
+  Auto,
+}
+
+pub enum BoxSizing {
+  ContentBox,
+  BorderBox,
+}
+
+pub enum BorderStyle {
+  None,
+  Solid,
+  Dashed,
+}
+
+pub enum FontStyle {
+  Normal,
+  Italic,
+}
+
+pub union LineHeight {
+  Normal,
+  /// A multiple of the font size.
+  Number { pub value: f32 },
+  Px { pub value: f32 },
+}
+
+impl Copy for LineHeight {}
+
+pub enum TextAlign {
+  Auto,
+  Start,
+  End,
+  Left,
+  Right,
+  Center,
+  Justify,
+}
+
+/// `white-space` shorthand values.
+pub enum WhiteSpace {
+  Normal,
+  NoWrap,
+  Pre,
+  PreWrap,
+  PreLine,
+}
+
+pub enum Direction {
+  Ltr,
+  Rtl,
+}
+
+/// `text-decoration-line` as flags.
+pub struct DecorationLine {
+  pub underline: bool,
+  pub overline: bool,
+  pub lineThrough: bool,
+}
+
+impl Copy for DecorationLine {}
+
+impl DecorationLine {
+  pub fn none() -> DecorationLine {
+    return DecorationLine { underline: false, overline: false, lineThrough: false }
+  }
+
+  pub fn underlined() -> DecorationLine {
+    return DecorationLine { underline: true, overline: false, lineThrough: false }
+  }
+}
+
+/// One `box-shadow`. Offsets, blur and spread are CSS pixels.
+pub struct BoxShadow {
+  pub offsetX: f32,
+  pub offsetY: f32,
+  pub blur: f32,
+  pub spread: f32,
+  pub color: Rgba<f32>,
+  pub inset: bool,
+}
+
+impl Copy for BoxShadow {}
+
+/// One property of a style patch. Each variant replaces the value of its property (per side or
+/// corner for the edge properties); text properties inherit down the tree as in CSS.
+pub union Property {
+  // Layout.
+  Display { pub value: Display },
+  Width { pub value: Length },
+  Height { pub value: Length },
+  MinWidth { pub value: Length },
+  MinHeight { pub value: Length },
+  MaxWidth { pub value: Length },
+  MaxHeight { pub value: Length },
+  Margin { pub side: Side, pub value: Length },
+  Padding { pub side: Side, pub value: Length },
+  BorderWidth { pub side: Side, pub value: f32 },
+  Inset { pub side: Side, pub value: Length },
+  Position { pub value: Position },
+  BoxSizing { pub value: BoxSizing },
+  FlexDirection { pub value: FlexDirection },
+  FlexWrap { pub value: FlexWrap },
+  FlexGrow { pub value: f32 },
+  FlexShrink { pub value: f32 },
+  FlexBasis { pub value: Length },
+  JustifyContent { pub value: Align },
+  AlignItems { pub value: Align },
+  AlignSelf { pub value: Align },
+  AlignContent { pub value: Align },
+  RowGap { pub value: Length },
+  ColumnGap { pub value: Length },
+  OverflowX { pub value: Overflow },
+  OverflowY { pub value: Overflow },
+  AspectRatio { pub value: f32 },
+  // Additional css-layout capabilities. Font and grid handles remain tree-owned.
+  UnicodeBidi { pub value: UnicodeBidi },
+  WritingMode { pub value: WritingMode },
+  TextOrientation { pub value: TextOrientation },
+  VerticalAlign { pub value: VerticalAlign },
+  BaselineSource { pub value: BaselineSource },
+  TextAlignLast { pub value: LayoutTextAlign },
+  TextWrap { pub value: TextWrap },
+  WhiteSpaceCollapse { pub value: WhiteSpaceCollapse },
+  TextJustify { pub value: TextJustify },
+  TextIndent { pub value: TextIndent },
+  TabSize { pub value: TabSize },
+  BoxDecorationBreak { pub value: BoxDecorationBreak },
+  MarginBreak { pub value: MarginBreak },
+  BreakBefore { pub value: BreakBetween },
+  BreakAfter { pub value: BreakBetween },
+  BreakInside { pub value: BreakInside },
+  Orphans { pub value: usize },
+  Widows { pub value: usize },
+  Order { pub value: i32 },
+  JustifySelf { pub value: Align },
+  JustifyItems { pub value: Align },
+  JustifyContentSafety { pub value: OverflowAlignment },
+  AlignContentSafety { pub value: OverflowAlignment },
+  AlignItemsSafety { pub value: OverflowAlignment },
+  AlignSelfSafety { pub value: OverflowAlignment },
+  JustifySelfSafety { pub value: OverflowAlignment },
+  JustifyItemsSafety { pub value: OverflowAlignment },
+  ScrollbarWidth { pub value: ScrollbarWidth },
+  ScrollbarGutter { pub value: ScrollbarGutter },
+  Float { pub value: Float },
+  Clear { pub value: Clear },
+  Visibility { pub value: Visibility },
+  AspectRatioAuto { pub value: bool },
+  ObjectFit { pub value: ObjectFit },
+  /// Position within free space after fitting. Percentages refer to that free space.
+  ObjectPosition { pub x: Length, pub y: Length },
+  // Paint.
+  BackgroundColor { pub color: Rgba<f32> },
+  /// A two-stop linear gradient at `angle` degrees (CSS `linear-gradient(<angle>, from, to)`).
+  BackgroundGradient { pub angle: f32, pub from: Rgba<f32>, pub to: Rgba<f32> },
+  BorderColor { pub color: Rgba<f32> },
+  BorderStyle { pub value: BorderStyle },
+  /// Corner radii in CSS pixels.
+  BorderRadius { pub value: Corners<f32> },
+  BoxShadow { pub value: BoxShadow },
+  NoBoxShadow,
+  Opacity { pub value: f32 },
+  /// Gaussian backdrop blur in logical pixels, clipped to the border box. Zero disables it.
+  BackdropBlur { pub value: f32 },
+  /// Whether the node can be the target of pointer events (`pointer-events: none` is false).
+  PointerEvents { pub value: bool },
+  /// `visibility`; inherited.
+  Visible { pub value: bool },
+  // Text, all inherited.
+  /// The font family list defined with [`Mutation.DefineFontFamily`].
+  FontFamily { pub family: u32 },
+  FontSize { pub value: f32 },
+  FontWeight { pub value: f32 },
+  FontStyle { pub value: FontStyle },
+  LineHeight { pub value: LineHeight },
+  Color { pub color: Rgba<f32> },
+  TextAlign { pub value: TextAlign },
+  WhiteSpace { pub value: WhiteSpace },
+  Direction { pub value: Direction },
+  TextDecorationLine { pub value: DecorationLine },
+  /// The decoration color; without one, decorations use the text color.
+  TextDecorationColor { pub color: Rgba<f32> },
+  TextDecorationWavy { pub value: bool },
+  /// The caret color of inputs (CSS `caret-color`); without one, the text color.
+  CaretColor { pub color: Rgba<f32> },
+  /// The background of selected text in inputs (CSS `::selection`).
+  SelectionColor { pub color: Rgba<f32> },
+  /// The color of an input's placeholder (CSS `::placeholder`); without one, the text color
+  /// at half its alpha.
+  PlaceholderColor { pub color: Rgba<f32> },
+}
+
+impl Copy for Property {}
+
+/// Accessibility roles, published to clients, inspectors and supported native accessibility bridges.
+pub enum Role {
+  None,
+  Generic,
+  Button,
+  Link,
+  Checkbox,
+  Radio,
+  TextBox,
+  Heading,
+  Paragraph,
+  List,
+  ListItem,
+  Image,
+  Dialog,
+  Menu,
+  MenuItem,
+  Tab,
+  TabList,
+  TabPanel,
+  Toolbar,
+  Navigation,
+  Main,
+  Form,
+  Group,
+  Slider,
+  Switch,
+  ListBox,
+  Option,
+  Tooltip,
+}
+
+pub enum Cursor {
+  Default,
+  Pointer,
+  Text,
+  Move,
+  Grab,
+  Grabbing,
+  NotAllowed,
+  ResizeHorizontal,
+  ResizeVertical,
+  ResizeNorthWestSouthEast,
+  ResizeNorthEastSouthWest,
+  Crosshair,
+}
+
+/// A node attribute. Text attributes are cleared by setting them empty.
+pub union Attribute {
+  /// Numeric accessibility state for sliders and other range controls.
+  ValueRange { pub min: f32, pub max: f32, pub value: f32 },
+  ClearValueRange,
+  Role { pub value: Role },
+  /// The accessible name.
+  Label { pub value: String },
+  /// A stable name for tests and inspectors.
+  TestId { pub value: String },
+  /// Tab order as in HTML: negative is focusable (by pointer and `Focus`) but not tabbable, 0
+  /// is tree order, and positive values come first, lowest first. [`NOT_FOCUSABLE`], the
+  /// default for every kind but `Input`, takes the node out of focus again.
+  TabIndex { pub value: i32 },
+  Cursor { pub value: Cursor },
+  /// A disabled node and its subtree take no focus, no active state and no pointer down, up
+  /// or click records.
+  Disabled { pub value: bool },
+  /// While focus is inside this node, Tab and Shift+Tab cycle through its tabbable
+  /// descendants only, as a modal dialog wants.
+  FocusTrap { pub value: bool },
+  /// An input that takes several lines: Enter inserts a line break, text wraps
+  /// (`white-space: pre-wrap`) and the box scrolls vertically. Without it, an input is one
+  /// line (`white-space: pre`) that scrolls horizontally to keep the caret in view, and line
+  /// breaks typed or pasted into it become spaces.
+  Multiline { pub value: bool },
+  /// An input whose value the user can select and copy but not change.
+  ReadOnly { pub value: bool },
+  /// The text an empty input shows (CSS `placeholder`), in the placeholder color.
+  Placeholder { pub value: String },
+  /// The checked state of a checkbox, radio button or switch (`aria-checked`). For
+  /// assistive technology, inspectors and tests; the tree draws nothing for it.
+  Checked { pub value: bool },
+  /// Whether a tab, list item or option is the selected one (`aria-selected`).
+  Selected { pub value: bool },
+  /// Whether what a button or menu item controls is open (`aria-expanded`).
+  Expanded { pub value: bool },
+}
+
+/// The tab index of a node that is not focusable: the default for all kinds but `Input`
+/// (whose default is 0).
+pub const NOT_FOCUSABLE: i32 = -2147483648
+
+/// Listener flags for [`Mutation.SetListeners`]: which events the client wants records for.
+pub const LISTEN_POINTER_DOWN: u32 = 1
+
+pub const LISTEN_POINTER_UP: u32 = 2
+
+pub const LISTEN_CLICK: u32 = 4
+
+pub const LISTEN_POINTER_MOVE: u32 = 8
+
+pub const LISTEN_POINTER_ENTER: u32 = 16
+
+pub const LISTEN_POINTER_LEAVE: u32 = 32
+
+pub const LISTEN_WHEEL: u32 = 64
+
+pub const LISTEN_KEY_DOWN: u32 = 128
+
+pub const LISTEN_KEY_UP: u32 = 256
+
+pub const LISTEN_FOCUS: u32 = 512
+
+pub const LISTEN_BLUR: u32 = 1024
+
+pub const LISTEN_INPUT: u32 = 2048
+
+pub const LISTEN_SCROLL: u32 = 4096
+
+/// Every listener flag.
+pub const LISTEN_LAYOUT: u32 = 8192
+
+/// Every public event.
+pub const LISTEN_ALL: u32 = 16383
+
+/// One drawing command of a canvas node, in CSS pixels from the content box's top-left corner.
+/// Path commands build a path that the next `Fill` or `Stroke` draws and then clears.
+pub union CanvasCommand {
+  FillRect {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub radius: f32,
+    pub color: Rgba<f32>
+  },
+  MoveTo { pub x: f32, pub y: f32 },
+  LineTo { pub x: f32, pub y: f32 },
+  QuadTo { pub x1: f32, pub y1: f32, pub x: f32, pub y: f32 },
+  CubicTo { pub x1: f32, pub y1: f32, pub x2: f32, pub y2: f32, pub x: f32, pub y: f32 },
+  Close,
+  Fill { pub color: Rgba<f32> },
+  Stroke { pub color: Rgba<f32>, pub width: f32 },
+}
+
+impl Copy for CanvasCommand {}
+
+/// A change to the tree. Apply a batch with `UiTree.apply`.
+pub union Mutation {
+  /// Places a popup relative to target after layout. The tree owns its fixed position and viewport constraints.
+  /// The popup must be a box; its anchor must exist and must not depend on the popup.
+  SetAnchor { pub id: u32, pub target: u32, pub options: AnchorOptions },
+  /// Removes automatic placement and restores the node's ordinary styles.
+  ClearAnchor { pub id: u32 },
+  /// Configures tree-managed vertical virtualization on a bounded column box.
+  /// The tree owns spacer geometry, measurement, scroll anchoring and focus retention.
+  /// Clients mount the indices returned by `UiTree.virtualRange` and bind their nodes
+  /// with `SetVirtualItems`. Use finite positive estimated height and nonnegative gap/overscan.
+  SetVirtualList { pub id: u32, pub count: usize, pub options: VirtualOptions },
+  /// Binds every direct child box to its logical index, in strictly increasing order.
+  /// Children must have zero flex shrink. The tree creates private layout spacers;
+  /// do not supply spacers, unrelated children, container gaps or vertical padding.
+  SetVirtualItems { pub id: u32, pub items: List<VirtualItem> },
+  /// Removes the controller and its private spacers, leaving client nodes intact.
+  /// An absent controller is a no-op, including after the container is destroyed.
+  ClearVirtualList { pub id: u32 },
+  /// Makes a detached node `id` of `kind`. Ids are the client's: any `u32` not in use.
+  Create { pub id: u32, pub kind: NodeKind },
+  /// Inserts `child` into `parent` before `before`, or last without it. A child already in the
+  /// tree moves, as in the DOM.
+  InsertBefore { pub parent: u32, pub child: u32, pub before: Option<u32> },
+  /// Detaches `id` (and its subtree) from its parent. It can be inserted again.
+  Remove { pub id: u32 },
+  /// Detaches and frees `id` and its whole subtree; their ids can be used again.
+  Destroy { pub id: u32 },
+  /// Sets `properties` in the `state` look of `id`, each replacing the earlier value of its
+  /// property.
+  SetStyle { pub id: u32, pub state: StyleState, pub properties: List<Property> },
+  /// Forgets every property set in the `state` look of `id`.
+  ClearStyle { pub id: u32, pub state: StyleState },
+  /// Sets the value of a text or input node. An input whose value changes puts its caret at
+  /// the end, ends any composition and forgets its undo history, as setting `value` in the DOM
+  /// does; setting the value it already has changes nothing, so a client can echo every
+  /// `Input` record back (a controlled input).
+  SetText { pub id: u32, pub value: String },
+  /// Selects the UTF-8 byte range from `anchor` to `focus` of an input's value (equal for a
+  /// caret). Offsets are clamped to the value and moved back to a character boundary.
+  SetSelection { pub id: u32, pub anchor: usize, pub focus: usize },
+  SetAttribute { pub id: u32, pub attribute: Attribute },
+  /// Sets the `LISTEN_*` flags of `id`.
+  SetListeners { pub id: u32, pub flags: u32 },
+  /// Makes `id` the root node, filling the viewport. The previous root is detached.
+  SetRoot { pub id: u32 },
+  Focus { pub id: u32 },
+  Blur,
+  /// Scrolls the scroll container `id` to offset (`x`, `y`) in CSS pixels, clamped to its
+  /// scroll range at the next frame.
+  ScrollTo { pub id: u32, pub x: f32, pub y: f32 },
+  /// At the next frame, scrolls the scroll containers around `id` the least that brings its
+  /// border box into view, as `scrollIntoView({ block: "nearest" })`.
+  ScrollIntoView { pub id: u32 },
+  /// Points an image or icon node at a resource defined with `DefineImage` or `DefineIcon`.
+  /// Replaces the node’s owned Grid template and item placement.
+  SetGrid { pub id: u32, pub value: Grid },
+  SetSource { pub id: u32, pub resource: u32 },
+  /// Replaces the drawing of a canvas node.
+  SetCanvas { pub id: u32, pub commands: List<CanvasCommand> },
+  /// Defines font family list `family` from CSS `font-family` text, such as
+  /// `"Inter, Noto Sans, sans-serif"`. Generic names map to the collection's generic families.
+  DefineFontFamily { pub family: u32, pub names: String },
+  /// Decodes a PNG or JPEG file as image resource `resource`.
+  DefineImage { pub resource: u32, pub data: Bytes },
+  /// Installs decoded, premultiplied sRGB samples without decoding on the UI thread.
+  DefineDecodedImage { pub resource: u32, pub image: Image },
+  /// Releases a resource. Nodes referencing it become empty until it is defined again.
+  ReleaseResource { pub resource: u32 },
+  /// Parses an SVG file as icon resource `resource`.
+  DefineIcon { pub resource: u32, pub data: Bytes },
+}
+
+/// A key that is equal for two properties exactly when one replaces the other: the variant,
+/// plus the side for per-side properties.
+pub fn propertyKey(property: Property) -> u32 {
+  return match property {
+    Property.ObjectFit { .. } => 388
+    Property.ObjectPosition { .. } => 392
+    Property.UnicodeBidi { .. } => 256
+    Property.WritingMode { .. } => 260
+    Property.TextOrientation { .. } => 264
+    Property.VerticalAlign { .. } => 268
+    Property.BaselineSource { .. } => 272
+    Property.TextAlignLast { .. } => 276
+    Property.TextWrap { .. } => 280
+    Property.WhiteSpaceCollapse { .. } => 284
+    Property.TextJustify { .. } => 288
+    Property.TextIndent { .. } => 292
+    Property.TabSize { .. } => 296
+    Property.BoxDecorationBreak { .. } => 300
+    Property.MarginBreak { .. } => 304
+    Property.BreakBefore { .. } => 308
+    Property.BreakAfter { .. } => 312
+    Property.BreakInside { .. } => 316
+    Property.Orphans { .. } => 320
+    Property.Widows { .. } => 324
+    Property.Order { .. } => 328
+    Property.JustifySelf { .. } => 332
+    Property.JustifyItems { .. } => 336
+    Property.JustifyContentSafety { .. } => 340
+    Property.AlignContentSafety { .. } => 344
+    Property.AlignItemsSafety { .. } => 348
+    Property.AlignSelfSafety { .. } => 352
+    Property.JustifySelfSafety { .. } => 356
+    Property.JustifyItemsSafety { .. } => 360
+    Property.ScrollbarWidth { .. } => 364
+    Property.ScrollbarGutter { .. } => 368
+    Property.Float { .. } => 372
+    Property.Clear { .. } => 376
+    Property.Visibility { .. } => 380
+    Property.AspectRatioAuto { .. } => 384
+
+    Property.Display { .. } => 0
+    Property.Width { .. } => 4
+    Property.Height { .. } => 8
+    Property.MinWidth { .. } => 12
+    Property.MinHeight { .. } => 16
+    Property.MaxWidth { .. } => 20
+    Property.MaxHeight { .. } => 24
+    Property.Margin { side, .. } => 28 + sideIndex(side)
+    Property.Padding { side, .. } => 32 + sideIndex(side)
+    Property.BorderWidth { side, .. } => 36 + sideIndex(side)
+    Property.Inset { side, .. } => 40 + sideIndex(side)
+    Property.Position { .. } => 44
+    Property.BoxSizing { .. } => 48
+    Property.FlexDirection { .. } => 52
+    Property.FlexWrap { .. } => 56
+    Property.FlexGrow { .. } => 60
+    Property.FlexShrink { .. } => 64
+    Property.FlexBasis { .. } => 68
+    Property.JustifyContent { .. } => 72
+    Property.AlignItems { .. } => 76
+    Property.AlignSelf { .. } => 80
+    Property.AlignContent { .. } => 84
+    Property.RowGap { .. } => 88
+    Property.ColumnGap { .. } => 92
+    Property.OverflowX { .. } => 96
+    Property.OverflowY { .. } => 100
+    Property.AspectRatio { .. } => 104
+    Property.BackgroundColor { .. } => 108
+    Property.BackgroundGradient { .. } => 112
+    Property.BorderColor { .. } => 116
+    Property.BorderStyle { .. } => 120
+    Property.BorderRadius { .. } => 124
+    Property.BoxShadow { .. } => 128
+    Property.NoBoxShadow => 132
+    Property.Opacity { .. } => 136
+    Property.BackdropBlur { .. } => 208
+    Property.PointerEvents { .. } => 140
+    Property.Visible { .. } => 144
+    Property.FontFamily { .. } => 148
+    Property.FontSize { .. } => 152
+    Property.FontWeight { .. } => 156
+    Property.FontStyle { .. } => 160
+    Property.LineHeight { .. } => 164
+    Property.Color { .. } => 168
+    Property.TextAlign { .. } => 172
+    Property.WhiteSpace { .. } => 176
+    Property.Direction { .. } => 180
+    Property.TextDecorationLine { .. } => 184
+    Property.TextDecorationColor { .. } => 188
+    Property.TextDecorationWavy { .. } => 192
+    Property.CaretColor { .. } => 196
+    Property.SelectionColor { .. } => 200
+    Property.PlaceholderColor { .. } => 204
+  }
+}
+
+fn sideIndex(side: Side) -> u32 {
+  return match side {
+    Side.Top => 0
+    Side.Right => 1
+    Side.Bottom => 2
+    Side.Left => 3
+  }
+}

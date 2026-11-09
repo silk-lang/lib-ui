@@ -1,0 +1,308 @@
+//! Viewport validation and idle refinement for cached canvas text.
+//! Bind text rectangles to raster slots after scene construction. Check needsRaster on camera
+//! changes; it skips previously covered regions and validates shared rasters once for complete views.
+import canvas_text { TextCache, TextRequest, TextViewport, textCovered, croppedText }
+import tree { UiTree }
+import atlas.atlas { AtlasTile }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.geometry.rect { Rect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.u64
+import silk.num.usize
+
+struct Binding {
+  bounds: Rect<f32>,
+  cache: usize,
+  tileIndex: u32,
+  tileGeneration: u32,
+}
+
+impl Copy for Binding {}
+
+/// Cached coverage checks for one collection of canvas text instances.
+pub struct TextBindings {
+  bindings: List<Binding>,
+  /// Conservative bounds for groups of 64 text instances, in append order.
+  pub blocks: List<Rect<f32>>,
+  /// Whether every instance has an uncropped raster in the current raster frame.
+  pub allTextBound: bool,
+  checkedViewport: Rect<f32>,
+  checkedRasterFrame: u64,
+  checkedZoom: f32,
+  checkedScale: f32,
+  checkedQuality: bool,
+  checkedMissingTiles: usize,
+}
+
+impl TextBindings {
+  /// Creates an empty set of bindings.
+  pub fn make() -> TextBindings {
+    return TextBindings {
+      bindings: List<Binding>.make(),
+      blocks: List<Rect<f32>>.make(),
+      allTextBound: true,
+      checkedViewport: Rect<f32>.new(0.0, 0.0, 0.0, 0.0),
+      checkedRasterFrame: u64.MAX,
+      checkedZoom: 0.0,
+      checkedScale: 0.0,
+      checkedQuality: false,
+      checkedMissingTiles: 0,
+    }
+  }
+
+  /// Removes all instance bindings before a scene rebuild.
+  pub fn clear(self: &mut Self) -> () {
+    self.bindings.clear()
+    self.blocks.clear()
+    self.allTextBound = true
+    self.checkedRasterFrame = u64.MAX
+  }
+
+  /// Appends a rectangle and its raster slot. Use usize.MAX for text that is not rasterized yet.
+  pub effect fn append(self: &mut Self, bounds: Rect<f32>, slot: usize, cache: &TextCache) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let block = self.bindings.length() / 64
+    if block == self.blocks.length() {
+      run self.blocks.append(bounds)
+    } else {
+      let old = self.blocks.get(block)
+      self.blocks.set(
+        block,
+        Rect<f32>.new(
+          f32.min(old.xMin, bounds.xMin),
+          f32.min(old.yMin, bounds.yMin),
+          f32.max(old.xMax, bounds.xMax),
+          f32.max(old.yMax, bounds.yMax),
+        ),
+      )
+    }
+    let index = self.bindings.length()
+    run self.bindings.append(
+      Binding { bounds: bounds, cache: usize.MAX, tileIndex: 0, tileGeneration: 0 },
+    )
+    self.rebind(index, slot, cache)
+  }
+
+  /// Updates one instance after rasterization. index must name an existing binding.
+  pub fn rebind(self: &mut Self, index: usize, slot: usize, cache: &TextCache) -> () {
+    let mut value = self.bindings.get(index)
+    value.cache = slot
+    if slot == usize.MAX {
+      self.allTextBound = false
+    } else {
+      let tile = cache.text.get(slot)
+      value.tileIndex = tile.tile.id.index
+      value.tileGeneration = tile.tile.id.generation
+      if croppedText(tile) {
+        self.allTextBound = false
+      }
+    }
+    self.bindings.set(index, value)
+    self.checkedRasterFrame = u64.MAX
+  }
+
+  /// Returns whether visible text needs new pixels or bindings at this viewport and quality.
+  /// Advance TextCache.rasterFrame when bindings or raster content change.
+  pub fn needsRaster(
+    self: &mut Self,
+    cache: &TextCache,
+    view: TextViewport,
+    scale: f32,
+    tree: &UiTree<'_>,
+    quality: bool,
+  ) -> bool {
+    // Complete overview bindings share hundreds of rasters across 100k labels.
+    // Validate each current raster once instead of checking every instance.
+    if self.allTextBound {
+      let mut at: usize = 0
+      while at < cache.text.length() {
+        let tile = cache.text.get(at)
+        if tile.used == cache.rasterFrame {
+          if let Option<AtlasTile>.None = tree.atlas.get(tile.tile.id) {
+            return true
+          }
+          let wanted = f32.max(
+            0.25,
+            f32.ceil(view.zoom * scale * f32.max(tile.stretchX, tile.stretchY) * 4.0) / 4.0,
+          )
+          let small = tile.size <= 12.0 && tile.naturalWidth <= 256.0 && tile.naturalHeight <= 32.0
+          if quality
+            && (tile.density < wanted
+              || tile.density > wanted * 4.0 && !(small && cache.textPixels < 16000000)) {
+            return true
+          }
+        }
+        at = at + 1
+      }
+      return false
+    }
+    let viewport = Rect<f32>.new(
+      view.x,
+      view.y,
+      view.x + view.width / view.zoom,
+      view.y + view.height / view.zoom,
+    )
+
+    // Tile handles cannot become live again without a new raster/binding epoch.
+    // Counting missing handles therefore detects atlas invalidation in O(unique
+    // rasters), including UI allocations that evict a canvas tile between frames.
+    let mut missing: usize = 0
+    let mut at: usize = 0
+    while at < cache.text.length() {
+      if tree.atlas.get(cache.text.get(at).tile.id).isNone() {
+        missing = missing + 1
+      }
+      at = at + 1
+    }
+    let reusable = self.checkedRasterFrame == cache.rasterFrame && self.checkedZoom == view.zoom
+      && self.checkedScale == scale
+      && (!quality || self.checkedQuality)
+      && self.checkedMissingTiles == missing
+    let checked = if reusable {
+      self.checkedViewport
+    } else {
+      Rect<f32>.new(0.0, 0.0, 0.0, 0.0)
+    }
+    if self.needsTextIn(cache, view, scale, tree, quality, viewport, checked) {
+      return true
+    }
+    self.checkedViewport = viewport
+    self.checkedRasterFrame = cache.rasterFrame
+    self.checkedZoom = view.zoom
+    self.checkedScale = scale
+    self.checkedQuality = quality || reusable && self.checkedQuality
+    self.checkedMissingTiles = missing
+    return false
+  }
+
+  fn needsTextIn(
+    self: &Self,
+    cache: &TextCache,
+    view: TextViewport,
+    scale: f32,
+    tree: &UiTree<'_>,
+    quality: bool,
+    viewport: Rect<f32>,
+    checked: Rect<f32>,
+  ) -> bool {
+    let mut block: usize = 0
+    while block < self.blocks.length() {
+      let b = self.blocks.get(block)
+      if b.xMin < viewport.xMax && b.xMax > viewport.xMin && b.yMin < viewport.yMax
+        && b.yMax > viewport.yMin
+        && !coveredIntersection(b, viewport, checked) {
+        let mut at = block * 64
+        let end = if at + 64 < self.bindings.length() {
+          at + 64
+        } else {
+          self.bindings.length()
+        }
+        while at < end {
+          let probe = self.bindings.get(at)
+          let b = probe.bounds
+          if b.xMin < viewport.xMax && b.xMax > viewport.xMin && b.yMin < viewport.yMax
+            && b.yMax > viewport.yMin
+            && !coveredIntersection(b, viewport, checked) {
+            if probe.cache == usize.MAX {
+              return true
+            }
+            let tile = cache.text.get(probe.cache)
+            if probe.tileIndex != tile.tile.id.index
+              || probe.tileGeneration != tile.tile.id.generation {
+              return true
+            }
+            if let Option<AtlasTile>.None = tree.atlas.get(tile.tile.id) {
+              return true
+            }
+            let wanted = f32.max(
+              0.25,
+              f32.ceil(view.zoom * scale * f32.max(tile.stretchX, tile.stretchY) * 4.0) / 4.0,
+            )
+            let small = tile.size <= 12.0 && tile.naturalWidth <= 256.0
+              && tile.naturalHeight <= 32.0
+            if quality
+              && (tile.density < wanted
+                || tile.density > wanted * 4.0 && !(small && cache.textPixels < 16000000)) {
+              return true
+            }
+
+            // Keep the crop until the visible text leaves its cached pixel bounds.
+            if !textCovered(
+              tile,
+              view,
+              TextRequest {
+                id: 0,
+                key: 0,
+                value: "",
+                size: tile.size,
+                weight: tile.weight,
+                family: tile.family,
+                fill: tile.fill,
+                x: b.xMin,
+                y: b.yMin,
+                width: b.width(),
+                height: b.height(),
+              },
+            ) {
+              return true
+            }
+          }
+          at = at + 1
+        }
+      }
+      block = block + 1
+    }
+    return false
+  }
+}
+
+// Only the part of a block/text box visible now needs to have been checked before.
+// This skips interior blocks during pans while retaining cropped-text edge checks.
+fn coveredIntersection(bounds: Rect<f32>, viewport: Rect<f32>, checked: Rect<f32>) -> bool {
+  return checked.xMax > checked.xMin && checked.yMax > checked.yMin
+    && f32.max(bounds.xMin, viewport.xMin) >= checked.xMin
+    && f32.max(bounds.yMin, viewport.yMin) >= checked.yMin
+    && f32.min(bounds.xMax, viewport.xMax) <= checked.xMax
+    && f32.min(bounds.yMax, viewport.yMax) <= checked.yMax
+}
+
+/// Idle deadline for improving raster density after camera motion.
+pub struct Refinement {
+  /// Whether a deferred quality update is required.
+  pub pending: bool,
+  deadline: f64,
+}
+
+impl Refinement {
+  /// Creates an idle controller with no pending work.
+  pub fn make() -> Refinement {
+    return Refinement { pending: false, deadline: 0.0 }
+  }
+
+  /// Returns whether density changes should wait. Motion starts a new delay in monotonic seconds.
+  /// Missing or uncovered text must still be rasterized during this interval.
+  pub fn defer(self: &mut Self, moving: bool, time: f64, delay: f64) -> bool {
+    if moving {
+      self.deadline = time + delay
+    }
+    return time < self.deadline
+  }
+
+  /// Returns the next quality-update deadline, or None when no update is pending.
+  pub fn nextDeadline(self: &Self) -> Option<f64> {
+    return if self.pending {
+      Option<f64>.some(self.deadline)
+    } else {
+      Option<f64>.None
+    }
+  }
+
+  /// Returns whether a pending quality update is due at time.
+  pub fn due(self: &Self, time: f64) -> bool {
+    return self.pending && time >= self.deadline
+  }
+}

@@ -1,0 +1,262 @@
+//! The app contract: [`App`] (view, update, subscriptions) on the model, [`Perform`] on the
+//! command type, and the [`Context`] and [`Subscriptions`] builders they write into.
+import heap { Heap }
+import ui { Ui }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.usize
+import silk.text.string { String }
+
+/// An app, implemented by its model type `Self` for its message type `M` and command type `C`.
+///
+/// `view` and `update` are plain functions: the runtime calls `view` to render and again to
+/// dispatch each event, and `update` for each message. Neither stores closures, and all their
+/// effects go through the builders: nodes and handlers into the [`Ui`], commands into the
+/// [`Context`], and memory through `ui.alloc` and `cx.alloc`.
+pub interface App<M, C> {
+  /// Describes the UI for the model.
+  fn view(self: &Self, ui: &mut Ui<M>) -> ()
+
+  /// Applies `message` to the model. Work with effects goes out as commands: `cx.command(c)`.
+  fn update(self: &mut Self, message: M, cx: &mut Context<C>) -> ()
+
+  /// The subscriptions the model wants now. The runtime asks after every update, starts the
+  /// new ones and stops the ones that are gone, by key. None by default.
+  fn subscriptions(self: &Self, subs: &mut Subscriptions<M>) -> () {
+    return ()
+  }
+}
+
+/// How a command turns into a message: the only effectful code of an app. `E` and `R` are the
+/// failures and requirements of that work (storage, network, clocks), provided once where the
+/// app starts, and swappable in tests. `perform` takes the command by value, so a command can
+/// move what it carries (a `String`, a buffer) into the work.
+pub interface Perform<M, E, ? R> {
+  effect fn perform(self: Self) -> M ! E ? R
+}
+
+/// The command type of an app without commands.
+pub struct NoCommand {}
+
+impl<M> Perform<M, never ? never> for NoCommand {
+  effect fn perform(self: Self) -> M {
+    return Intrinsic.trap("ui-app: NoCommand is never performed")
+  }
+}
+
+/// What `update` writes into: commands to perform after it, and memory.
+pub struct Context<C> {
+  pub heap: Heap,
+  pub commands: List<C>,
+}
+
+impl<C> Context<C> {
+  pub fn make() -> Context<C> {
+    return Context<C> { heap: Heap.make(), commands: List<C>.make() }
+  }
+
+  /// Performs `command` after this update; the message it produces is handled next.
+  pub fn command(self: &mut Self, command: C) -> () {
+    self.heap.alloc(self.commands.append(move command))
+  }
+
+  /// Runs allocating work (see [`Heap.alloc`]).
+  pub fn alloc<A>(self: &mut Self, work: once Effect<A ! OutOfMemoryError ? &mut Allocator>) -> A {
+    return self.heap.alloc(move work)
+  }
+
+  /// A copy of `value` as an owned `String`.
+  pub fn copy(self: &mut Self, value: string) -> String {
+    return self.heap.alloc(String.copy(value))
+  }
+}
+
+/// The kinds of subscription.
+pub enum SubscriptionKind {
+  /// A message every `interval` seconds.
+  Every,
+  /// A message per display frame.
+  AnimationFrame,
+  /// A message when a key with exact modifiers goes down, wherever focus is.
+  KeyBinding,
+  /// A message when the viewport changes size.
+  Resize,
+}
+
+/// One subscription the model asked for.
+pub struct SubscriptionRecord {
+  pub key: u64,
+  pub kind: SubscriptionKind,
+  pub interval: f64,
+  pub keyStart: u32,
+  pub keyLength: u32,
+  pub modifiers: u32,
+}
+
+impl Copy for SubscriptionRecord {}
+
+/// What a firing subscription delivers to its handler.
+pub struct Delivery {
+  pub kind: SubscriptionKind,
+  pub key: u64,
+  /// The time in seconds (timers, frames).
+  pub time: f64,
+  /// The viewport size (resize).
+  pub width: f32,
+  pub height: f32,
+}
+
+impl Copy for Delivery {}
+
+/// The builder `subscriptions` writes into. As with views, handlers are lambdas that are never
+/// stored: the runtime asks again when a subscription fires and calls the matching handler.
+pub struct Subscriptions<M> {
+  pub heap: Heap,
+  pub records: List<SubscriptionRecord>,
+  pub bytes: List<u8>,
+  delivering: bool,
+  delivery: Delivery,
+  pub messages: List<M>,
+}
+
+impl<M> Subscriptions<M> {
+  pub fn make() -> Subscriptions<M> {
+    return Subscriptions<M> {
+      heap: Heap.make(),
+      records: List<SubscriptionRecord>.make(),
+      bytes: List<u8>.make(),
+      delivering: false,
+      delivery: Delivery {
+        kind: SubscriptionKind.Every,
+        key: 0,
+        time: 0.0,
+        width: 0.0,
+        height: 0.0,
+      },
+      messages: List<M>.make(),
+    }
+  }
+
+  /// Starts collecting the model's subscriptions.
+  pub fn beginCollect(self: &mut Self) -> () {
+    self.records.clear()
+    self.bytes.clear()
+    self.delivering = false
+  }
+
+  /// Starts delivering `delivery` to the handler with its kind and key.
+  pub fn beginDelivery(self: &mut Self, delivery: Delivery) -> () {
+    self.delivering = true
+    self.delivery = delivery
+  }
+
+  /// The collected subscriptions.
+  pub fn list(self: &Self) -> &[SubscriptionRecord] {
+    return self.records.asSlice()
+  }
+
+  /// The key name of a key binding.
+  pub fn keyName(self: &Self, record: SubscriptionRecord) -> &[u8] {
+    return Slice.view(
+      self.bytes.asSlice(),
+      u32.toUsize(record.keyStart),
+      u32.toUsize(record.keyLength),
+    )
+  }
+
+  fn add(self: &mut Self, record: SubscriptionRecord) -> () {
+    self.heap.alloc(self.records.append(record))
+  }
+
+  fn wants(self: &Self, kind: SubscriptionKind, key: u64) -> bool {
+    return self.delivering && self.delivery.kind == kind && self.delivery.key == key
+  }
+
+  /// `handler(time)` every `interval` seconds, the first one `interval` after the
+  /// subscription starts.
+  pub fn every(self: &mut Self, key: u64, interval: f64, handler: fn(f64) -> M) -> () {
+    if self.wants(SubscriptionKind.Every, key) {
+      self.heap.alloc(self.messages.append(handler(self.delivery.time)))
+    } else if !self.delivering {
+      self.add(
+        SubscriptionRecord {
+          key: key,
+          kind: SubscriptionKind.Every,
+          interval: interval,
+          keyStart: 0,
+          keyLength: 0,
+          modifiers: 0,
+        },
+      )
+    }
+  }
+
+  /// `handler(time)` once per display frame, with the frame's time in seconds. For motion the
+  /// model drives (a game, a chart); style changes animate better inside the tree.
+  pub fn animationFrame(self: &mut Self, key: u64, handler: fn(f64) -> M) -> () {
+    if self.wants(SubscriptionKind.AnimationFrame, key) {
+      self.heap.alloc(self.messages.append(handler(self.delivery.time)))
+    } else if !self.delivering {
+      self.add(
+        SubscriptionRecord {
+          key: key,
+          kind: SubscriptionKind.AnimationFrame,
+          interval: 0.0,
+          keyStart: 0,
+          keyLength: 0,
+          modifiers: 0,
+        },
+      )
+    }
+  }
+
+  /// `handler()` when the key named `name` (a UI Events `key`, such as `"n"` or `"Escape"`)
+  /// goes down with exactly the `MOD_*` bits `modifiers`, wherever focus is. A handler in the
+  /// view that stops the event first wins.
+  pub fn keyBinding(
+    self: &mut Self,
+    key: u64,
+    name: string,
+    modifiers: u32,
+    handler: fn() -> M,
+  ) -> () {
+    if self.wants(SubscriptionKind.KeyBinding, key) {
+      self.heap.alloc(self.messages.append(handler()))
+    } else if !self.delivering {
+      let start = usize.toU32(self.bytes.length())
+      self.heap.alloc(self.bytes.appendSlice(String.utf8Bytes(name)))
+      self.add(
+        SubscriptionRecord {
+          key: key,
+          kind: SubscriptionKind.KeyBinding,
+          interval: 0.0,
+          keyStart: start,
+          keyLength: usize.toU32(String.byteLength(name)),
+          modifiers: modifiers,
+        },
+      )
+    }
+  }
+
+  /// `handler(width, height)` when the viewport changes size, in CSS pixels.
+  pub fn resize(self: &mut Self, key: u64, handler: fn(f32, f32) -> M) -> () {
+    if self.wants(SubscriptionKind.Resize, key) {
+      self.heap.alloc(self.messages.append(handler(self.delivery.width, self.delivery.height)))
+    } else if !self.delivering {
+      self.add(
+        SubscriptionRecord {
+          key: key,
+          kind: SubscriptionKind.Resize,
+          interval: 0.0,
+          keyStart: 0,
+          keyLength: 0,
+          modifiers: 0,
+        },
+      )
+    }
+  }
+}

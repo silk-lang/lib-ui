@@ -1,0 +1,292 @@
+//! IconCache: tiles equal svg_render's output at the same size, hits do not render again, and
+//! animated icons get one tile per rounded frame.
+import icons { IconCache, IconId, IconOptions, IconStyle }
+import uploads { Upload }
+import atlas.atlas { Atlas, AtlasOptions, AtlasTile, AtlasError }
+import svg_render.lib { RenderOptions, RenderError, Pixmap, Environment }
+import svg_render.lib as renderer
+import svg_render.environment { noHostStyles }
+import svg_core.structure { Options as StructureOptions }
+import svg_core.resources { Resolver, DataOnly, Limits as ResourceLimits, ProcessingMode }
+import svg_core.url { Url, UrlError }
+import svg_css.media_features { Environment as MediaEnvironment }
+import svg_css.colors { Color, Context as ColorContext }
+import svg_css.tokens { Limits }
+import svg_fonts.database { FontDatabase }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.num.u32
+import silk.num.usize
+
+fn still() -> &'static [u8] {
+  return b"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='6' fill='#3060c0' fill-opacity='0.75'/><path d='M2 14 L14 2' stroke='black' stroke-width='1.5'/></svg>"
+}
+
+fn spinnerSvg() -> &'static [u8] {
+  return b"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect x='7' y='1' width='2' height='6' fill='green'><animateTransform attributeName='transform' type='rotate' from='0 8 8' to='360 8 8' dur='1s' repeatCount='indefinite'/></rect></svg>"
+}
+
+fn pulseSvg() -> &'static [u8] {
+  return b"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><style>@keyframes p { from { opacity: 0 } to { opacity: 1 } } circle { animation: p 1s linear infinite }</style><circle cx='8' cy='8' r='6'/></svg>"
+}
+
+fn iconEnvironment<'a>(base: &'a Url, fonts: &'a FontDatabase) -> Environment<'a, 'a> {
+  let black = Color.srgb(0.0, 0.0, 0.0, 1.0)
+  let mut structure = StructureOptions.defaults()
+  structure.policy.mode = ProcessingMode.Animated
+  return Environment<'a, 'a> {
+    base: base,
+    media: MediaEnvironment.headless(300.0, 150.0),
+    colors: ColorContext.make(black, [black; 19]),
+    fontFamily: b"serif",
+    systemFonts: [b"16px serif"; 6],
+    cssLimits: Limits.make(),
+    structure: move structure,
+    fonts: fonts,
+    styles: noHostStyles(),
+  }
+}
+
+effect fn invalidBase(error: UrlError) -> never
+  ! RenderError {
+  drop error
+  fail RenderError.InvalidStyleContext
+}
+
+/// Whether the last upload holds `pixmap` (color) or its alpha channel (mask), and its tile has
+/// the pixmap's size.
+fn lastUploadIs(cache: &IconCache, pixmap: &Pixmap, mask: bool) -> bool {
+  let uploads = cache.uploads()
+  if uploads.length == 0 {
+    return false
+  }
+  let upload = uploads[uploads.length - 1]
+  let width = upload.tile.bounds.xMax - upload.tile.bounds.xMin
+  let height = upload.tile.bounds.yMax - upload.tile.bounds.yMin
+  if width != pixmap.width() || height != pixmap.height() {
+    return false
+  }
+  let bytes = cache.uploadBytes()
+  let rgba = pixmap.data()
+  let step: usize = if mask {
+    4
+  } else {
+    1
+  }
+  let pixelBytes: u32 = if mask {
+    1
+  } else {
+    4
+  }
+  if upload.bytesPerRow != width * pixelBytes {
+    return false
+  }
+  let count = rgba.length / step
+  if upload.offset + count > bytes.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < count {
+    let expected = if mask {
+      rgba[i * 4 + 3]
+    } else {
+      rgba[i]
+    }
+    if bytes[upload.offset + i] != expected {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn sameTile(a: AtlasTile, b: AtlasTile) -> bool {
+  return a.id.index == b.id.index && a.id.generation == b.id.generation
+}
+
+effect fn reference(
+  data: &[u8],
+  width: u32,
+  height: u32,
+  time: f64,
+  host: &Environment<'_, '_>,
+) -> Pixmap
+  ! RenderError | OutOfMemoryError
+  ? &mut Resolver | &mut Allocator {
+  let mut options = RenderOptions.make()
+  options.width = width
+  options.height = height
+  options.time = time
+  return run renderer.render(data, &options, host)
+}
+
+test effect fn tilesEqualSvgRenderAtTheSameSize() -> ()
+  ! AssertionError<'static> | RenderError | AtlasError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let base = run Effect.catch<UrlError>(Url.fromFilePath(b"/icons/icon.svg"), invalidBase)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let fonts = FontDatabase.make()
+  let host = iconEnvironment(&base, &fonts)
+  let mut resolver = DataOnly.make(ResourceLimits.defaults())
+  let mut atlas = Atlas.make(AtlasOptions.default())
+  let mut cache = IconCache.make(IconOptions.default())
+  let icon = run cache.register(still(), &host)
+    |> Effect.provideMut<Resolver>(&mut resolver)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(!cache.animated(icon), "a still icon")
+  drop atlas.beginFrame()
+  let sizes: [u32; 6] = [16, 16, 24, 24, 13, 20]
+  let mut i: usize = 0
+  while i < sizes.length {
+    let width = sizes[i]
+    let height = sizes[i + 1]
+    let expected = run reference(still(), width, height, 0.0, &host)
+      |> Effect.provideMut<Resolver>(&mut resolver)
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    let color = run cache.icon(&mut atlas, &host, icon, width, height, IconStyle.Color, 0.0)
+      |> Effect.provideMut<Resolver>(&mut resolver)
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    run Testing.expect(lastUploadIs(&cache, &expected, false), "a color tile is svg_render's RGBA")
+    let mask = run cache.icon(&mut atlas, &host, icon, width, height, IconStyle.Mask, 0.0)
+      |> Effect.provideMut<Resolver>(&mut resolver)
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    run Testing.expect(lastUploadIs(&cache, &expected, true), "a mask tile is svg_render's alpha")
+    run Testing.expect(!sameTile(color, mask), "styles are separate tiles")
+    i = i + 2
+  }
+  run Testing.expect(cache.length() == 6 && cache.uploads().length == 6, "six tiles uploaded")
+
+  // Later frames hit without rendering or uploading.
+  cache.clearUploads()
+  drop atlas.beginFrame()
+  let again = run cache.icon(&mut atlas, &host, icon, 24, 24, IconStyle.Mask, 7.0)
+    |> Effect.provideMut<Resolver>(&mut resolver)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  drop again
+  run Testing.expect(cache.uploads().length == 0, "a hit uploads nothing")
+  run Testing.expect(
+    cache.stats().hits == 1 && cache.stats().misses == 6,
+    "one hit after six misses",
+  )
+}
+
+test effect fn animatedIconsAreCachedPerRoundedFrame() -> ()
+  ! AssertionError<'static> | RenderError | AtlasError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let base = run Effect.catch<UrlError>(Url.fromFilePath(b"/icons/icon.svg"), invalidBase)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let fonts = FontDatabase.make()
+  let host = iconEnvironment(&base, &fonts)
+  let mut resolver = DataOnly.make(ResourceLimits.defaults())
+  let mut atlas = Atlas.make(AtlasOptions.default())
+  let mut cache = IconCache.make(IconOptions { framesPerSecond: 30.0 })
+  let spinner = run cache.register(spinnerSvg(), &host)
+    |> Effect.provideMut<Resolver>(&mut resolver)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let pulse = run cache.register(pulseSvg(), &host)
+    |> Effect.provideMut<Resolver>(&mut resolver)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let still = run cache.register(still(), &host)
+    |> Effect.provideMut<Resolver>(&mut resolver)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(cache.animated(spinner), "SMIL animates")
+  run Testing.expect(cache.animated(pulse), "CSS Animations animate")
+  run Testing.expect(cache.frameOf(still, 5.0) == 0, "a still icon has one frame")
+  run Testing.expect(
+    cache.frameOf(spinner, 0.01) == 0 && cache.frameOf(spinner, 0.02) == 1,
+    "time rounds to the nearest frame",
+  )
+  run Testing.expect(cache.frameOf(spinner, -1.0) == 0, "negative time is frame zero")
+
+  drop atlas.beginFrame()
+  let first = run cache.icon(&mut atlas, &host, spinner, 20, 20, IconStyle.Color, 0.0)
+    |> Effect.provideMut<Resolver>(&mut resolver)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let near = run cache.icon(&mut atlas, &host, spinner, 20, 20, IconStyle.Color, 0.01)
+    |> Effect.provideMut<Resolver>(&mut resolver)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(sameTile(first, near), "times in one frame share a tile")
+  let times: [f64; 4] = [0.25, 0.26, 0.5, 0.75]
+  let mut i: usize = 0
+  while i < times.length {
+    let tile = run cache.icon(&mut atlas, &host, spinner, 20, 20, IconStyle.Color, times[i])
+      |> Effect.provideMut<Resolver>(&mut resolver)
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    run Testing.expect(!sameTile(tile, first), "a later frame is another tile")
+    if i != 1 {
+      // 0.26 s rounds to frame 8 like 0.25 s, so it uploads nothing.
+      let frame = cache.frameOf(spinner, times[i])
+      let expected = run reference(spinnerSvg(), 20, 20, u32.toF64(frame) / 30.0, &host)
+        |> Effect.provideMut<Resolver>(&mut resolver)
+        |> Effect.provideMut<Allocator>(&mut allocator)
+      run Testing.expect(
+        lastUploadIs(&cache, &expected, false),
+        "a frame is svg_render's output at the frame's time",
+      )
+    }
+    i = i + 1
+  }
+  run Testing.expect(cache.length() == 4, "frames 0, 8, 15 and 23")
+  let pulsed = run cache.icon(&mut atlas, &host, pulse, 20, 20, IconStyle.Mask, 0.5)
+    |> Effect.provideMut<Resolver>(&mut resolver)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  drop pulsed
+  let expected = run reference(pulseSvg(), 20, 20, 0.5, &host)
+    |> Effect.provideMut<Resolver>(&mut resolver)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    lastUploadIs(&cache, &expected, true),
+    "a CSS-animated frame matches svg_render",
+  )
+}
+
+test effect fn evictedFramesAreRenderedAgainAndPruned() -> ()
+  ! AssertionError<'static> | RenderError | AtlasError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let base = run Effect.catch<UrlError>(Url.fromFilePath(b"/icons/icon.svg"), invalidBase)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let fonts = FontDatabase.make()
+  let host = iconEnvironment(&base, &fonts)
+  let mut resolver = DataOnly.make(ResourceLimits.defaults())
+
+  // One 16 x 16 monochrome texture holds four 8 x 8 frames.
+  let mut atlas = Atlas.make(
+    AtlasOptions { textureSize: 16, maxTextureSize: 16, maxTextures: 1, padding: 0 },
+  )
+  let mut cache = IconCache.make(IconOptions { framesPerSecond: 10.0 })
+  let spinner = run cache.register(spinnerSvg(), &host)
+    |> Effect.provideMut<Resolver>(&mut resolver)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+
+  // Ten frames of a running animation, one per atlas frame: the oldest are evicted.
+  let mut frame: usize = 0
+  while frame < 10 {
+    drop atlas.beginFrame()
+    drop run cache.icon(&mut atlas, &host, spinner, 8, 8, IconStyle.Mask, usize.toF64(frame) / 10.0)
+      |> Effect.provideMut<Resolver>(&mut resolver)
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    frame = frame + 1
+  }
+  run Testing.expect(cache.stats().misses == 10, "every frame rendered once")
+  let pruned = run cache.prune(&atlas) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(pruned == 6 && cache.length() == 4, "evicted frames are pruned, four stay")
+
+  // The first frame again: evicted, so rendered again.
+  drop atlas.beginFrame()
+  cache.clearUploads()
+  drop run cache.icon(&mut atlas, &host, spinner, 8, 8, IconStyle.Mask, 0.0)
+    |> Effect.provideMut<Resolver>(&mut resolver)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(cache.uploads().length == 1 && cache.stats().misses == 11, "rendered again")
+
+  let empty = run Effect.result(cache.icon(&mut atlas, &host, spinner, 0, 8, IconStyle.Mask, 0.0))
+    |> Effect.provideMut<Resolver>(&mut resolver)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let refused = match &empty {
+    Result<AtlasTile, RenderError | AtlasError | OutOfMemoryError>.Failure { error } => true
+    _ => false
+  }
+  run Testing.expect(refused, "a zero size is refused")
+}

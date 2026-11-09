@@ -1,0 +1,322 @@
+//! Bounded contact sheets for timed inspector captures. Composition runs in the client,
+//! outside the application's event loop. Captions show sample, elapsed milliseconds and
+//! source frame; repeated frame numbers deliberately expose a stalled presentation.
+import reply { writeBase64, writeString }
+import ui_tree.inspect { writeInt }
+import codec.png
+import codec.png { PngError }
+import codec.image { Image, ImageError }
+import vector.pixmap { Pixmap, Rgba8 }
+import silk.collections.bytes { Bytes }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.encoding.base64 { Base64, Base64Error }
+import silk.json.value { Json, Value }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.text.string { String }
+
+/// One client-side capture, limited to 24 thumbnails and at most 60 seconds between samples.
+pub struct Capture {
+  pub count: u32,
+  pub interval: u64,
+  pub columns: u32,
+  pub tileWidth: u32,
+  pub taken: u32,
+  tileHeight: u32,
+  sheet: Option<Pixmap>,
+  metadata: String,
+}
+
+impl Capture {
+  pub fn make() -> Capture {
+    return Capture {
+      count: 10,
+      interval: 100,
+      columns: 5,
+      tileWidth: 480,
+      taken: 0,
+      tileHeight: 0,
+      sheet: Option<Pixmap>.None,
+      metadata: String.make(),
+    }
+  }
+
+  /// Validates options before allocating or asking the app for any captures.
+  pub fn configure(self: &mut Self, arguments: Option<&Value>) -> bool {
+    let count = integer(arguments, "count", 10)
+    let interval = integer(arguments, "intervalMs", 100)
+    let columns = integer(
+      arguments,
+      "columns",
+      if count < 5 {
+        count
+      } else {
+        5
+      },
+    )
+    let width = integer(arguments, "tileWidth", 480)
+    if count < 1 || count > 24 || interval < 16 || interval > 60000 || columns < 1 || columns > 6
+      || columns > count
+      || width < 160
+      || width > 800 {
+      return false
+    }
+    self.count = u64.toU32(count)
+    self.interval = interval
+    self.columns = u64.toU32(columns)
+    self.tileWidth = u64.toU32(width)
+    return true
+  }
+
+  /// Adds a screenshot reply and its actual arrival time. No waiting or app input occurs here.
+  /// The first screenshot fixes the tile aspect ratio; later resizes are fitted inside it.
+  pub effect fn append(self: &mut Self, reply: &Value, elapsed: u64) -> ()
+    ! PngError | ImageError | OutOfMemoryError
+    ? &mut Allocator {
+    let encoded = String.utf8Bytes(Json.asString(Json.field(reply, "png")).unwrapOr(""))
+    let length = match Base64.decodedLength(encoded) {
+      Result<usize, Base64Error>.Success { value } => value
+      Result<usize, Base64Error>.Failure { error } => {
+        fail PngError.InvalidData
+      }
+    }
+    if length > 67108864 {
+      fail PngError.TooLarge
+    }
+    let mut bytes = run Bytes.zeroed(length)
+    match Base64.decodeInto(bytes.asMutSlice(), encoded) {
+      Result<usize, Base64Error>.Success { value } => {
+        bytes.truncate(value)
+      }
+      Result<usize, Base64Error>.Failure { error } => {
+        fail PngError.InvalidData
+      }
+    }
+    let image = run png.decode(bytes.asSlice())
+    if self.taken == 0 {
+      self.tileHeight = image.height() * self.tileWidth / image.width()
+      if self.tileHeight > 600 {
+        self.tileHeight = 600
+      }
+      if self.tileHeight < 1 {
+        self.tileHeight = 1
+      }
+      let mut sheet = run Pixmap.make(
+        self.columns * (self.tileWidth + 8) + 8,
+        ((self.count + self.columns - 1) / self.columns) * (self.tileHeight + 32) + 8,
+      )
+      sheet.clear(Rgba8.make(239, 241, 236, 255))
+      self.sheet = Option<Pixmap>.some(move sheet)
+    }
+    let frame = Json.asU64(Json.field(reply, "frame")).unwrapOr(0)
+    let x = 8 + (self.taken % self.columns) * (self.tileWidth + 8)
+    let y = 8 + (self.taken / self.columns) * (self.tileHeight + 32)
+    let mut label = String.make()
+    run writeInt(&mut label, u32.toU64(self.taken + 1))
+    run label.append(" +")
+    run writeInt(&mut label, elapsed)
+    run label.append("ms f")
+    run writeInt(&mut label, frame)
+    if let Option<Pixmap>.Some { value } = &mut self.sheet {
+      thumbnail(
+        image.width(),
+        image.height(),
+        image.data(),
+        &mut value,
+        x,
+        y + 24,
+        self.tileWidth,
+        self.tileHeight,
+      )
+      caption(&mut value, String.view(&label), x + 4, y + 4)
+    }
+    if self.taken != 0 {
+      run self.metadata.append(",")
+    }
+    run self.metadata.append("{\"sample\":")
+    run writeInt(&mut self.metadata, u32.toU64(self.taken + 1))
+    run self.metadata.append(",\"elapsedMs\":")
+    run writeInt(&mut self.metadata, elapsed)
+    run self.metadata.append(",\"frame\":")
+    run writeInt(&mut self.metadata, frame)
+    run self.metadata.append("}")
+    self.taken = self.taken + 1
+  }
+
+  /// A screenshot-shaped protocol reply with one PNG mosaic plus timing metadata.
+  pub effect fn finish(self: &Self, out: &mut String) -> ()
+    ! ImageError | OutOfMemoryError
+    ? &mut Allocator {
+    if let Option<Pixmap>.Some { value } = &self.sheet {
+      let png = run png.encodePixels(value.width(), value.height(), value.data())
+      out.clear()
+      run out.append("{\"ok\":true,\"scale\":1,\"width\":")
+      run writeInt(&mut out, u32.toU64(value.width()))
+      run out.append(",\"height\":")
+      run writeInt(&mut out, u32.toU64(value.height()))
+      run out.append(",\"samples\":[")
+      run out.append(String.view(&self.metadata))
+      run out.append("],\"png\":\"")
+      run writeBase64(&mut out, png.asSlice())
+      run out.append("\"}")
+    }
+  }
+
+  pub fn timings(self: &Self) -> string {
+    return String.view(&self.metadata)
+  }
+}
+
+fn integer(arguments: Option<&Value>, key: string, fallback: u64) -> u64 {
+  if let Option<&Value>.Some { value } = Json.fieldAt(arguments, key) {
+    return Json.asU64(Option<&Value>.some(value)).unwrapOr(u64.MAX)
+  }
+  return fallback
+}
+
+// A box average retains thin strokes when reducing the capture to a contact-sheet cell.
+fn thumbnail(
+  sw: u32,
+  sh: u32,
+  data: &[u8],
+  target: &mut Pixmap,
+  x: u32,
+  y: u32,
+  w: u32,
+  h: u32,
+) -> () {
+  let mut dw = w
+  let mut dh = sh * w / sw
+  if dh > h {
+    dh = h
+    dw = sw * h / sh
+  }
+  if dw == 0 || dh == 0 {
+    return
+  }
+  let ox = x + (w - dw) / 2
+  let oy = y + (h - dh) / 2
+  let stride = target.width()
+  let dest = target.dataMut()
+  let mut dy: u32 = 0
+  while dy < dh {
+    let mut dx: u32 = 0
+    while dx < dw {
+      let x0 = dx * sw / dw
+      let y0 = dy * sh / dh
+      let x1 = (dx + 1) * sw / dw
+      let y1 = (dy + 1) * sh / dh
+      let mut totals: [u32; 4] = [0; 4]
+      let mut samples: u32 = 0
+      let mut sy = y0
+      while sy < y1 || sy == y0 {
+        let mut sx = x0
+        while sx < x1 || sx == x0 {
+          let at = u32.toUsize((sy * sw + sx) * 4)
+          let mut c: usize = 0
+          while c < 4 {
+            totals[c] = totals[c] + u8.toU32(data[at + c])
+            c = c + 1
+          }
+          samples = samples + 1
+          sx = sx + 1
+        }
+        sy = sy + 1
+      }
+      let at = u32.toUsize(((oy + dy) * stride + ox + dx) * 4)
+      let mut c: usize = 0
+      while c < 4 {
+        dest[at + c] = u32.toU8(totals[c] / samples)
+        c = c + 1
+      }
+      dx = dx + 1
+    }
+    dy = dy + 1
+  }
+}
+
+// Tiny deterministic bitmap captions avoid a font installation dependency in the MCP client.
+fn glyph(c: u8) -> u32 {
+  return match c {
+    48 => 31599
+    49 => 11415
+    50 => 29671
+    51 => 29647
+    52 => 23497
+    53 => 31183
+    54 => 31215
+    55 => 29330
+    56 => 31727
+    57 => 31695
+    43 => 1488
+    109 => 4077
+    115 => 3870
+    102 => 13778
+    _ => 0
+  }
+}
+
+fn caption(target: &mut Pixmap, text: string, x: u32, y: u32) -> () {
+  let width = target.width()
+  let height = target.height()
+  let data = target.dataMut()
+  let chars = String.utf8Bytes(text)
+  let mut i: usize = 0
+  while i < chars.length {
+    let bits = glyph(chars[i])
+    let mut row: u32 = 0
+    while row < 10 {
+      let mut col: u32 = 0
+      while col < 6 {
+        let px = x + usize.toU32(i) * 8 + col
+        let py = y + row
+        if px < width && py < height
+          && (u32.shiftRight(bits, 14 - (row / 2 * 3 + col / 2)) & 1) != 0 {
+          let at = u32.toUsize((py * width + px) * 4)
+          data[at] = 48
+          data[at + 1] = 55
+          data[at + 2] = 46
+          data[at + 3] = 255
+        }
+        col = col + 1
+      }
+      row = row + 1
+    }
+    i = i + 1
+  }
+}
+
+/// Reduces a screenshot before transport, preserving thin strokes with box averaging.
+/// `width` must be positive and no greater than the source width; callers validate it.
+pub effect fn reduced(source: &Pixmap, width: u32) -> Pixmap
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let height = source.height() * width / source.width()
+  let mut result = run Pixmap.make(
+    width,
+    if height == 0 {
+      1
+    } else {
+      height
+    },
+  )
+  thumbnail(
+    source.width(),
+    source.height(),
+    source.data(),
+    &mut result,
+    0,
+    0,
+    width,
+    if height == 0 {
+      1
+    } else {
+      height
+    },
+  )
+  return move result
+}

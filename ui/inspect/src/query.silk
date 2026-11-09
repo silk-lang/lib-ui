@@ -1,0 +1,427 @@
+//! Finding nodes: by id, role, accessible name, label, text and test id, and by position (the
+//! node a pointer would target, with its path, and the node an inspector's picker points at).
+import ui_tree.tree { UiTree }
+import ui_tree.node { NONE }
+import ui_tree.mutation { NodeKind, Role }
+import ui_tree.paint { borderBox, paddingBox }
+import ui_tree.inspect { FragmentInfo, fragmentsOf }
+import layout.lib { FragmentKind }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.usize
+import silk.text.string { String }
+
+/// What to look for. Every field that is set must match; an empty query matches every node.
+///
+/// Text fields match case-insensitively (ASCII) as substrings after trimming, as Playwright's
+/// locators do, unless `exact` asks for the whole value with its case.
+pub struct Query {
+  /// The node's client id.
+  pub id: Option<u32>,
+  pub roleIs: Option<Role>,
+  /// The accessible name: the label attribute, or else the node's text content (the text of
+  /// its descendants, joined by spaces).
+  pub name: String,
+  /// The label attribute alone.
+  pub label: String,
+  /// The value of a text or input node.
+  pub text: String,
+  pub testId: String,
+  pub exact: bool,
+  /// Only nodes inside this one (itself included), or NONE for the whole tree.
+  pub within: u32,
+  /// Whether nodes without a box (`display: none`, detached from the root's layout) and nodes
+  /// with `visibility: hidden` match too.
+  pub includeHidden: bool,
+}
+
+impl Query {
+  /// Matches every visible node.
+  pub fn any() -> Query {
+    return Query {
+      id: Option<u32>.None,
+      roleIs: Option<Role>.None,
+      name: String.make(),
+      label: String.make(),
+      text: String.make(),
+      testId: String.make(),
+      exact: false,
+      within: NONE,
+      includeHidden: false,
+    }
+  }
+
+  pub fn byId(id: u32) -> Query {
+    let mut q = Query.any()
+    q.id = Option<u32>.Some { value: id }
+    q.includeHidden = true
+    return move q
+  }
+
+  pub fn byRole(value: Role) -> Query {
+    let mut q = Query.any()
+    q.roleIs = Option<Role>.Some { value: value }
+    return move q
+  }
+
+  /// A node of role `value` whose accessible name contains `name`, as Playwright's
+  /// `getByRole(role, { name })`.
+  pub effect fn byRoleNamed(value: Role, name: string) -> Query
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut q = Query.byRole(value)
+    q.name = run String.copy(name)
+    return move q
+  }
+
+  pub effect fn byName(name: string) -> Query
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut q = Query.any()
+    q.name = run String.copy(name)
+    return move q
+  }
+
+  pub effect fn byLabel(label: string) -> Query
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut q = Query.any()
+    q.label = run String.copy(label)
+    return move q
+  }
+
+  pub effect fn byText(text: string) -> Query
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut q = Query.any()
+    q.text = run String.copy(text)
+    return move q
+  }
+
+  pub effect fn byTestId(testId: string) -> Query
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut q = Query.any()
+    q.testId = run String.copy(testId)
+    q.exact = true
+    return move q
+  }
+}
+
+// Text matching.
+
+fn lower(b: u8) -> u8 {
+  if b >= 65 && b <= 90 {
+    return b + 32
+  }
+  return b
+}
+
+fn isSpace(b: u8) -> bool {
+  return b == 32 || b == 9 || b == 10 || b == 13
+}
+
+/// `value` trimmed of ASCII white space at both ends.
+fn trimmed(value: string) -> string {
+  let bytes = String.utf8Bytes(value)
+  let mut start: usize = 0
+  let mut end = bytes.length
+  while start < end && isSpace(bytes[start]) {
+    start = start + 1
+  }
+  while end > start && isSpace(bytes[end - 1]) {
+    end = end - 1
+  }
+  return String.slice(value, start, end - start)
+}
+
+/// Whether `value` matches `wanted` (see [`Query`]). An empty `wanted` always matches.
+pub fn textMatches(value: string, wanted: string, exact: bool) -> bool {
+  if String.byteLength(wanted) == 0 {
+    return true
+  }
+  if exact {
+    return same(value, wanted)
+  }
+  let hay = String.utf8Bytes(trimmed(value))
+  let needle = String.utf8Bytes(trimmed(wanted))
+  if needle.length == 0 {
+    return true
+  }
+  if needle.length > hay.length {
+    return false
+  }
+  let mut start: usize = 0
+  while start + needle.length <= hay.length {
+    let mut k: usize = 0
+    while k < needle.length && lower(hay[start + k]) == lower(needle[k]) {
+      k = k + 1
+    }
+    if k == needle.length {
+      return true
+    }
+    start = start + 1
+  }
+  return false
+}
+
+fn same(a: string, b: string) -> bool {
+  let x = String.utf8Bytes(a)
+  let y = String.utf8Bytes(b)
+  if x.length != y.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < x.length {
+    if x[i] != y[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// Names.
+
+effect fn gatherText(tree: &UiTree<'_>, slot: u32, out: &mut String) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let node = tree.node(slot)
+  if node.kind == NodeKind.Text || node.kind == NodeKind.Input {
+    let value = trimmed(String.view(&node.text))
+    if String.byteLength(value) != 0 {
+      if out.ownedByteLength() != 0 {
+        run out.append(" ")
+      }
+      run out.append(value)
+    }
+    return ()
+  }
+  let mut mine = List<u32>.make()
+  run tree.childSlots(slot, &mut mine)
+  let mut i: usize = 0
+  while i < mine.length() {
+    run gatherText(tree, mine.get(i), &mut out)
+    i = i + 1
+  }
+}
+
+/// The text content of node `id`: its own value for text and input nodes, else the values of
+/// the text and input nodes below it in tree order, trimmed and joined by single spaces.
+pub effect fn textContent(tree: &UiTree<'_>, id: u32, out: &mut String) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  let slot = tree.slotOf(id)
+  if slot == NONE {
+    return ()
+  }
+  run gatherText(tree, slot, &mut out)
+}
+
+/// The accessible name of node `id`: its label attribute, or its text content without one.
+pub effect fn accessibleName(tree: &UiTree<'_>, id: u32, out: &mut String) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  let slot = tree.slotOf(id)
+  if slot == NONE {
+    return ()
+  }
+  let node = tree.node(slot)
+  if node.label.ownedByteLength() != 0 {
+    run out.append(String.view(&node.label))
+    return ()
+  }
+  run textContent(tree, id, &mut out)
+}
+
+// Queries.
+
+/// Whether layout gave node `slot` a box and it is not hidden by `visibility`.
+pub effect fn visible(tree: &UiTree<'_>, slot: u32) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !tree.node(slot).computed.text.visible {
+    return false
+  }
+  let mut fragments = List<FragmentInfo>.make()
+  run fragmentsOf(tree, slot, &mut fragments)
+  return fragments.length() != 0
+}
+
+effect fn matchesSlot(tree: &UiTree<'_>, slot: u32, query: &Query, scratch: &mut String) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let node = tree.node(slot)
+  match query.id {
+    Option<u32>.Some { value } => {
+      if node.id != value {
+        return false
+      }
+    }
+    Option<u32>.None => {}
+  }
+  match query.roleIs {
+    Option<Role>.Some { value } => {
+      if node.accessRole != value {
+        return false
+      }
+    }
+    Option<Role>.None => {}
+  }
+  if !textMatches(String.view(&node.testId), String.view(&query.testId), query.exact) {
+    return false
+  }
+  if !textMatches(String.view(&node.label), String.view(&query.label), query.exact) {
+    return false
+  }
+  if query.text.ownedByteLength() != 0 {
+    if node.kind != NodeKind.Text && node.kind != NodeKind.Input {
+      return false
+    }
+    if !textMatches(String.view(&node.text), String.view(&query.text), query.exact) {
+      return false
+    }
+  }
+  if query.name.ownedByteLength() != 0 {
+    run accessibleName(tree, node.id, &mut scratch)
+    if !textMatches(String.view(&scratch), String.view(&query.name), query.exact) {
+      return false
+    }
+  }
+  if !query.includeHidden && !run visible(tree, slot) {
+    return false
+  }
+  return true
+}
+
+/// Whether node `id` matches `query` (ignoring `within`).
+pub effect fn matches(tree: &UiTree<'_>, id: u32, query: &Query) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let slot = tree.slotOf(id)
+  if slot == NONE {
+    return false
+  }
+  let mut scratch = String.make()
+  return run matchesSlot(tree, slot, query, &mut scratch)
+}
+
+/// The ids of the nodes that match `query`, in tree order (a node before its descendants).
+/// Only nodes under the root are searched, unless `within` names a detached subtree.
+pub effect fn queryAll(tree: &UiTree<'_>, query: &Query, out: &mut List<u32>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  let start = if query.within == NONE {
+    tree.root
+  } else {
+    tree.slotOf(query.within)
+  }
+  if start == NONE {
+    return ()
+  }
+  let mut scratch = String.make()
+  let mut stack = List<u32>.make()
+  let mut children = List<u32>.make()
+  run stack.append(start)
+  while stack.length() != 0 {
+    let last = stack.length() - 1
+    let slot = stack.get(last)
+    stack.truncate(last)
+    if run matchesSlot(tree, slot, query, &mut scratch) {
+      run out.append(tree.node(slot).id)
+    }
+    run tree.childSlots(slot, &mut children)
+    let mut i = children.length()
+    while i > 0 {
+      i = i - 1
+      run stack.append(children.get(i))
+    }
+  }
+}
+
+/// The first node that matches `query` in tree order, or NONE.
+pub effect fn queryFirst(tree: &UiTree<'_>, query: &Query) -> u32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut found = List<u32>.make()
+  run queryAll(tree, query, &mut found)
+  if found.length() == 0 {
+    return NONE
+  }
+  return found.get(0)
+}
+
+// Positions.
+
+/// The ids from the root down to the node a pointer at (`x`, `y`) would target, as
+/// `UiTree.hitTest` decides it (text resolves to its element; `pointer-events: none` and
+/// hidden nodes are skipped). Empty when nothing is hit.
+pub effect fn hitPath(tree: &UiTree<'_>, x: f32, y: f32, out: &mut List<u32>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  let id = tree.hitTest(x, y)
+  if id == NONE {
+    return ()
+  }
+  run tree.pathTo(tree.slotOf(id), &mut out)
+}
+
+fn inside(left: f32, top: f32, right: f32, bottom: f32, x: f32, y: f32) -> bool {
+  return x >= left && x < right && y >= top && y < bottom
+}
+
+/// The deepest painted node under (`x`, `y`) in fragment `index` and below it, or NONE: what
+/// devtools' element picker selects. Unlike hit testing it returns text nodes and nodes with
+/// `pointer-events: none`, but still respects clipping and `visibility: hidden`.
+fn pickFragment(tree: &UiTree<'_>, index: usize, x: f32, y: f32) -> u32 {
+  let values = tree.output.fragments.values.asSlice()
+  let f = tree.visualFragment(index)
+  let slot = tree.slotOfCssNode(f.source)
+  let box = borderBox(&f)
+  let opaque = !f.positioningShell && f.kind != FragmentKind.Line && slot != NONE
+  if opaque && f.kind == FragmentKind.Box && tree.node(slot).computed.clips() {
+    let p = paddingBox(&f)
+    if !inside(p.xMin, p.yMin, p.xMax, p.yMax, x, y) {
+      if inside(box.xMin, box.yMin, box.xMax, box.yMax, x, y)
+        && tree.node(slot).computed.text.visible {
+        return slot
+      }
+      return NONE
+    }
+  }
+  let mut child = f.lastChild
+  while child != usize.MAX {
+    let found = pickFragment(tree, child, x, y)
+    if found != NONE {
+      return found
+    }
+    child = values[child].previousSibling
+  }
+  if opaque && inside(box.xMin, box.yMin, box.xMax, box.yMax, x, y)
+    && tree.node(slot).computed.text.visible {
+    return slot
+  }
+  return NONE
+}
+
+/// The id of the topmost, deepest node painted under (`x`, `y`), text nodes included, or
+/// NONE: the element an inspector's picker highlights.
+pub fn pick(tree: &UiTree<'_>, x: f32, y: f32) -> u32 {
+  let values = tree.output.fragments.values.asSlice()
+  let mut index = values.length
+  while index > 0 {
+    index = index - 1
+    if values[index].parent == usize.MAX {
+      let found = pickFragment(tree, index, x, y)
+      if found != NONE {
+        return tree.node(found).id
+      }
+    }
+  }
+  return NONE
+}

@@ -1,0 +1,401 @@
+//! What nodes reference by client id: font family lists, decoded images and parsed SVG icons.
+import atlas.atlas { Atlas, AtlasError, AtlasTile }
+import sprites.icons { IconCache, IconId, IconOptions, IconStyle }
+import sprites.images { ImageId, ImageStore }
+import svg_render.lib { Environment, RenderError }
+import svg_render.environment { noHostStyles }
+import svg_core.structure { Options as StructureOptions }
+import svg_core.resources { DataOnly, Limits as ResourceLimits, ProcessingMode, Resolver }
+import svg_core.url { Url, UrlError }
+import svg_css.colors { Color as CssColor, Context as ColorContext }
+import svg_css.media_features { Environment as MediaEnvironment }
+import svg_css.tokens { Limits }
+import svg_fonts.database { FontDatabase }
+import codec.image { Image }
+import codec.decode
+import font_collection.lib { Family, Generic }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.u64
+import silk.text.string { String }
+
+/// A resource that could not be defined: the data did not decode or parse.
+pub struct ResourceError {}
+
+/// A font family list.
+struct FamilyList {
+  id: u32,
+  families: List<Family>,
+}
+
+fn isSpace(byte: u8) -> bool {
+  return byte == 32 || byte == 9 || byte == 10 || byte == 13
+}
+
+fn lower(byte: u8) -> u8 {
+  if byte >= 65 && byte <= 90 {
+    return byte + 32
+  }
+  return byte
+}
+
+fn sameWord(bytes: &[u8], start: usize, end: usize, word: &[u8]) -> bool {
+  if end - start != word.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < word.length {
+    if lower(bytes[start + i]) != word[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn genericOf(bytes: &[u8], start: usize, end: usize) -> Option<Generic> {
+  if sameWord(bytes, start, end, b"serif") {
+    return Option<Generic>.Some { value: Generic.Serif }
+  }
+  if sameWord(bytes, start, end, b"sans-serif") {
+    return Option<Generic>.Some { value: Generic.SansSerif }
+  }
+  if sameWord(bytes, start, end, b"monospace") {
+    return Option<Generic>.Some { value: Generic.Monospace }
+  }
+  if sameWord(bytes, start, end, b"cursive") {
+    return Option<Generic>.Some { value: Generic.Cursive }
+  }
+  if sameWord(bytes, start, end, b"fantasy") {
+    return Option<Generic>.Some { value: Generic.Fantasy }
+  }
+  if sameWord(bytes, start, end, b"system-ui") {
+    return Option<Generic>.Some { value: Generic.SystemUi }
+  }
+  if sameWord(bytes, start, end, b"emoji") {
+    return Option<Generic>.Some { value: Generic.Emoji }
+  }
+  if sameWord(bytes, start, end, b"math") {
+    return Option<Generic>.Some { value: Generic.Math }
+  }
+  return Option<Generic>.None
+}
+
+/// Parses CSS `font-family` text: comma-separated names, optionally quoted; unquoted generic
+/// keywords become generic families.
+pub effect fn parseFamilies(text: &[u8], out: &mut List<Family>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut at: usize = 0
+  while at < text.length {
+    let mut end = at
+    while end < text.length && text[end] != 44 {
+      end = end + 1
+    }
+    let mut start = at
+    let mut stop = end
+    while start < stop && isSpace(text[start]) {
+      start = start + 1
+    }
+    while stop > start && isSpace(text[stop - 1]) {
+      stop = stop - 1
+    }
+    let mut quoted = false
+    if stop - start >= 2 && (text[start] == 34 || text[start] == 39)
+      && text[stop - 1] == text[start] {
+      start = start + 1
+      stop = stop - 1
+      quoted = true
+    }
+    if stop > start {
+      let mut generic = Option<Generic>.None
+      if !quoted {
+        generic = genericOf(text, start, stop)
+      }
+      match generic {
+        Option<Generic>.Some { value } => {
+          run out.append(Family.generic(value))
+        }
+        Option<Generic>.None => {
+          let mut name = List<u8>.make()
+          let mut i = start
+          while i < stop {
+            run name.append(text[i])
+            i = i + 1
+          }
+          run out.append(run Family.named(name.asSlice()))
+        }
+      }
+    }
+    at = end + 1
+  }
+}
+
+/// The font family lists defined so far.
+pub struct Families {
+  lists: List<FamilyList>,
+}
+
+impl Families {
+  pub fn make() -> Families {
+    return Families { lists: List<FamilyList>.make() }
+  }
+
+  /// Defines (or redefines) family list `id` from CSS `font-family` text.
+  pub effect fn define(self: &mut Self, id: u32, text: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut families = List<Family>.make()
+    run parseFamilies(String.utf8Bytes(text), &mut families)
+    let lists = self.lists.asMutSlice()
+    let mut i: usize = 0
+    while i < lists.length {
+      if lists[i].id == id {
+        lists[i].families = move families
+        return ()
+      }
+      i = i + 1
+    }
+    run self.lists.append(FamilyList { id: id, families: move families })
+  }
+
+  /// A copy of family list `id`, or `sans-serif` when it is not defined.
+  pub effect fn copyOf(self: &Self, id: u32, out: &mut List<Family>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let lists = self.lists.asSlice()
+    let mut i: usize = 0
+    while i < lists.length {
+      if lists[i].id == id {
+        let families = lists[i].families.asSlice()
+        let mut j: usize = 0
+        while j < families.length {
+          run out.append(run families[j].copy())
+          j = j + 1
+        }
+        return ()
+      }
+      i = i + 1
+    }
+    run out.append(Family.generic(Generic.SansSerif))
+  }
+}
+
+/// What a resource id names.
+pub union Resource {
+  Image { pub image: ImageId, pub width: u32, pub height: u32 },
+  Icon { pub icon: IconId },
+}
+
+impl Copy for Resource {}
+
+struct Entry {
+  id: u32,
+  resource: Resource,
+}
+
+impl Copy for Entry {}
+
+struct IconHost {
+  base: Url,
+  fonts: FontDatabase,
+}
+
+fn hostOf<'h>(host: &'h IconHost) -> Environment<'h, 'h> {
+  let black = CssColor.srgb(0.0, 0.0, 0.0, 1.0)
+  let mut structure = StructureOptions.defaults()
+  structure.policy.mode = ProcessingMode.Animated
+  return Environment<'h, 'h> {
+    base: &host.base,
+    media: MediaEnvironment.headless(300.0, 150.0),
+    colors: ColorContext.make(black, [black; 19]),
+    fontFamily: b"sans-serif",
+    systemFonts: [b"16px sans-serif"; 6],
+    cssLimits: Limits.make(),
+    structure: move structure,
+    fonts: &host.fonts,
+    styles: noHostStyles(),
+  }
+}
+
+effect fn badUrl(error: UrlError) -> never
+  ! ResourceError {
+  drop error
+  fail ResourceError {}
+}
+
+effect fn badSvg(error: RenderError) -> never
+  ! ResourceError {
+  drop error
+  fail ResourceError {}
+}
+
+effect fn badImage<E>(error: E) -> never
+  ! ResourceError {
+  drop error
+  fail ResourceError {}
+}
+
+effect fn noTile<E>(error: E) -> Option<AtlasTile> {
+  drop error
+  return Option<AtlasTile>.None
+}
+
+effect fn iconTile(
+  icons: &mut IconCache,
+  atlas: &mut Atlas,
+  host: &Environment<'_, '_>,
+  icon: IconId,
+  width: u32,
+  height: u32,
+  time: f64,
+) -> Option<AtlasTile>
+  ! RenderError | AtlasError | OutOfMemoryError
+  ? &mut Resolver | &mut Allocator {
+  return Option<AtlasTile>.Some {
+    value: run icons.icon(&mut atlas, host, icon, width, height, IconStyle.Mask, time),
+  }
+}
+
+effect fn imageTile(images: &mut ImageStore, atlas: &mut Atlas, id: ImageId) -> Option<AtlasTile>
+  ! AtlasError | OutOfMemoryError
+  ? &mut Allocator {
+  return run images.tile(&mut atlas, id)
+}
+
+/// Images and icons by client resource id.
+pub struct Resources {
+  entries: List<Entry>,
+  pub images: ImageStore,
+  pub icons: IconCache,
+  host: IconHost,
+  resolver: DataOnly,
+}
+
+impl Resources {
+  pub effect fn make() -> Resources
+    ! ResourceError | OutOfMemoryError
+    ? &mut Allocator {
+    let base = run Effect.catch<UrlError>(Url.fromFilePath(b"/ui/icons/icon.svg"), badUrl)
+    return Resources {
+      entries: List<Entry>.make(),
+      images: ImageStore.make(),
+      icons: IconCache.make(IconOptions.default()),
+      host: IconHost { base: move base, fonts: FontDatabase.make() },
+      resolver: DataOnly.make(ResourceLimits.defaults()),
+    }
+  }
+
+  /// The resource defined as `id`.
+  pub fn get(self: &Self, id: u32) -> Option<Resource> {
+    let entries = self.entries.asSlice()
+    let mut i: usize = 0
+    while i < entries.length {
+      if entries[i].id == id {
+        return Option<Resource>.Some { value: entries[i].resource }
+      }
+      i = i + 1
+    }
+    return Option<Resource>.None
+  }
+
+  effect fn put(self: &mut Self, id: u32, resource: Resource) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let entries = self.entries.asMutSlice()
+    let mut i: usize = 0
+    while i < entries.length {
+      if entries[i].id == id {
+        entries[i].resource = resource
+        return ()
+      }
+      i = i + 1
+    }
+    run self.entries.append(Entry { id: id, resource: resource })
+  }
+
+  /// Decodes a PNG or JPEG file as image `id`.
+  pub effect fn defineImage(self: &mut Self, atlas: &mut Atlas, id: u32, data: &[u8]) -> ()
+    ! ResourceError | OutOfMemoryError
+    ? &mut Allocator {
+    let image = run Effect.catchAll(decode.decodeSrgb(data), badImage)
+    run self.defineDecoded(&mut atlas, id, move image)
+  }
+
+  /// Installs already decoded, premultiplied sRGB pixels. Replacing an image frees its old tile.
+  pub effect fn defineDecoded(self: &mut Self, atlas: &mut Atlas, id: u32, image: Image) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let width = image.width()
+    let height = image.height()
+    let stored = run self.images.insert(move image)
+    run self.release(&mut atlas, id)
+    run self.put(id, Resource.Image { image: stored, width: width, height: height })
+  }
+
+  /// Removes a client resource and releases decoded image storage and its atlas tile.
+  pub effect fn release(self: &mut Self, atlas: &mut Atlas, id: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut i: usize = 0
+    while i < self.entries.length() {
+      if self.entries.asSlice()[i].id == id {
+        let old = self.entries.remove(i)
+        match old.resource {
+          Resource.Image { image, .. } => {
+            drop run self.images.remove(&mut atlas, image)
+          }
+          Resource.Icon { icon } => {
+            run self.icons.unregister(&mut atlas, icon)
+          }
+        }
+        return ()
+      }
+      i = i + 1
+    }
+  }
+
+  /// Parses an SVG file as icon `id`.
+  pub effect fn defineIcon(self: &mut Self, atlas: &mut Atlas, id: u32, data: &[u8]) -> ()
+    ! ResourceError | OutOfMemoryError
+    ? &mut Allocator {
+    let host = hostOf(&self.host)
+    let icon = run Effect.catch<RenderError>(self.icons.register(data, &host), badSvg)
+      |> Effect.provideMut<Resolver>(&mut self.resolver)
+    drop host
+    run self.release(&mut atlas, id)
+    run self.put(id, Resource.Icon { icon: icon })
+  }
+
+  /// The mask tile of `icon` at `width` x `height` device pixels, or None when it cannot be drawn.
+  pub effect fn iconTile(
+    self: &mut Self,
+    atlas: &mut Atlas,
+    icon: IconId,
+    width: u32,
+    height: u32,
+    time: f64,
+  ) -> Option<AtlasTile>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let host = hostOf(&self.host)
+    let tile = run Effect.catchAll(
+      iconTile(&mut self.icons, &mut atlas, &host, icon, width, height, time),
+      noTile,
+    )
+      |> Effect.provideMut<Resolver>(&mut self.resolver)
+    drop host
+    return tile
+  }
+
+  /// The tile of `image`, or None when it cannot be placed.
+  pub effect fn imageTile(self: &mut Self, atlas: &mut Atlas, image: ImageId) -> Option<AtlasTile>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run Effect.catch<AtlasError>(imageTile(&mut self.images, &mut atlas, image), noTile)
+  }
+}

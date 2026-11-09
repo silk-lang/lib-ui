@@ -1,0 +1,462 @@
+//! Text system tests over the Noto, Amiri and M+ subsets in ui/text/tests/fonts: fallback by
+//! coverage, line breaking with real advances, glyph runs behind fragments, run sharing and
+//! hyphenation. The Chrome comparison in scripts/chrome-text.mjs checks positions.
+import system { TextSystem }
+import fonts { TextStyle }
+import font_collection.lib { FontCollection, Family }
+import layout.lib as Engine
+import layout.lib {
+  Style,
+  Display,
+  DisplayOutside,
+  DisplayInside,
+  Dimension,
+  Direction,
+  Tree,
+  NodeId,
+  LayoutTree,
+  OptionalSize,
+  InvalidNode,
+  TextError,
+  FragmentationError,
+  FragmentKind,
+  TextFragment
+}
+
+static if Intrinsic.targetOperatingSystem() == "windows" {
+  import silk.platform.windows.host_input { WindowsHostInput }
+  import silk.system.host_input { HostInput }
+} else {
+  import silk.platform.native.host_input { NativeHostInput }
+}
+
+import silk.system.host_input { HostInputError }
+import silk.system.filesystem { Path, FileSystem, FileError }
+import silk.system.filesystem_native { OsFileSystem }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.text.string { String }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.num.f32
+import silk.num.usize
+
+const SANS: string = "ui/text/tests/fonts/NotoSans-Regular.subset.ttf"
+
+const ARABIC: string = "ui/text/tests/fonts/Amiri-Regular.subset.ttf"
+
+const JAPANESE: string = "ui/text/tests/fonts/MPLUS1p-Regular.subset.ttf"
+
+effect fn workingDirectory() -> Bytes
+  ! HostInputError | OutOfMemoryError
+  ? &mut Allocator {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    let mut inputs = run WindowsHostInput.capture()
+    return run HostInput.workingDirectory() |> Effect.provideMut<HostInput>(&mut inputs)
+  } else {
+    return run NativeHostInput.workingDirectory()
+  }
+}
+
+/// Reads a file relative to the repository root (tests run from there).
+effect fn readFile(relative: string) -> Bytes
+  ! FileError | HostInputError | OutOfMemoryError
+  ? &mut Allocator {
+  let cwd = run workingDirectory()
+  let root = run Path.root()
+  let path = run Path.resolve(&root, relative)
+  let mut files = run OsFileSystem.makeBytes(Bytes.asSlice(&cwd))
+  return run FileSystem.readFile(&path) |> Effect.provideMut<FileSystem>(&mut files)
+}
+
+effect fn fonts() -> FontCollection
+  ! FileError | HostInputError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut collection = FontCollection.make()
+  drop run collection.add(run readFile(SANS))
+  drop run collection.add(run readFile(ARABIC))
+  drop run collection.add(run readFile(JAPANESE))
+  return move collection
+}
+
+effect fn sans(size: f32) -> TextStyle
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut families = List<Family>.make()
+  run families.append(run Family.named(String.utf8Bytes("Noto Sans")))
+  return TextStyle.make(move families, size)
+}
+
+/// Lays `text` out in a block `width` wide with font key `key`.
+effect fn layout(system: &mut TextSystem<'_>, key: usize, width: f32, text: string) -> LayoutTree
+  ! OutOfMemoryError | InvalidNode | TextError | FragmentationError
+  ? &mut Allocator {
+  let mut root = Style.make()
+  root.width = Dimension.px(width)
+  root.fontKey = key
+  let mut tree = run Tree.make(move root)
+  let value = run String.copy(text)
+  let rootId = tree.root()
+  drop run tree.appendText(rootId, move value)
+  let mut output = LayoutTree.make()
+  run Engine.compute(&tree, &mut output, &mut system, OptionalSize.definite(width, 100000.0))
+  output.fragments.resolveLocations()
+  return move output
+}
+
+/// The text fragments of `output`, with their y positions.
+effect fn texts(output: &LayoutTree, out: &mut List<TextFragment>, ys: &mut List<f32>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  ys.clear()
+  let fragments = output.fragments.values.asSlice()
+  let mut index: usize = 0
+  while index < fragments.length {
+    let fragment = &fragments[index]
+    if fragment.kind == FragmentKind.Text && fragment.textData != usize.MAX {
+      run out.append(output.fragments.texts.get(fragment.textData))
+      run ys.append(fragment.worldLocation.y)
+    }
+    index = index + 1
+  }
+}
+
+fn near(a: f32, b: f32) -> bool {
+  return f32.abs(a - b) < 0.01
+}
+
+effect fn fontMetricsComeFromTheFaceBody() -> ()
+  ! AssertionError<'static> | FileError | HostInputError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fonts()
+  run Testing.expect(collection.faceCount() == 3, "three faces load")
+  let mut system = TextSystem.make(&collection)
+  let key = run system.addStyle(run sans(16.0))
+  let info = system.keyInfo(key)
+  run Testing.expect(info.face == 0, "Noto Sans is face 0")
+  let metrics = system.fonts.metricsOf(key)
+
+  // Noto Sans: ascender 1069, descender -293 at 1000 units per em.
+  run Testing.expect(metrics.ascent > 16.0 && metrics.ascent < 18.0, "ascent is about 1.07 em")
+  run Testing.expect(metrics.descent > 4.0 && metrics.descent < 6.0, "descent is about 0.29 em")
+}
+
+effect fn latinTextWrapsAtWordBoundariesBody() -> ()
+  ! AssertionError<'static>
+    | FileError
+    | HostInputError
+    | OutOfMemoryError
+    | InvalidNode
+    | TextError
+    | FragmentationError
+  ? &mut Allocator {
+  let collection = run fonts()
+  let mut system = TextSystem.make(&collection)
+  let key = run system.addStyle(run sans(16.0))
+  let wide = run layout(&mut system, key, 1000.0, "The quick brown fox jumps")
+  let mut found = List<TextFragment>.make()
+  let mut ys = List<f32>.make()
+  run texts(&wide, &mut found, &mut ys)
+  run Testing.expect(found.length() > 1, "fragments split at word boundaries")
+  let mut index: usize = 1
+  while index < found.length() {
+    run Testing.expect(ys.get(index) == ys.get(0), "a wide block keeps one line")
+    index = index + 1
+  }
+  run Testing.expect(found.get(0).sourceStart == 0, "the line starts at the text start")
+  run Testing.expect(found.get(found.length() - 1).sourceEnd == 25, "the line ends at the text end")
+  let narrow = run layout(&mut system, key, 60.0, "The quick brown fox jumps")
+  run texts(&narrow, &mut found, &mut ys)
+  let mut lines: usize = 1
+  index = 1
+  while index < found.length() {
+    run Testing.expect(ys.get(index) >= ys.get(index - 1), "lines go down the page")
+    if ys.get(index) > ys.get(index - 1) {
+      lines = lines + 1
+    }
+    let previous = found.get(index - 1)
+    run Testing.expect(
+      found.get(index).sourceStart >= previous.sourceEnd,
+      "fragments follow source order",
+    )
+    index = index + 1
+  }
+  run Testing.expect(lines >= 3, "a narrow block wraps onto several lines")
+}
+
+effect fn fallbackPicksTheFaceThatHasTheCharactersBody() -> ()
+  ! AssertionError<'static>
+    | FileError
+    | HostInputError
+    | OutOfMemoryError
+    | InvalidNode
+    | TextError
+    | FragmentationError
+  ? &mut Allocator {
+  let collection = run fonts()
+  let mut system = TextSystem.make(&collection)
+  let key = run system.addStyle(run sans(20.0))
+  let output = run layout(&mut system, key, 1000.0, "Hi مرحبا 漢字")
+  let mut found = List<TextFragment>.make()
+  let mut ys = List<f32>.make()
+  run texts(&output, &mut found, &mut ys)
+  let mut arabic = false
+  let mut japanese = false
+  let mut latin = false
+  let mut index: usize = 0
+  while index < found.length() {
+    let fragment = found.get(index)
+    let run_ = system.glyphRun(fragment.shapeKey)
+    if run_.face == 1 {
+      arabic = true
+      run Testing.expect(fragment.bidiLevel == 1, "Arabic is right to left")
+      run Testing.expect(run_.rtl, "the Arabic run is shaped right to left")
+    } else if run_.face == 2 {
+      japanese = true
+    } else if run_.face == 0 {
+      latin = true
+    }
+    run Testing.expect(
+      system.keyInfo(fragment.fontKey).face == run_.face,
+      "the fragment's font key names the run's face",
+    )
+    index = index + 1
+  }
+  run Testing.expect(latin && arabic && japanese, "each script falls back to a face that covers it")
+}
+
+effect fn glyphRunsMatchTheirFragmentsBody() -> ()
+  ! AssertionError<'static>
+    | FileError
+    | HostInputError
+    | OutOfMemoryError
+    | InvalidNode
+    | TextError
+    | FragmentationError
+  ? &mut Allocator {
+  let collection = run fonts()
+  let mut system = TextSystem.make(&collection)
+  let key = run system.addStyle(run sans(16.0))
+  let output = run layout(&mut system, key, 1000.0, "AVA office")
+  let fragments = output.fragments.values.asSlice()
+  let mut checked: usize = 0
+  let mut index: usize = 0
+  while index < fragments.length {
+    let fragment = &fragments[index]
+    if fragment.kind == FragmentKind.Text && fragment.textData != usize.MAX {
+      let data = output.fragments.texts.get(fragment.textData)
+      let glyphRun = system.glyphRun(data.shapeKey)
+      let glyphs = system.runGlyphs(data.shapeKey)
+      run Testing.expect(glyphs.length > 0, "the run has glyphs")
+      run Testing.expect(
+        near(glyphRun.advance, fragment.size.width),
+        "the run advance is the fragment width",
+      )
+      run Testing.expect(glyphRun.size == 16.0, "the run keeps the font size")
+      let mut pen: f32 = 0.0
+      let mut at: usize = 0
+      while at < glyphs.length {
+        run Testing.expect(near(glyphs[at].x, pen), "glyphs sit at the running pen position")
+        pen = pen + glyphs[at].advance
+        at = at + 1
+      }
+      checked = checked + 1
+    }
+    index = index + 1
+  }
+  run Testing.expect(checked >= 2, "each word has a run")
+}
+
+effect fn identicalRunsShareAShapeKeyBody() -> ()
+  ! AssertionError<'static>
+    | FileError
+    | HostInputError
+    | OutOfMemoryError
+    | InvalidNode
+    | TextError
+    | FragmentationError
+  ? &mut Allocator {
+  let collection = run fonts()
+  let mut system = TextSystem.make(&collection)
+  let key = run system.addStyle(run sans(16.0))
+  let first = run layout(&mut system, key, 80.0, "same words here")
+  let count = system.glyphs.length()
+  let second = run layout(&mut system, key, 80.0, "same words here")
+  run Testing.expect(system.glyphs.length() == count, "laying out the same text again adds no runs")
+  let mut a = List<TextFragment>.make()
+  let mut b = List<TextFragment>.make()
+  let mut ys = List<f32>.make()
+  run texts(&first, &mut a, &mut ys)
+  run texts(&second, &mut b, &mut ys)
+  run Testing.expect(a.length() == b.length(), "the same lines")
+  let mut index: usize = 0
+  while index < a.length() {
+    run Testing.expect(a.get(index).shapeKey == b.get(index).shapeKey, "the same keys")
+    index = index + 1
+  }
+  system.glyphs.clear()
+  run Testing.expect(system.glyphs.length() == 0, "clear forgets every run")
+}
+
+effect fn softHyphensBreakAndShowAHyphenBody() -> ()
+  ! AssertionError<'static>
+    | FileError
+    | HostInputError
+    | OutOfMemoryError
+    | InvalidNode
+    | TextError
+    | FragmentationError
+  ? &mut Allocator {
+  let collection = run fonts()
+  let mut system = TextSystem.make(&collection)
+  let key = run system.addStyle(run sans(16.0))
+
+  // "extra\u{AD}ordinary": a block too narrow for the word breaks at the soft hyphen.
+  let output = run layout(&mut system, key, 50.0, "extra\u{AD}ordinary")
+  let mut found = List<TextFragment>.make()
+  let mut ys = List<f32>.make()
+  run texts(&output, &mut found, &mut ys)
+  run Testing.expect(found.length() == 2, "the word breaks once")
+  let head = found.get(0)
+  let glyphs = system.runGlyphs(head.shapeKey)
+
+  // Five letters plus the hyphen (the soft hyphen itself shapes to nothing visible).
+  run Testing.expect(glyphs.length >= 6, "the first line ends in a hyphen glyph")
+  run Testing.expect(ys.get(1) > ys.get(0), "the rest goes on the next line")
+}
+
+test effect fn fontMetricsComeFromTheFace() -> ()
+  ! AssertionError<'static> | FileError | HostInputError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run fontMetricsComeFromTheFaceBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn latinTextWrapsAtWordBoundaries() -> ()
+  ! AssertionError<'static>
+    | FileError
+    | HostInputError
+    | OutOfMemoryError
+    | InvalidNode
+    | TextError
+    | FragmentationError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run latinTextWrapsAtWordBoundariesBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn fallbackPicksTheFaceThatHasTheCharacters() -> ()
+  ! AssertionError<'static>
+    | FileError
+    | HostInputError
+    | OutOfMemoryError
+    | InvalidNode
+    | TextError
+    | FragmentationError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run fallbackPicksTheFaceThatHasTheCharactersBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn glyphRunsMatchTheirFragments() -> ()
+  ! AssertionError<'static>
+    | FileError
+    | HostInputError
+    | OutOfMemoryError
+    | InvalidNode
+    | TextError
+    | FragmentationError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run glyphRunsMatchTheirFragmentsBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn identicalRunsShareAShapeKey() -> ()
+  ! AssertionError<'static>
+    | FileError
+    | HostInputError
+    | OutOfMemoryError
+    | InvalidNode
+    | TextError
+    | FragmentationError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run identicalRunsShareAShapeKeyBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn softHyphensBreakAndShowAHyphen() -> ()
+  ! AssertionError<'static>
+    | FileError
+    | HostInputError
+    | OutOfMemoryError
+    | InvalidNode
+    | TextError
+    | FragmentationError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run softHyphensBreakAndShowAHyphenBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Optical sizing changes glyph outlines and advances at the same nominal em size.
+// Reusing the default-axis instance made small native UI labels noticeably too narrow.
+effect fn opticalSizingBody() -> ()
+  ! AssertionError<'static>
+    | FileError
+    | HostInputError
+    | OutOfMemoryError
+    | InvalidNode
+    | TextError
+    | FragmentationError
+  ? &mut Allocator {
+  let mut collection = run fonts()
+  drop run collection.add(run readFile("ui/text/tests/fonts/RobotoFlex.subset.ttf"))
+  let mut system = TextSystem.make(&collection)
+  let mut keys = List<usize>.make()
+  let sizes: [f32; 3] = [12.0, 72.0, 12.0]
+  let mut i: usize = 0
+  while i < sizes.length {
+    let mut families = List<Family>.make()
+    run families.append(run Family.named(String.utf8Bytes("Roboto Flex")))
+    let key = run system.addStyle(TextStyle.make(move families, sizes[i]))
+    run keys.append(key)
+    i = i + 1
+  }
+  run Testing.expect(system.keyInfo(keys.get(0)).face == 3, "variable face selected")
+  run Testing.expect(
+    system.fonts.instanceOf(keys.get(0)) != system.fonts.instanceOf(keys.get(1)),
+    "optical sizes use distinct outlines",
+  )
+  run Testing.expect(
+    system.fonts.instanceOf(keys.get(0)) == system.fonts.instanceOf(keys.get(2)),
+    "same optical size reuses its outline instance",
+  )
+  let mut advances = List<f32>.make()
+  i = 0
+  while i < 2 {
+    let output = run layout(&mut system, keys.get(i), 2000.0, "Hamburgefonts")
+    let mut found = List<TextFragment>.make()
+    let mut ys = List<f32>.make()
+    run texts(&output, &mut found, &mut ys)
+    let advance = system.glyphRun(found.get(0).shapeKey).advance / sizes[i]
+    run advances.append(advance)
+    i = i + 1
+  }
+  run Testing.expect(
+    f32.abs(advances.get(0) - advances.get(1)) > 0.01,
+    "optical sizing changes normalized advances",
+  )
+  let small = run system.addStyle(run sans(12.0))
+  let large = run system.addStyle(run sans(72.0))
+  run Testing.expect(
+    system.fonts.instanceOf(small) == system.fonts.instanceOf(large),
+    "static fonts share outlines across sizes",
+  )
+}
+
+test effect fn opticalSizingUsesTheRequestedTextSize() -> ()
+  ! AssertionError<'static>
+    | FileError
+    | HostInputError
+    | OutOfMemoryError
+    | InvalidNode
+    | TextError
+    | FragmentationError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run opticalSizingBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}

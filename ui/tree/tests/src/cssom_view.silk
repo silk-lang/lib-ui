@@ -1,0 +1,277 @@
+//! CSSOM View must observe the actual rendered fragment, pointer and scroll paths.
+import ui_tree.lib {
+  UiTree,
+  TreeError,
+  Batch,
+  FrameInput,
+  NodeKind,
+  Property,
+  Length,
+  Position,
+  Overflow,
+  Input,
+  NONE
+}
+import ui_tree.cssom_view as view
+import ui_fixtures.fixtures as fixtures
+import svg_css.cssom_view { ScrollBehavior, ScrollIntoViewOptions, CheckVisibilityOptions }
+import svg_css.cssom_view_window { ScrollResult, ScrollRequest }
+import svg_css.cssom_geometry { DOMRect }
+import svg_css.cssom_error { CssomError }
+import svg_css.cssom_view_geometry { getBoxQuads, BoxQuadOptions }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.testing.testing { Testing, AssertionError }
+
+fn frameAt(time: f64) -> FrameInput {
+  return FrameInput { width: 300.0, height: 200.0, scale: 1.0, time: time }
+}
+
+effect fn hitBody() -> ()
+  ! TreeError | CssomError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.style(
+    1,
+    &[Property.Width { value: Length.px(300.0) }, Property.Height { value: Length.px(200.0) }],
+  )
+  run batch.box(
+    1,
+    2,
+    &[
+      Property.Width { value: Length.px(50.0) },
+      Property.Height { value: Length.px(50.0) },
+      Property.Position { value: Position.Relative },
+      Property.OverflowX { value: Overflow.Clip },
+      Property.OverflowY { value: Overflow.Visible },
+    ],
+  )
+  run batch.box(
+    2,
+    3,
+    &[Property.Width { value: Length.px(40.0) }, Property.Height { value: Length.px(100.0) }],
+  )
+  run tree.apply(run batch.take())
+  run tree.frame(frameAt(0.0))
+  run Testing.expect(
+    tree.hitTest(20.0, 70.0) == 3,
+    "visible vertical overflow remains pointer targetable",
+  )
+  run Testing.expect(
+    view.elementFromPoint(&tree, 20.0, 70.0) == 3,
+    "View uses the same overflow traversal",
+  )
+  let mut hits = List<u32>.make()
+  run view.elementsFromPoint(&tree, 20.0, 20.0, &mut hits)
+  run Testing.expect(
+    hits.length() == 3 && hits.get(0) == 3 && hits.get(1) == 2 && hits.get(2) == 1,
+    "hit stack is reverse fragment paint order, children before parents",
+  )
+  let rect = run view.getBoundingClientRect(&tree, 3)
+  run Testing.expect(
+    rect.width == 40.0 && rect.height == 100.0,
+    "client geometry comes from own border fragments",
+  )
+  let quads = run getBoxQuads(&view.NativeGeometry { tree: &tree }, 3, BoxQuadOptions.make())
+  run Testing.expect(
+    quads.length() == 1 && quads.get(0).bounds().height == rect.height,
+    "GeometryUtils adapts the same actual fragment",
+  )
+  run Testing.expect(
+    view.elementFromPoint(&tree, 301.0, 1.0) == NONE,
+    "viewport rejection precedes hit traversal",
+  )
+  run Testing.expect(
+    view.elementFromPoint(&tree, 300.0, 200.0) == 1,
+    "equal viewport edge keeps root fallback",
+  )
+  let mut change = Batch.make()
+  run change.style(2, &[Property.PointerEvents { value: false }])
+  run tree.apply(run change.take())
+  run tree.frame(frameAt(0.0))
+  run Testing.expect(tree.hitTest(20.0, 20.0) == 1, "pointer-events inherits through descendants")
+  let mut override = Batch.make()
+  run override.style(3, &[Property.PointerEvents { value: true }, Property.Opacity { value: 0.0 }])
+  run tree.apply(run override.take())
+  run tree.frame(frameAt(0.0))
+  run Testing.expect(
+    tree.hitTest(20.0, 20.0) == 3,
+    "descendant auto overrides inherited none, opacity does not suppress hits",
+  )
+  run Testing.expect(
+    view.checkVisibility(&tree, 3, CheckVisibilityOptions.make()),
+    "opacity is opt-in for visibility",
+  )
+  let mut visibility = CheckVisibilityOptions.make()
+  visibility.opacityProperty = true
+  run Testing.expect(
+    !view.checkVisibility(&tree, 3, visibility),
+    "visibility checks computed opacity when requested",
+  )
+}
+
+test effect fn viewNativeHitsClippingAndGeometryShareRenderedFragments() -> ()
+  ! TreeError | CssomError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run hitBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn scrollBody() -> ()
+  ! TreeError | CssomError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.style(
+    1,
+    &[Property.Width { value: Length.px(300.0) }, Property.Height { value: Length.px(200.0) }],
+  )
+  run batch.box(
+    1,
+    2,
+    &[
+      Property.Width { value: Length.px(100.0) },
+      Property.Height { value: Length.px(60.0) },
+      Property.OverflowY { value: Overflow.Auto },
+    ],
+  )
+  run batch.box(
+    2,
+    3,
+    &[Property.Width { value: Length.px(80.0) }, Property.Height { value: Length.px(240.0) }],
+  )
+  run batch.box(
+    2,
+    4,
+    &[Property.Width { value: Length.px(80.0) }, Property.Height { value: Length.px(20.0) }],
+  )
+  run tree.apply(run batch.take())
+  run tree.frame(frameAt(0.0))
+  let before = run view.getBoundingClientRect(&tree, 4)
+  let smooth = run view.requestScroll(&mut tree, 2, 0.0, 100.0, ScrollBehavior.Smooth, false, true)
+  run Testing.expect(
+    tree.needsFrame() && tree.scrollOffset(2).y == 0.0,
+    "smooth request schedules real future frames",
+  )
+  run tree.frame(frameAt(0.125))
+  let middle = tree.scrollOffset(2).y
+  run Testing.expect(
+    middle > 0.0 && middle < 100.0,
+    "actual frame time advances actual scroll offset",
+  )
+  let moving = run view.getBoundingClientRect(&tree, 4)
+  run Testing.expect(
+    moving.y == before.y - f32.toF64(middle),
+    "geometry tracks animation offsets without relayout",
+  )
+  run tree.frame(frameAt(0.25))
+  run Testing.expect(
+    tree.scrollOffset(2).y == 100.0 && !view.scrollAnimating(&tree),
+    "smooth completes at clamped destination",
+  )
+  run Testing.expect(
+    match tree.viewScrollState.result(smooth.id) {
+      Option<ScrollResult>.Some { value } => value == ScrollResult.Completed
+      _ => false
+    },
+    "completion is observed after final offset is applied",
+  )
+  let interrupted = run view.requestScroll(
+    &mut tree,
+    2,
+    0.0,
+    180.0,
+    ScrollBehavior.Smooth,
+    false,
+    true,
+  )
+  run tree.dispatch(Input.Wheel { x: 10.0, y: 10.0, deltaX: 0.0, deltaY: -5.0, modifiers: 0 })
+  run Testing.expect(
+    match tree.viewScrollState.result(interrupted.id) {
+      Option<ScrollResult>.Some { value } => value == ScrollResult.Interrupted
+      _ => false
+    },
+    "wheel input interrupts pending animation rather than fighting its offsets",
+  )
+  let mut requests = List<ScrollRequest>.make()
+  run view.scrollIntoView(&mut tree, 4, ScrollIntoViewOptions.make(), false, false, &mut requests)
+  let shown = run view.getBoundingClientRect(&tree, 4)
+  run Testing.expect(shown.bottom() <= 60.0, "scrollIntoView clamps using actual overflow extent")
+  let measured = view.metrics(&tree, 2)
+  run Testing.expect(
+    measured.clientHeight == 60.0 && measured.scrollHeight == 260.0,
+    "client and scroll extents use padding and real layout overflow",
+  )
+}
+
+test effect fn viewSmoothScrollUpdatesActualGeometryAndInterruptsOnInput() -> ()
+  ! TreeError | CssomError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run scrollBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn rangeBody() -> ()
+  ! TreeError | CssomError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.style(
+    1,
+    &[Property.FontSize { value: 20.0 }, Property.Width { value: Length.px(280.0) }],
+  )
+  run batch.text(1, 2, "AéBC")
+  run tree.apply(run batch.take())
+  run tree.frame(frameAt(0.0))
+  let mut rects = List<DOMRect>.make()
+  run view.rangeClientRects(
+    &tree,
+    view.Range {
+      start: view.BoundaryPoint { node: 2, offset: 1 },
+      end: view.BoundaryPoint { node: 2, offset: 2 },
+    },
+    &mut rects,
+  )
+  run Testing.expect(
+    rects.length() > 0 && rects.get(0).width > 0.0,
+    "UTF-16 range selects the actual multibyte grapheme's shaped advance",
+  )
+  let rect = rects.get(0)
+  let found = run view.caretPositionFromPoint(&tree, rect.x + 0.1, rect.y + rect.height / 2.0)
+  run Testing.expect(
+    match found {
+      Option<view.CaretPosition>.Some { value } => value.offsetNode == 2 && value.offset == 1
+      _ => false
+    },
+    "caret hit converts byte offset back to UTF-16 and returns the actual text node",
+  )
+  run view.rangeClientRects(
+    &tree,
+    view.Range {
+      start: view.BoundaryPoint { node: 2, offset: 2 },
+      end: view.BoundaryPoint { node: 2, offset: 2 },
+    },
+    &mut rects,
+  )
+  run Testing.expect(
+    rects.length() > 0 && rects.get(0).width == 0.0 && rects.get(0).height > 0.0,
+    "collapsed text range retains a zero-width font-metric rectangle",
+  )
+}
+
+test effect fn viewCaretAndRangesUseNativeGlyphRunsAndDomOffsets() -> ()
+  ! TreeError | CssomError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run rangeBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}

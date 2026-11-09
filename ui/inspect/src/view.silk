@@ -1,0 +1,1413 @@
+//! The live view of one node, like devtools' Elements side panel: what the node is, its
+//! attributes, listeners and states, its box model, the style patches the client set per
+//! state, and the computed style. Deterministic text, for people and agents alike.
+import ui_tree.mutation {
+  BaselineSource,
+  BoxDecorationBreak,
+  BreakBetween,
+  BreakInside,
+  Clear,
+  Float,
+  LayoutTextAlign,
+  MarginBreak,
+  OverflowAlignment,
+  ScrollbarGutter,
+  ScrollbarWidth,
+  TabSize,
+  TextIndent,
+  TextJustify,
+  TextOrientation,
+  TextWrap,
+  UnicodeBidi,
+  VerticalAlign,
+  Visibility,
+  WhiteSpaceCollapse,
+  WritingMode,
+  VerticalAlignKind,
+  Dimension,
+  DimensionKind,
+  ObjectFit
+}
+import silk.num.usize
+import ui_tree.tree { UiTree }
+import ui_tree.node { NONE }
+import ui_tree.mutation {
+  Property,
+  Length,
+  Side,
+  Display,
+  FlexDirection,
+  FlexWrap,
+  Align,
+  Position,
+  Overflow,
+  BoxSizing,
+  BorderStyle,
+  FontStyle,
+  LineHeight,
+  TextAlign,
+  WhiteSpace,
+  Direction,
+  Cursor,
+  NOT_FOCUSABLE,
+  LISTEN_POINTER_DOWN,
+  LISTEN_POINTER_UP,
+  LISTEN_CLICK,
+  LISTEN_POINTER_MOVE,
+  LISTEN_POINTER_ENTER,
+  LISTEN_POINTER_LEAVE,
+  LISTEN_WHEEL,
+  LISTEN_KEY_DOWN,
+  LISTEN_KEY_UP,
+  LISTEN_FOCUS,
+  LISTEN_BLUR,
+  LISTEN_INPUT,
+  LISTEN_SCROLL
+}
+import ui_tree.mutation { Role, NodeKind }
+import ui_tree.style { Computed, Fill }
+import ui_tree.inspect { kindName, roleName, writeInt, writeNumber }
+import overlay { BoxModel, boxModels }
+import silk.collections.list { List }
+import silk.color.rgba { Rgba }
+import silk.geometry.corners { Corners }
+import silk.geometry.rect { Rect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.i32
+import silk.num.i64
+import silk.num.u32
+import silk.text.string { String }
+
+// Values.
+
+effect fn color(out: &mut String, c: Rgba<f32>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.append("rgba(")
+  run writeInt(&mut out, f32.toU64(f32.floor(f32.max(0.0, f32.min(1.0, c.r)) * 255.0 + 0.5)))
+  run out.append(",")
+  run writeInt(&mut out, f32.toU64(f32.floor(f32.max(0.0, f32.min(1.0, c.g)) * 255.0 + 0.5)))
+  run out.append(",")
+  run writeInt(&mut out, f32.toU64(f32.floor(f32.max(0.0, f32.min(1.0, c.b)) * 255.0 + 0.5)))
+  run out.append(",")
+  run writeNumber(&mut out, c.a)
+  run out.append(")")
+}
+
+effect fn px(out: &mut String, value: f32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run writeNumber(&mut out, value)
+  run out.append("px")
+}
+
+effect fn length(out: &mut String, value: Length) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match value {
+    Length.Calc { pixels, percent } => {
+      run out.append("calc(")
+      run px(&mut out, pixels)
+      run out.append(" + ")
+      run writeNumber(&mut out, percent)
+      run out.append("%)")
+    }
+    Length.MinContent => {
+      run out.append("min-content")
+    }
+    Length.MaxContent => {
+      run out.append("max-content")
+    }
+    Length.FitContent => {
+      run out.append("fit-content")
+    }
+    Length.Content => {
+      run out.append("content")
+    }
+    Length.Normal => {
+      run out.append("normal")
+    }
+
+    Length.Auto => {
+      run out.append("auto")
+    }
+    Length.None => {
+      run out.append("none")
+    }
+    Length.Px { value: v } => {
+      run px(&mut out, v)
+    }
+    Length.Percent { value: v } => {
+      run writeNumber(&mut out, v)
+      run out.append("%")
+    }
+  }
+}
+
+effect fn rect(out: &mut String, r: Rect<f32>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.append("[")
+  run writeNumber(&mut out, r.xMin)
+  run out.append(",")
+  run writeNumber(&mut out, r.yMin)
+  run out.append(" ")
+  run writeNumber(&mut out, r.xMax - r.xMin)
+  run out.append("x")
+  run writeNumber(&mut out, r.yMax - r.yMin)
+  run out.append("]")
+}
+
+effect fn signed(out: &mut String, value: i32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if value < 0 {
+    run out.append("-")
+    run writeInt(&mut out, i64.toU64(-i32.toI64(value)))
+  } else {
+    run writeInt(&mut out, i64.toU64(i32.toI64(value)))
+  }
+}
+
+fn sideName(side: Side) -> string<'static> {
+  return match side {
+    Side.Top => "top"
+    Side.Right => "right"
+    Side.Bottom => "bottom"
+    Side.Left => "left"
+  }
+}
+
+fn displayName(value: Display) -> string<'static> {
+  return match value {
+    Display.None => "none"
+    Display.Block => "block"
+    Display.Inline => "inline"
+    Display.InlineBlock => "inline-block"
+    Display.Flex => "flex"
+    Display.InlineFlex => "inline-flex"
+    Display.FlowRoot => "flow-root"
+    Display.Grid => "grid"
+    Display.InlineGrid => "inline-grid"
+    Display.Contents => "contents"
+  }
+}
+
+fn directionName(value: FlexDirection) -> string<'static> {
+  return match value {
+    FlexDirection.Row => "row"
+    FlexDirection.RowReverse => "row-reverse"
+    FlexDirection.Column => "column"
+    FlexDirection.ColumnReverse => "column-reverse"
+  }
+}
+
+fn wrapName(value: FlexWrap) -> string<'static> {
+  return match value {
+    FlexWrap.NoWrap => "nowrap"
+    FlexWrap.Wrap => "wrap"
+    FlexWrap.WrapReverse => "wrap-reverse"
+  }
+}
+
+fn alignName(value: Align) -> string<'static> {
+  return match value {
+    Align.Auto => "auto"
+    Align.Normal => "normal"
+    Align.Start => "start"
+    Align.End => "end"
+    Align.Center => "center"
+    Align.Stretch => "stretch"
+    Align.Baseline => "baseline"
+    Align.SpaceBetween => "space-between"
+    Align.SpaceAround => "space-around"
+    Align.SpaceEvenly => "space-evenly"
+    Align.FlexStart => "flex-start"
+    Align.FlexEnd => "flex-end"
+    Align.LastBaseline => "last-baseline"
+    Align.SelfStart => "self-start"
+    Align.SelfEnd => "self-end"
+    Align.Left => "left"
+    Align.Right => "right"
+  }
+}
+
+fn positionName(value: Position) -> string<'static> {
+  return match value {
+    Position.Static => "static"
+    Position.Relative => "relative"
+    Position.Absolute => "absolute"
+    Position.Fixed => "fixed"
+    Position.Sticky => "sticky"
+  }
+}
+
+fn overflowName(value: Overflow) -> string<'static> {
+  return match value {
+    Overflow.Visible => "visible"
+    Overflow.Hidden => "hidden"
+    Overflow.Clip => "clip"
+    Overflow.Scroll => "scroll"
+    Overflow.Auto => "auto"
+  }
+}
+
+fn boxSizingName(value: BoxSizing) -> string<'static> {
+  return match value {
+    BoxSizing.ContentBox => "content-box"
+    BoxSizing.BorderBox => "border-box"
+  }
+}
+
+fn borderStyleName(value: BorderStyle) -> string<'static> {
+  return match value {
+    BorderStyle.None => "none"
+    BorderStyle.Solid => "solid"
+    BorderStyle.Dashed => "dashed"
+  }
+}
+
+fn fontStyleName(value: FontStyle) -> string<'static> {
+  return match value {
+    FontStyle.Normal => "normal"
+    FontStyle.Italic => "italic"
+  }
+}
+
+fn textAlignName(value: TextAlign) -> string<'static> {
+  return match value {
+    TextAlign.Auto => "auto"
+    TextAlign.Start => "start"
+    TextAlign.End => "end"
+    TextAlign.Left => "left"
+    TextAlign.Right => "right"
+    TextAlign.Center => "center"
+    TextAlign.Justify => "justify"
+  }
+}
+
+fn whiteSpaceName(value: WhiteSpace) -> string<'static> {
+  return match value {
+    WhiteSpace.Normal => "normal"
+    WhiteSpace.NoWrap => "nowrap"
+    WhiteSpace.Pre => "pre"
+    WhiteSpace.PreWrap => "pre-wrap"
+    WhiteSpace.PreLine => "pre-line"
+  }
+}
+
+fn textDirectionName(value: Direction) -> string<'static> {
+  return match value {
+    Direction.Ltr => "ltr"
+    Direction.Rtl => "rtl"
+  }
+}
+
+pub fn cursorName(value: Cursor) -> string<'static> {
+  return match value {
+    Cursor.Default => "default"
+    Cursor.Pointer => "pointer"
+    Cursor.Text => "text"
+    Cursor.Move => "move"
+    Cursor.Grab => "grab"
+    Cursor.Grabbing => "grabbing"
+    Cursor.NotAllowed => "not-allowed"
+    Cursor.ResizeHorizontal => "ew-resize"
+    Cursor.ResizeVertical => "ns-resize"
+    Cursor.ResizeNorthWestSouthEast => "nwse-resize"
+    Cursor.ResizeNorthEastSouthWest => "nesw-resize"
+    Cursor.Crosshair => "crosshair"
+  }
+}
+
+effect fn corners(out: &mut String, r: Corners<f32>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run px(&mut out, r.topLeft)
+  if r.topRight != r.topLeft || r.bottomRight != r.topLeft || r.bottomLeft != r.topLeft {
+    run out.append(" ")
+    run px(&mut out, r.topRight)
+    run out.append(" ")
+    run px(&mut out, r.bottomRight)
+    run out.append(" ")
+    run px(&mut out, r.bottomLeft)
+  }
+}
+
+effect fn named(out: &mut String, name: string, value: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.append(name)
+  run out.append(": ")
+  run out.append(value)
+}
+
+effect fn sided(out: &mut String, name: string, side: Side) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.append(name)
+  run out.append("-")
+  run out.append(sideName(side))
+  run out.append(": ")
+}
+
+/// Writes `property` as a CSS declaration without the semicolon, such as `padding-top: 6px`.
+pub effect fn writeProperty(out: &mut String, property: Property) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match property {
+    Property.UnicodeBidi { value } => {
+      run out.append("unicode-bidi: ")
+      run out.append(unicodeBidiName(value))
+    }
+    Property.WritingMode { value } => {
+      run out.append("writing-mode: ")
+      run out.append(writingModeName(value))
+    }
+    Property.TextOrientation { value } => {
+      run out.append("text-orientation: ")
+      run out.append(textOrientationName(value))
+    }
+    Property.VerticalAlign { value } => {
+      run out.append("vertical-align: ")
+      if value.kind == VerticalAlignKind.Shift {
+        run dimension(&mut out, value.shift)
+      } else {
+        run out.append(verticalName(value.kind))
+      }
+    }
+    Property.BaselineSource { value } => {
+      run out.append("baseline-source: ")
+      run out.append(baselineSourceName(value))
+    }
+    Property.TextAlignLast { value } => {
+      run out.append("text-align-last: ")
+      run out.append(layoutTextAlignName(value))
+    }
+    Property.TextWrap { value } => {
+      run out.append("text-wrap: ")
+      run out.append(textWrapName(value))
+    }
+    Property.WhiteSpaceCollapse { value } => {
+      run out.append("white-space-collapse: ")
+      run out.append(whiteSpaceCollapseName(value))
+    }
+    Property.TextJustify { value } => {
+      run out.append("text-justify: ")
+      run out.append(textJustifyName(value))
+    }
+    Property.TextIndent { value } => {
+      run out.append("text-indent: ")
+      run dimension(&mut out, value.value)
+      if value.hanging {
+        run out.append(" hanging")
+      }
+      if value.eachLine {
+        run out.append(" each-line")
+      }
+    }
+    Property.TabSize { value } => {
+      run out.append("tab-size: ")
+      match value {
+        TabSize.Number { value: n } => {
+          run writeNumber(&mut out, n)
+        }
+        TabSize.Length { value: n } => {
+          run px(&mut out, n)
+        }
+      }
+    }
+    Property.BoxDecorationBreak { value } => {
+      run out.append("box-decoration-break: ")
+      run out.append(boxDecorationBreakName(value))
+    }
+    Property.MarginBreak { value } => {
+      run out.append("margin-break: ")
+      run out.append(marginBreakName(value))
+    }
+    Property.BreakBefore { value } => {
+      run out.append("break-before: ")
+      run out.append(breakBetweenName(value))
+    }
+    Property.BreakAfter { value } => {
+      run out.append("break-after: ")
+      run out.append(breakBetweenName(value))
+    }
+    Property.BreakInside { value } => {
+      run out.append("break-inside: ")
+      run out.append(breakInsideName(value))
+    }
+    Property.Orphans { value } => {
+      run out.append("orphans: ")
+      run writeInt(&mut out, usize.toU64(value))
+    }
+    Property.Widows { value } => {
+      run out.append("widows: ")
+      run writeInt(&mut out, usize.toU64(value))
+    }
+    Property.Order { value } => {
+      run out.append("order: ")
+      run signed(&mut out, value)
+    }
+    Property.JustifySelf { value } => {
+      run out.append("justify-self: ")
+      run out.append(alignName(value))
+    }
+    Property.JustifyItems { value } => {
+      run out.append("justify-items: ")
+      run out.append(alignName(value))
+    }
+    Property.JustifyContentSafety { value } => {
+      run out.append("justify-content-safety: ")
+      run out.append(overflowAlignmentName(value))
+    }
+    Property.AlignContentSafety { value } => {
+      run out.append("align-content-safety: ")
+      run out.append(overflowAlignmentName(value))
+    }
+    Property.AlignItemsSafety { value } => {
+      run out.append("align-items-safety: ")
+      run out.append(overflowAlignmentName(value))
+    }
+    Property.AlignSelfSafety { value } => {
+      run out.append("align-self-safety: ")
+      run out.append(overflowAlignmentName(value))
+    }
+    Property.JustifySelfSafety { value } => {
+      run out.append("justify-self-safety: ")
+      run out.append(overflowAlignmentName(value))
+    }
+    Property.JustifyItemsSafety { value } => {
+      run out.append("justify-items-safety: ")
+      run out.append(overflowAlignmentName(value))
+    }
+    Property.ScrollbarWidth { value } => {
+      run out.append("scrollbar-width: ")
+      run out.append(scrollbarWidthName(value))
+    }
+    Property.ScrollbarGutter { value } => {
+      run out.append("scrollbar-gutter: ")
+      run out.append(scrollbarGutterName(value))
+    }
+    Property.Float { value } => {
+      run out.append("float: ")
+      run out.append(floatName(value))
+    }
+    Property.Clear { value } => {
+      run out.append("clear: ")
+      run out.append(clearName(value))
+    }
+    Property.Visibility { value } => {
+      run out.append("visibility: ")
+      run out.append(visibilityName(value))
+    }
+    Property.AspectRatioAuto { value } => {
+      run out.append("aspect-ratio-auto: ")
+      run out.append(
+        if value {
+          "true"
+        } else {
+          "false"
+        },
+      )
+    }
+    Property.ObjectFit { value } => {
+      run named(
+        &mut out,
+        "object-fit",
+        match value {
+          ObjectFit.Fill => "fill"
+          ObjectFit.Contain => "contain"
+          ObjectFit.Cover => "cover"
+          ObjectFit.None => "none"
+          ObjectFit.ScaleDown => "scale-down"
+        },
+      )
+    }
+    Property.ObjectPosition { x, y } => {
+      run out.append("object-position: ")
+      run length(&mut out, x)
+      run out.append(" ")
+      run length(&mut out, y)
+    }
+
+    Property.Display { value } => {
+      run named(&mut out, "display", displayName(value))
+    }
+    Property.Width { value } => {
+      run out.append("width: ")
+      run length(&mut out, value)
+    }
+    Property.Height { value } => {
+      run out.append("height: ")
+      run length(&mut out, value)
+    }
+    Property.MinWidth { value } => {
+      run out.append("min-width: ")
+      run length(&mut out, value)
+    }
+    Property.MinHeight { value } => {
+      run out.append("min-height: ")
+      run length(&mut out, value)
+    }
+    Property.MaxWidth { value } => {
+      run out.append("max-width: ")
+      run length(&mut out, value)
+    }
+    Property.MaxHeight { value } => {
+      run out.append("max-height: ")
+      run length(&mut out, value)
+    }
+    Property.Margin { side, value } => {
+      run sided(&mut out, "margin", side)
+      run length(&mut out, value)
+    }
+    Property.Padding { side, value } => {
+      run sided(&mut out, "padding", side)
+      run length(&mut out, value)
+    }
+    Property.BorderWidth { side, value } => {
+      run out.append("border-")
+      run out.append(sideName(side))
+      run out.append("-width: ")
+      run px(&mut out, value)
+    }
+    Property.Inset { side, value } => {
+      run out.append(sideName(side))
+      run out.append(": ")
+      run length(&mut out, value)
+    }
+    Property.Position { value } => {
+      run named(&mut out, "position", positionName(value))
+    }
+    Property.BoxSizing { value } => {
+      run named(&mut out, "box-sizing", boxSizingName(value))
+    }
+    Property.FlexDirection { value } => {
+      run named(&mut out, "flex-direction", directionName(value))
+    }
+    Property.FlexWrap { value } => {
+      run named(&mut out, "flex-wrap", wrapName(value))
+    }
+    Property.FlexGrow { value } => {
+      run out.append("flex-grow: ")
+      run writeNumber(&mut out, value)
+    }
+    Property.FlexShrink { value } => {
+      run out.append("flex-shrink: ")
+      run writeNumber(&mut out, value)
+    }
+    Property.FlexBasis { value } => {
+      run out.append("flex-basis: ")
+      run length(&mut out, value)
+    }
+    Property.JustifyContent { value } => {
+      run named(&mut out, "justify-content", alignName(value))
+    }
+    Property.AlignItems { value } => {
+      run named(&mut out, "align-items", alignName(value))
+    }
+    Property.AlignSelf { value } => {
+      run named(&mut out, "align-self", alignName(value))
+    }
+    Property.AlignContent { value } => {
+      run named(&mut out, "align-content", alignName(value))
+    }
+    Property.RowGap { value } => {
+      run out.append("row-gap: ")
+      run length(&mut out, value)
+    }
+    Property.ColumnGap { value } => {
+      run out.append("column-gap: ")
+      run length(&mut out, value)
+    }
+    Property.OverflowX { value } => {
+      run named(&mut out, "overflow-x", overflowName(value))
+    }
+    Property.OverflowY { value } => {
+      run named(&mut out, "overflow-y", overflowName(value))
+    }
+    Property.AspectRatio { value } => {
+      run out.append("aspect-ratio: ")
+      if value > 0.0 {
+        run writeNumber(&mut out, value)
+      } else {
+        run out.append("auto")
+      }
+    }
+    Property.BackgroundColor { color: c } => {
+      run out.append("background-color: ")
+      run color(&mut out, c)
+    }
+    Property.BackgroundGradient { angle, from, to } => {
+      run out.append("background-image: linear-gradient(")
+      run writeNumber(&mut out, angle)
+      run out.append("deg, ")
+      run color(&mut out, from)
+      run out.append(", ")
+      run color(&mut out, to)
+      run out.append(")")
+    }
+    Property.BorderColor { color: c } => {
+      run out.append("border-color: ")
+      run color(&mut out, c)
+    }
+    Property.BorderStyle { value } => {
+      run named(&mut out, "border-style", borderStyleName(value))
+    }
+    Property.BorderRadius { value } => {
+      run out.append("border-radius: ")
+      run corners(&mut out, value)
+    }
+    Property.BoxShadow { value } => {
+      run out.append("box-shadow: ")
+      if value.inset {
+        run out.append("inset ")
+      }
+      run px(&mut out, value.offsetX)
+      run out.append(" ")
+      run px(&mut out, value.offsetY)
+      run out.append(" ")
+      run px(&mut out, value.blur)
+      run out.append(" ")
+      run px(&mut out, value.spread)
+      run out.append(" ")
+      run color(&mut out, value.color)
+    }
+    Property.NoBoxShadow => {
+      run out.append("box-shadow: none")
+    }
+    Property.BackdropBlur { value } => {
+      run out.append("backdrop-filter: blur(")
+      run px(&mut out, value)
+      run out.append(")")
+    }
+    Property.Opacity { value } => {
+      run out.append("opacity: ")
+      run writeNumber(&mut out, value)
+    }
+    Property.PointerEvents { value } => {
+      run named(
+        &mut out,
+        "pointer-events",
+        if value {
+          "auto"
+        } else {
+          "none"
+        },
+      )
+    }
+    Property.Visible { value } => {
+      run named(
+        &mut out,
+        "visibility",
+        if value {
+          "visible"
+        } else {
+          "hidden"
+        },
+      )
+    }
+    Property.FontFamily { family } => {
+      run out.append("font-family: #")
+      run writeInt(&mut out, u32.toU64(family))
+    }
+    Property.FontSize { value } => {
+      run out.append("font-size: ")
+      run px(&mut out, value)
+    }
+    Property.FontWeight { value } => {
+      run out.append("font-weight: ")
+      run writeNumber(&mut out, value)
+    }
+    Property.FontStyle { value } => {
+      run named(&mut out, "font-style", fontStyleName(value))
+    }
+    Property.LineHeight { value } => {
+      run out.append("line-height: ")
+      match value {
+        LineHeight.Normal => {
+          run out.append("normal")
+        }
+        LineHeight.Number { value: v } => {
+          run writeNumber(&mut out, v)
+        }
+        LineHeight.Px { value: v } => {
+          run px(&mut out, v)
+        }
+      }
+    }
+    Property.Color { color: c } => {
+      run out.append("color: ")
+      run color(&mut out, c)
+    }
+    Property.CaretColor { color: c } => {
+      run out.append("caret-color: ")
+      run color(&mut out, c)
+    }
+    Property.SelectionColor { color: c } => {
+      run out.append("selection-color: ")
+      run color(&mut out, c)
+    }
+    Property.PlaceholderColor { color: c } => {
+      run out.append("placeholder-color: ")
+      run color(&mut out, c)
+    }
+    Property.TextAlign { value } => {
+      run named(&mut out, "text-align", textAlignName(value))
+    }
+    Property.WhiteSpace { value } => {
+      run named(&mut out, "white-space", whiteSpaceName(value))
+    }
+    Property.Direction { value } => {
+      run named(&mut out, "direction", textDirectionName(value))
+    }
+    Property.TextDecorationLine { value } => {
+      run out.append("text-decoration-line:")
+      if !value.underline && !value.overline && !value.lineThrough {
+        run out.append(" none")
+      }
+      if value.underline {
+        run out.append(" underline")
+      }
+      if value.overline {
+        run out.append(" overline")
+      }
+      if value.lineThrough {
+        run out.append(" line-through")
+      }
+    }
+    Property.TextDecorationColor { color: c } => {
+      run out.append("text-decoration-color: ")
+      run color(&mut out, c)
+    }
+    Property.TextDecorationWavy { value } => {
+      run named(
+        &mut out,
+        "text-decoration-style",
+        if value {
+          "wavy"
+        } else {
+          "solid"
+        },
+      )
+    }
+  }
+}
+
+/// The computed style of a node as properties. For a text node (`text`) only the inherited
+/// text properties are listed: it has no box of its own to style.
+pub effect fn computedProperties(c: &Computed, text: bool, out: &mut List<Property>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  run out.append(Property.UnicodeBidi { value: c.unicodeBidi })
+  run out.append(Property.WritingMode { value: c.text.writingMode })
+  run out.append(Property.TextOrientation { value: c.text.textOrientation })
+  run out.append(Property.VerticalAlign { value: c.verticalAlign })
+  run out.append(Property.BaselineSource { value: c.baselineSource })
+  run out.append(Property.TextAlignLast { value: c.text.textAlignLast })
+  run out.append(Property.TextWrap { value: c.text.textWrap })
+  run out.append(Property.WhiteSpaceCollapse { value: c.text.whiteSpaceCollapse })
+  run out.append(Property.TextJustify { value: c.text.textJustify })
+  run out.append(Property.TextIndent { value: c.text.textIndent })
+  run out.append(Property.TabSize { value: c.text.tabSize })
+  run out.append(Property.BoxDecorationBreak { value: c.boxDecorationBreak })
+  run out.append(Property.MarginBreak { value: c.marginBreak })
+  run out.append(Property.BreakBefore { value: c.breakBefore })
+  run out.append(Property.BreakAfter { value: c.breakAfter })
+  run out.append(Property.BreakInside { value: c.breakInside })
+  run out.append(Property.Orphans { value: c.text.orphans })
+  run out.append(Property.Widows { value: c.text.widows })
+  run out.append(Property.Order { value: c.order })
+  run out.append(Property.JustifySelf { value: c.justifySelf })
+  run out.append(Property.JustifyItems { value: c.justifyItems })
+  run out.append(Property.JustifyContentSafety { value: c.justifyContentSafety })
+  run out.append(Property.AlignContentSafety { value: c.alignContentSafety })
+  run out.append(Property.AlignItemsSafety { value: c.alignItemsSafety })
+  run out.append(Property.AlignSelfSafety { value: c.alignSelfSafety })
+  run out.append(Property.JustifySelfSafety { value: c.justifySelfSafety })
+  run out.append(Property.JustifyItemsSafety { value: c.justifyItemsSafety })
+  run out.append(Property.ScrollbarWidth { value: c.scrollbarWidth })
+  run out.append(Property.ScrollbarGutter { value: c.scrollbarGutter })
+  run out.append(Property.Float { value: c.float })
+  run out.append(Property.Clear { value: c.clear })
+  run out.append(Property.Visibility { value: c.text.visibility })
+  run out.append(Property.AspectRatioAuto { value: c.aspectRatioAuto })
+  if !text {
+    run boxProperties(c, &mut out)
+    run out.append(Property.ObjectFit { value: c.objectFit })
+    run out.append(Property.ObjectPosition { x: c.objectX, y: c.objectY })
+  }
+  let t = c.text
+  run out.append(Property.FontFamily { family: t.family })
+  run out.append(Property.FontSize { value: t.size })
+  run out.append(Property.FontWeight { value: t.weight })
+  run out.append(Property.FontStyle { value: t.style })
+  run out.append(Property.LineHeight { value: t.lineHeight })
+  run out.append(Property.Color { color: t.color })
+  run out.append(Property.TextAlign { value: t.align })
+  run out.append(Property.WhiteSpace { value: t.whiteSpace })
+  run out.append(Property.Direction { value: t.direction })
+  run out.append(Property.TextDecorationLine { value: t.decoration })
+  if t.hasDecorationColor {
+    run out.append(Property.TextDecorationColor { color: t.decorationColor })
+  }
+  run out.append(Property.TextDecorationWavy { value: t.wavy })
+}
+
+effect fn boxProperties(c: &Computed, out: &mut List<Property>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.append(Property.Display { value: c.display })
+  run out.append(Property.Position { value: c.position })
+  run out.append(Property.BoxSizing { value: c.boxSizing })
+  run out.append(Property.Width { value: c.width })
+  run out.append(Property.Height { value: c.height })
+  run out.append(Property.MinWidth { value: c.minWidth })
+  run out.append(Property.MinHeight { value: c.minHeight })
+  run out.append(Property.MaxWidth { value: c.maxWidth })
+  run out.append(Property.MaxHeight { value: c.maxHeight })
+  run out.append(Property.Margin { side: Side.Top, value: c.margin.top })
+  run out.append(Property.Margin { side: Side.Right, value: c.margin.right })
+  run out.append(Property.Margin { side: Side.Bottom, value: c.margin.bottom })
+  run out.append(Property.Margin { side: Side.Left, value: c.margin.left })
+  run out.append(Property.Padding { side: Side.Top, value: c.padding.top })
+  run out.append(Property.Padding { side: Side.Right, value: c.padding.right })
+  run out.append(Property.Padding { side: Side.Bottom, value: c.padding.bottom })
+  run out.append(Property.Padding { side: Side.Left, value: c.padding.left })
+  run out.append(Property.BorderWidth { side: Side.Top, value: c.border.top })
+  run out.append(Property.BorderWidth { side: Side.Right, value: c.border.right })
+  run out.append(Property.BorderWidth { side: Side.Bottom, value: c.border.bottom })
+  run out.append(Property.BorderWidth { side: Side.Left, value: c.border.left })
+  if c.position != Position.Static {
+    run out.append(Property.Inset { side: Side.Top, value: c.inset.top })
+    run out.append(Property.Inset { side: Side.Right, value: c.inset.right })
+    run out.append(Property.Inset { side: Side.Bottom, value: c.inset.bottom })
+    run out.append(Property.Inset { side: Side.Left, value: c.inset.left })
+  }
+  if c.display == Display.Flex || c.display == Display.InlineFlex {
+    run out.append(Property.FlexDirection { value: c.flexDirection })
+    run out.append(Property.FlexWrap { value: c.flexWrap })
+    run out.append(Property.JustifyContent { value: c.justifyContent })
+    run out.append(Property.AlignItems { value: c.alignItems })
+    run out.append(Property.AlignContent { value: c.alignContent })
+    run out.append(Property.RowGap { value: c.rowGap })
+    run out.append(Property.ColumnGap { value: c.columnGap })
+  }
+  run out.append(Property.FlexGrow { value: c.flexGrow })
+  run out.append(Property.FlexShrink { value: c.flexShrink })
+  run out.append(Property.FlexBasis { value: c.flexBasis })
+  run out.append(Property.AlignSelf { value: c.alignSelf })
+  run out.append(Property.OverflowX { value: c.overflowX })
+  run out.append(Property.OverflowY { value: c.overflowY })
+  run out.append(Property.AspectRatio { value: c.aspectRatio })
+  match c.background {
+    Fill.None => {
+      run out.append(
+        Property.BackgroundColor { color: Rgba<f32> { r: 0.0, g: 0.0, b: 0.0, a: 0.0 } },
+      )
+    }
+    Fill.Solid { color: fill } => {
+      run out.append(Property.BackgroundColor { color: fill })
+    }
+    Fill.Gradient { angle, from, to } => {
+      run out.append(Property.BackgroundGradient { angle: angle, from: from, to: to })
+    }
+  }
+  run out.append(Property.BorderColor { color: c.borderColor })
+  run out.append(Property.BorderStyle { value: c.borderStyle })
+  run out.append(Property.BorderRadius { value: c.radii })
+  if c.hasShadow {
+    run out.append(Property.BoxShadow { value: c.shadow })
+  } else {
+    run out.append(Property.NoBoxShadow)
+  }
+  run out.append(Property.Opacity { value: c.opacity })
+  run out.append(Property.BackdropBlur { value: c.backdropBlur })
+  run out.append(Property.PointerEvents { value: c.pointerEvents })
+}
+
+effect fn patch(out: &mut String, title: string, properties: &List<Property>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if properties.length() == 0 {
+    return ()
+  }
+  run out.append("style ")
+  run out.append(title)
+  run out.append(" {\n")
+  let values = properties.asSlice()
+  let mut i: usize = 0
+  while i < values.length {
+    run out.append("  ")
+    run writeProperty(&mut out, values[i])
+    run out.append(";\n")
+    i = i + 1
+  }
+  run out.append("}\n")
+}
+
+effect fn flag(out: &mut String, listeners: u32, bit: u32, name: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if u32.bitAnd(listeners, bit) != 0 {
+    run out.append(" ")
+    run out.append(name)
+  }
+}
+
+effect fn quotedText(out: &mut String, value: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.append("\"")
+  let bytes = String.utf8Bytes(value)
+  let mut start: usize = 0
+  let mut i: usize = 0
+  while i < bytes.length {
+    let b = bytes[i]
+    if b == 34 || b == 92 || b == 10 {
+      run out.append(String.slice(value, start, i - start))
+      if b == 10 {
+        run out.append("\\n")
+      } else if b == 34 {
+        run out.append("\\\"")
+      } else {
+        run out.append("\\\\")
+      }
+      start = i + 1
+    }
+    i = i + 1
+  }
+  run out.append(String.slice(value, start, bytes.length - start))
+  run out.append("\"")
+}
+
+/// Ends a line, writing ` none` first when nothing followed its heading (which ends at byte
+/// `headingEnd`).
+effect fn noneAfter(out: &mut String, headingEnd: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if out.ownedByteLength() == headingEnd {
+    run out.append(" none")
+  }
+  run out.append("\n")
+}
+
+/// What [`inspectNode`] writes besides the node, its attributes, states and box model.
+pub struct InspectOptions {
+  /// The style patches the client set, per state.
+  pub patches: bool,
+  /// The computed style.
+  pub computed: bool,
+}
+
+impl InspectOptions {
+  pub fn all() -> InspectOptions {
+    return InspectOptions { patches: true, computed: true }
+  }
+}
+
+/// Writes the live view of node `id` (from the last frame's styles and layout) to `out`:
+///
+/// ```text
+/// box #10 role=button label="New" parent=#2 children=#11
+/// attributes: tabIndex=0 cursor=pointer
+/// listeners: pointerdown pointerup click ...
+/// state: hovered pressed focused focus-visible
+/// box model: margin [x,y wxh] border [..] padding [..] content [..]
+/// style base { background-color: rgba(229,231,235,1); ... }
+/// computed { display: block; ... }
+/// ```
+pub effect fn inspectNode(
+  tree: &UiTree<'_>,
+  id: u32,
+  options: InspectOptions,
+  out: &mut String,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let slot = tree.slotOf(id)
+  if slot == NONE {
+    run out.append("(no node #")
+    run writeInt(&mut out, u32.toU64(id))
+    run out.append(")\n")
+    return ()
+  }
+  let node = tree.node(slot)
+  run out.append(kindName(node.kind))
+  run out.append(" #")
+  run writeInt(&mut out, u32.toU64(node.id))
+  if node.accessRole != Role.None {
+    run out.append(" role=")
+    run out.append(roleName(node.accessRole))
+  }
+  if node.hasValueRange {
+    run out.append(" valueNow=")
+    run writeNumber(&mut out, node.valueNow)
+    run out.append(" valueMin=")
+    run writeNumber(&mut out, node.valueMin)
+    run out.append(" valueMax=")
+    run writeNumber(&mut out, node.valueMax)
+  }
+  if node.label.ownedByteLength() != 0 {
+    run out.append(" label=")
+    run quotedText(&mut out, String.view(&node.label))
+  }
+  if node.testId.ownedByteLength() != 0 {
+    run out.append(" testId=")
+    run quotedText(&mut out, String.view(&node.testId))
+  }
+  if node.text.ownedByteLength() != 0 {
+    run out.append(" text=")
+    run quotedText(&mut out, String.view(&node.text))
+  }
+  run out.append(" parent=")
+  if node.parent == NONE {
+    if tree.root == slot {
+      run out.append("(root)")
+    } else {
+      run out.append("(detached)")
+    }
+  } else {
+    run out.append("#")
+    run writeInt(&mut out, u32.toU64(tree.node(node.parent).id))
+  }
+  let mut children = List<u32>.make()
+  run tree.childSlots(slot, &mut children)
+  if children.length() != 0 {
+    run out.append(" children=")
+    let mut i: usize = 0
+    while i < children.length() {
+      if i != 0 {
+        run out.append(",")
+      }
+      run out.append("#")
+      run writeInt(&mut out, u32.toU64(tree.node(children.get(i)).id))
+      i = i + 1
+    }
+  }
+  run out.append("\n")
+
+  let attributesAt = out.ownedByteLength()
+  run out.append("attributes:")
+  if node.tabIndex != NOT_FOCUSABLE {
+    run out.append(" tabIndex=")
+    run signed(&mut out, node.tabIndex)
+  }
+  if node.cursor != Cursor.Default {
+    run out.append(" cursor=")
+    run out.append(cursorName(node.cursor))
+  }
+  if node.disabled {
+    run out.append(" disabled")
+  }
+  if node.focusTrap {
+    run out.append(" focusTrap")
+  }
+  if node.checked {
+    run out.append(" checked")
+  }
+  if node.selected {
+    run out.append(" selected")
+  }
+  if node.expanded {
+    run out.append(" expanded")
+  }
+  run noneAfter(&mut out, attributesAt + 11)
+
+  let listenersAt = out.ownedByteLength()
+  run out.append("listeners:")
+  let l = node.listeners
+  run flag(&mut out, l, LISTEN_POINTER_DOWN, "pointerdown")
+  run flag(&mut out, l, LISTEN_POINTER_UP, "pointerup")
+  run flag(&mut out, l, LISTEN_CLICK, "click")
+  run flag(&mut out, l, LISTEN_POINTER_MOVE, "pointermove")
+  run flag(&mut out, l, LISTEN_POINTER_ENTER, "pointerenter")
+  run flag(&mut out, l, LISTEN_POINTER_LEAVE, "pointerleave")
+  run flag(&mut out, l, LISTEN_WHEEL, "wheel")
+  run flag(&mut out, l, LISTEN_KEY_DOWN, "keydown")
+  run flag(&mut out, l, LISTEN_KEY_UP, "keyup")
+  run flag(&mut out, l, LISTEN_FOCUS, "focus")
+  run flag(&mut out, l, LISTEN_BLUR, "blur")
+  run flag(&mut out, l, LISTEN_INPUT, "input")
+  run flag(&mut out, l, LISTEN_SCROLL, "scroll")
+  run noneAfter(&mut out, listenersAt + 10)
+
+  let stateAt = out.ownedByteLength()
+  run out.append("state:")
+  if node.hovered {
+    run out.append(" hovered")
+  }
+  if node.pressed {
+    run out.append(" pressed")
+  }
+  if tree.focused == slot {
+    run out.append(" focused")
+    if tree.focusVisible {
+      run out.append(" focus-visible")
+    }
+  }
+  if node.scrollX != 0.0 || node.scrollY != 0.0 {
+    run out.append(" scroll=")
+    run writeNumber(&mut out, node.scrollX)
+    run out.append(",")
+    run writeNumber(&mut out, node.scrollY)
+  }
+  run noneAfter(&mut out, stateAt + 6)
+
+  let mut models = List<BoxModel>.make()
+  run boxModels(tree, id, &mut models)
+  if models.length() == 0 {
+    run out.append("box model: (no box)\n")
+  }
+  let list = models.asSlice()
+  let mut m: usize = 0
+  while m < list.length {
+    run out.append("box model: margin ")
+    run rect(&mut out, list[m].margin)
+    run out.append(" border ")
+    run rect(&mut out, list[m].border)
+    run out.append(" padding ")
+    run rect(&mut out, list[m].padding)
+    run out.append(" content ")
+    run rect(&mut out, list[m].content)
+    run out.append("\n")
+    m = m + 1
+  }
+
+  if options.patches {
+    run patch(&mut out, "base", &node.base)
+    run patch(&mut out, "hover", &node.hover)
+    run patch(&mut out, "active", &node.active)
+    run patch(&mut out, "focus", &node.focus)
+    run patch(&mut out, "focus-visible", &node.focusVisible)
+  }
+  if options.computed {
+    let mut computed = List<Property>.make()
+    run computedProperties(&node.computed, node.kind == NodeKind.Text, &mut computed)
+    run patch(&mut out, "computed", &computed)
+  }
+}
+
+fn verticalName(value: VerticalAlignKind) -> string<'static> {
+  return match value {
+    VerticalAlignKind.Baseline => "baseline"
+    VerticalAlignKind.Middle => "middle"
+    VerticalAlignKind.TextTop => "text-top"
+    VerticalAlignKind.TextBottom => "text-bottom"
+    VerticalAlignKind.Top => "top"
+    VerticalAlignKind.Bottom => "bottom"
+    VerticalAlignKind.Sub => "sub"
+    VerticalAlignKind.Super => "super"
+    VerticalAlignKind.Shift => "shift"
+  }
+}
+
+effect fn dimension(out: &mut String, value: Dimension) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match value.kind {
+    DimensionKind.Length => {
+      run px(&mut out, value.value)
+    }
+    DimensionKind.Percent => {
+      run writeNumber(&mut out, value.percent * 100.0)
+      run out.append("%")
+    }
+    DimensionKind.Calc => {
+      run length(&mut out, Length.calc(value.value, value.percent * 100.0))
+    }
+    DimensionKind.Auto => {
+      run out.append("auto")
+    }
+    DimensionKind.None => {
+      run out.append("none")
+    }
+    DimensionKind.Normal => {
+      run out.append("normal")
+    }
+    DimensionKind.Content => {
+      run out.append("content")
+    }
+    DimensionKind.MinContent => {
+      run out.append("min-content")
+    }
+    DimensionKind.MaxContent => {
+      run out.append("max-content")
+    }
+    DimensionKind.FitContent => {
+      run out.append("fit-content")
+    }
+  }
+}
+
+fn unicodeBidiName(value: UnicodeBidi) -> string<'static> {
+  return match value {
+    UnicodeBidi.Normal => "normal"
+    UnicodeBidi.Embed => "embed"
+    UnicodeBidi.Isolate => "isolate"
+    UnicodeBidi.BidiOverride => "bidi-override"
+    UnicodeBidi.IsolateOverride => "isolate-override"
+    UnicodeBidi.Plaintext => "plaintext"
+  }
+}
+
+fn writingModeName(value: WritingMode) -> string<'static> {
+  return match value {
+    WritingMode.HorizontalTb => "horizontal-tb"
+    WritingMode.VerticalRl => "vertical-rl"
+    WritingMode.VerticalLr => "vertical-lr"
+    WritingMode.SidewaysRl => "sideways-rl"
+    WritingMode.SidewaysLr => "sideways-lr"
+  }
+}
+
+fn textOrientationName(value: TextOrientation) -> string<'static> {
+  return match value {
+    TextOrientation.Mixed => "mixed"
+    TextOrientation.Upright => "upright"
+    TextOrientation.Sideways => "sideways"
+  }
+}
+
+fn baselineSourceName(value: BaselineSource) -> string<'static> {
+  return match value {
+    BaselineSource.Auto => "auto"
+    BaselineSource.First => "first"
+    BaselineSource.Last => "last"
+  }
+}
+
+fn layoutTextAlignName(value: LayoutTextAlign) -> string<'static> {
+  return match value {
+    LayoutTextAlign.Auto => "auto"
+    LayoutTextAlign.Start => "start"
+    LayoutTextAlign.End => "end"
+    LayoutTextAlign.Left => "left"
+    LayoutTextAlign.Right => "right"
+    LayoutTextAlign.Center => "center"
+    LayoutTextAlign.Justify => "justify"
+  }
+}
+
+fn textWrapName(value: TextWrap) -> string<'static> {
+  return match value {
+    TextWrap.Wrap => "wrap"
+    TextWrap.NoWrap => "nowrap"
+  }
+}
+
+fn whiteSpaceCollapseName(value: WhiteSpaceCollapse) -> string<'static> {
+  return match value {
+    WhiteSpaceCollapse.Collapse => "collapse"
+    WhiteSpaceCollapse.Discard => "discard"
+    WhiteSpaceCollapse.Preserve => "preserve"
+    WhiteSpaceCollapse.PreserveBreaks => "preserve-breaks"
+    WhiteSpaceCollapse.PreserveSpaces => "preserve-spaces"
+    WhiteSpaceCollapse.BreakSpaces => "break-spaces"
+  }
+}
+
+fn textJustifyName(value: TextJustify) -> string<'static> {
+  return match value {
+    TextJustify.Auto => "auto"
+    TextJustify.None => "none"
+    TextJustify.InterWord => "inter-word"
+    TextJustify.InterCharacter => "inter-character"
+  }
+}
+
+fn boxDecorationBreakName(value: BoxDecorationBreak) -> string<'static> {
+  return match value {
+    BoxDecorationBreak.Slice => "slice"
+    BoxDecorationBreak.Clone => "clone"
+  }
+}
+
+fn marginBreakName(value: MarginBreak) -> string<'static> {
+  return match value {
+    MarginBreak.Auto => "auto"
+    MarginBreak.Keep => "keep"
+    MarginBreak.Discard => "discard"
+  }
+}
+
+fn breakBetweenName(value: BreakBetween) -> string<'static> {
+  return match value {
+    BreakBetween.Auto => "auto"
+    BreakBetween.Avoid => "avoid"
+    BreakBetween.Always => "always"
+    BreakBetween.All => "all"
+    BreakBetween.AvoidPage => "avoid-page"
+    BreakBetween.Page => "page"
+    BreakBetween.Left => "left"
+    BreakBetween.Right => "right"
+    BreakBetween.Recto => "recto"
+    BreakBetween.Verso => "verso"
+    BreakBetween.AvoidColumn => "avoid-column"
+    BreakBetween.Column => "column"
+    BreakBetween.AvoidRegion => "avoid-region"
+    BreakBetween.Region => "region"
+  }
+}
+
+fn breakInsideName(value: BreakInside) -> string<'static> {
+  return match value {
+    BreakInside.Auto => "auto"
+    BreakInside.Avoid => "avoid"
+    BreakInside.AvoidPage => "avoid-page"
+    BreakInside.AvoidColumn => "avoid-column"
+    BreakInside.AvoidRegion => "avoid-region"
+  }
+}
+
+fn overflowAlignmentName(value: OverflowAlignment) -> string<'static> {
+  return match value {
+    OverflowAlignment.Default => "default"
+    OverflowAlignment.Safe => "safe"
+    OverflowAlignment.Unsafe => "unsafe"
+  }
+}
+
+fn scrollbarWidthName(value: ScrollbarWidth) -> string<'static> {
+  return match value {
+    ScrollbarWidth.Auto => "auto"
+    ScrollbarWidth.Thin => "thin"
+    ScrollbarWidth.None => "none"
+  }
+}
+
+fn scrollbarGutterName(value: ScrollbarGutter) -> string<'static> {
+  return match value {
+    ScrollbarGutter.Auto => "auto"
+    ScrollbarGutter.Stable => "stable"
+    ScrollbarGutter.StableBothEdges => "stable-both-edges"
+  }
+}
+
+fn floatName(value: Float) -> string<'static> {
+  return match value {
+    Float.None => "none"
+    Float.Left => "left"
+    Float.Right => "right"
+  }
+}
+
+fn clearName(value: Clear) -> string<'static> {
+  return match value {
+    Clear.None => "none"
+    Clear.Left => "left"
+    Clear.Right => "right"
+    Clear.Both => "both"
+  }
+}
+
+fn visibilityName(value: Visibility) -> string<'static> {
+  return match value {
+    Visibility.Visible => "visible"
+    Visibility.Hidden => "hidden"
+    Visibility.Collapse => "collapse"
+  }
+}

@@ -1,0 +1,72 @@
+//! Fragmented output is reachable through the retained UI layer and can return to normal flow.
+import ui_tree.lib {
+  UiTree,
+  TreeError,
+  Batch,
+  NodeKind,
+  Property,
+  Length,
+  BreakBetween,
+  FrameInput,
+  Fragmentainers,
+  LayoutRect,
+  fragmentsOf,
+  FragmentInfo
+}
+import ui_fixtures.fixtures as fixtures
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+
+effect fn body() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.box(1, 2, &[Property.Height { value: Length.px(20.0) }])
+  run batch.box(
+    1,
+    3,
+    &[
+      Property.Height { value: Length.px(20.0) },
+      Property.BreakBefore { value: BreakBetween.Page },
+    ],
+  )
+  run tree.apply(run batch.take())
+  let pages = [
+    LayoutRect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 },
+    LayoutRect { x: 0.0, y: 150.0, width: 100.0, height: 100.0 },
+  ]
+  let frames = pagesOf(&pages)
+  let input = FrameInput { width: 100.0, height: 250.0, scale: 1.0, time: 0.0 }
+  run tree.frameFragmented(input, move frames)
+  let mut fragments = List<FragmentInfo>.make()
+  run fragmentsOf(&tree, tree.slotOf(3), &mut fragments)
+  run Testing.expect(
+    fragments.length() > 0 && fragments.asSlice()[0].border.yMin == 150.0,
+    "forced page breaks use the host's second page rectangle",
+  )
+  run tree.frame(input)
+  run fragmentsOf(&tree, tree.slotOf(3), &mut fragments)
+  run Testing.expect(
+    fragments.asSlice()[0].border.yMin == 20.0,
+    "continuous frames do not reuse paginated geometry",
+  )
+}
+
+test effect fn pageBreakThroughTree() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run body() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+fn pagesOf<'a>(pages: &'a [LayoutRect]) -> Fragmentainers<'a> {
+  let mut frames: Fragmentainers<'a> = Fragmentainers.empty()
+  frames.rects = Option<&'a [LayoutRect]>.some(pages)
+  return move frames
+}

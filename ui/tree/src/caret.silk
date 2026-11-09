@@ -1,0 +1,411 @@
+//! Text geometry of an input, read from the fragments css-layout made for its text: where a
+//! caret at an offset is drawn, which rectangles a selection covers, and which offset a point
+//! is nearest to. Every position comes from the text fragments' source ranges and the advances
+//! of the glyph runs shaped during layout; nothing here shapes text again.
+//!
+//! Offsets are UTF-8 byte offsets into the text css-layout laid out (an input's display text:
+//! its value with any composition spliced in).
+import layout.lib { LayoutTree, Fragment, FragmentKind, TextFragmentKind }
+import node { NO_INDEX }
+import ui_text.system { TextSystem }
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.geometry.rect { Rect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.usize
+
+/// One text fragment of the input's text, in CSS pixels of the viewport.
+pub struct Piece {
+  /// The source range the fragment covers.
+  pub start: usize,
+  pub end: usize,
+  /// The fragment's box.
+  pub x0: f32,
+  pub x1: f32,
+  pub top: f32,
+  pub bottom: f32,
+  /// The line box it sits on: its fragment index and vertical extent.
+  pub line: usize,
+  pub lineTop: f32,
+  pub lineBottom: f32,
+  pub shapeKey: usize,
+  /// Whether the fragment is a shaped glyph run (not a tab or a preserved line break).
+  pub glyphs: bool,
+  /// A preserved line break: the caret before it is at the end of its line, and the offset
+  /// after it starts the next line.
+  pub lineBreak: bool,
+  pub rtl: bool,
+}
+
+impl Copy for Piece {}
+
+/// A range of offsets.
+pub struct Span {
+  pub start: usize,
+  pub end: usize,
+}
+
+impl Copy for Span {}
+
+fn minimum(a: usize, b: usize) -> usize {
+  if a < b {
+    return a
+  }
+  return b
+}
+
+fn maximum(a: usize, b: usize) -> usize {
+  if a > b {
+    return a
+  }
+  return b
+}
+
+/// The line box above fragment `index`, or the fragment itself when there is none.
+fn lineOf(output: &LayoutTree, index: usize) -> usize {
+  let values = output.fragments.values.asSlice()
+  let mut at = values[index].parent
+  while at != NO_INDEX {
+    if values[at].kind == FragmentKind.Line {
+      return at
+    }
+    at = values[at].parent
+  }
+  return index
+}
+
+/// Geometry of one actual shaped text fragment. Callers must supply a text fragment with
+/// textData; sharing this conversion keeps CSSOM ranges and input selection on the same runs.
+pub fn pieceOf(output: &LayoutTree, text: &TextSystem<'_>, index: usize) -> Piece {
+  let values = output.fragments.values.asSlice()
+  let fragment = values[index]
+  let data = output.fragments.texts.get(fragment.textData)
+  let line = lineOf(output, index)
+  let lineBox = values[line]
+  let glyphs = data.kind == TextFragmentKind.Glyphs
+  return Piece {
+    start: data.sourceStart,
+    end: data.sourceEnd,
+    x0: fragment.worldLocation.x,
+    x1: fragment.worldLocation.x + fragment.size.width,
+    top: fragment.worldLocation.y,
+    bottom: fragment.worldLocation.y + fragment.size.height,
+    line: line,
+    lineTop: lineBox.worldLocation.y,
+    lineBottom: lineBox.worldLocation.y + lineBox.size.height,
+    shapeKey: data.shapeKey,
+    glyphs: glyphs,
+    lineBreak: data.kind == TextFragmentKind.SegmentBreak,
+    rtl: if glyphs {
+      text.glyphRun(data.shapeKey).rtl
+    } else {
+      data.bidiLevel % 2 == 1
+    },
+  }
+}
+
+/// The text fragments of css-layout node `inner` inside fragment `root` (an input's box), in
+/// fragment order (line by line, logical order within a line for left-to-right text).
+pub effect fn collect(
+  output: &LayoutTree,
+  text: &TextSystem<'_>,
+  root: usize,
+  inner: usize,
+  out: &mut List<Piece>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  if root == NO_INDEX || root >= output.fragments.values.length() {
+    return ()
+  }
+  let values = output.fragments.values.asSlice()
+  let mut stack = List<usize>.make()
+  run stack.append(root)
+  while stack.length() != 0 {
+    let last = stack.length() - 1
+    let index = stack.get(last)
+    stack.truncate(last)
+    let f = values[index]
+    if f.kind == FragmentKind.Text && f.source == inner && f.textData != NO_INDEX {
+      run out.append(pieceOf(output, text, index))
+    }
+
+    // Children in reverse so they pop in order.
+    let mut children = List<usize>.make()
+    let mut child = f.firstChild
+    while child != NO_INDEX {
+      run children.append(child)
+      child = values[child].nextSibling
+    }
+    let mut i = children.length()
+    while i > 0 {
+      i = i - 1
+      run stack.append(children.get(i))
+    }
+  }
+}
+
+/// The x of a caret at offset `d` of piece `p` (clamped to the piece). Inside a cluster (a
+/// ligature) the position is interpolated by bytes.
+pub fn caretX(text: &TextSystem<'_>, p: &Piece, d: usize) -> f32 {
+  let startEdge = if p.rtl {
+    p.x1
+  } else {
+    p.x0
+  }
+  let endEdge = if p.rtl {
+    p.x0
+  } else {
+    p.x1
+  }
+  if d <= p.start {
+    return startEdge
+  }
+  if d >= p.end && !p.glyphs {
+    return endEdge
+  }
+  if !p.glyphs {
+    let fraction = usize.toF32(d - p.start) / usize.toF32(p.end - p.start)
+    return startEdge + (endEdge - startEdge) * fraction
+  }
+  let glyphs = text.runGlyphs(p.shapeKey)
+  if glyphs.length == 0 {
+    return if d >= p.end {
+      endEdge
+    } else {
+      startEdge
+    }
+  }
+
+  // The cluster holding `d`: the last cluster start at or before it (the last cluster when
+  // `d` is the end), and where the next cluster starts.
+  let atEnd = d >= p.end
+  let mut first = usize.MAX
+  let mut cluster = usize.MAX
+  let mut found = false
+  let mut i: usize = 0
+  while i < glyphs.length {
+    let c = glyphs[i].cluster
+    if c < first {
+      first = c
+    }
+    if (atEnd || c <= d) && (!found || c > cluster) {
+      cluster = c
+      found = true
+    }
+    i = i + 1
+  }
+  if !found {
+    cluster = first
+  }
+  let mut next = p.end
+  i = 0
+  while i < glyphs.length {
+    let c = glyphs[i].cluster
+    if c > cluster && c < next {
+      next = c
+    }
+    i = i + 1
+  }
+
+  // Its visual extent, from the pen positions of its glyphs.
+  let mut lo = f32.MAX
+  let mut hi = -f32.MAX
+  let mut pen: f32 = 0.0
+  i = 0
+  while i < glyphs.length {
+    let g = glyphs[i]
+    if g.cluster == cluster {
+      lo = f32.min(lo, pen)
+      hi = f32.max(hi, pen + g.advance)
+    }
+    pen = pen + g.advance
+    i = i + 1
+  }
+  if lo > hi {
+    return startEdge
+  }
+  let mut fraction: f32 = 1.0
+  if !atEnd {
+    if d <= cluster {
+      fraction = 0.0
+    } else if next > cluster {
+      fraction = f32.min(1.0, usize.toF32(d - cluster) / usize.toF32(next - cluster))
+    }
+  }
+  if p.rtl {
+    return p.x0 + hi - (hi - lo) * fraction
+  }
+  return p.x0 + lo + (hi - lo) * fraction
+}
+
+/// The piece a caret at offset `d` is drawn on, or NO_INDEX: the piece that holds `d`, or
+/// failing that the last piece ending at `d` (the end of a line or of the text). At a soft
+/// wrap the caret goes to the start of the next line.
+pub fn pieceAt(pieces: &List<Piece>, d: usize) -> usize {
+  let values = pieces.asSlice()
+  let mut i: usize = 0
+  while i < values.length {
+    if values[i].start <= d && d < values[i].end {
+      return i
+    }
+    i = i + 1
+  }
+  let mut found = NO_INDEX
+  i = 0
+  while i < values.length {
+    if values[i].end == d && !values[i].lineBreak {
+      found = i
+    }
+    i = i + 1
+  }
+  if found != NO_INDEX {
+    return found
+  }
+
+  // Past everything (a stale layout): the last piece.
+  if values.length != 0 {
+    return values.length - 1
+  }
+  return NO_INDEX
+}
+
+/// The caret rectangle at offset `d`, one CSS pixel wide, or an empty rectangle when the text
+/// has no fragments.
+pub fn caretRect(text: &TextSystem<'_>, pieces: &List<Piece>, d: usize) -> Rect<f32> {
+  let index = pieceAt(pieces, d)
+  if index == NO_INDEX {
+    return Rect<f32>.new(0.0, 0.0, 0.0, 0.0)
+  }
+  let p = pieces.asSlice()[index]
+  let x = caretX(text, &p, d)
+  return Rect<f32>.new(x, p.top, x + 1.0, p.bottom)
+}
+
+/// The x range of the part [`lo`, `hi`) of piece `p` covers, as (left, right), or an empty
+/// range (left > right) when they do not meet.
+pub fn spanX(text: &TextSystem<'_>, p: &Piece, lo: usize, hi: usize) -> Rect<f32> {
+  let a = maximum(lo, p.start)
+  let b = minimum(hi, p.end)
+  if a >= b {
+    return Rect<f32>.new(1.0, 0.0, 0.0, 0.0)
+  }
+  let xa = caretX(text, p, a)
+  let xb = caretX(text, p, b)
+  return Rect<f32>.new(f32.min(xa, xb), p.lineTop, f32.max(xa, xb), p.lineBottom)
+}
+
+/// The line (piece index of its first piece) nearest to `y`.
+pub fn lineNear(pieces: &List<Piece>, y: f32) -> usize {
+  let values = pieces.asSlice()
+  let mut best = NO_INDEX
+  let mut bestDistance = f32.MAX
+  let mut i: usize = 0
+  while i < values.length {
+    let p = values[i]
+    let distance: f32 = if y < p.lineTop {
+      p.lineTop - y
+    } else if y >= p.lineBottom {
+      y - p.lineBottom + 0.001
+    } else {
+      0.0
+    }
+    if distance < bestDistance {
+      bestDistance = distance
+      best = i
+    }
+    i = i + 1
+  }
+  return best
+}
+
+/// The offset among `boundaries` nearest to (`x`, `y`): on the nearest line, the boundary whose
+/// caret is closest to `x`. NO_INDEX when there are no pieces.
+pub fn offsetNear(
+  text: &TextSystem<'_>,
+  pieces: &List<Piece>,
+  boundaries: &List<usize>,
+  x: f32,
+  y: f32,
+) -> usize {
+  let lineIndex = lineNear(pieces, y)
+  if lineIndex == NO_INDEX {
+    return NO_INDEX
+  }
+  let line = pieces.asSlice()[lineIndex].line
+  let values = pieces.asSlice()
+  let offsets = boundaries.asSlice()
+  let mut best = NO_INDEX
+  let mut bestDistance = f32.MAX
+  let mut i: usize = 0
+  while i < values.length {
+    let p = values[i]
+    if p.line == line {
+      let mut j: usize = 0
+      while j < offsets.length {
+        let b = offsets[j]
+        let inside = b >= p.start && (b < p.end || b == p.end && !p.lineBreak)
+        if inside {
+          let distance = f32.abs(caretX(text, &p, b) - x)
+          if distance < bestDistance {
+            bestDistance = distance
+            best = b
+          }
+        }
+        j = j + 1
+      }
+    }
+    i = i + 1
+  }
+  return best
+}
+
+/// The first and last offsets of the line piece `index` is on: the smallest start and the
+/// largest end of its pieces, a line break's end excluded.
+pub fn lineRange(pieces: &List<Piece>, index: usize) -> Span {
+  let values = pieces.asSlice()
+  let line = values[index].line
+  let mut lo = usize.MAX
+  let mut hi: usize = 0
+  let mut i: usize = 0
+  while i < values.length {
+    let p = values[i]
+    if p.line == line {
+      lo = minimum(lo, p.start)
+      let end = if p.lineBreak {
+        p.start
+      } else {
+        p.end
+      }
+      hi = maximum(hi, end)
+    }
+    i = i + 1
+  }
+  return Span { start: lo, end: hi }
+}
+
+/// The first piece of the line before (`up`) or after the line of piece `index`, or NO_INDEX.
+pub fn adjacentLine(pieces: &List<Piece>, index: usize, up: bool) -> usize {
+  let values = pieces.asSlice()
+  let here = values[index]
+  let mut best = NO_INDEX
+  let mut i: usize = 0
+  while i < values.length {
+    let p = values[i]
+    if p.line != here.line {
+      if up && p.lineBottom <= here.lineTop + 0.01 {
+        if best == NO_INDEX || p.lineTop > values[best].lineTop {
+          best = i
+        }
+      } else if !up && p.lineTop >= here.lineBottom - 0.01 {
+        if best == NO_INDEX || p.lineTop < values[best].lineTop {
+          best = i
+        }
+      }
+    }
+    i = i + 1
+  }
+  return best
+}

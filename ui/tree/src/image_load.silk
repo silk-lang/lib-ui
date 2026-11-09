@@ -1,0 +1,98 @@
+//! Portable image-request state and stale-result rejection.
+//! Native and browser hosts perform I/O and decoding. A host installs image pixels only when
+//! the request generation is current, then records completion with finish.
+import silk.core.ownership { Copy }
+
+/// Observable state of an image request.
+pub enum ImageState {
+  /// No request has started.
+  Empty,
+  /// The host is fetching or decoding the image.
+  Loading,
+  /// The decoded image has been installed.
+  Ready,
+  /// The request failed; error identifies the failure category.
+  Failed,
+  /// The client cancelled this request.
+  Cancelled
+}
+
+/// Portable failure categories for image hosts.
+pub enum ImageError {
+  /// No failure.
+  None,
+  /// A local file could not be read.
+  File,
+  /// A network operation failed.
+  Network,
+  /// The server returned an unsuccessful HTTP status.
+  HttpStatus,
+  /// Image decoding failed.
+  Decode,
+  /// The resource exceeded the host's size limit.
+  TooLarge,
+  /// The host could not start the work.
+  Start
+}
+
+/// State for one resource ID. Request generations prevent stale workers from replacing newer images.
+pub struct ImageLoad {
+  /// Caller-owned resource ID.
+  pub resource: u32,
+  /// Token captured by the host for the current request.
+  pub generation: u64,
+  /// Current request state.
+  pub state: ImageState,
+  /// Failure category, or None.
+  pub error: ImageError,
+}
+
+impl Copy for ImageLoad {}
+
+impl ImageLoad {
+  /// Creates an empty request state for a resource ID.
+  pub fn make(resource: u32) -> ImageLoad {
+    return ImageLoad {
+      resource: resource,
+      generation: 0,
+      state: ImageState.Empty,
+      error: ImageError.None,
+    }
+  }
+
+  /// Starts a replacement request and returns its generation token.
+  pub fn begin(self: &mut Self) -> u64 {
+    self.generation = self.generation + 1
+    self.state = ImageState.Loading
+    self.error = ImageError.None
+    return self.generation
+  }
+
+  /// Returns whether a result can still be installed for generation.
+  pub fn accepts(self: &Self, generation: u64) -> bool {
+    return self.generation == generation && self.state == ImageState.Loading
+  }
+
+  /// Invalidates an unfinished request. Completed resources retain their state.
+  pub fn cancel(self: &mut Self) -> () {
+    if self.state == ImageState.Loading {
+      self.generation = self.generation + 1
+      self.state = ImageState.Cancelled
+    }
+  }
+
+  /// Completes a current request, returning false for stale or already completed results.
+  /// None means successful pixel installation; other errors set the state to Failed.
+  pub fn finish(self: &mut Self, generation: u64, error: ImageError) -> bool {
+    if !self.accepts(generation) {
+      return false
+    }
+    self.error = error
+    self.state = if error == ImageError.None {
+      ImageState.Ready
+    } else {
+      ImageState.Failed
+    }
+    return true
+  }
+}

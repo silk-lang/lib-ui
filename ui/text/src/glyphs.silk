@@ -1,0 +1,201 @@
+//! Shaped glyph runs, the paint side of `TextRun.shapeKey`.
+//!
+//! Every text fragment css-layout produces carries the `shapeKey` of the run it came from.
+//! [`GlyphStore.glyphRun`] and [`GlyphStore.glyphsOf`] give that run's font and its glyphs, positioned
+//! from the fragment's left edge, ready to be looked up in a `font-raster` glyph cache.
+//! Identical runs share one key, so reshaping the same text during line fitting adds nothing.
+import silk.collections.hash { Hash, HashSeed, Word }
+import silk.collections.hash_map { HashMap }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+
+/// One glyph of a run, in CSS pixels.
+pub struct PositionedGlyph {
+  pub glyph: u32,
+  /// An upright glyph shaped with vertical metrics, in logical inline/block coordinates.
+  pub upright: bool,
+  /// The source offset (in the text node) of the cluster the glyph belongs to.
+  pub cluster: usize,
+  /// The glyph origin, from the left edge of the run and from its baseline, y down.
+  pub x: f32,
+  pub y: f32,
+  /// The pen advance after the glyph, justification included.
+  pub advance: f32,
+}
+
+impl Copy for PositionedGlyph {}
+
+/// A run of glyphs in one font, in visual (left to right) order.
+pub struct GlyphRun {
+  /// The font key of the run, as `TextFragment.fontKey` and `Measure.font` use it.
+  pub fontKey: usize,
+  /// The face index in the font collection, and the face id for `font-raster` keys.
+  pub face: usize,
+  /// The font size in CSS pixels.
+  pub size: f32,
+  pub rtl: bool,
+  /// The sum of the glyph advances: the width of the fragment.
+  pub advance: f32,
+  start: usize,
+  end: usize,
+  hash: u64,
+}
+
+impl Copy for GlyphRun {}
+
+impl GlyphRun {
+  /// Fingerprint of the font key, size, direction and positioned glyphs. Together
+  /// with the raster face identity, this validates paint metadata across key reuse.
+  pub fn fingerprint(self: &Self) -> u64 {
+    return self.hash
+  }
+}
+
+pub struct GlyphStore {
+  seed: HashSeed,
+  map: HashMap<Word, u32>,
+  runs: List<GlyphRun>,
+  glyphs: List<PositionedGlyph>,
+}
+
+fn sameGlyphs(left: &[PositionedGlyph], right: &[PositionedGlyph]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut index: usize = 0
+  while index < left.length {
+    let a = left[index]
+    let b = right[index]
+    if a.upright != b.upright || a.glyph != b.glyph || a.cluster != b.cluster || a.x != b.x
+      || a.y != b.y
+      || a.advance != b.advance {
+      return false
+    }
+    index = index + 1
+  }
+  return true
+}
+
+impl GlyphStore {
+  pub fn make() -> GlyphStore {
+    let seed = Hash.seed(0x676c797068)
+    return GlyphStore {
+      seed: seed,
+      map: HashMap<Word, u32>.make(seed),
+      runs: List<GlyphRun>.make(),
+      glyphs: List<PositionedGlyph>.make(),
+    }
+  }
+
+  /// The number of distinct runs kept.
+  pub fn length(self: &Self) -> usize {
+    return self.runs.length()
+  }
+
+  /// Forgets every run. Keys handed out before become invalid, so the layout tree that holds
+  /// them must be invalidated (`LayoutTree.invalidate`) before its next compute.
+  pub fn clear(self: &mut Self) -> () {
+    self.map.clear()
+    self.runs.clear()
+    self.glyphs.clear()
+  }
+
+  fn hashOf(self: &Self, fontKey: usize, size: f32, rtl: bool, glyphs: &[PositionedGlyph]) -> u64 {
+    let mut hashed = Hash.mix(&self.seed, usize.toU64(fontKey))
+    hashed = Hash.combine(hashed, u32.toU64(f32.toBits(size)))
+    if rtl {
+      hashed = Hash.combine(hashed, 1)
+    }
+    let mut index: usize = 0
+    while index < glyphs.length {
+      let glyph = glyphs[index]
+      hashed = Hash.combine(
+        hashed,
+        u64.bitOr(u32.toU64(glyph.glyph), u64.shiftLeft(usize.toU64(glyph.cluster), 32)),
+      )
+      hashed = Hash.combine(
+        hashed,
+        u64.bitOr(
+          u32.toU64(f32.toBits(glyph.x)),
+          u64.shiftLeft(u32.toU64(f32.toBits(glyph.advance)), 32),
+        ),
+      )
+      hashed = Hash.combine(hashed, u32.toU64(f32.toBits(glyph.y)))
+      hashed = Hash.combine(
+        hashed,
+        if glyph.upright {
+          1
+        } else {
+          0
+        },
+      )
+      index = index + 1
+    }
+    return hashed
+  }
+
+  /// The key of a run with these glyphs, adding it when it is new.
+  pub effect fn intern(
+    self: &mut Self,
+    fontKey: usize,
+    face: usize,
+    size: f32,
+    rtl: bool,
+    glyphs: &[PositionedGlyph],
+  ) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let hashed = self.hashOf(fontKey, size, rtl, glyphs)
+    if let Option<u32>.Some { value } = self.map.get(Word { value: hashed }) {
+      let existing = self.runs.get(u32.toUsize(value))
+      if existing.fontKey == fontKey && existing.size == size && existing.rtl == rtl
+        && sameGlyphs(
+          Slice.view(self.glyphs.asSlice(), existing.start, existing.end - existing.start),
+          glyphs,
+        ) {
+        return u32.toUsize(value)
+      }
+    }
+    let start = self.glyphs.length()
+    run self.glyphs.appendSlice(glyphs)
+    let mut advance: f32 = 0.0
+    let mut index: usize = 0
+    while index < glyphs.length {
+      advance = advance + glyphs[index].advance
+      index = index + 1
+    }
+    let key = self.runs.length()
+    run self.runs.append(
+      GlyphRun {
+        fontKey: fontKey,
+        face: face,
+        size: size,
+        rtl: rtl,
+        advance: advance,
+        start: start,
+        end: self.glyphs.length(),
+        hash: hashed,
+      },
+    )
+    drop run self.map.insert(Word { value: hashed }, usize.toU32(key))
+    return key
+  }
+
+  /// The run behind `shapeKey`.
+  pub fn glyphRun(self: &Self, shapeKey: usize) -> GlyphRun {
+    return self.runs.get(shapeKey)
+  }
+
+  /// The glyphs of the run behind `shapeKey`, in visual order.
+  pub fn glyphsOf(self: &Self, shapeKey: usize) -> &[PositionedGlyph] {
+    let value = self.runs.get(shapeKey)
+    return Slice.view(self.glyphs.asSlice(), value.start, value.end - value.start)
+  }
+}

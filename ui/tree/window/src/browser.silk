@@ -1,0 +1,92 @@
+//! What a window-host app reads from the page it runs in. In a browser build these are imports
+//! from the `silk_browser` module of `browser/app-host.js`; natively they answer as if there
+//! were no page.
+import silk.collections.bytes { Bytes }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.string { String }
+
+static if Intrinsic.targetArchitecture() == "wasm32" {
+  import silk.mem.pointer { Pointer }
+  import silk.num.i32
+
+  unsafe extern "C" fn hostCheck() -> u32 as "silk_browser#check"
+
+  @foreign(noCapture: .("key"))
+  unsafe extern "C" fn hostStoredLength(
+    key: ?[*]const u8,
+    keyLength: usize,
+  ) -> i32 as "silk_browser#stored_length"
+
+  @foreign(noCapture: ("key", "into"))
+  unsafe extern "C" fn hostStoredRead(
+    key: ?[*]const u8,
+    keyLength: usize,
+    into: ?[*]mut u8,
+    length: usize,
+  ) -> i32 as "silk_browser#stored_read"
+
+  @foreign(noCapture: ("key", "value"))
+  unsafe extern "C" fn hostStore(
+    key: ?[*]const u8,
+    keyLength: usize,
+    value: ?[*]const u8,
+    valueLength: usize,
+  ) -> u32 as "silk_browser#store"
+}
+
+/// Whether the page asked for the rendering check (`?check` in its address), the browser's
+/// version of a native app's `--check` argument. Always false natively.
+pub fn checkRequested() -> bool {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    return unsafe hostCheck() != 0
+  } else {
+    return false
+  }
+}
+
+/// The bytes the page keeps under `key` (its `localStorage`, as UTF-8), or None when there are
+/// none. Always None natively.
+pub effect fn stored(key: string) -> Option<Bytes>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    let name = String.utf8Bytes(key)
+    let length = unsafe hostStoredLength(Pointer.fromSlice(name), name.length)
+    if length < 0 {
+      return Option<Bytes>.None
+    }
+    let mut bytes = run Bytes.zeroed(i32.toUsize(length))
+    let size = bytes.length()
+    let read = unsafe hostStoredRead(
+      Pointer.fromSlice(name),
+      name.length,
+      Pointer.fromMutSlice(bytes.asMutSlice()),
+      size,
+    )
+    if read != length {
+      return Option<Bytes>.None
+    }
+    return Option<Bytes>.some(move bytes)
+  } else {
+    return Option<Bytes>.None
+  }
+}
+
+/// Keeps `value` (UTF-8 text) under `key` in the page's `localStorage`. False when the page
+/// refused it (storage full or blocked), and always natively.
+pub fn store(key: string, value: string) -> bool {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    let name = String.utf8Bytes(key)
+    let bytes = String.utf8Bytes(value)
+    return unsafe hostStore(
+      Pointer.fromSlice(name),
+      name.length,
+      Pointer.fromSlice(bytes),
+      bytes.length,
+    )
+      != 0
+  } else {
+    return false
+  }
+}

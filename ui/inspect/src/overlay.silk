@@ -1,0 +1,217 @@
+//! The highlight overlay: the box model of chosen nodes drawn as devtools draws it (content
+//! blue, padding green, border yellow, margin orange), in an isolated layer on top of the
+//! tree's frame. The tree's own scene and paint caches are never touched.
+import ui_tree.tree { UiTree }
+import ui_tree.node { NONE }
+import ui_tree.inspect { FragmentInfo, fragmentsOf }
+import layout.lib { FragmentKind }
+import ui_scene.primitives { Quad, ContentMask, Background, Isolation, BorderStyle }
+import ui_scene.scene { Scene }
+import silk.collections.list { List }
+import silk.color.rgba { Rgba }
+import silk.core.ownership { Copy }
+import silk.geometry.corners { Corners }
+import silk.geometry.insets { Insets }
+import silk.geometry.rect { Rect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+
+/// The four boxes of one fragment of a node, in CSS pixels of the viewport.
+pub struct BoxModel {
+  pub margin: Rect<f32>,
+  pub border: Rect<f32>,
+  pub padding: Rect<f32>,
+  pub content: Rect<f32>,
+}
+
+impl Copy for BoxModel {}
+
+/// The box model of each of node `id`'s own fragments after the last layout: one for a block,
+/// one per line for an inline box or a text node split across lines. Empty when the node has
+/// no box.
+pub effect fn boxModels(tree: &UiTree<'_>, id: u32, out: &mut List<BoxModel>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  let slot = tree.slotOf(id)
+  if slot == NONE {
+    return ()
+  }
+  let css = tree.node(slot).css
+  let values = tree.output.fragments.values.asSlice()
+  let mut fragments = List<FragmentInfo>.make()
+  run fragmentsOf(tree, slot, &mut fragments)
+  let mut i: usize = 0
+  while i < fragments.length() {
+    let info = fragments.get(i)
+    let f = &values[info.index]
+    i = i + 1
+    if f.source != css {
+      continue
+    }
+    if f.kind == FragmentKind.Text {
+      // Text comes as one fragment per run: one box per line box it occupies.
+      let mut b = info.border
+      while i < fragments.length() && fragments.get(i).parent == info.parent
+        && values[fragments.get(i).index].source == css {
+        b = merged(b, fragments.get(i).border)
+        i = i + 1
+      }
+      run out.append(BoxModel { margin: b, border: b, padding: b, content: b })
+      continue
+    }
+    let m = f.usedMargin
+    let b = info.border
+    run out.append(
+      BoxModel {
+        margin: Rect<f32>.new(b.xMin - m.left, b.yMin - m.top, b.xMax + m.right, b.yMax + m.bottom),
+        border: b,
+        padding: info.padding,
+        content: info.content,
+      },
+    )
+  }
+}
+
+fn merged(a: Rect<f32>, b: Rect<f32>) -> Rect<f32> {
+  return Rect<f32>.new(
+    f32.min(a.xMin, b.xMin),
+    f32.min(a.yMin, b.yMin),
+    f32.max(a.xMax, b.xMax),
+    f32.max(a.yMax, b.yMax),
+  )
+}
+
+/// The overlay's colors. [`HighlightColors.devtools`] are Chrome's.
+pub struct HighlightColors {
+  pub content: Rgba<f32>,
+  pub padding: Rgba<f32>,
+  pub border: Rgba<f32>,
+  pub margin: Rgba<f32>,
+}
+
+impl Copy for HighlightColors {}
+
+fn rgba(r: f32, g: f32, b: f32, a: f32) -> Rgba<f32> {
+  return Rgba<f32> { r: r / 255.0, g: g / 255.0, b: b / 255.0, a: a }
+}
+
+impl HighlightColors {
+  pub fn devtools() -> HighlightColors {
+    return HighlightColors {
+      content: rgba(111.0, 168.0, 220.0, 0.66),
+      padding: rgba(147.0, 196.0, 125.0, 0.55),
+      border: rgba(255.0, 229.0, 153.0, 0.66),
+      margin: rgba(246.0, 178.0, 107.0, 0.66),
+    }
+  }
+}
+
+/// What to highlight.
+pub struct Highlight {
+  /// Client ids; unknown ids and nodes without a box are skipped.
+  pub nodes: List<u32>,
+  pub colors: HighlightColors,
+}
+
+impl Highlight {
+  pub fn make() -> Highlight {
+    return Highlight { nodes: List<u32>.make(), colors: HighlightColors.devtools() }
+  }
+
+  /// A highlight of node `id` alone.
+  pub effect fn of(id: u32) -> Highlight
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut h = Highlight.make()
+    run h.nodes.append(id)
+    return move h
+  }
+}
+
+fn scaled(r: Rect<f32>, s: f32) -> Rect<f32> {
+  return Rect<f32>.new(r.xMin * s, r.yMin * s, r.xMax * s, r.yMax * s)
+}
+
+fn transparent() -> Rgba<f32> {
+  return Rgba<f32> { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }
+}
+
+/// The ring between `outer` and `inner` (device pixels) as one bordered quad.
+effect fn ring(
+  scene: &mut Scene,
+  outer: Rect<f32>,
+  inner: Rect<f32>,
+  mask: ContentMask,
+  color: Rgba<f32>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let top = f32.max(0.0, inner.yMin - outer.yMin)
+  let right = f32.max(0.0, outer.xMax - inner.xMax)
+  let bottom = f32.max(0.0, outer.yMax - inner.yMax)
+  let left = f32.max(0.0, inner.xMin - outer.xMin)
+  if top == 0.0 && right == 0.0 && bottom == 0.0 && left == 0.0 {
+    return ()
+  }
+  drop run scene.quad(
+    Quad {
+      bounds: outer,
+      mask: mask,
+      background: Background.solid(transparent()),
+      cornerRadii: Corners<f32>.uniform(0.0),
+      borderWidths: Insets<f32>.new(top, right, bottom, left),
+      borderColor: color,
+      borderStyle: BorderStyle.Solid,
+    },
+  )
+}
+
+/// Adds the highlight to `scene` (not finished) as one isolated layer over the whole viewport,
+/// in the device pixels of the tree's last frame.
+pub effect fn paintHighlight(tree: &UiTree<'_>, highlight: &Highlight, scene: &mut Scene) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let s = tree.input.scale
+  let viewport = Rect<f32>.new(0.0, 0.0, tree.input.width * s, tree.input.height * s)
+  let mask = ContentMask.new(viewport)
+  drop run scene.pushIsolatedLayer(viewport, mask, Isolation { opacity: 1.0, blend: 0 })
+  let colors = highlight.colors
+  let mut models = List<BoxModel>.make()
+  let ids = highlight.nodes.asSlice()
+  let mut i: usize = 0
+  while i < ids.length {
+    run boxModels(tree, ids[i], &mut models)
+    let list = models.asSlice()
+    let mut j: usize = 0
+    while j < list.length {
+      let m = list[j]
+      let content = scaled(m.content, s)
+      let padding = scaled(m.padding, s)
+      let border = scaled(m.border, s)
+      let margin = scaled(m.margin, s)
+      if content.xMax > content.xMin && content.yMax > content.yMin {
+        drop run scene.quad(Quad.fill(content, mask, Background.solid(colors.content)))
+      }
+      run ring(&mut scene, padding, content, mask, colors.padding)
+      run ring(&mut scene, border, padding, mask, colors.border)
+      run ring(&mut scene, margin, border, mask, colors.margin)
+      j = j + 1
+    }
+    i = i + 1
+  }
+  run scene.popLayer()
+}
+
+/// The tree's last frame with the highlight on top, as a finished scene in `out` (cleared
+/// first). Draw `out` instead of `tree.scene()` while the overlay is on; the atlas tiles are
+/// the tree's, so the uploads stay the same.
+pub effect fn compose(tree: &UiTree<'_>, highlight: &Highlight, out: &mut Scene) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  let frame = tree.scene()
+  run out.replay(frame, 0, frame.operationCount())
+  run paintHighlight(tree, highlight, &mut out)
+  run out.finish()
+}

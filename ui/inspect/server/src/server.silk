@@ -1,0 +1,733 @@
+//! The inspector server: the protocol over a local socket, polled from the app's frame loop.
+//!
+//! Off unless the build is a debug build (`optimization = "none"`) and `SILK_UI_INSPECT` is
+//! set. The variable names where to listen:
+//!
+//! - `1` (or empty): the Unix socket `silk-ui-inspect.sock` in the working directory (TCP port
+//!   7357 on Windows, which has no Unix sockets here)
+//! - `tcp:<port>`: TCP on 127.0.0.1 (`tcp:0` lets the system choose; the port is printed)
+//! - anything else: the path of a Unix socket
+//!
+//! The server never blocks the frame loop while it waits for clients: `poll` accepts and
+//! serves only connections that are already there. Each connection carries one request line
+//! and gets one reply line, then the server closes it.
+import protocol { Protocol, Outcome }
+import reply { malformed, notYet }
+import ui_tree.tree { UiTree }
+import ui_scene.scene { Scene }
+import silk.collections.bytes { Bytes }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.io.byte_duplex { ByteDuplex, ByteIoError, ReadTransfer }
+import silk.io.writer { Writer }
+
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  import silk.io.writer_native { StderrWriter }
+}
+
+import silk.json.scanner { JsonError }
+import silk.json.value { Json, Value }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.net.address { Endpoint, IpAddress, Ipv4Address, Port }
+import silk.net.socket_native {
+  AcceptedView,
+  AcceptedContext,
+  BoundAddress,
+  ConnectOptions,
+  Connection,
+  ListenOptions,
+  NativeSocketError,
+  accept,
+  connectUnixOwned,
+  listen,
+  listenUnix,
+  withAcceptedContext
+}
+
+static if Intrinsic.targetArchitecture() == "wasm32" {
+  // The browser has no sockets, and dropping std's socket types does not compile there, so the
+  // inspector holds these stand-ins and is always off.
+  struct Listener {}
+
+  impl Listener {
+    effect fn close(self: &mut Self) -> () ! NativeSocketError {}
+  }
+
+  struct Accepted {}
+} else {
+  import silk.net.socket_native { Accepted, Listener }
+}
+
+import silk.num.u16
+import silk.num.u64
+import silk.num.usize
+import silk.system.filesystem { FileError }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.system.monotonic_clock { MonotonicClock, ReadyWatch }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
+import silk.system.system_clock { Instant, SystemClock }
+import silk.text.format { Format, ParseError }
+import silk.text.string { String, InvalidUtf8 }
+import silk.collections.slice { Slice }
+import silk.mem.pointer { Pointer }
+import ui_tree.inspect { writeInt }
+
+/// The environment variable that turns the inspector on.
+pub const VARIABLE: string = "SILK_UI_INSPECT"
+
+/// The Unix socket `1` stands for.
+pub const DEFAULT_PATH: string = "silk-ui-inspect.sock"
+
+/// The TCP port `1` stands for where Unix sockets are not available.
+pub const DEFAULT_PORT: u16 = 7357
+
+/// The longest request line the server reads.
+pub const MAX_REQUEST: usize = 1048576
+
+/// How long a connected client may take to send its request, and to take the reply.
+const IO_TIMEOUT: u64 = 2000000000
+
+/// A clock for one non-blocking attempt: time stands still until a socket operation would
+/// wait, and the wait jumps straight to the deadline, so the operation times out at once
+/// instead of sleeping.
+struct PollClock {
+  mark: Instant,
+}
+
+impl MonotonicClock for PollClock {
+  effect fn now(self: &mut Self) -> Instant {
+    return SystemClock.make(SystemClock.seconds(&self.mark), SystemClock.nanoseconds(&self.mark))
+  }
+
+  effect fn getResolution(self: &mut Self) -> u64 {
+    return 1
+  }
+
+  effect fn waitUntil(self: &mut Self, when: Instant) -> () {
+    self.mark = move when
+  }
+
+  effect fn waitFor(self: &mut Self, howLong: u64) -> () {
+    self.mark = MonotonicClock.deadlineAfter(&self.mark, howLong)
+  }
+
+  effect fn waitReady(self: &mut Self, watch: &mut [ReadyWatch], until: Option<Instant>) -> usize {
+    let ready = OsMonotonicClock.pollNow(&mut watch)
+    if ready > 0 {
+      return ready
+    }
+    match move until {
+      Option<Instant>.Some { value } => {
+        self.mark = move value
+      }
+      Option<Instant>.None => Intrinsic.trap(
+        "PollClock requires a deadline when no socket is ready",
+      )
+    }
+    return 0
+  }
+}
+
+/// A deadline one nanosecond after the poll clock's start: one try, then a timeout.
+fn pollDeadline() -> Option<Instant> {
+  return Option<Instant>.some(SystemClock.make(0, 1))
+}
+
+fn pollClock() -> PollClock {
+  return PollClock { mark: SystemClock.make(0, 0) }
+}
+
+/// Where the inspector listens.
+pub union Address {
+  Unix { pub path: String },
+  Tcp { pub port: u16 },
+}
+
+/// Reads an address in the syntax of `SILK_UI_INSPECT` (see the module docs). None when a
+/// `tcp:` port is not a number.
+pub effect fn parseAddress(value: string) -> Option<Address>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if value == "" || value == "1" {
+    static if Intrinsic.targetOperatingSystem() == "windows" {
+      return Option<Address>.Some { value: Address.Tcp { port: DEFAULT_PORT } }
+    } else {
+      return Option<Address>.Some { value: Address.Unix { path: run String.copy(DEFAULT_PATH) } }
+    }
+  }
+  if String.startsWith(value, "tcp:") {
+    let digits = String.slice(value, 4, String.byteLength(value) - 4)
+    return match move Format.u16Value(digits) {
+      Result<u16, ParseError>.Success { value: port } => Option<Address>.Some {
+        value: Address.Tcp { port: port },
+      }
+      Result<u16, ParseError>.Failure { error } => Option<Address>.None
+    }
+  }
+  return Option<Address>.Some { value: Address.Unix { path: run String.copy(value) } }
+}
+
+/// `address` with a relative Unix socket path made absolute against `cwd` (the kernel only
+/// binds absolute paths here).
+pub effect fn resolved(address: Address, cwd: &[u8]) -> Address
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match move address {
+    Address.Unix { path } => {
+      if String.startsWith(String.view(&path), "/") || cwd.length == 0 {
+        return Address.Unix { path: move path }
+      }
+      let mut full = run String.copy(unsafe String.fromUtf8Unchecked(cwd))
+      if !String.endsWith(String.view(&full), "/") {
+        run full.append("/")
+      }
+      run full.append(String.view(&path))
+      return Address.Unix { path: move full }
+    }
+    Address.Tcp { port } => Address.Tcp { port: port }
+  }
+}
+
+/// Appends `unix:<path>` or `tcp:127.0.0.1:<port>`.
+pub effect fn describeAddress(address: &Address, out: &mut String) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match &address.* {
+    Address.Unix { path } => {
+      run out.append("unix:")
+      run out.append(String.view(&path))
+    }
+    Address.Tcp { port } => {
+      run out.append("tcp:127.0.0.1:")
+      run writeInt(&mut out, u16.toU64(port))
+    }
+  }
+}
+
+/// How the app opts in.
+pub struct InspectorOptions {
+  /// Also start in optimized builds (the environment variable is still needed). For CI jobs
+  /// that test the inspector against a release build; apps should leave it off.
+  pub releaseBuilds: bool,
+  /// Print the address (or why the server did not start) to stderr.
+  pub announce: bool,
+}
+
+impl InspectorOptions {
+  pub fn make() -> InspectorOptions {
+    return InspectorOptions { releaseBuilds: false, announce: true }
+  }
+}
+
+/// Whether this is a debug build.
+pub fn debugBuild() -> bool {
+  static if Intrinsic.profileText("optimization") == "none" {
+    return true
+  } else {
+    return false
+  }
+}
+
+/// The inspector an app owns next to its tree. When it is off (the default), every method
+/// returns at once.
+pub struct Inspector {
+  listener: Option<Listener>,
+  address: Option<Address>,
+  protocol: Protocol,
+  /// A command dispatched input: no request runs until the app drew the next frame.
+  awaitingFrame: bool,
+  line: Bytes,
+  reply: String,
+  /// Requests served, for tests and logs.
+  pub served: u64,
+}
+
+effect fn say(text: string) -> () {
+  // The browser has no standard error, and the inspector never starts there.
+  static if Intrinsic.targetArchitecture() != "wasm32" {
+    let mut writer = StderrWriter.make()
+    drop run Effect.result(Writer.writeString(text) |> Effect.provideMut<Writer>(&mut writer))
+  }
+}
+
+impl Inspector {
+  /// An inspector that is off.
+  pub fn off() -> Inspector {
+    return Inspector {
+      listener: Option<Listener>.None,
+      address: Option<Address>.None,
+      protocol: Protocol.make(),
+      awaitingFrame: false,
+      line: Bytes.make(),
+      reply: String.make(),
+      served: 0,
+    }
+  }
+
+  /// Starts the inspector when the build and `SILK_UI_INSPECT` allow it, and returns one that
+  /// is off otherwise (also when the socket cannot be opened; `announce` says why).
+  pub effect fn start(options: InspectorOptions) -> Inspector
+    ! HostInputError | OutOfMemoryError
+    ? &mut HostInput | &mut Allocator {
+    if !debugBuild() && !options.releaseBuilds {
+      return Inspector.off()
+    }
+    let value = match run HostInput.variableNamed(VARIABLE) {
+      Option<Bytes>.Some { value } => move value
+      Option<Bytes>.None => {
+        return Inspector.off()
+      }
+    }
+    let text = match HostInput.text(value.asSlice()) {
+      Result<string, InvalidUtf8>.Success { value: t } => t
+      Result<string, InvalidUtf8>.Failure { error } => "1"
+    }
+    let address = match run parseAddress(text) {
+      Option<Address>.Some { value: a } => move a
+      Option<Address>.None => {
+        if options.announce {
+          run say("ui-inspect: SILK_UI_INSPECT is not 1, tcp:<port> or a socket path\n")
+        }
+        return Inspector.off()
+      }
+    }
+    let cwd = run HostInput.workingDirectory()
+    let absolute = run resolved(move address, cwd.asSlice())
+    return run Inspector.listenAt(move absolute, options.announce)
+  }
+
+  /// Starts the inspector at `address` (a Unix socket path must be absolute, see [`resolved`])
+  /// regardless of the build and the environment, for tests.
+  pub effect fn listenAt(address: Address, announce: bool) -> Inspector
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      drop address
+      return Inspector.off()
+    } else {
+      let mut inspector = Inspector.off()
+      let opened = run Effect.result(open(&address))
+      match move opened {
+        Result<Listener, NativeSocketError | FileError | OutOfMemoryError>.Success { value } => {
+          let mut text = run String.copy("ui-inspect: listening on ")
+          match &value.boundAddress() {
+            BoundAddress.Tcp { endpoint } => {
+              let port = endpoint.port().value()
+              run text.append("tcp:127.0.0.1:")
+              run writeInt(&mut text, u16.toU64(port))
+              inspector.address = Option<Address>.Some { value: Address.Tcp { port: port } }
+            }
+            _ => {
+              run describeAddress(&address, &mut text)
+              inspector.address = Option<Address>.Some { value: move address }
+            }
+          }
+          run text.append("\n")
+          if announce {
+            run say(String.view(&text))
+          }
+          inspector.listener = Option<Listener>.Some { value: move value }
+        }
+        Result<Listener, NativeSocketError | FileError | OutOfMemoryError>.Failure { error } => {
+          drop error
+          if announce {
+            let mut text = run String.copy("ui-inspect: could not listen on ")
+            run describeAddress(&address, &mut text)
+            run text.append("\n")
+            run say(String.view(&text))
+          }
+        }
+      }
+      return move inspector
+    }
+  }
+
+  /// Whether the server is listening.
+  pub fn enabled(self: &Self) -> bool {
+    return match &self.listener {
+      Option<Listener>.Some { value } => true
+      Option<Listener>.None => false
+    }
+  }
+
+  /// Where it listens (TCP with the port the system chose).
+  pub fn listenAddress(self: &Self) -> &Option<Address> {
+    return &self.address
+  }
+
+  /// How long the app's event loop should wait at most, in seconds, so that requests are
+  /// served while the app is idle. None when the inspector is off: wait as usual.
+  pub fn pollInterval(self: &Self) -> Option<f64> {
+    if self.enabled() {
+      return Option<f64>.some(0.02)
+    }
+    return Option<f64>.None
+  }
+
+  /// Serves at most one waiting request per poll, unless earlier input still waits for a
+  /// frame. Returns true when the app has work: a command dispatched input (take the tree's
+  /// event records and answer them, as for window input) or changed the highlight. Either
+  /// way, drain [`Inspector.dispatchNext`] with application handling between each input,
+  /// then compose a frame and call [`Inspector.afterFrame`].
+  pub effect fn poll(self: &mut Self, tree: &mut UiTree<'_>) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.enabled() || self.awaitingFrame {
+      return false
+    }
+
+    // Hosts may drain a compound interaction immediately, or process one event per frame.
+    // In either case a subsequent request cannot overwrite unprocessed input.
+    if self.protocol.hasInput() {
+      drop run self.protocol.dispatchNext(&mut tree)
+      self.protocol.dispatched = true
+      self.awaitingFrame = true
+      return true
+    }
+    if tree.stats.frame == 0 {
+      self.protocol.repaint = true
+      return true
+    }
+    let mut changed = false
+    while !self.awaitingFrame {
+      let next = run Effect.result(self.acceptOne())
+      let accepted = match move next {
+        Result<Accepted, NativeSocketError>.Success { value } => move value
+        Result<Accepted, NativeSocketError>.Failure { error } => {
+          drop error
+          break
+        }
+      }
+      run self.serve(move accepted, &mut tree)
+      self.served = self.served + 1
+      if self.protocol.dispatched || self.protocol.repaint {
+        changed = true
+      }
+      if self.protocol.dispatched {
+        drop run self.protocol.dispatchNext(&mut tree)
+        self.awaitingFrame = true
+      }
+
+      // Yield to native input and timers even when clients continuously request screenshots.
+      break
+    }
+    return changed
+  }
+
+  /// Dispatches the next input of a compound click, key press or text entry. Service host
+  /// requests and application messages after each true result, just as for native input.
+  pub effect fn dispatchNext(self: &mut Self, tree: &mut UiTree<'_>) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run self.protocol.dispatchNext(&mut tree)
+  }
+
+  /// Publishes the complete app scene for captures and highlighting, including custom drawing.
+  pub effect fn afterFrameScene(self: &mut Self, tree: &UiTree<'_>, scene: &Scene) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.enabled() {
+      return ()
+    }
+    run self.protocol.afterFrameScene(tree, scene)
+    self.protocol.dispatched = false
+    self.protocol.repaint = false
+    self.awaitingFrame = false
+  }
+
+  /// The composed app scene with an optional inspector highlight.
+  pub fn sceneWith<'t>(self: &'t Self, scene: &'t Scene) -> &'t Scene {
+    if self.protocol.highlighting() {
+      return self.protocol.overlayScene()
+    }
+    return scene
+  }
+
+  /// Adds the event records waiting in the tree's queue to the inspector's event log (the
+  /// `events` command). Call it right before the app takes them (`UiTree.takeEvents`, or
+  /// ui-app's `pump`), so each record is logged once.
+  pub effect fn observe(self: &mut Self, tree: &UiTree<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.enabled() {
+      return ()
+    }
+    run self.protocol.observe(tree)
+  }
+
+  /// Takes the frame's atlas uploads for screenshots, rebuilds the highlight overlay and lets
+  /// the next request run. Call after every `UiTree.frame`, before the uploads are cleared.
+  pub effect fn afterFrame(self: &mut Self, tree: &UiTree<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.enabled() {
+      return ()
+    }
+    run self.protocol.afterFrame(tree)
+    self.protocol.dispatched = false
+    self.protocol.repaint = false
+    self.awaitingFrame = false
+  }
+
+  /// The scene to draw: the tree's, or the tree's with the highlight on top.
+  pub fn scene<'t>(self: &'t Self, tree: &'t UiTree<'_>) -> &'t Scene {
+    if self.protocol.highlighting() {
+      return self.protocol.overlayScene()
+    }
+    return tree.scene()
+  }
+
+  /// Whether the app should draw [`Inspector.scene`] after a highlight change or input.
+  pub fn wantsFrame(self: &Self) -> bool {
+    return self.protocol.dispatched || self.protocol.repaint
+  }
+
+  /// The protocol state (highlight, flags), for apps that want to look.
+  pub fn state(self: &Self) -> &Protocol {
+    return &self.protocol
+  }
+
+  /// Stops listening and removes the Unix socket file.
+  pub effect fn close(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match move Intrinsic.replace(self.listener, Option<Listener>.None) {
+      Option<Listener>.Some { value } => {
+        let mut listener = move value
+        drop run Effect.result(listener.close())
+        match &self.address {
+          Option<Address>.Some { value: a } => {
+            match &a {
+              Address.Unix { path } => {
+                run removeSocket(String.view(&path))
+              }
+              _ => {}
+            }
+          }
+          Option<Address>.None => {}
+        }
+      }
+      Option<Listener>.None => {}
+    }
+  }
+
+  effect fn acceptOne(self: &mut Self) -> Accepted
+    ! NativeSocketError {
+    // The browser has no sockets; there the inspector is always off.
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      fail NativeSocketError.Closed
+    } else {
+      let mut clock = pollClock()
+      return match &mut self.listener {
+        Option<Listener>.Some { value } => run accept(&mut value, pollDeadline())
+          |> Effect.provideMut<MonotonicClock>(&mut clock)
+        Option<Listener>.None => {
+          fail NativeSocketError.Closed
+        }
+      }
+    }
+  }
+
+  /// Reads one request line from `accepted`, runs it and writes the reply.
+  effect fn serve(self: &mut Self, accepted: Accepted, tree: &mut UiTree<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.line.clear()
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      drop accepted
+    } else {
+      let mut clock = OsMonotonicClock.make()
+      let context = Session {
+        protocol: &mut self.protocol,
+        tree: &mut tree.*,
+        line: &mut self.line,
+        reply: &mut self.reply,
+      }
+      let served = run Effect.result(
+        withAcceptedContext(move accepted, move context)
+          |> Effect.provideMut<MonotonicClock>(&mut clock),
+      )
+      drop served
+    }
+  }
+}
+
+/// What serving one connection needs.
+struct Session<'s, 't, 'f> {
+  protocol: &'s mut Protocol,
+  tree: &'t mut UiTree<'f>,
+  line: &'s mut Bytes,
+  reply: &'s mut String,
+}
+
+impl<'s, 't, 'f> AcceptedContext<
+  (),
+  ByteIoError | OutOfMemoryError,
+  &mut MonotonicClock | &mut Allocator
+  ? never
+> for Session<'s, 't, 'f> {
+  use: Session.serve
+}
+
+impl<'s, 't, 'f> Session<'s, 't, 'f> {
+  effect<'call> fn serve<'call>(context: Self, view: &'call mut AcceptedView<'call>) -> ()
+    ! ByteIoError | OutOfMemoryError
+    ? &mut MonotonicClock | &mut Allocator {
+    let start = run MonotonicClock.now()
+    let deadline = MonotonicClock.deadlineAfter(&start, IO_TIMEOUT)
+    let complete = run readLine(&mut view.connection.*, &mut context.line.*, &deadline)
+    if !complete {
+      run malformed(&mut context.reply.*, "the request is not one line of at most 1 MiB")
+    } else {
+      let parsed = run Effect.result(Json.parse(context.line.asSlice()))
+      match move parsed {
+        Result<Value, JsonError | OutOfMemoryError>.Success { value } => {
+          let outcome = run context.protocol.handle(
+            &mut context.tree.*,
+            &value,
+            0,
+            &mut context.reply.*,
+          )
+          if outcome == Outcome.Pending {
+            // Frames cannot happen while one connection is served: the client asks again.
+            run notYet(&mut context.reply.*, &value)
+          }
+        }
+        Result<Value, JsonError | OutOfMemoryError>.Failure { error } => {
+          drop error
+          run malformed(&mut context.reply.*, "the request is not valid JSON")
+        }
+      }
+    }
+    run context.reply.append("\n")
+
+    // Rendering is application work, not socket I/O. A costly screenshot must not consume
+    // the client's entire write deadline before the first byte can be sent.
+    let ready = run MonotonicClock.now()
+    let writeDeadline = MonotonicClock.deadlineAfter(&ready, IO_TIMEOUT)
+    run writeAll(&mut view.connection.*, context.reply.ownedUtf8Bytes(), &writeDeadline)
+  }
+}
+
+/// Reads until a newline (not kept) or the end of the stream into `line`. False when the
+/// line is too long or nothing came before the deadline.
+effect fn readLine(connection: &mut Connection, line: &mut Bytes, deadline: &Instant) -> bool
+  ! ByteIoError | OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock {
+  let mut chunk: [u8; 4096] = [0; 4096]
+  while true {
+    let copy = SystemClock.make(SystemClock.seconds(deadline), SystemClock.nanoseconds(deadline))
+    match run ByteDuplex.readSome(&mut chunk, Option<Instant>.some(move copy))
+      |> Effect.provideMut<ByteDuplex>(&mut connection.*) {
+      ReadTransfer.Data { count } => {
+        let mut i: usize = 0
+        while i < count {
+          if chunk[i] == 10 {
+            run line.append(Slice.view(&chunk, 0, i))
+            return true
+          }
+          i = i + 1
+        }
+        run line.append(Slice.view(&chunk, 0, count))
+        if line.length() > MAX_REQUEST {
+          return false
+        }
+      }
+      ReadTransfer.End => {
+        return line.length() != 0
+      }
+    }
+  }
+  return false
+}
+
+effect fn writeAll(connection: &mut Connection, bytes: &[u8], deadline: &Instant) -> ()
+  ! ByteIoError
+  ? &mut MonotonicClock {
+  let mut at: usize = 0
+  while at < bytes.length {
+    let copy = SystemClock.make(SystemClock.seconds(deadline), SystemClock.nanoseconds(deadline))
+    let n = run ByteDuplex.writeSome(
+      Slice.view(bytes, at, bytes.length - at),
+      Option<Instant>.some(move copy),
+    )
+      |> Effect.provideMut<ByteDuplex>(&mut connection.*)
+    at = at + n
+  }
+  let copy = SystemClock.make(SystemClock.seconds(deadline), SystemClock.nanoseconds(deadline))
+  run ByteDuplex.flush(Option<Instant>.some(move copy))
+    |> Effect.provideMut<ByteDuplex>(&mut connection.*)
+}
+
+/// Opens the listener. A Unix socket file nobody answers on (left by a crash) is removed first.
+effect fn open(address: &Address) -> Listener
+  ! NativeSocketError | FileError | OutOfMemoryError
+  ? &mut Allocator {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    fail NativeSocketError.Closed
+  } else {
+    match &address.* {
+      Address.Tcp { port } => {
+        let local = Endpoint.make(
+          IpAddress.V4 { value: Ipv4Address.fromOctets([127, 0, 0, 1]) },
+          Port.fromU16(port),
+        )
+        return run listen(local, ListenOptions.defaults())
+      }
+      Address.Unix { path } => {
+        let bytes = path.ownedUtf8Bytes()
+        let first = run Effect.result(listenUnix(bytes, ListenOptions.defaults()))
+        match move first {
+          Result<Listener, NativeSocketError>.Success { value } => {
+            return move value
+          }
+          Result<Listener, NativeSocketError>.Failure { error } => {
+            drop error
+          }
+        }
+        let mut clock = OsMonotonicClock.make()
+        let start = run MonotonicClock.now() |> Effect.provideMut<MonotonicClock>(&mut clock)
+        let probe = run Effect.result(
+          connectUnixOwned(
+            bytes,
+            ConnectOptions.defaults(),
+            Option<Instant>.some(MonotonicClock.deadlineAfter(&start, 200000000)),
+          ),
+        )
+          |> Effect.provideMut<MonotonicClock>(&mut clock)
+        match move probe {
+          Result<Connection, NativeSocketError>.Success { value } => {
+            // Another app is inspected at this path.
+            let mut live = move value
+            drop run Effect.result(live.close())
+            fail NativeSocketError.Closed
+          }
+          Result<Connection, NativeSocketError>.Failure { error } => {
+            drop error
+          }
+        }
+        run removeSocket(String.view(&path))
+        return run listenUnix(bytes, ListenOptions.defaults())
+      }
+    }
+  }
+}
+
+static if Intrinsic.targetOperatingSystem() != "windows"
+  && Intrinsic.targetArchitecture() != "wasm32" {
+  // silk.system.filesystem refuses to remove a socket file (WrongType), so unlink it directly.
+  unsafe extern "C" fn unlink(path: ?[*]const u8) -> i32
+}
+
+/// Removes the socket file at `path` (absolute).
+effect fn removeSocket(path: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  static if Intrinsic.targetOperatingSystem() != "windows"
+    && Intrinsic.targetArchitecture() != "wasm32" {
+    let mut bytes = run Bytes.copy(String.utf8Bytes(path))
+    run bytes.append(b"\0")
+    drop unsafe unlink(Pointer.fromSlice(bytes.asSlice()))
+  }
+}

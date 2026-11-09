@@ -1,0 +1,2073 @@
+//! [`UiTree`]: the retained tree. Clients change it with [`Mutation`] batches, call
+//! [`UiTree.frame`] once per frame, and read the finished `Scene` and the event records.
+import layout.lib { Fragmentainers, computeFragmented }
+import virtual_list { VirtualList, VirtualRange }
+import virtual_list as virtual
+import anchoring
+import anchoring { Anchored }
+import inspect
+import cssom_view
+import cssom_view { ScrollAnimation }
+import svg_css.cssom_view_window { ScrollState, ViewTarget, ViewTargetKind }
+import svg_css.cssom_error { CssomError }
+import mutation {
+  Mutation,
+  NodeKind,
+  StyleState,
+  Property,
+  Attribute,
+  Role,
+  Cursor,
+  Display,
+  FontStyle,
+  Overflow,
+  WhiteSpace,
+  CanvasCommand,
+  LISTEN_FOCUS,
+  LISTEN_BLUR,
+  LISTEN_LAYOUT,
+  NOT_FOCUSABLE,
+  propertyKey
+}
+import input { Input }
+import interact
+import layers
+import edit
+import edit { EditState, HostRequest, Keymap, ImeArea, NATIVE_KEYMAP }
+import style { Computed, TextStyle }
+import node {
+  NONE,
+  NO_INDEX,
+  FrameInput,
+  FrameStats,
+  EventKind,
+  Event,
+  PaintCache,
+  Node,
+  FaceSlot,
+  Pending
+}
+import paint { TextInk, Painter, paintRoots, hashFragments, inkFragments }
+import resources { Families, Resources, Resource, ResourceError }
+import provider { Provider }
+import ui_text.system { TextSystem }
+import ui_text.fonts { TextStyle as FontStyleRequest }
+import font_collection.lib { FontCollection, Family, Request, Style as FaceStyle }
+import font_raster.cache { GlyphCache }
+import font_raster.face { FontFace }
+import atlas.atlas { Atlas, AtlasOptions, AtlasTile }
+import ui_scene.scene { Scene }
+import ui_scene.primitives { ContentMask }
+import ui_scene.path_cache { PathCache }
+import layout.lib {
+  Tree,
+  Fragment,
+  NodeId,
+  LayoutTree,
+  OptionalSize,
+  InvalidNode,
+  NaturalDimensions,
+  Style as CssStyle,
+  Dimension
+}
+import layout.lib as Engine
+import silk.collections.bytes { Bytes }
+import silk.collections.hash { Hash, HashSeed, Word }
+import silk.collections.hash_map { HashMap }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.geometry.rect { Rect }
+import silk.geometry.vector { Vector2 }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.text.string { String }
+
+/// Why a mutation or a frame failed.
+pub union TreeError {
+  /// Mutation `index` of the batch names a node id that does not exist.
+  UnknownNode { pub index: usize, pub id: u32 },
+  /// Mutation `index` creates a node id already in use.
+  IdInUse { pub index: usize, pub id: u32 },
+  /// Mutation `index` does not apply to the node's kind (children of a leaf, text of a box).
+  WrongKind { pub index: usize, pub id: u32 },
+  /// Mutation `index` would put a node inside itself, or move the root.
+  BadMove { pub index: usize, pub id: u32 },
+  /// Mutation `index` names a resource that is not defined.
+  UnknownResource { pub index: usize, pub resource: u32 },
+  /// Mutation `index` defines a resource whose data did not decode.
+  BadResource { pub index: usize, pub resource: u32 },
+  /// Layout or text shaping failed.
+  Layout,
+  /// Virtual list configuration or bindings are invalid.
+  BadVirtualList { pub index: usize, pub id: u32 },
+  /// A CSSOM View scroll scheduler operation failed.
+  View { pub error: CssomError },
+}
+
+impl Copy for TreeError {}
+
+struct FontKeyEntry {
+  family: u32,
+  size: f32,
+  weight: f32,
+  italic: bool,
+  key: usize,
+}
+
+impl Copy for FontKeyEntry {}
+
+effect fn layoutFailed<E>(error: E) -> never
+  ! TreeError {
+  drop error
+  fail TreeError.Layout
+}
+
+effect fn viewFailed(error: CssomError) -> never
+  ! TreeError {
+  fail TreeError.View { error: error }
+}
+
+fn defaultDisplay(kind: NodeKind) -> Display {
+  return match kind {
+    NodeKind.Box => Display.Block
+    NodeKind.Text => Display.Inline
+    NodeKind.Image => Display.Inline
+    NodeKind.Icon => Display.Inline
+    NodeKind.Input => Display.InlineBlock
+    NodeKind.Canvas => Display.Block
+  }
+}
+
+/// Sets `property` in `list`, replacing an earlier value of the same property.
+effect fn setProperty(list: &mut List<Property>, property: Property) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let key = propertyKey(property)
+  let values = list.asMutSlice()
+  let mut i: usize = 0
+  while i < values.length {
+    if propertyKey(values[i]) == key {
+      values[i] = property
+      return ()
+    }
+    i = i + 1
+  }
+  run list.append(property)
+}
+
+fn applyAll(computed: &mut Computed, list: &List<Property>) -> () {
+  let values = list.asSlice()
+  let mut i: usize = 0
+  while i < values.length {
+    computed.apply(values[i])
+    i = i + 1
+  }
+}
+
+/// The retained tree.
+///
+/// It borrows the fonts it draws with. Each frame: [`UiTree.apply`] the client's batches, call
+/// [`UiTree.frame`], hand [`UiTree.scene`] and [`UiTree.uploads`] to a renderer, and drain
+/// [`UiTree.takeEvents`].
+pub struct UiTree<'a> {
+  /// Tree-owned virtualization controllers. Use mutations and `virtualRange` to access them.
+  pub virtualLists: List<VirtualList>,
+  /// Retained popup placement relationships. Configure them through SetAnchor.
+  pub anchors: List<Anchored>,
+  pub layout: Tree,
+  pub output: LayoutTree,
+  pub provider: Provider<'a>,
+  pub nodes: List<Node>,
+  free: List<u32>,
+  ids: HashMap<Word, u32>,
+  /// The slot of each css-layout node, or NONE.
+  pub slotOfCss: List<u32>,
+  /// The root slot, or NONE.
+  pub root: u32,
+  /// The focused slot, or NONE.
+  pub focused: u32,
+  families: Families,
+  pub resources: Resources,
+  fontKeys: List<FontKeyEntry>,
+  pub faces: List<FaceSlot<'a>>,
+  pub atlas: Atlas,
+  pub glyphs: GlyphCache,
+  pub paths: PathCache,
+  pub sceneA: Scene,
+  pub sceneB: Scene,
+  /// Whether `sceneB` holds the current frame.
+  pub flipped: bool,
+  /// Whether the previous scene can be replayed from (false after a resize of the atlas
+  /// or before the first frame).
+  pub replayable: bool,
+  pub seed: HashSeed,
+  pub stylesDirty: bool,
+  pub frameNumber: u64,
+  /// Changes to published semantics or allocated geometry.
+  pub semanticRevision: u64,
+  pub input: FrameInput,
+  laidOut: FrameInput,
+  laidOutRevision: usize,
+  laidOutScrolls: usize,
+  pub stats: FrameStats,
+  pub events: List<Event>,
+  /// The node ids in the order the last frame painted them (replayed subtrees included).
+  pub paintOrder: List<u32>,
+  /// Per fragment of the last layout: the hash of its subtree's paint inputs.
+  pub fragmentHashes: List<u64>,
+  /// Per fragment of the last layout: the bounds of its subtree's ink in CSS pixels.
+  pub fragmentInk: List<Rect<f32>>,
+  /// Per fragment of the last layout: whether its subtree holds a scroll container.
+  pub fragmentScrollers: List<bool>,
+  /// Whether the fragment hashes and ink are out of date: layout, styles or mutations changed
+  /// since they were computed. Scrolling leaves them as they are.
+  paintCachesStale: bool,
+  /// Whether a scroll offset changed since the last frame.
+  pub scrolled: bool,
+  /// Whether no scroll offset changed between the previous frame and this one.
+  scrollsStill: bool,
+  pub textInk: List<TextInk>,
+  facesDirty: bool,
+  pub uploads: Pending,
+  /// The first fragment of each css-layout node in the last layout, or NO_INDEX.
+  pub fragmentOf: List<usize>,
+  /// Next fragment with the same CSS source, in arena order.
+  pub nextSourceFragment: List<usize>,
+  /// First paint-order index per node slot, or NONE.
+  pub paintIndexOf: List<u32>,
+  /// Whether focus should show as focus-visible: the last focus change came from the keyboard.
+  pub focusVisible: bool,
+  /// The hovered nodes as (slot, id) pairs, the target first, then its ancestors.
+  pub hoverChain: List<u64>,
+  /// The nodes in the active state as (slot, id) pairs, and the node holding the pointer
+  /// capture (NONE when no button is down).
+  pub pressChain: List<u64>,
+  pub capture: u32,
+  pub captureId: u32,
+  /// The click count of the press, for its click record.
+  pub pressCount: u32,
+  /// A scrollbar thumb being dragged: the container slot (NONE when none), the axis, and the
+  /// pointer and scroll offset where the drag started.
+  pub thumbSlot: u32,
+  pub thumbVertical: bool,
+  pub thumbStart: f32,
+  pub thumbOffset: f32,
+  /// Where the pointer is, and whether it is in the window.
+  pub pointerX: f32,
+  pub pointerY: f32,
+  pub pointerInside: bool,
+  /// Nodes to scroll into view at the next frame, as (slot, id) pairs.
+  pub reveal: List<u64>,
+  /// CSSOM scroll completion/events and the animations driven by the real frame clock.
+  pub viewScrollState: ScrollState,
+  pub viewScrollAnimations: List<ScrollAnimation>,
+  /// Whether a mutation was applied since the last frame.
+  applied: bool,
+  pub layoutObserversDirty: bool,
+  /// Whether something only paint shows changed since the last frame (a caret moved).
+  pub paintDirty: bool,
+  /// Requests for the host (clipboard), oldest first.
+  pub requests: List<HostRequest>,
+  /// The modifier keys editing shortcuts use; the compilation target's by default.
+  pub keymap: Keymap,
+}
+
+impl<'a> UiTree<'a> {
+  /// An empty tree drawing with the fonts of `collection`.
+  pub effect fn make(collection: &'a FontCollection) -> UiTree<'a>
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut viewport = CssStyle.make()
+    viewport.width = Dimension.px(0.0)
+    viewport.height = Dimension.px(0.0)
+    let mut layout = run Tree.make(move viewport)
+
+    // Scroll and sticky offsets are applied when painting, so scrolling needs no layout.
+    layout.stickyDeferred = true
+    let resources = run Effect.catch<ResourceError>(Resources.make(), layoutFailed)
+    let seed = Hash.seed(0x7569747265)
+    return UiTree<'a> {
+      virtualLists: List<VirtualList>.make(),
+      anchors: List<Anchored>.make(),
+      layout: move layout,
+      output: LayoutTree.make(),
+      provider: Provider<'a> {
+        text: TextSystem.make(collection),
+        naturals: List<NaturalDimensions>.make(),
+      },
+      nodes: List<Node>.make(),
+      free: List<u32>.make(),
+      ids: HashMap<Word, u32>.make(seed),
+      slotOfCss: List<u32>.make(),
+      root: NONE,
+      focused: NONE,
+      families: Families.make(),
+      resources: move resources,
+      fontKeys: List<FontKeyEntry>.make(),
+      faces: List<FaceSlot<'a>>.make(),
+      atlas: Atlas.make(AtlasOptions.default()),
+      glyphs: GlyphCache.make(),
+      paths: PathCache.make(),
+      sceneA: Scene.make(),
+      sceneB: Scene.make(),
+      flipped: false,
+      replayable: false,
+      seed: seed,
+      stylesDirty: true,
+      frameNumber: 0,
+      semanticRevision: 0,
+      input: FrameInput { width: 0.0, height: 0.0, scale: 1.0, time: 0.0 },
+      laidOut: FrameInput { width: -1.0, height: -1.0, scale: 0.0, time: 0.0 },
+      laidOutRevision: usize.MAX,
+      laidOutScrolls: usize.MAX,
+      stats: FrameStats.zero(),
+      events: List<Event>.make(),
+      paintOrder: List<u32>.make(),
+      fragmentHashes: List<u64>.make(),
+      fragmentInk: List<Rect<f32>>.make(),
+      fragmentScrollers: List<bool>.make(),
+      paintCachesStale: true,
+      scrolled: false,
+      scrollsStill: false,
+      textInk: List<TextInk>.make(),
+      facesDirty: true,
+      uploads: Pending.make(),
+      fragmentOf: List<usize>.make(),
+      nextSourceFragment: List<usize>.make(),
+      paintIndexOf: List<u32>.make(),
+      focusVisible: false,
+      hoverChain: List<u64>.make(),
+      pressChain: List<u64>.make(),
+      capture: NONE,
+      captureId: NONE,
+      pressCount: 0,
+      thumbSlot: NONE,
+      thumbVertical: true,
+      thumbStart: 0.0,
+      thumbOffset: 0.0,
+      pointerX: 0.0,
+      pointerY: 0.0,
+      pointerInside: false,
+      reveal: List<u64>.make(),
+      viewScrollState: ScrollState.make(),
+      viewScrollAnimations: List<ScrollAnimation>.make(),
+      applied: false,
+      layoutObserversDirty: false,
+      paintDirty: false,
+      requests: List<HostRequest>.make(),
+      keymap: NATIVE_KEYMAP,
+    }
+  }
+
+  // Nodes.
+
+  /// The slot of node `id`, or NONE.
+  pub fn slotOf(self: &Self, id: u32) -> u32 {
+    return match self.ids.get(Word { value: u32.toU64(id) }) {
+      Option<u32>.Some { value } => value
+      Option<u32>.None => NONE
+    }
+  }
+
+  /// Whether node `id` exists.
+  pub fn contains(self: &Self, id: u32) -> bool {
+    return self.slotOf(id) != NONE
+  }
+
+  pub fn node(self: &Self, slot: u32) -> &Node {
+    return &self.nodes.asSlice()[u32.toUsize(slot)]
+  }
+
+  fn nodeMut(self: &mut Self, slot: u32) -> &mut Node {
+    return &mut self.nodes.asMutSlice()[u32.toUsize(slot)]
+  }
+
+  /// The slot of css-layout node `index`, or NONE.
+  pub fn slotOfCssNode(self: &Self, index: usize) -> u32 {
+    if index < self.slotOfCss.length() {
+      return self.slotOfCss.get(index)
+    }
+    return NONE
+  }
+
+  effect fn mapCss(self: &mut Self, index: usize, slot: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    while self.slotOfCss.length() <= index {
+      run self.slotOfCss.append(NONE)
+    }
+    self.slotOfCss.set(index, slot)
+  }
+
+  /// Returns the items a virtual container needs mounted after the latest configuration or frame.
+  /// Clients reconcile this range with ordinary node mutations, then call `frame` again.
+  pub fn virtualRange(self: &Self, id: u32) -> Option<VirtualRange> {
+    return virtual.request(&self, id)
+  }
+
+  /// The number of live nodes.
+  pub fn nodeCount(self: &Self) -> usize {
+    return self.ids.length()
+  }
+
+  /// The id of the root node, or NONE.
+  pub fn rootId(self: &Self) -> u32 {
+    if self.root == NONE {
+      return NONE
+    }
+    return self.node(self.root).id
+  }
+
+  /// The children of `slot`, in order.
+  pub effect fn childSlots(self: &Self, slot: u32, out: &mut List<u32>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    out.clear()
+    let css = self.node(slot).css
+    let nodes = self.layout.nodes.asSlice()
+    let mut child = nodes[css].firstChild
+    while child != NO_INDEX {
+      let found = self.slotOfCssNode(child)
+      if found != NONE {
+        run out.append(found)
+      }
+      child = nodes[child].nextSibling
+    }
+  }
+
+  // Mutations.
+
+  /// Applies `batch` in order. On a bad mutation it stops and fails with its index; the
+  /// mutations before it stay applied.
+  pub effect fn apply(self: &mut Self, batch: List<Mutation>) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut mutations = move batch
+    let mut reversed = List<Mutation>.make()
+    while true {
+      match mutations.pop() {
+        Option<Mutation>.Some { value } => {
+          run reversed.append(move value)
+        }
+        Option<Mutation>.None => {
+          break
+        }
+      }
+    }
+    let mut index: usize = 0
+    while true {
+      match reversed.pop() {
+        Option<Mutation>.Some { value } => {
+          run self.applyOne(index, move value)
+        }
+        Option<Mutation>.None => {
+          break
+        }
+      }
+      index = index + 1
+    }
+  }
+
+  /// Applies one mutation; `index` is reported in errors.
+  pub effect fn applyOne(self: &mut Self, index: usize, mutation: Mutation) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    self.semanticRevision = self.semanticRevision + 1
+    self.applied = true
+    match move mutation {
+      Mutation.SetAnchor { id, target, options } => {
+        run anchoring.configure(&mut self, index, id, target, options)
+      }
+      Mutation.ClearAnchor { id } => {
+        anchoring.clear(&mut self, id)
+      }
+      Mutation.SetVirtualList { id, count, options } => {
+        run virtual.configure(&mut self, index, id, count, options)
+      }
+      Mutation.SetVirtualItems { id, items } => {
+        run virtual.bind(&mut self, index, id, move items)
+      }
+      Mutation.ClearVirtualList { id } => {
+        run virtual.clear(&mut self, id)
+      }
+      Mutation.Create { id, kind } => {
+        run self.create(index, id, kind)
+      }
+      Mutation.InsertBefore { parent, child, before } => {
+        run self.insertBefore(index, parent, child, before)
+      }
+      Mutation.Remove { id } => {
+        let slot = run self.require(index, id)
+        run self.detach(index, slot)
+      }
+      Mutation.Destroy { id } => {
+        let slot = run self.require(index, id)
+        run self.destroy(index, slot)
+      }
+      Mutation.SetStyle { id, state, properties } => {
+        let slot = run self.require(index, id)
+        let values = properties.asSlice()
+        let node = self.nodeMut(slot)
+        let mut i: usize = 0
+        while i < values.length {
+          match state {
+            StyleState.Base => {
+              run setProperty(&mut node.base, values[i])
+            }
+            StyleState.Hover => {
+              run setProperty(&mut node.hover, values[i])
+            }
+            StyleState.Active => {
+              run setProperty(&mut node.active, values[i])
+            }
+            StyleState.Focus => {
+              run setProperty(&mut node.focus, values[i])
+            }
+            StyleState.FocusVisible => {
+              run setProperty(&mut node.focusVisible, values[i])
+            }
+          }
+          i = i + 1
+        }
+        self.stylesDirty = true
+      }
+      Mutation.ClearStyle { id, state } => {
+        let slot = run self.require(index, id)
+        let node = self.nodeMut(slot)
+        match state {
+          StyleState.Base => {
+            node.base.clear()
+          }
+          StyleState.Hover => {
+            node.hover.clear()
+          }
+          StyleState.Active => {
+            node.active.clear()
+          }
+          StyleState.Focus => {
+            node.focus.clear()
+          }
+          StyleState.FocusVisible => {
+            node.focusVisible.clear()
+          }
+        }
+        self.stylesDirty = true
+      }
+      Mutation.SetText { id, value } => {
+        let slot = run self.require(index, id)
+        run self.setText(index, slot, move value)
+      }
+      Mutation.SetAttribute { id, attribute } => {
+        let slot = run self.require(index, id)
+        let node = self.nodeMut(slot)
+        match move attribute {
+          Attribute.ValueRange { min, max, value } => {
+            node.hasValueRange = true
+            node.valueMin = min
+            node.valueMax = max
+            node.valueNow = value
+          }
+          Attribute.ClearValueRange => {
+            node.hasValueRange = false
+          }
+
+          Attribute.Role { value } => {
+            node.accessRole = value
+          }
+          Attribute.Label { value } => {
+            node.label = move value
+          }
+          Attribute.TestId { value } => {
+            node.testId = move value
+          }
+          Attribute.TabIndex { value } => {
+            node.tabIndex = value
+          }
+          Attribute.Cursor { value } => {
+            node.cursor = value
+          }
+          Attribute.Disabled { value } => {
+            node.disabled = value
+          }
+          Attribute.FocusTrap { value } => {
+            node.focusTrap = value
+          }
+          Attribute.Checked { value } => {
+            node.checked = value
+          }
+          Attribute.Selected { value } => {
+            node.selected = value
+          }
+          Attribute.Expanded { value } => {
+            node.expanded = value
+          }
+          Attribute.Multiline { value } => {
+            node.edit.multiline = value
+            let isInput = node.kind == NodeKind.Input
+            self.stylesDirty = true
+            if isInput {
+              run edit.syncDisplay(&mut self, slot)
+            }
+          }
+          Attribute.ReadOnly { value } => {
+            node.edit.readOnly = value
+            node.content = node.content + 1
+            self.paintDirty = true
+          }
+          Attribute.Placeholder { value } => {
+            node.edit.placeholder = move value
+            let isInput = node.kind == NodeKind.Input
+            if isInput {
+              run edit.syncDisplay(&mut self, slot)
+            }
+          }
+        }
+      }
+      Mutation.SetSelection { id, anchor, focus } => {
+        let slot = run self.require(index, id)
+        if self.node(slot).kind != NodeKind.Input {
+          fail TreeError.WrongKind { index: index, id: id }
+        }
+        run edit.setSelection(&mut self, slot, anchor, focus)
+      }
+      Mutation.SetListeners { id, flags } => {
+        let slot = run self.require(index, id)
+        let node = self.nodeMut(slot)
+        if u32.bitAnd(node.listeners, LISTEN_LAYOUT) == 0 {
+          node.layoutReported = false
+        }
+        node.listeners = flags
+        self.layoutObserversDirty = true
+      }
+      Mutation.SetRoot { id } => {
+        let slot = run self.require(index, id)
+        run self.setRoot(index, slot)
+      }
+      Mutation.Focus { id } => {
+        let slot = run self.require(index, id)
+        run self.focusSlot(slot)
+      }
+      Mutation.Blur => {
+        run self.focusSlot(NONE)
+      }
+      Mutation.ScrollTo { id, x, y } => {
+        let slot = run self.require(index, id)
+        self.viewScrollState.interruptTarget(
+          ViewTarget { kind: ViewTargetKind.Element, id: u32.toUsize(id) },
+        )
+        run interact.scrollTo(&mut self, slot, x, y)
+      }
+      Mutation.ScrollIntoView { id } => {
+        let slot = run self.require(index, id)
+        self.viewScrollState.interruptAll()
+        self.viewScrollAnimations.clear()
+        run self.reveal.append(interact.pair(slot, id))
+      }
+      Mutation.SetGrid { id, value } => {
+        let slot = run self.require(index, id)
+        let css = self.node(slot).css
+        run Effect.catchAll(value.install(&mut self.layout, NodeId { index: css }), layoutFailed)
+        self.paintDirty = true
+      }
+      Mutation.SetSource { id, resource } => {
+        let slot = run self.require(index, id)
+        let kind = self.node(slot).kind
+        if kind != NodeKind.Image && kind != NodeKind.Icon {
+          fail TreeError.WrongKind { index: index, id: id }
+        }
+        match self.resources.get(resource) {
+          Option<Resource>.Some { value } => {
+            let matches = match value {
+              Resource.Image { .. } => kind == NodeKind.Image
+              Resource.Icon { .. } => kind == NodeKind.Icon
+            }
+            if !matches {
+              fail TreeError.WrongKind { index: index, id: id }
+            }
+          }
+          Option<Resource>.None => {
+            fail TreeError.UnknownResource { index: index, resource: resource }
+          }
+        }
+        let node = self.nodeMut(slot)
+        node.resource = resource
+        node.content = node.content + 1
+        run self.updateNatural(slot)
+      }
+      Mutation.SetCanvas { id, commands } => {
+        let slot = run self.require(index, id)
+        if self.node(slot).kind != NodeKind.Canvas {
+          fail TreeError.WrongKind { index: index, id: id }
+        }
+        let node = self.nodeMut(slot)
+        node.canvas = move commands
+        node.content = node.content + 1
+      }
+      Mutation.DefineFontFamily { family, names } => {
+        run self.families.define(family, String.view(&names))
+
+        // Keys made from the old list keep their faces; restyle so new keys are made.
+        let entries = self.fontKeys.asMutSlice()
+        let mut i: usize = 0
+        while i < entries.length {
+          if entries[i].family == family {
+            entries[i].family = NONE
+          }
+          i = i + 1
+        }
+        self.stylesDirty = true
+      }
+      Mutation.DefineImage { resource, data } => {
+        let ok = run Effect.catch<ResourceError>(
+          defineImage(&mut self.resources, &mut self.atlas, resource, Bytes.asSlice(&data)),
+          resourceFailed,
+        )
+        if !ok {
+          fail TreeError.BadResource { index: index, resource: resource }
+        }
+        run self.refreshSources(resource)
+      }
+      Mutation.DefineDecodedImage { resource, image } => {
+        run self.resources.defineDecoded(&mut self.atlas, resource, move image)
+        run self.refreshSources(resource)
+      }
+      Mutation.ReleaseResource { resource } => {
+        run self.resources.release(&mut self.atlas, resource)
+        run self.refreshSources(resource)
+      }
+      Mutation.DefineIcon { resource, data } => {
+        let ok = run Effect.catch<ResourceError>(
+          defineIcon(&mut self.resources, &mut self.atlas, resource, Bytes.asSlice(&data)),
+          resourceFailed,
+        )
+        if !ok {
+          fail TreeError.BadResource { index: index, resource: resource }
+        }
+        run self.refreshSources(resource)
+      }
+    }
+  }
+
+  effect fn require(self: &Self, index: usize, id: u32) -> u32
+    ! TreeError {
+    let slot = self.slotOf(id)
+    if slot == NONE {
+      fail TreeError.UnknownNode { index: index, id: id }
+    }
+    return slot
+  }
+
+  effect fn create(self: &mut Self, index: usize, id: u32, kind: NodeKind) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if self.contains(id) {
+      fail TreeError.IdInUse { index: index, id: id }
+    }
+    let mut css: usize = 0
+    let mut inner: usize = NO_INDEX
+    if kind == NodeKind.Text {
+      let made = run self.layout.createText(String.make())
+      css = made.index
+    } else {
+      let made = run self.layout.create(CssStyle.make())
+      css = made.index
+      if kind == NodeKind.Input {
+        let text = run self.layout.createText(String.make())
+        inner = text.index
+        run Effect.catchAll(
+          self.layout.insertBefore(
+            NodeId { index: css },
+            NodeId { index: inner },
+            Option<NodeId>.None,
+          ),
+          layoutFailed,
+        )
+      }
+    }
+    let mut computed = Computed.inheriting(TextStyle.initial())
+    computed.display = defaultDisplay(kind)
+    let node = Node {
+      id: id,
+      kind: kind,
+      live: true,
+      css: css,
+      inner: inner,
+      parent: NONE,
+      base: List<Property>.make(),
+      hover: List<Property>.make(),
+      active: List<Property>.make(),
+      focus: List<Property>.make(),
+      focusVisible: List<Property>.make(),
+      computed: computed,
+      fontKey: 0,
+      layoutHash: 0,
+      paintHash: 0,
+      styled: false,
+      text: String.make(),
+      accessRole: Role.None,
+      hasValueRange: false,
+      valueMin: 0.0,
+      valueMax: 0.0,
+      valueNow: 0.0,
+      label: String.make(),
+      testId: String.make(),
+      tabIndex: if kind == NodeKind.Input {
+        0
+      } else {
+        NOT_FOCUSABLE
+      },
+      cursor: Cursor.Default,
+      disabled: false,
+      focusTrap: false,
+      checked: false,
+      selected: false,
+      expanded: false,
+      listeners: 0,
+      layoutReported: false,
+      reportedBounds: Rect<f32>.new(0.0, 0.0, 0.0, 0.0),
+      hovered: false,
+      pressed: false,
+      scrollX: 0.0,
+      scrollY: 0.0,
+      resource: NONE,
+      canvas: List<CanvasCommand>.make(),
+      content: 1,
+      edit: EditState.make(),
+      cache: PaintCache.empty(),
+    }
+    let mut slot: u32 = 0
+    if self.free.length() != 0 {
+      let last = self.free.length() - 1
+      slot = self.free.get(last)
+      self.free.truncate(last)
+      let nodes = self.nodes.asMutSlice()
+      nodes[u32.toUsize(slot)] = move node
+    } else {
+      slot = usize.toU32(self.nodes.length())
+      run self.nodes.append(move node)
+    }
+    drop run self.ids.insert(Word { value: u32.toU64(id) }, slot)
+    run self.mapCss(css, slot)
+    if inner != NO_INDEX {
+      // The input's text node maps to no slot, but the table reaches it so `destroy` can clear it.
+      run self.mapCss(inner, NONE)
+    }
+    if kind == NodeKind.Image || kind == NodeKind.Icon {
+      run Effect.catchAll(
+        self.layout.setNaturalMeasurement(NodeId { index: css }, u32.toUsize(slot)),
+        layoutFailed,
+      )
+    }
+    if kind == NodeKind.Input {
+      run edit.syncDisplay(&mut self, slot)
+    }
+    self.stylesDirty = true
+  }
+
+  fn canHaveChildren(kind: NodeKind) -> bool {
+    return kind == NodeKind.Box
+  }
+
+  /// Whether `slot` is `ancestor` or inside it.
+  fn within(self: &Self, slot: u32, ancestor: u32) -> bool {
+    let mut at = slot
+    while at != NONE {
+      if at == ancestor {
+        return true
+      }
+      at = self.node(at).parent
+    }
+    return false
+  }
+
+  effect fn insertBefore(
+    self: &mut Self,
+    index: usize,
+    parent: u32,
+    child: u32,
+    before: Option<u32>,
+  ) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let parentSlot = run self.require(index, parent)
+    let childSlot = run self.require(index, child)
+    if !UiTree.canHaveChildren(self.node(parentSlot).kind) {
+      fail TreeError.WrongKind { index: index, id: parent }
+    }
+    if childSlot == self.root || self.within(parentSlot, childSlot) {
+      fail TreeError.BadMove { index: index, id: child }
+    }
+    let mut beforeCss = Option<NodeId>.None
+    if let Option<u32>.Some { value } = before {
+      let beforeSlot = run self.require(index, value)
+      if self.node(beforeSlot).parent != parentSlot {
+        fail TreeError.BadMove { index: index, id: value }
+      }
+      if beforeSlot == childSlot {
+        return ()
+      }
+      beforeCss = Option<NodeId>.Some { value: NodeId { index: self.node(beforeSlot).css } }
+    }
+    let parentCss = self.node(parentSlot).css
+    let childCss = self.node(childSlot).css
+    run Effect.catchAll(
+      self.layout.insertBefore(NodeId { index: parentCss }, NodeId { index: childCss }, beforeCss),
+      layoutFailed,
+    )
+    let moved = self.nodeMut(childSlot)
+    moved.parent = parentSlot
+    self.stylesDirty = true
+  }
+
+  effect fn detach(self: &mut Self, index: usize, slot: u32) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let parent = self.node(slot).parent
+    let css = self.node(slot).css
+    if parent == NONE && slot != self.root {
+      return ()
+    }
+    run Effect.catchAll(self.layout.remove(NodeId { index: css }), layoutFailed)
+    if slot == self.root {
+      self.root = NONE
+    }
+    let detached = self.nodeMut(slot)
+    detached.parent = NONE
+    if self.focused != NONE && self.within(self.focused, slot) {
+      run self.focusSlot(NONE)
+    }
+    self.stylesDirty = true
+  }
+
+  effect fn destroy(self: &mut Self, index: usize, slot: u32) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    run self.detach(index, slot)
+    let mut doomed = List<u32>.make()
+    run doomed.append(slot)
+    let mut children = List<u32>.make()
+    let mut at: usize = 0
+    while at < doomed.length() {
+      run self.childSlots(doomed.get(at), &mut children)
+      run doomed.appendSlice(children.asSlice())
+      at = at + 1
+    }
+    let mut v: usize = 0
+    while v < doomed.length() {
+      let id = self.node(doomed.get(v)).id
+      run virtual.clear(&mut self, id)
+      anchoring.clear(&mut self, id)
+      v = v + 1
+    }
+    let css = self.node(slot).css
+    run Effect.catchAll(self.layout.destroy(NodeId { index: css }), layoutFailed)
+    let mut i: usize = 0
+    while i < doomed.length() {
+      let gone = doomed.get(i)
+      let node = self.nodeMut(gone)
+      node.live = false
+      node.base.clear()
+      node.hover.clear()
+      node.active.clear()
+      node.focus.clear()
+      node.focusVisible.clear()
+      node.canvas.clear()
+      node.text.clear()
+      node.label.clear()
+      node.testId.clear()
+      let id = node.id
+      let nodeCss = node.css
+      let inner = node.inner
+      drop self.ids.remove(Word { value: u32.toU64(id) })
+      self.slotOfCss.set(nodeCss, NONE)
+      if inner != NO_INDEX {
+        self.slotOfCss.set(inner, NONE)
+      }
+      run self.free.append(gone)
+      i = i + 1
+    }
+  }
+
+  effect fn setRoot(self: &mut Self, index: usize, slot: u32) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if slot == self.root {
+      return ()
+    }
+    let previous = self.root
+    if previous != NONE {
+      run self.detach(index, previous)
+    }
+    if self.node(slot).parent != NONE {
+      run self.detach(index, slot)
+    }
+    if self.node(slot).kind == NodeKind.Text {
+      fail TreeError.WrongKind { index: index, id: self.node(slot).id }
+    }
+    let css = self.node(slot).css
+    let viewport = self.layout.root()
+    run Effect.catchAll(
+      self.layout.insertBefore(viewport, NodeId { index: css }, Option<NodeId>.None),
+      layoutFailed,
+    )
+    self.root = slot
+    self.stylesDirty = true
+  }
+
+  effect fn setText(self: &mut Self, index: usize, slot: u32, value: String) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let kind = self.node(slot).kind
+    let mut target: usize = 0
+    if kind == NodeKind.Text {
+      target = self.node(slot).css
+    } else if kind == NodeKind.Input {
+      run edit.setValue(&mut self, slot, move value)
+      return ()
+    } else {
+      fail TreeError.WrongKind { index: index, id: self.node(slot).id }
+    }
+    let copy = run String.copy(String.view(&value))
+    run Effect.catchAll(self.layout.setText(NodeId { index: target }, move copy), layoutFailed)
+    let node = self.nodeMut(slot)
+    node.text = move value
+    node.content = node.content + 1
+  }
+
+  /// Moves focus to `slot` (NONE blurs), queueing focus and blur records for listeners.
+  pub effect fn focusSlot(self: &mut Self, slot: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if slot == self.focused {
+      return ()
+    }
+    self.semanticRevision = self.semanticRevision + 1
+    let previous = self.focused
+    self.focused = slot
+    run edit.focusChanged(&mut self, previous, slot)
+    if previous != NONE && self.node(previous).live
+      && u32.bitAnd(self.node(previous).listeners, LISTEN_BLUR) != 0 {
+      run self.queue(EventKind.Blur, previous)
+    }
+    if slot != NONE && u32.bitAnd(self.node(slot).listeners, LISTEN_FOCUS) != 0 {
+      run self.queue(EventKind.Focus, slot)
+    }
+    self.stylesDirty = true
+  }
+
+  /// The node ids from the root down to `slot`.
+  pub effect fn pathTo(self: &Self, slot: u32, out: &mut List<u32>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    out.clear()
+    let mut at = slot
+    while at != NONE {
+      run out.append(self.node(at).id)
+      at = self.node(at).parent
+    }
+    let values = out.asMutSlice()
+    let mut i: usize = 0
+    let mut j = values.length
+    while i + 1 < j {
+      j = j - 1
+      let swap = values[i]
+      values[i] = values[j]
+      values[j] = swap
+      i = i + 1
+    }
+  }
+
+  effect fn queue(self: &mut Self, kind: EventKind, slot: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut path = List<u32>.make()
+    run self.pathTo(slot, &mut path)
+    let target = self.node(slot).id
+    run self.events.append(Event.make(kind, target, move path))
+  }
+
+  /// Queues `event` for the client.
+  pub effect fn queueEvent(self: &mut Self, event: Event) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.events.append(move event)
+  }
+
+  /// Feeds one input record to the tree: hit testing against the last frame, hover and active
+  /// states, pointer capture, focus, tab order, keyboard clicks and scrolling, and the event
+  /// records for listeners. State changes show at the next frame.
+  pub effect fn dispatch(self: &mut Self, input: Input) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let interruptsScroll = match &input {
+      Input.Wheel { x, y, deltaX, deltaY, modifiers } => true
+      Input.PointerDown { x, y, button, modifiers, clickCount } => true
+      Input.KeyDown { key, code, modifiers, repeat } => true
+      _ => false
+    }
+    if interruptsScroll {
+      self.viewScrollState.interruptAll()
+      self.viewScrollAnimations.clear()
+    }
+    run interact.dispatch(&mut self, move input)
+  }
+
+  /// The id of the node a pointer at (`x`, `y`) would target in the last frame, or NONE.
+  pub fn hitTest(self: &Self, x: f32, y: f32) -> u32 {
+    let slot = interact.hitSlot(self, x, y)
+    if slot == NONE {
+      return NONE
+    }
+    return self.node(slot).id
+  }
+
+  /// The cursor for the hovered node: the nearest cursor attribute other than `Default` on
+  /// its path.
+  pub fn cursor(self: &Self) -> Cursor {
+    return interact.cursorOf(self)
+  }
+
+  /// The scroll offset of node `id`, (0, 0) when it does not scroll or does not exist.
+  /// Node `id` was scrolled to (`x`, `y`) outside the tree, as a compositor scrolls the last
+  /// frame without the tree: the tree takes the offset and tells scroll listeners, as a wheel
+  /// scroll does.
+  pub effect fn scrolledElsewhere(self: &mut Self, id: u32, x: f32, y: f32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let slot = self.slotOf(id)
+    if slot == NONE {
+      return ()
+    }
+    self.viewScrollState.interruptTarget(
+      ViewTarget { kind: ViewTargetKind.Element, id: u32.toUsize(id) },
+    )
+    run interact.scrolledElsewhere(&mut self, slot, x, y)
+  }
+
+  pub fn scrollOffset(self: &Self, id: u32) -> Vector2<f32> {
+    let slot = self.slotOf(id)
+    if slot == NONE {
+      return Vector2<f32> { x: 0.0, y: 0.0 }
+    }
+    return Vector2<f32> { x: self.node(slot).scrollX, y: self.node(slot).scrollY }
+  }
+
+  /// Moves the queued host requests (clipboard reads and writes) to `out`, oldest first.
+  pub effect fn takeRequests(self: &mut Self, out: &mut List<HostRequest>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut reversed = List<HostRequest>.make()
+    while true {
+      match self.requests.pop() {
+        Option<HostRequest>.Some { value } => {
+          run reversed.append(move value)
+        }
+        Option<HostRequest>.None => {
+          break
+        }
+      }
+    }
+    while true {
+      match reversed.pop() {
+        Option<HostRequest>.Some { value } => {
+          run out.append(move value)
+        }
+        Option<HostRequest>.None => {
+          break
+        }
+      }
+    }
+  }
+
+  /// What the platform input method needs after the last frame: whether a text field has
+  /// focus, and the caret rectangle in CSS pixels to place the candidate window by.
+  pub effect fn imeArea(self: &Self) -> ImeArea
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run edit.imeArea(self)
+  }
+
+  /// The time the focused caret blinks next, or -1 when no caret shows. Hosts that draw only
+  /// on demand ask for a frame at that time.
+  pub fn nextBlink(self: &Self) -> f64 {
+    return edit.nextBlink(self)
+  }
+
+  /// The selection of input `id` as (anchor, focus) UTF-8 byte offsets into its value, or
+  /// (0, 0) when it is not an input.
+  pub fn selection(self: &Self, id: u32) -> Vector2<usize> {
+    let slot = self.slotOf(id)
+    if slot == NONE {
+      return Vector2<usize> { x: 0, y: 0 }
+    }
+    let e = &self.node(slot).edit
+    return Vector2<usize> { x: e.anchor, y: e.focus }
+  }
+
+  /// The caret rectangle of input `id` in CSS pixels of the viewport, from the last layout.
+  pub effect fn caretRect(self: &Self, id: u32) -> Rect<f32>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let slot = self.slotOf(id)
+    if slot == NONE || self.node(slot).kind != NodeKind.Input {
+      return Rect<f32>.new(0.0, 0.0, 0.0, 0.0)
+    }
+    return run edit.caretRectOf(self, slot)
+  }
+
+  /// Moves the queued event records to `out`, oldest first.
+  pub effect fn takeEvents(self: &mut Self, out: &mut List<Event>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut reversed = List<Event>.make()
+    while true {
+      match self.events.pop() {
+        Option<Event>.Some { value } => {
+          run reversed.append(move value)
+        }
+        Option<Event>.None => {
+          break
+        }
+      }
+    }
+    while true {
+      match reversed.pop() {
+        Option<Event>.Some { value } => {
+          run out.append(move value)
+        }
+        Option<Event>.None => {
+          break
+        }
+      }
+    }
+  }
+
+  effect fn refreshSources(self: &mut Self, resource: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut slot: u32 = 0
+    while u32.toUsize(slot) < self.nodes.length() {
+      let matches = self.node(slot).live && self.node(slot).resource == resource
+      if matches {
+        let node = self.nodeMut(slot)
+        node.content = node.content + 1
+        self.paintCachesStale = true
+        run self.updateNatural(slot)
+      }
+      slot = slot + 1
+    }
+  }
+
+  /// Gives css-layout the natural size of an image or icon node.
+  effect fn updateNatural(self: &mut Self, slot: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let kind = self.node(slot).kind
+    let resource = self.node(slot).resource
+    let fontSize = self.node(slot).computed.text.size
+    let css = self.node(slot).css
+    let mut natural = NaturalDimensions.none()
+    if kind == NodeKind.Image {
+      if let Option<Resource>.Some { value } = self.resources.get(resource) {
+        if let Resource.Image { image, width, height } = value {
+          natural.size = OptionalSize.definite(u32.toF32(width), u32.toF32(height))
+          if height != 0 {
+            natural.aspectRatio = u32.toF32(width) / u32.toF32(height)
+          }
+        }
+      }
+    } else if kind == NodeKind.Icon {
+      natural.size = OptionalSize.definite(fontSize, fontSize)
+      natural.aspectRatio = 1.0
+    } else {
+      return ()
+    }
+    let key = u32.toUsize(slot)
+    let changed = key >= self.provider.naturals.length()
+      || !sameNatural(self.provider.naturals.get(key), natural)
+    if changed {
+      run self.provider.setNatural(key, natural)
+      run Effect.catchAll(
+        self.layout.setNaturalMeasurement(NodeId { index: css }, key),
+        ignoreInvalid,
+      )
+    }
+  }
+
+  // Styles.
+
+  /// The font key of a text style, registering it with the text system on first use.
+  effect fn fontKeyOf(self: &mut Self, text: TextStyle) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let italic = text.style == FontStyle.Italic
+    let entries = self.fontKeys.asSlice()
+    let mut i: usize = 0
+    while i < entries.length {
+      let entry = entries[i]
+      if entry.family == text.family && entry.size == text.size && entry.weight == text.weight
+        && entry.italic == italic {
+        return entry.key
+      }
+      i = i + 1
+    }
+    let mut families = List<Family>.make()
+    run self.families.copyOf(text.family, &mut families)
+    let mut request = FontStyleRequest.make(move families, text.size)
+    request.request = Request {
+      weight: f32.toF64(text.weight),
+      width: 100.0,
+      style: if italic {
+        FaceStyle.Italic
+      } else {
+        FaceStyle.Normal
+      },
+    }
+    let key = run self.provider.text.addStyle(move request)
+    run self.fontKeys.append(
+      FontKeyEntry {
+        family: text.family,
+        size: text.size,
+        weight: text.weight,
+        italic: italic,
+        key: key,
+      },
+    )
+    return key
+  }
+
+  /// Recomputes every node's style from its patches, variants and parent.
+  effect fn resolveStyles(self: &mut Self) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if !self.stylesDirty {
+      return ()
+    }
+    self.stylesDirty = false
+    self.paintCachesStale = true
+    if self.root == NONE {
+      return ()
+    }
+    let mut stack = List<u32>.make()
+    let mut children = List<u32>.make()
+    run stack.append(self.root)
+    while stack.length() != 0 {
+      let last = stack.length() - 1
+      let slot = stack.get(last)
+      stack.truncate(last)
+      run self.resolve(slot)
+      run self.childSlots(slot, &mut children)
+      let mut i = children.length()
+      while i > 0 {
+        i = i - 1
+        run stack.append(children.get(i))
+      }
+    }
+  }
+
+  effect fn resolve(self: &mut Self, slot: u32) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let parent = self.node(slot).parent
+    let mut inherited = TextStyle.initial()
+    if parent != NONE {
+      inherited = self.node(parent).computed.text
+    }
+    let node = self.node(slot)
+    let mut computed = Computed.inheriting(inherited)
+
+    // CSS pointer-events inherits, but an explicit descendant auto remains targetable.
+    if parent != NONE {
+      computed.pointerEvents = self.node(parent).computed.pointerEvents
+    }
+    computed.display = defaultDisplay(node.kind)
+    if node.kind == NodeKind.Input {
+      // Inputs keep their spaces; one line scrolls sideways, several wrap and scroll down.
+      if node.edit.multiline {
+        computed.apply(Property.WhiteSpace { value: WhiteSpace.PreWrap })
+        computed.overflowX = Overflow.Hidden
+        computed.overflowY = Overflow.Auto
+      } else {
+        computed.apply(Property.WhiteSpace { value: WhiteSpace.Pre })
+        computed.overflowX = Overflow.Hidden
+        computed.overflowY = Overflow.Hidden
+      }
+    }
+    if node.kind != NodeKind.Text {
+      applyAll(&mut computed, &node.base)
+      if node.hovered {
+        applyAll(&mut computed, &node.hover)
+      }
+      if node.pressed {
+        applyAll(&mut computed, &node.active)
+      }
+      if self.focused == slot {
+        applyAll(&mut computed, &node.focus)
+        if self.focusVisible || node.kind == NodeKind.Input {
+          applyAll(&mut computed, &node.focusVisible)
+        }
+      }
+    }
+    anchoring.apply(&self, node.id, &mut computed)
+    let kind = node.kind
+    let css = node.css
+    let previousLayout = node.layoutHash
+    let styled = node.styled
+    let sizeChanged = node.computed.text.size != computed.text.size
+    let fontKey = run self.fontKeyOf(computed.text)
+    let layoutHash = computed.layoutHash(&self.seed, fontKey)
+    let paintHash = computed.paintHash(&self.seed)
+    let target = self.nodeMut(slot)
+    target.computed = computed
+    target.fontKey = fontKey
+    target.paintHash = paintHash
+    if kind != NodeKind.Text && (!styled || layoutHash != previousLayout) {
+      target.layoutHash = layoutHash
+      target.styled = true
+      run Effect.catchAll(
+        self.layout.setStyle(NodeId { index: css }, computed.toLayout(fontKey)),
+        layoutFailed,
+      )
+    }
+    if kind == NodeKind.Icon && sizeChanged {
+      run self.updateNatural(slot)
+    }
+  }
+
+  // Frames.
+
+  /// Whether a frame would draw something new: styles, layout or scroll offsets changed, or a
+  /// scroll into view waits. Hosts that draw only on demand ask after applying batches and
+  /// dispatching input.
+  pub fn needsFrame(self: &Self) -> bool {
+    return self.applied || self.stylesDirty || self.paintDirty || self.scrolled
+      || cssom_view.scrollAnimating(self)
+      || self.layout.revision() != self.laidOutRevision
+      || self.layout.scrollRevision() != self.laidOutScrolls
+      || self.reveal.length() != 0
+      || !self.replayable
+  }
+
+  /// The scene of the last frame, finished and ready to draw.
+  pub fn scene(self: &Self) -> &Scene {
+    if self.flipped {
+      return &self.sceneB
+    }
+    return &self.sceneA
+  }
+
+  /// Applies styles, lays out what changed and paints the frame.
+  pub effect fn frame(self: &mut Self, input: FrameInput) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    self.frameNumber = self.frameNumber + 1
+    if self.applied || self.paintDirty {
+      self.paintCachesStale = true
+    }
+    self.applied = false
+    self.input = input
+    self.stats = FrameStats.zero()
+    self.stats.frame = self.frameNumber
+    run self.resolveStyles()
+    run virtual.prepare(&mut self)
+    run self.layoutFrame()
+    run Effect.catch<CssomError>(cssom_view.advanceScrolls(&mut self), viewFailed)
+    if run interact.settleScrolls(&mut self) {
+      run self.layoutFrame()
+      drop run interact.settleScrolls(&mut self)
+    }
+    if run edit.revealCaret(&mut self) {
+      run self.layoutFrame()
+    }
+
+    // Scrolling and relayout move content under a still pointer: hover follows, and a hover
+    // variant that changes layout is laid out in the same frame.
+    if !self.stats.layoutSkipped || self.scrolled {
+      run interact.refreshHover(&mut self)
+      run self.resolveStyles()
+      run self.layoutFrame()
+    }
+    run self.settleVirtual()
+    run self.settleAnchors()
+    run self.notifyLayout()
+    edit.beginPaint(&mut self)
+    self.scrollsStill = !self.scrolled
+    run self.paintFrame()
+    self.scrolled = false
+    self.paintDirty = false
+    self.stats.nodes = self.nodeCount()
+    self.stats.fragments = self.output.fragments.values.length()
+  }
+
+  effect fn settleAnchors(self: &mut Self) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut pass: usize = 0
+    while pass <= self.anchors.length() {
+      if !(run anchoring.settle(&mut self)) {
+        break
+      }
+      run self.resolveStyles()
+      run self.layoutFrame()
+      if run interact.settleScrolls(&mut self) {
+        run self.layoutFrame()
+      }
+      run interact.refreshHover(&mut self)
+      run self.resolveStyles()
+      run self.layoutFrame()
+      pass = pass + 1
+    }
+  }
+
+  effect fn settleVirtual(self: &mut Self) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut pass: usize = 0
+    while pass < 4 {
+      if !(run virtual.settle(&mut self)) {
+        break
+      }
+      run virtual.prepare(&mut self)
+      run self.layoutFrame()
+      if run interact.settleScrolls(&mut self) {
+        run self.layoutFrame()
+      }
+      run interact.refreshHover(&mut self)
+      run self.resolveStyles()
+      run self.layoutFrame()
+      pass = pass + 1
+    }
+  }
+
+  /// Lays out and paints pages or columns supplied by the host. Break policies, widows,
+  /// orphans and fixed page-positioned elements use the same styles as continuous frames.
+  /// Geometry queries describe this output until the next frame; `frame` resumes continuous
+  /// layout. Fragmentainer slices are borrowed only for this call.
+  /// Virtual scroll containers require continuous layout; clear them first or this returns `TreeError.Layout`.
+  pub effect fn frameFragmented(
+    self: &mut Self,
+    input: FrameInput,
+    frames: Fragmentainers<'_>,
+  ) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if self.virtualLists.length() != 0 {
+      fail TreeError.Layout
+    }
+    self.frameNumber = self.frameNumber + 1
+    self.applied = false
+    self.input = input
+    self.stats = FrameStats.zero()
+    self.stats.frame = self.frameNumber
+    run self.resolveStyles()
+    let mut viewport = CssStyle.make()
+    let root = self.layout.root()
+    run Effect.catchAll(self.layout.setStyle(root, move viewport), layoutFailed)
+    run Effect.catchAll(
+      computeFragmented(
+        &self.layout,
+        &mut self.output,
+        &mut self.provider,
+        OptionalSize.none(),
+        move frames,
+      ),
+      layoutFailed,
+    )
+    self.output.fragments.resolveLocations()
+    self.paintCachesStale = true
+    self.semanticRevision = self.semanticRevision + 1
+    self.laidOutRevision = usize.MAX
+    self.stats.layout = self.output.stats
+    self.stats.layoutSkipped = false
+    run self.indexFragments()
+    self.layoutObserversDirty = true
+    run self.notifyLayout()
+    edit.beginPaint(&mut self)
+    self.scrollsStill = false
+    run self.paintFrame()
+    self.paintDirty = false
+    self.stats.nodes = self.nodeCount()
+    self.stats.fragments = self.output.fragments.values.length()
+  }
+
+  /// The atlas tile for a registered image, for custom scene composition. Allocation and
+  /// re-upload after eviction are managed by the resource store and collected by `frame`.
+  pub effect fn imageTile(self: &mut Self, resource: u32) -> Option<AtlasTile>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match self.resources.get(resource) {
+      Option<Resource>.Some { value: Resource.Image { image, .. } } => run self.resources.imageTile(
+        &mut self.atlas,
+        image,
+      )
+      _ => Option<AtlasTile>.None
+    }
+  }
+
+  /// Whether a mutation or an edit changed styles or layout inputs since the last layout.
+  pub fn layoutPending(self: &Self) -> bool {
+    return self.stylesDirty || self.layout.revision() != self.laidOutRevision
+  }
+
+  /// Resolves styles and lays out now, at the last frame's size, so geometry queries between
+  /// frames see the current text. The next frame paints as usual.
+  pub effect fn layoutNow(self: &mut Self) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    run self.resolveStyles()
+    run virtual.prepare(&mut self)
+    run self.layoutFrame()
+    if run interact.settleScrolls(&mut self) {
+      run self.layoutFrame()
+    }
+    run self.settleVirtual()
+    run self.settleAnchors()
+  }
+
+  effect fn layoutFrame(self: &mut Self) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if self.input.width != self.laidOut.width || self.input.height != self.laidOut.height {
+      let mut viewport = CssStyle.make()
+      viewport.width = Dimension.px(self.input.width)
+      viewport.height = Dimension.px(self.input.height)
+      let viewportId = self.layout.root()
+      run Effect.catchAll(self.layout.setStyle(viewportId, move viewport), layoutFailed)
+    }
+    if self.layout.revision() == self.laidOutRevision
+      && self.layout.scrollRevision() == self.laidOutScrolls
+      && self.input.width == self.laidOut.width
+      && self.input.height == self.laidOut.height {
+      return ()
+    }
+    let viewport = OptionalSize.definite(self.input.width, self.input.height)
+    let moved = self.layout.revision() == self.laidOutRevision
+      && self.input.width == self.laidOut.width
+      && self.input.height == self.laidOut.height
+      && (run Engine.repositionScroll(&self.layout, &mut self.output, viewport))
+    if !moved {
+      run Effect.catchAll(
+        Engine.compute(
+          &self.layout,
+          &mut self.output,
+          &mut self.provider,
+          OptionalSize.definite(self.input.width, self.input.height),
+        ),
+        layoutFailed,
+      )
+    }
+    self.output.fragments.resolveLocations()
+    self.paintCachesStale = true
+    self.semanticRevision = self.semanticRevision + 1
+    self.laidOut = self.input
+    self.laidOutRevision = self.layout.revision()
+    self.laidOutScrolls = self.layout.scrollRevision()
+    self.stats.layout = self.output.stats
+    self.stats.layoutSkipped = false
+    if !moved {
+      run self.indexFragments()
+    }
+    self.layoutObserversDirty = true
+  }
+
+  /// Reports changed geometry once after layout, including scrolling and first attachment.
+  effect fn notifyLayout(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.layoutObserversDirty {
+      return ()
+    }
+    self.layoutObserversDirty = false
+    let mut i: usize = 0
+    while i < self.nodes.length() {
+      let node = &self.nodes.asSlice()[i]
+      if node.live && u32.bitAnd(node.listeners, LISTEN_LAYOUT) != 0 {
+        let id = node.id
+        let before = node.reportedBounds
+        let reported = node.layoutReported
+        if let Option<inspect.NodeInfo>.Some { value } = run inspect.info(&self.*, id) {
+          let bounds = value.bounds
+          if !reported || before.xMin != bounds.xMin || before.yMin != bounds.yMin
+            || before.xMax != bounds.xMax
+            || before.yMax != bounds.yMax {
+            let slot = usize.toU32(i)
+            let target = self.nodeMut(slot)
+            target.layoutReported = true
+            target.reportedBounds = bounds
+            let mut path = List<u32>.make()
+            run self.pathTo(slot, &mut path)
+            let mut event = Event.make(EventKind.Layout, id, move path)
+            event.bounds = bounds
+            run self.queueEvent(move event)
+          }
+        }
+      }
+      i = i + 1
+    }
+  }
+
+  /// Fills `fragmentOf` from the last layout.
+  effect fn indexFragments(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.facesDirty = true
+    self.fragmentOf.clear()
+    run self.fragmentOf.appendRepeated(NO_INDEX, self.layout.nodes.length())
+    let values = self.output.fragments.values.asSlice()
+    self.nextSourceFragment.clear()
+    run self.nextSourceFragment.appendRepeated(NO_INDEX, values.length)
+    let mut i = values.length
+    while i > 0 {
+      i = i - 1
+      let source = values[i].source
+      if source < self.fragmentOf.length() && !values[i].positioningShell {
+        self.nextSourceFragment.set(i, self.fragmentOf.get(source))
+        self.fragmentOf.set(source, i)
+      }
+    }
+  }
+
+  /// Loads the raster face of every font key the layout's text fragments use.
+  effect fn loadFaces(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.facesDirty {
+      return ()
+    }
+    let count = self.output.fragments.texts.length()
+    let mut i: usize = 0
+    while i < count {
+      let key = self.output.fragments.texts.get(i).fontKey
+      while self.faces.length() <= key {
+        run self.faces.append(FaceSlot<'a> { loaded: false, face: Option<FontFace<'a>>.None })
+      }
+      if !self.faces.asSlice()[key].loaded {
+        let face = run self.provider.text.rasterFace(key)
+        let slots = self.faces.asMutSlice()
+        slots[key] = FaceSlot<'a> { loaded: true, face: move face }
+      }
+      i = i + 1
+    }
+    self.facesDirty = false
+  }
+
+  /// Hashes and bounds every fragment again when layout, styles or mutations changed since they
+  /// were last computed. A frame that only scrolled keeps them.
+  effect fn refreshPaintCaches(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let count = self.output.fragments.values.length()
+    if !self.paintCachesStale && self.fragmentHashes.length() == count
+      && self.fragmentInk.length() == count {
+      return ()
+    }
+    run hashFragments(
+      &self.seed,
+      &self.output,
+      &self.slotOfCss,
+      &self.layout,
+      &self.nodes,
+      &mut self.fragmentHashes,
+    )
+    run inkFragments(
+      &self.output,
+      &self.slotOfCss,
+      &self.layout,
+      &self.nodes,
+      self.input.width,
+      self.input.height,
+      &mut self.fragmentInk,
+      &mut self.fragmentScrollers,
+    )
+    self.paintCachesStale = false
+  }
+
+  /// Whether the fragment ink describes the last layout, so hit testing can skip by it.
+  pub fn inkCurrent(self: &Self) -> bool {
+    return !self.paintCachesStale
+      && self.fragmentInk.length() == self.output.fragments.values.length()
+  }
+
+  /// Where fragment `index` of the last layout draws against where the layout put it, in CSS
+  /// pixels: the scroll offsets and sticky offsets above it (see `layers`).
+  pub fn shiftOf(self: &Self, index: usize) -> Vector2<f32> {
+    return layers.shiftOf(
+      &self.output,
+      &self.slotOfCss,
+      &self.layout,
+      &self.nodes,
+      index,
+      self.input.width,
+      self.input.height,
+    )
+  }
+
+  /// Fragment `index` of the last layout, moved to where it draws.
+  pub fn visualFragment(self: &Self, index: usize) -> Fragment {
+    let values = self.output.fragments.values.asSlice()
+    return layers.visual(&values[index], self.shiftOf(index))
+  }
+
+  effect fn paintFrame(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.loadFaces()
+    if self.paintDirty {
+      self.paintCachesStale = true
+    }
+    run self.refreshPaintCaches()
+    run self.paths.beginFrame()
+    self.paintOrder.clear()
+    let window = ContentMask.new(
+      Rect<f32>.new(
+        0.0,
+        0.0,
+        self.input.width * self.input.scale,
+        self.input.height * self.input.scale,
+      ),
+    )
+    self.flipped = !self.flipped
+    if self.flipped {
+      self.sceneB.clear()
+      let mut painter = Painter {
+        nodes: &mut self.nodes,
+        slotOfCss: &self.slotOfCss,
+        css: &self.layout,
+        output: &self.output,
+        text: &self.provider.text,
+        faces: &self.faces,
+        atlas: &mut self.atlas,
+        glyphs: &mut self.glyphs,
+        textInk: &mut self.textInk,
+        resources: &mut self.resources,
+        paths: &mut self.paths,
+        scene: &mut self.sceneB,
+        previous: &self.sceneA,
+        replayable: self.replayable,
+        scrollsStill: self.scrollsStill,
+        hashes: &self.fragmentHashes,
+        ink: &self.fragmentInk,
+        scrollers: &self.fragmentScrollers,
+        cull: window.bounds,
+        lead: self.input.height * self.input.scale,
+        width: self.input.width,
+        height: self.input.height,
+        stats: &mut self.stats,
+        order: &mut self.paintOrder,
+        frame: self.frameNumber,
+        scale: self.input.scale,
+        time: self.input.time,
+        seed: self.seed,
+        only: NONE,
+        inside: false,
+      }
+      run paintRoots(&mut painter, window)
+      drop painter
+      run self.sceneB.finish()
+      self.stats.primitives = self.sceneB.primitiveCount()
+    } else {
+      self.sceneA.clear()
+      let mut painter = Painter {
+        nodes: &mut self.nodes,
+        slotOfCss: &self.slotOfCss,
+        css: &self.layout,
+        output: &self.output,
+        text: &self.provider.text,
+        faces: &self.faces,
+        atlas: &mut self.atlas,
+        glyphs: &mut self.glyphs,
+        textInk: &mut self.textInk,
+        resources: &mut self.resources,
+        paths: &mut self.paths,
+        scene: &mut self.sceneA,
+        previous: &self.sceneB,
+        replayable: self.replayable,
+        scrollsStill: self.scrollsStill,
+        hashes: &self.fragmentHashes,
+        ink: &self.fragmentInk,
+        scrollers: &self.fragmentScrollers,
+        cull: window.bounds,
+        lead: self.input.height * self.input.scale,
+        width: self.input.width,
+        height: self.input.height,
+        stats: &mut self.stats,
+        order: &mut self.paintOrder,
+        frame: self.frameNumber,
+        scale: self.input.scale,
+        time: self.input.time,
+        seed: self.seed,
+        only: NONE,
+        inside: false,
+      }
+      run paintRoots(&mut painter, window)
+      drop painter
+      run self.sceneA.finish()
+      self.stats.primitives = self.sceneA.primitiveCount()
+    }
+    self.replayable = true
+    self.paintIndexOf.clear()
+    run self.paintIndexOf.appendRepeated(NONE, self.nodes.length())
+    let mut orderIndex: usize = 0
+    while orderIndex < self.paintOrder.length() {
+      let slot = self.slotOf(self.paintOrder.get(orderIndex))
+      if slot != NONE && self.paintIndexOf.get(u32.toUsize(slot)) == NONE {
+        self.paintIndexOf.set(u32.toUsize(slot), usize.toU32(orderIndex))
+      }
+      orderIndex = orderIndex + 1
+    }
+    run self.gatherUploads()
+  }
+
+  /// Paints node `slot` and its subtree alone into `scene` (finished), from the last layout,
+  /// without touching the paint caches. For snapshots of one node.
+  pub effect fn paintSubtree(self: &mut Self, slot: u32, scene: &mut Scene) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let window = ContentMask.new(
+      Rect<f32>.new(
+        0.0,
+        0.0,
+        self.input.width * self.input.scale,
+        self.input.height * self.input.scale,
+      ),
+    )
+    let mut stats = FrameStats.zero()
+    let mut order = List<u32>.make()
+    let mut painter = Painter {
+      nodes: &mut self.nodes,
+      slotOfCss: &self.slotOfCss,
+      css: &self.layout,
+      output: &self.output,
+      text: &self.provider.text,
+      faces: &self.faces,
+      atlas: &mut self.atlas,
+      glyphs: &mut self.glyphs,
+      textInk: &mut self.textInk,
+      resources: &mut self.resources,
+      paths: &mut self.paths,
+      scene: &mut scene,
+      previous: &self.sceneA,
+      replayable: false,
+      scrollsStill: false,
+      hashes: &self.fragmentHashes,
+      ink: &self.fragmentInk,
+      scrollers: &self.fragmentScrollers,
+      cull: window.bounds,
+      lead: 0.0,
+      width: self.input.width,
+      height: self.input.height,
+      stats: &mut stats,
+      order: &mut order,
+      frame: self.frameNumber,
+      scale: self.input.scale,
+      time: self.input.time,
+      seed: self.seed,
+      only: slot,
+      inside: false,
+    }
+    run paintRoots(&mut painter, window)
+    drop painter
+    run scene.finish()
+    run self.gatherUploads()
+  }
+
+  /// Moves the tiles the caches allocated this frame into [`UiTree.uploads`].
+  effect fn gatherUploads(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let glyphs = self.glyphs.uploads()
+    let mut i: usize = 0
+    while i < glyphs.length {
+      run self.uploads.push(
+        glyphs[i].tile,
+        self.glyphs.uploadBytes(),
+        glyphs[i].offset,
+        glyphs[i].bytesPerRow,
+      )
+      i = i + 1
+    }
+    self.glyphs.clearUploads()
+    let icons = self.resources.icons.uploads()
+    i = 0
+    while i < icons.length {
+      run self.uploads.push(
+        icons[i].tile,
+        self.resources.icons.uploadBytes(),
+        icons[i].offset,
+        icons[i].bytesPerRow,
+      )
+      i = i + 1
+    }
+    self.resources.icons.clearUploads()
+    let images = self.resources.images.uploads()
+    i = 0
+    while i < images.length {
+      run self.uploads.push(
+        images[i].tile,
+        self.resources.images.uploadBytes(),
+        images[i].offset,
+        images[i].bytesPerRow,
+      )
+      i = i + 1
+    }
+    self.resources.images.clearUploads()
+  }
+
+  /// The atlas tiles allocated since the last [`UiTree.clearUploads`], with their pixels, for
+  /// the renderer to copy into its textures.
+  pub fn pendingUploads(self: &Self) -> &Pending {
+    return &self.uploads
+  }
+
+  pub fn clearUploads(self: &mut Self) -> () {
+    self.uploads.clear()
+  }
+
+  /// Forces the next frame to paint everything again.
+  pub fn invalidatePaint(self: &mut Self) -> () {
+    self.replayable = false
+  }
+}
+
+effect fn ignoreInvalid(error: InvalidNode) -> () {
+  drop error
+}
+
+fn sameNatural(a: NaturalDimensions, b: NaturalDimensions) -> bool {
+  return a.aspectRatio == b.aspectRatio && a.size.width == b.size.width
+    && a.size.height == b.size.height
+}
+
+effect fn defineImage(
+  resources: &mut Resources,
+  atlas: &mut Atlas,
+  resource: u32,
+  data: &[u8],
+) -> bool
+  ! ResourceError | OutOfMemoryError
+  ? &mut Allocator {
+  run resources.defineImage(&mut atlas, resource, data)
+  return true
+}
+
+effect fn defineIcon(
+  resources: &mut Resources,
+  atlas: &mut Atlas,
+  resource: u32,
+  data: &[u8],
+) -> bool
+  ! ResourceError | OutOfMemoryError
+  ? &mut Allocator {
+  run resources.defineIcon(&mut atlas, resource, data)
+  return true
+}
+
+effect fn resourceFailed(error: ResourceError) -> bool {
+  drop error
+  return false
+}

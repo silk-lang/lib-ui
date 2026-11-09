@@ -1,0 +1,137 @@
+//! Image body, fit, cropping and resource lifetime through the app/tree boundary.
+import ui_app.app { App, Context, NoCommand }
+import ui_app.runtime { Runtime }
+import ui_app.ui { Ui }
+import ui_tree.lib { UiTree, TreeError, FrameInput, CpuSnapshot, Batch }
+import ui_tree.mutation { Property, Length, ObjectFit }
+import ui_fixtures.fixtures as fixtures
+import codec.image { Image, ImageError }
+import vector.geometry_error { GeometryError }
+import vector.pixmap { Pixmap }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+
+struct Example {
+  fit: ObjectFit,
+  top: bool
+}
+
+enum Message {
+  Change
+}
+
+impl App<Message, NoCommand> for Example {
+  fn update(self: &mut Self, message: Message, cx: &mut Context<NoCommand>) -> () {}
+
+  fn view(self: &Self, ui: &mut Ui<Message>) -> () {
+    ui.imageWith(
+      50,
+      |ui| {
+        ui.label("Photograph")
+        ui.width(Length.px(100.0))
+        ui.height(Length.px(100.0))
+        ui.style(
+          &[
+            Property.ObjectFit { value: self.fit },
+            Property.ObjectPosition {
+              x: Length.percent(50.0),
+              y: Length.percent(
+                if self.top {
+                  0.0
+                } else {
+                  50.0
+                },
+              ),
+            },
+          ],
+        )
+      },
+    )
+  }
+}
+
+fn viewport() -> FrameInput {
+  return FrameInput { width: 100.0, height: 100.0, scale: 1.0, time: 0.0 }
+}
+
+fn red(pixels: &Pixmap, x: usize, y: usize) -> bool {
+  let at = (y * 100 + x) * 4
+  let data = pixels.data()
+  return data[at] > 240 && data[at + 1] < 10 && data[at + 2] < 10
+}
+
+effect fn picture(tree: &mut UiTree<'_>) -> ()
+  ! ImageError | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut image = run Image.make(40, 20)
+  let bytes = image.dataMut()
+  let mut i: usize = 0
+  while i < bytes.length {
+    bytes[i] = 255
+    bytes[i + 3] = 255
+    i = i + 4
+  }
+  let mut batch = Batch.make()
+  run batch.decodedImage(50, move image)
+  run tree.apply(run batch.take())
+}
+
+effect fn frame(tree: &mut UiTree<'_>, snapshot: &mut CpuSnapshot) -> Pixmap
+  ! TreeError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  run tree.frame(viewport())
+  run snapshot.sync(&mut tree)
+  return run snapshot.render(&tree)
+}
+
+effect fn body() -> ()
+  ! AssertionError<'static> | ImageError | TreeError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut app = Runtime<Example, Message, NoCommand>.make(
+    Example { fit: ObjectFit.Contain, top: false },
+  )
+  run picture(&mut tree)
+  run app.start(&mut tree, 0.0)
+  let mut snapshot = CpuSnapshot.make()
+  let centered = run frame(&mut tree, &mut snapshot)
+  run Testing.expect(
+    !red(&centered, 50, 10) && red(&centered, 50, 30) && !red(&centered, 50, 90),
+    "contain centers an image without stretching",
+  )
+  app.model.top = true
+  run app.render(&mut tree)
+  let top = run frame(&mut tree, &mut snapshot)
+  run Testing.expect(
+    red(&top, 50, 10) && !red(&top, 50, 60),
+    "object position controls the leftover space",
+  )
+  app.model.fit = ObjectFit.Cover
+  run app.render(&mut tree)
+  let cover = run frame(&mut tree, &mut snapshot)
+  run Testing.expect(
+    red(&cover, 1, 1) && red(&cover, 98, 98),
+    "cover fills and clips the content box",
+  )
+  run picture(&mut tree)
+  run Testing.expect(
+    tree.resources.images.length() == 1,
+    "replacing a resource releases old decoded storage",
+  )
+  let mut batch = Batch.make()
+  run batch.releaseResource(50)
+  run tree.apply(run batch.take())
+  let empty = run frame(&mut tree, &mut snapshot)
+  run Testing.expect(
+    tree.resources.images.length() == 0 && !red(&empty, 50, 50),
+    "release removes pixels from both storage and painting",
+  )
+}
+
+test effect fn fittedImagesAndLifetime() -> ()
+  ! AssertionError<'static> | ImageError | TreeError | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run body() |> Effect.provideMut<Allocator>(&mut allocator)
+}

@@ -1,0 +1,224 @@
+//! Synthetic input aimed at nodes: the pointer, wheel and key records a person would make,
+//! built from the last layout. They go through `UiTree.dispatch` (or a recording
+//! [`Session`](session.Session)), the same path a window and T4's scripted tests use.
+import ui_tree.tree { UiTree }
+import ui_tree.node { NONE }
+import ui_tree.input { Input, MOD_SHIFT, BUTTON_PRIMARY }
+import ui_tree.inspect { FragmentInfo, fragmentsOf }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.geometry.rect { Rect }
+import silk.geometry.vector { Vector2 }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.u32
+import silk.text.string { String }
+
+fn intersect(a: Rect<f32>, b: Rect<f32>) -> Rect<f32> {
+  return Rect<f32>.new(
+    f32.max(a.xMin, b.xMin),
+    f32.max(a.yMin, b.yMin),
+    f32.min(a.xMax, b.xMax),
+    f32.min(a.yMax, b.yMax),
+  )
+}
+
+/// The part of node `slot`'s first box that clipping ancestors and the viewport leave visible.
+effect fn visibleBox(tree: &UiTree<'_>, slot: u32) -> Rect<f32>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut fragments = List<FragmentInfo>.make()
+  run fragmentsOf(tree, slot, &mut fragments)
+  if fragments.length() == 0 {
+    return Rect<f32>.new(0.0, 0.0, 0.0, 0.0)
+  }
+  let mut rect = fragments.get(0).border
+  rect = intersect(rect, Rect<f32>.new(0.0, 0.0, tree.input.width, tree.input.height))
+  let mut at = tree.node(slot).parent
+  while at != NONE {
+    if tree.node(at).computed.clips() {
+      run fragmentsOf(tree, at, &mut fragments)
+      if fragments.length() != 0 {
+        rect = intersect(rect, fragments.get(0).padding)
+      }
+    }
+    at = tree.node(at).parent
+  }
+  return rect
+}
+
+/// Whether hit testing at (`x`, `y`) lands on `slot` or a node inside it.
+effect fn reaches(tree: &UiTree<'_>, slot: u32, x: f32, y: f32) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let hit = tree.hitTest(x, y)
+  if hit == NONE {
+    return false
+  }
+  let mut at = tree.slotOf(hit)
+  while at != NONE {
+    if at == slot {
+      return true
+    }
+    at = tree.node(at).parent
+  }
+  return false
+}
+
+/// A point (CSS pixels) where a pointer reaches node `id` or one of its descendants: the
+/// centre of its visible box if hit testing gets there, else the first of a 5 by 5 grid over
+/// it that does. None when the node is hidden, scrolled out, covered or not targetable.
+pub effect fn pointOf(tree: &UiTree<'_>, id: u32) -> Option<Vector2<f32>>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let slot = tree.slotOf(id)
+  if slot == NONE {
+    return Option<Vector2<f32>>.None
+  }
+  let r = run visibleBox(tree, slot)
+  if r.xMax <= r.xMin || r.yMax <= r.yMin {
+    return Option<Vector2<f32>>.None
+  }
+  let cx = (r.xMin + r.xMax) * 0.5
+  let cy = (r.yMin + r.yMax) * 0.5
+  if run reaches(tree, slot, cx, cy) {
+    return Option<Vector2<f32>>.Some { value: Vector2<f32> { x: cx, y: cy } }
+  }
+  let mut j: u32 = 0
+  while j < 5 {
+    let mut i: u32 = 0
+    while i < 5 {
+      let x = r.xMin + (r.xMax - r.xMin) * (u32.toF32(i) * 2.0 + 1.0) / 10.0
+      let y = r.yMin + (r.yMax - r.yMin) * (u32.toF32(j) * 2.0 + 1.0) / 10.0
+      if run reaches(tree, slot, x, y) {
+        return Option<Vector2<f32>>.Some { value: Vector2<f32> { x: x, y: y } }
+      }
+      i = i + 1
+    }
+    j = j + 1
+  }
+  return Option<Vector2<f32>>.None
+}
+
+/// Appends a move onto node `id` and a primary press and release there. False (nothing
+/// appended) when no point reaches the node.
+pub effect fn click(tree: &UiTree<'_>, id: u32, out: &mut List<Input>) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match run pointOf(tree, id) {
+    Option<Vector2<f32>>.Some { value } => {
+      run out.append(Input.PointerMove { x: value.x, y: value.y, modifiers: 0 })
+      run out.append(
+        Input.PointerDown {
+          x: value.x,
+          y: value.y,
+          button: BUTTON_PRIMARY,
+          modifiers: 0,
+          clickCount: 1,
+        },
+      )
+      run out.append(
+        Input.PointerUp { x: value.x, y: value.y, button: BUTTON_PRIMARY, modifiers: 0 },
+      )
+      return true
+    }
+    Option<Vector2<f32>>.None => {
+      return false
+    }
+  }
+}
+
+/// Appends a move onto node `id`.
+pub effect fn hover(tree: &UiTree<'_>, id: u32, out: &mut List<Input>) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match run pointOf(tree, id) {
+    Option<Vector2<f32>>.Some { value } => {
+      run out.append(Input.PointerMove { x: value.x, y: value.y, modifiers: 0 })
+      return true
+    }
+    Option<Vector2<f32>>.None => {
+      return false
+    }
+  }
+}
+
+/// Appends a wheel record over node `id`, positive `deltaY` scrolling down.
+pub effect fn wheel(
+  tree: &UiTree<'_>,
+  id: u32,
+  deltaX: f32,
+  deltaY: f32,
+  out: &mut List<Input>,
+) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match run pointOf(tree, id) {
+    Option<Vector2<f32>>.Some { value } => {
+      run out.append(
+        Input.Wheel { x: value.x, y: value.y, deltaX: deltaX, deltaY: deltaY, modifiers: 0 },
+      )
+      return true
+    }
+    Option<Vector2<f32>>.None => {
+      return false
+    }
+  }
+}
+
+/// Appends a key down and up of UI Events `key` and `code`.
+pub effect fn press(key: string, code: string, modifiers: u32, out: &mut List<Input>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.append(
+    Input.KeyDown {
+      key: run String.copy(key),
+      code: run String.copy(code),
+      modifiers: modifiers,
+      repeat: false,
+    },
+  )
+  run out.append(
+    Input.KeyUp { key: run String.copy(key), code: run String.copy(code), modifiers: modifiers },
+  )
+}
+
+/// Appends Tab, or Shift+Tab when `backward`.
+pub effect fn tab(backward: bool, out: &mut List<Input>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let modifiers: u32 = if backward {
+    MOD_SHIFT
+  } else {
+    0
+  }
+  run press("Tab", "Tab", modifiers, &mut out)
+}
+
+/// Dispatches each of `inputs` to `tree`, in order.
+pub effect fn dispatchAll(tree: &mut UiTree<'_>, inputs: List<Input>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut list = move inputs
+  let mut reversed = List<Input>.make()
+  while true {
+    match list.pop() {
+      Option<Input>.Some { value } => {
+        run reversed.append(move value)
+      }
+      Option<Input>.None => {
+        break
+      }
+    }
+  }
+  while true {
+    match reversed.pop() {
+      Option<Input>.Some { value } => {
+        run tree.dispatch(move value)
+      }
+      Option<Input>.None => {
+        break
+      }
+    }
+  }
+}

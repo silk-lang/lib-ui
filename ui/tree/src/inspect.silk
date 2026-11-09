@@ -1,0 +1,849 @@
+//! Inspection for people, tests and agents: per-node queries, a deterministic text snapshot of
+//! the tree ([`describe`]), and pixel snapshots through the CPU reference renderer
+//! ([`CpuSnapshot`]).
+import tree { UiTree, TreeError }
+import node { NONE, NO_INDEX, Node, Pending }
+import mutation { NodeKind, Role, Display, Length }
+import style { Computed, Fill, TextStyle }
+import paint { borderBox, paddingBox, contentBox }
+import layout.lib { Fragment, FragmentKind, Rect as LayoutRect }
+import ui_scene.cpu { AtlasPixels, CpuRenderer }
+import ui_scene.scene { Scene }
+import ui_scene.color as color
+import vector.geometry_error { GeometryError }
+import vector.pixmap { Pixmap }
+import codec.png
+import codec.image { ImageError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.color.rgba { Rgba }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.geometry.rect { Rect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.i64
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.text.string { String }
+
+/// One layout fragment of a node, in CSS pixels of the viewport.
+pub struct FragmentInfo {
+  pub kind: FragmentKind,
+  /// The fragment's index in the layout output, and its parent's (a line box for text).
+  pub index: usize,
+  pub parent: usize,
+  pub border: Rect<f32>,
+  pub padding: Rect<f32>,
+  pub content: Rect<f32>,
+}
+
+impl Copy for FragmentInfo {}
+
+/// What a node is and where it is, for queries.
+pub struct NodeInfo {
+  pub id: u32,
+  pub kind: NodeKind,
+  /// The parent's id, or NONE.
+  pub parent: u32,
+  /// The union of the node's fragments' border boxes (zero when it has none).
+  pub bounds: Rect<f32>,
+  /// Whether layout produced any fragment for the node.
+  pub laidOut: bool,
+  pub focused: bool,
+  pub hovered: bool,
+  /// Whether the node is in the active state (a press on it or a descendant).
+  pub pressed: bool,
+  /// The scroll offset of a scroll container.
+  pub scrollX: f32,
+  pub scrollY: f32,
+  /// The position of the node in the last frame's paint order, or NONE when it was not painted.
+  pub paintIndex: u32,
+}
+
+impl Copy for NodeInfo {}
+
+fn merge(a: Rect<f32>, b: Rect<f32>) -> Rect<f32> {
+  return Rect<f32>.new(
+    f32.min(a.xMin, b.xMin),
+    f32.min(a.yMin, b.yMin),
+    f32.max(a.xMax, b.xMax),
+    f32.max(a.yMax, b.yMax),
+  )
+}
+
+/// The fragments of node `slot` after the last layout, in fragment order. An input's own box
+/// comes with the fragments of the text inside it.
+pub effect fn fragmentsOf(tree: &UiTree<'_>, slot: u32, out: &mut List<FragmentInfo>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  let css = tree.node(slot).css
+  let inner = tree.node(slot).inner
+  let values = tree.output.fragments.values.asSlice()
+  let mut own = if css < tree.fragmentOf.length() {
+    tree.fragmentOf.get(css)
+  } else {
+    NO_INDEX
+  }
+  let mut nested = if inner != css && inner < tree.fragmentOf.length() {
+    tree.fragmentOf.get(inner)
+  } else {
+    NO_INDEX
+  }
+  while own != NO_INDEX || nested != NO_INDEX {
+    let i = if own < nested {
+      own
+    } else {
+      nested
+    }
+    let moved = tree.visualFragment(i)
+    let f = &moved
+    run out.append(
+      FragmentInfo {
+        kind: f.kind,
+        index: i,
+        parent: f.parent,
+        border: borderBox(f),
+        padding: paddingBox(f),
+        content: contentBox(f),
+      },
+    )
+    if i == own {
+      own = tree.nextSourceFragment.get(i)
+    } else {
+      nested = tree.nextSourceFragment.get(i)
+    }
+  }
+}
+
+/// What node `id` is and where the last layout put it.
+pub effect fn info(tree: &UiTree<'_>, id: u32) -> Option<NodeInfo>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let slot = tree.slotOf(id)
+  if slot == NONE {
+    return Option<NodeInfo>.None
+  }
+  let node = tree.node(slot)
+  let mut bounds = Rect<f32>.new(0.0, 0.0, 0.0, 0.0)
+  let mut laidOut = false
+  let mut source = node.css
+  let mut pass: usize = 0
+  while pass < 2 {
+    if source < tree.fragmentOf.length() && (pass == 0 || source != node.css) {
+      let mut fragment = tree.fragmentOf.get(source)
+      while fragment != NO_INDEX {
+        let border = borderBox(&tree.visualFragment(fragment))
+        bounds = if laidOut {
+          merge(bounds, border)
+        } else {
+          border
+        }
+        laidOut = true
+        fragment = tree.nextSourceFragment.get(fragment)
+      }
+    }
+    source = node.inner
+    pass = pass + 1
+  }
+  let mut paintIndex = NONE
+  if u32.toUsize(slot) < tree.paintIndexOf.length() {
+    let index = tree.paintIndexOf.get(u32.toUsize(slot))
+    if index != NONE && u32.toUsize(index) < tree.paintOrder.length()
+      && tree.paintOrder.get(u32.toUsize(index)) == id {
+      paintIndex = index
+    }
+  }
+  let parent = if node.parent == NONE {
+    NONE
+  } else {
+    tree.node(node.parent).id
+  }
+  return Option<NodeInfo>.Some {
+    value: NodeInfo {
+      id: id,
+      kind: node.kind,
+      parent: parent,
+      bounds: bounds,
+      laidOut: laidOut,
+      focused: tree.focused == slot,
+      hovered: node.hovered,
+      pressed: node.pressed,
+      scrollX: node.scrollX,
+      scrollY: node.scrollY,
+      paintIndex: paintIndex,
+    },
+  }
+}
+
+/// The ids of the children of node `id`, in order.
+pub effect fn childrenOf(tree: &UiTree<'_>, id: u32, out: &mut List<u32>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  let slot = tree.slotOf(id)
+  if slot == NONE {
+    return ()
+  }
+  let mut slots = List<u32>.make()
+  run tree.childSlots(slot, &mut slots)
+  let mut i: usize = 0
+  while i < slots.length() {
+    run out.append(tree.node(slots.get(i)).id)
+    i = i + 1
+  }
+}
+
+/// The ids of the nodes whose test id, label or text equals `value`, in tree order.
+pub effect fn findAll(tree: &UiTree<'_>, value: string, out: &mut List<u32>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  if tree.root == NONE {
+    return ()
+  }
+  let mut stack = List<u32>.make()
+  let mut children = List<u32>.make()
+  run stack.append(tree.root)
+  while stack.length() != 0 {
+    let last = stack.length() - 1
+    let slot = stack.get(last)
+    stack.truncate(last)
+    let node = tree.node(slot)
+    if same(String.view(&node.testId), value) || same(String.view(&node.label), value)
+      || same(String.view(&node.text), value) {
+      run out.append(node.id)
+    }
+    run tree.childSlots(slot, &mut children)
+    let mut i = children.length()
+    while i > 0 {
+      i = i - 1
+      run stack.append(children.get(i))
+    }
+  }
+}
+
+fn same(a: string, b: string) -> bool {
+  let x = String.utf8Bytes(a)
+  let y = String.utf8Bytes(b)
+  if x.length != y.length || x.length == 0 {
+    return false
+  }
+  let mut i: usize = 0
+  while i < x.length {
+    if x[i] != y[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+// Text output.
+
+effect fn digits(out: &mut String, value: u64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if value >= 10 {
+    run digits(&mut out, value / 10)
+  }
+  let digit = value % 10
+  let text = match digit {
+    0 => "0"
+    1 => "1"
+    2 => "2"
+    3 => "3"
+    4 => "4"
+    5 => "5"
+    6 => "6"
+    7 => "7"
+    8 => "8"
+    _ => "9"
+  }
+  run out.append(text)
+}
+
+/// Writes `value` in decimal.
+pub effect fn writeInt(out: &mut String, value: u64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run digits(&mut out, value)
+}
+
+/// Writes `value` rounded to hundredths, without trailing zeros.
+pub effect fn writeNumber(out: &mut String, value: f32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut hundredths = f32.floor(f32.abs(value) * 100.0 + 0.5)
+  if value < 0.0 && hundredths != 0.0 {
+    run out.append("-")
+  }
+  let whole = f32.floor(hundredths / 100.0)
+  let fraction = f32.toU64(hundredths - whole * 100.0)
+  run digits(&mut out, f32.toU64(whole))
+  if fraction != 0 {
+    run out.append(".")
+    if fraction % 10 == 0 {
+      run digits(&mut out, fraction / 10)
+    } else {
+      if fraction < 10 {
+        run out.append("0")
+      }
+      run digits(&mut out, fraction)
+    }
+  }
+}
+
+/// An input's flags, placeholder, and while it has focus its selection and composition.
+effect fn describeEdit(tree: &UiTree<'_>, slot: u32, out: &mut String) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let e = &tree.node(slot).edit
+  if e.multiline {
+    run out.append(" multiline")
+  }
+  if e.readOnly {
+    run out.append(" readonly")
+  }
+  if String.ownedByteLength(&e.placeholder) != 0 {
+    run out.append(" placeholder=")
+    run quoted(&mut out, String.view(&e.placeholder))
+  }
+  if tree.focused != slot {
+    return ()
+  }
+  run out.append(" selection=")
+  run writeInt(&mut out, usize.toU64(e.anchor))
+  if e.focus != e.anchor {
+    run out.append("-")
+    run writeInt(&mut out, usize.toU64(e.focus))
+  }
+  if e.composing {
+    run out.append(" preedit=")
+    run quoted(&mut out, String.view(&e.preedit))
+  }
+}
+
+effect fn quoted(out: &mut String, value: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.append("\"")
+  let bytes = String.utf8Bytes(value)
+  let mut start: usize = 0
+  let mut i: usize = 0
+  while i < bytes.length {
+    let b = bytes[i]
+    if b == 34 || b == 92 || b == 10 {
+      run out.append(String.slice(value, start, i - start))
+      if b == 10 {
+        run out.append("\\n")
+      } else if b == 34 {
+        run out.append("\\\"")
+      } else {
+        run out.append("\\\\")
+      }
+      start = i + 1
+    }
+    i = i + 1
+  }
+  run out.append(String.slice(value, start, bytes.length - start))
+  run out.append("\"")
+}
+
+pub fn kindName(kind: NodeKind) -> string<'static> {
+  return match kind {
+    NodeKind.Box => "box"
+    NodeKind.Text => "text"
+    NodeKind.Image => "image"
+    NodeKind.Icon => "icon"
+    NodeKind.Input => "input"
+    NodeKind.Canvas => "canvas"
+  }
+}
+
+pub fn roleName(value: Role) -> string<'static> {
+  return match value {
+    Role.None => "none"
+    Role.Generic => "generic"
+    Role.Button => "button"
+    Role.Link => "link"
+    Role.Checkbox => "checkbox"
+    Role.Radio => "radio"
+    Role.TextBox => "textbox"
+    Role.Heading => "heading"
+    Role.Paragraph => "paragraph"
+    Role.List => "list"
+    Role.ListItem => "listitem"
+    Role.Image => "img"
+    Role.Dialog => "dialog"
+    Role.Menu => "menu"
+    Role.MenuItem => "menuitem"
+    Role.Tab => "tab"
+    Role.TabList => "tablist"
+    Role.TabPanel => "tabpanel"
+    Role.Toolbar => "toolbar"
+    Role.Navigation => "navigation"
+    Role.Main => "main"
+    Role.Form => "form"
+    Role.Group => "group"
+    Role.Slider => "slider"
+    Role.Switch => "switch"
+    Role.ListBox => "listbox"
+    Role.Option => "option"
+    Role.Tooltip => "tooltip"
+  }
+}
+
+effect fn writeColor(out: &mut String, color: Rgba<f32>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.append("rgba(")
+  run writeInt(&mut out, f32.toU64(f32.floor(f32.max(0.0, f32.min(1.0, color.r)) * 255.0 + 0.5)))
+  run out.append(",")
+  run writeInt(&mut out, f32.toU64(f32.floor(f32.max(0.0, f32.min(1.0, color.g)) * 255.0 + 0.5)))
+  run out.append(",")
+  run writeInt(&mut out, f32.toU64(f32.floor(f32.max(0.0, f32.min(1.0, color.b)) * 255.0 + 0.5)))
+  run out.append(",")
+  run writeNumber(&mut out, color.a)
+  run out.append(")")
+}
+
+effect fn writeRect(out: &mut String, rect: Rect<f32>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.append("[")
+  run writeNumber(&mut out, rect.xMin)
+  run out.append(",")
+  run writeNumber(&mut out, rect.yMin)
+  run out.append(" ")
+  run writeNumber(&mut out, rect.xMax - rect.xMin)
+  run out.append("x")
+  run writeNumber(&mut out, rect.yMax - rect.yMin)
+  run out.append("]")
+}
+
+/// What [`describe`] writes besides kinds, ids, attributes, text and rectangles.
+pub struct DescribeOptions {
+  /// Paint styles that differ from the initial ones: background, border, radius, shadow,
+  /// opacity, and text color and size where they change from the parent's.
+  pub styles: bool,
+  /// Nodes that layout gave no box (`display: none` and detached subtrees) are listed too.
+  pub hidden: bool,
+}
+
+impl Copy for DescribeOptions {}
+
+impl DescribeOptions {
+  pub fn plain() -> DescribeOptions {
+    return DescribeOptions { styles: false, hidden: true }
+  }
+
+  pub fn withStyles() -> DescribeOptions {
+    return DescribeOptions { styles: true, hidden: true }
+  }
+}
+
+effect fn describeStyles(out: &mut String, c: &Computed, parent: TextStyle, kind: NodeKind) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match c.background {
+    Fill.None => {}
+    Fill.Solid { color } => {
+      run out.append(" background=")
+      run writeColor(&mut out, color)
+    }
+    Fill.Gradient { angle, from, to } => {
+      run out.append(" background=gradient(")
+      run writeNumber(&mut out, angle)
+      run out.append("deg,")
+      run writeColor(&mut out, from)
+      run out.append(",")
+      run writeColor(&mut out, to)
+      run out.append(")")
+    }
+  }
+  if c.border.top > 0.0 || c.border.right > 0.0 || c.border.bottom > 0.0 || c.border.left > 0.0 {
+    run out.append(" border=")
+    run writeNumber(&mut out, c.border.top)
+    run out.append(",")
+    run writeNumber(&mut out, c.border.right)
+    run out.append(",")
+    run writeNumber(&mut out, c.border.bottom)
+    run out.append(",")
+    run writeNumber(&mut out, c.border.left)
+    run out.append(" ")
+    run writeColor(&mut out, c.borderColor)
+  }
+  let r = c.radii
+  if r.topLeft > 0.0 || r.topRight > 0.0 || r.bottomRight > 0.0 || r.bottomLeft > 0.0 {
+    run out.append(" radius=")
+    run writeNumber(&mut out, r.topLeft)
+    if r.topRight != r.topLeft || r.bottomRight != r.topLeft || r.bottomLeft != r.topLeft {
+      run out.append(",")
+      run writeNumber(&mut out, r.topRight)
+      run out.append(",")
+      run writeNumber(&mut out, r.bottomRight)
+      run out.append(",")
+      run writeNumber(&mut out, r.bottomLeft)
+    }
+  }
+  if c.hasShadow {
+    run out.append(" shadow=")
+    run writeNumber(&mut out, c.shadow.offsetX)
+    run out.append(",")
+    run writeNumber(&mut out, c.shadow.offsetY)
+    run out.append(",")
+    run writeNumber(&mut out, c.shadow.blur)
+    run out.append(",")
+    run writeNumber(&mut out, c.shadow.spread)
+    if c.shadow.inset {
+      run out.append(" inset")
+    }
+    run out.append(" ")
+    run writeColor(&mut out, c.shadow.color)
+  }
+  if c.opacity != 1.0 {
+    run out.append(" opacity=")
+    run writeNumber(&mut out, c.opacity)
+  }
+  if c.display == Display.None {
+    run out.append(" display=none")
+  }
+  if c.text.size != parent.size {
+    run out.append(" font-size=")
+    run writeNumber(&mut out, c.text.size)
+  }
+  if c.text.weight != parent.weight {
+    run out.append(" font-weight=")
+    run writeNumber(&mut out, c.text.weight)
+  }
+  let pc = parent.color
+  let cc = c.text.color
+  if pc.r != cc.r || pc.g != cc.g || pc.b != cc.b || pc.a != cc.a {
+    run out.append(" color=")
+    run writeColor(&mut out, cc)
+  }
+}
+
+effect fn describeNode(
+  tree: &UiTree<'_>,
+  slot: u32,
+  depth: usize,
+  options: DescribeOptions,
+  out: &mut String,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let node = tree.node(slot)
+  let mut fragments = List<FragmentInfo>.make()
+  run fragmentsOf(tree, slot, &mut fragments)
+  if fragments.length() == 0 && !options.hidden {
+    return ()
+  }
+  let mut i: usize = 0
+  while i < depth {
+    run out.append("  ")
+    i = i + 1
+  }
+  run out.append(kindName(node.kind))
+  run out.append(" #")
+  run writeInt(&mut out, u32.toU64(node.id))
+  if node.accessRole != Role.None {
+    run out.append(" role=")
+    run out.append(roleName(node.accessRole))
+  }
+  if String.ownedByteLength(&node.label) != 0 {
+    run out.append(" label=")
+    run quoted(&mut out, String.view(&node.label))
+  }
+  if String.ownedByteLength(&node.testId) != 0 {
+    run out.append(" testId=")
+    run quoted(&mut out, String.view(&node.testId))
+  }
+  if node.kind == NodeKind.Text || node.kind == NodeKind.Input {
+    run out.append(" ")
+    run quoted(&mut out, String.view(&node.text))
+  }
+  if node.kind == NodeKind.Input {
+    run describeEdit(tree, slot, &mut out)
+  }
+  if tree.focused == slot {
+    run out.append(" focused")
+  }
+  if node.disabled {
+    run out.append(" disabled")
+  }
+  if node.checked {
+    run out.append(" checked")
+  }
+  if node.selected {
+    run out.append(" selected")
+  }
+  if node.expanded {
+    run out.append(" expanded")
+  }
+  if fragments.length() == 0 {
+    run out.append(" (no box)")
+  } else if node.kind == NodeKind.Text {
+    // Text: one rectangle per line box it occupies.
+    let mut j: usize = 0
+    while j < fragments.length() {
+      let line = fragments.get(j).parent
+      let mut rect = fragments.get(j).border
+      j = j + 1
+      while j < fragments.length() && fragments.get(j).parent == line {
+        rect = merge(rect, fragments.get(j).border)
+        j = j + 1
+      }
+      run out.append(" ")
+      run writeRect(&mut out, rect)
+    }
+  } else {
+    // Boxes: the union of their own fragments; a box split across lines says how many.
+    let css = node.css
+    let mut own: usize = 0
+    let mut bounds = Rect<f32>.new(0.0, 0.0, 0.0, 0.0)
+    let mut j: usize = 0
+    while j < fragments.length() {
+      let fragment = fragments.get(j)
+      if fragment.kind == FragmentKind.Box || fragment.kind == FragmentKind.Inline {
+        if tree.output.fragments.values.asSlice()[fragment.index].source == css {
+          bounds = if own == 0 {
+            fragment.border
+          } else {
+            merge(bounds, fragment.border)
+          }
+          own = own + 1
+        }
+      }
+      j = j + 1
+    }
+    run out.append(" ")
+    run writeRect(&mut out, bounds)
+    if own > 1 {
+      run out.append(" fragments=")
+      run writeInt(&mut out, usize.toU64(own))
+    }
+    if node.scrollX != 0.0 || node.scrollY != 0.0 {
+      run out.append(" scroll=")
+      run writeNumber(&mut out, node.scrollX)
+      run out.append(",")
+      run writeNumber(&mut out, node.scrollY)
+    }
+  }
+  if options.styles && node.kind != NodeKind.Text {
+    let parent = if node.parent == NONE {
+      TextStyle.initial()
+    } else {
+      tree.node(node.parent).computed.text
+    }
+    run describeStyles(&mut out, &node.computed, parent, node.kind)
+  }
+  run out.append("\n")
+  let mut children = List<u32>.make()
+  run tree.childSlots(slot, &mut children)
+  let mut k: usize = 0
+  while k < children.length() {
+    run describeNode(tree, children.get(k), depth + 1, options, &mut out)
+    k = k + 1
+  }
+}
+
+/// A text snapshot of the tree from the root down: one line per node, indented by depth, with
+/// its kind, id, role, label, test id, text, focus and border box (CSS pixels, rounded to
+/// hundredths). The output depends only on the tree and its last layout, so tests compare it
+/// as a golden and agents read it like an accessibility snapshot.
+pub effect fn describe(tree: &UiTree<'_>, options: DescribeOptions, out: &mut String) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if tree.root == NONE {
+    run out.append("(no root)\n")
+    return ()
+  }
+  run describeNode(tree, tree.root, 0, options, &mut out)
+}
+
+/// [`describe`] of the subtree of node `id`.
+pub effect fn describeNodeById(
+  tree: &UiTree<'_>,
+  id: u32,
+  options: DescribeOptions,
+  out: &mut String,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let slot = tree.slotOf(id)
+  if slot == NONE {
+    run out.append("(no node)\n")
+    return ()
+  }
+  run describeNode(tree, slot, 0, options, &mut out)
+}
+
+// Pixels.
+
+/// The device size of the last frame.
+pub fn deviceWidth(tree: &UiTree<'_>) -> u32 {
+  return f32.toU32(f32.floor(tree.input.width * tree.input.scale + 0.5))
+}
+
+pub fn deviceHeight(tree: &UiTree<'_>) -> u32 {
+  return f32.toU32(f32.floor(tree.input.height * tree.input.scale + 0.5))
+}
+
+/// CPU copies of the tree's atlas and a CPU renderer, for screenshots and goldens. Call
+/// [`CpuSnapshot.sync`] after every frame (it takes the frame's uploads), then render.
+pub struct CpuSnapshot {
+  pixels: AtlasPixels,
+  renderer: CpuRenderer,
+  scene: Scene,
+}
+
+impl CpuSnapshot {
+  pub fn make() -> CpuSnapshot {
+    return CpuSnapshot {
+      pixels: AtlasPixels.make(),
+      renderer: CpuRenderer.make(),
+      scene: Scene.make(),
+    }
+  }
+
+  /// Copies the tiles the last frame uploaded and clears the tree's upload queue.
+  pub effect fn sync(self: &mut Self, tree: &mut UiTree<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.pixels.sync(&tree.atlas)
+    let pending = tree.pendingUploads()
+    let list = pending.entries()
+    let mut i: usize = 0
+    while i < list.length {
+      self.pixels.write(list[i].tile, pending.pixels(list[i]))
+      i = i + 1
+    }
+    tree.clearUploads()
+  }
+
+  /// Copies the tiles the last frame uploaded and leaves the tree's upload queue alone, for a
+  /// second consumer (an inspector next to a GPU renderer). Call it before the queue is
+  /// cleared.
+  pub effect fn copyUploads(self: &mut Self, tree: &UiTree<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.pixels.sync(&tree.atlas)
+    let pending = tree.pendingUploads()
+    let list = pending.entries()
+    let mut i: usize = 0
+    while i < list.length {
+      self.pixels.write(list[i].tile, pending.pixels(list[i]))
+      i = i + 1
+    }
+  }
+
+  /// The last frame drawn over a transparent background.
+  pub effect fn render(self: &mut Self, tree: &UiTree<'_>) -> Pixmap
+    ! GeometryError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut target = run Pixmap.make(deviceWidth(tree), deviceHeight(tree))
+    run self.renderer.draw(tree.scene(), &self.pixels, &mut target)
+    return move target
+  }
+
+  /// `scene` drawn over a transparent background at the size of the tree's last frame. For
+  /// scenes built over the tree's atlas, such as an inspector overlay composed over the frame.
+  pub effect fn renderScene(self: &mut Self, tree: &UiTree<'_>, scene: &Scene) -> Pixmap
+    ! GeometryError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut target = run Pixmap.make(deviceWidth(tree), deviceHeight(tree))
+    run self.renderer.draw(scene, &self.pixels, &mut target)
+    return move target
+  }
+
+  /// Draws `scene` over `background` at the tree's device size. Use the same clear color
+  /// as a native renderer when comparing opaque window output with the CPU reference.
+  pub effect fn renderSceneOver(
+    self: &mut Self,
+    tree: &UiTree<'_>,
+    scene: &Scene,
+    background: Rgba<f32>,
+  ) -> Pixmap
+    ! GeometryError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut target = run Pixmap.make(deviceWidth(tree), deviceHeight(tree))
+    target.clear(color.toRgba8(background))
+    run self.renderer.draw(scene, &self.pixels, &mut target)
+    return move target
+  }
+
+  /// Node `id` and its subtree alone, cropped to its border box (device pixels, rounded out).
+  /// Returns an empty pixmap when the node has no box.
+  pub effect fn renderNode(self: &mut Self, tree: &mut UiTree<'_>, id: u32) -> Pixmap
+    ! GeometryError | OutOfMemoryError
+    ? &mut Allocator {
+    let found = run info(&tree.*, id)
+    let bounds = match found {
+      Option<NodeInfo>.Some { value } => value.bounds
+      Option<NodeInfo>.None => Rect<f32>.new(0.0, 0.0, 0.0, 0.0)
+    }
+    self.scene.clear()
+    let slot = tree.slotOf(id)
+    run tree.paintSubtree(slot, &mut self.scene)
+    run self.sync(&mut tree)
+    let width = deviceWidth(&tree.*)
+    let height = deviceHeight(&tree.*)
+    let mut full = run Pixmap.make(width, height)
+    run self.renderer.draw(&self.scene, &self.pixels, &mut full)
+    let s = tree.input.scale
+    let x0 = clampU(f32.floor(bounds.xMin * s), width)
+    let y0 = clampU(f32.floor(bounds.yMin * s), height)
+    let x1 = clampU(f32.ceil(bounds.xMax * s), width)
+    let y1 = clampU(f32.ceil(bounds.yMax * s), height)
+    let w = if x1 > x0 {
+      x1 - x0
+    } else {
+      0
+    }
+    let h = if y1 > y0 {
+      y1 - y0
+    } else {
+      0
+    }
+    let mut crop = run Pixmap.make(w, h)
+    let source = full.data()
+    let target = crop.dataMut()
+    let mut y: u32 = 0
+    while y < h {
+      let mut x: u32 = 0
+      while x < w {
+        let from = (u32.toUsize(y0 + y) * u32.toUsize(width) + u32.toUsize(x0 + x)) * 4
+        let to = (u32.toUsize(y) * u32.toUsize(w) + u32.toUsize(x)) * 4
+        target[to] = source[from]
+        target[to + 1] = source[from + 1]
+        target[to + 2] = source[from + 2]
+        target[to + 3] = source[from + 3]
+        x = x + 1
+      }
+      y = y + 1
+    }
+    return move crop
+  }
+}
+
+fn clampU(value: f32, limit: u32) -> u32 {
+  if value <= 0.0 {
+    return 0
+  }
+  let v = f32.toU32(value)
+  if v > limit {
+    return limit
+  }
+  return v
+}
+
+/// A pixmap as a PNG file.
+pub effect fn encodePng(pixmap: &Pixmap) -> Bytes
+  ! ImageError | OutOfMemoryError
+  ? &mut Allocator {
+  return run png.encodePixels(pixmap.width(), pixmap.height(), pixmap.data())
+}

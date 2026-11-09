@@ -1,0 +1,320 @@
+//! The tree's node records and the per-frame data shared by the tree and its painter.
+import mutation { NodeKind, Property, Role, Cursor, CanvasCommand }
+import style { Computed }
+import edit { EditState }
+import font_raster.face { FontFace }
+import atlas.atlas { AtlasTile }
+import layout.lib { LayoutStats }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.geometry.rect { Rect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.usize
+import silk.text.string { String }
+
+/// No node, in slots and css-layout indices.
+pub const NONE: u32 = 4294967295
+
+pub const NO_INDEX: usize = usize.MAX
+
+/// What a frame is drawn at: the viewport in CSS pixels, device pixels per CSS pixel, and the
+/// time in seconds (for animated icons).
+pub struct FrameInput {
+  pub width: f32,
+  pub height: f32,
+  pub scale: f32,
+  pub time: f64,
+}
+
+impl Copy for FrameInput {}
+
+/// What the last frame did, for tests, benchmarks and inspectors.
+pub struct FrameStats {
+  pub frame: u64,
+  /// css-layout's counters for the frame's layout (zero when layout was skipped).
+  pub layout: LayoutStats,
+  pub layoutSkipped: bool,
+  /// Subtrees copied from the previous scene, and subtrees painted again.
+  pub replayedSubtrees: usize,
+  pub repaintedSubtrees: usize,
+  /// Paint operations copied by replay.
+  pub replayedOperations: usize,
+  /// Box, inline and text fragments visited by paint (replayed ones excluded).
+  pub paintedFragments: usize,
+  /// Subtrees paint skipped because their ink lies outside the clip.
+  pub culledSubtrees: usize,
+  pub glyphs: usize,
+  pub primitives: usize,
+  pub nodes: usize,
+  pub fragments: usize,
+}
+
+impl Copy for FrameStats {}
+
+impl FrameStats {
+  pub fn zero() -> FrameStats {
+    return FrameStats {
+      frame: 0,
+      layout: LayoutStats.zero(),
+      layoutSkipped: true,
+      replayedSubtrees: 0,
+      repaintedSubtrees: 0,
+      replayedOperations: 0,
+      paintedFragments: 0,
+      culledSubtrees: 0,
+      glyphs: 0,
+      primitives: 0,
+      nodes: 0,
+      fragments: 0,
+    }
+  }
+}
+
+pub enum EventKind {
+  PointerDown,
+  PointerUp,
+  Click,
+  PointerMove,
+  PointerEnter,
+  PointerLeave,
+  Wheel,
+  KeyDown,
+  KeyUp,
+  Focus,
+  Blur,
+  Input,
+  Scroll,
+  /// The target border box changed after layout; does not bubble.
+  Layout,
+}
+
+/// An event record for the client. `path` holds the node ids from the root to the target, so
+/// the client can run capture and bubbling over it.
+///
+/// Pointer down, up, move, click and wheel records and key records are queued when the target
+/// or any node on its path listens for them (they bubble). Enter, leave, focus, blur and scroll
+/// records are queued only for a target that listens itself.
+pub struct Event {
+  pub kind: EventKind,
+  pub target: u32,
+  /// The measured viewport-relative border box in CSS pixels, for Layout records.
+  pub bounds: Rect<f32>,
+  pub path: List<u32>,
+  /// The pointer in CSS pixels of the viewport, for pointer and wheel records. For `Scroll`
+  /// records, the container's new scroll offset.
+  pub x: f32,
+  pub y: f32,
+  /// `MOD_*` bits.
+  pub modifiers: u32,
+  /// The button of pointer down, up and click records (`BUTTON_*`).
+  pub button: u32,
+  /// The click count of pointer down and click records: 1 for a single click, 2 for a double
+  /// click, 0 for a click made with the keyboard.
+  pub detail: u32,
+  /// The wheel delta of `Wheel` records in CSS pixels, positive down and right.
+  pub deltaX: f32,
+  pub deltaY: f32,
+  /// The UI Events `key` and `code` of key records.
+  pub key: String,
+  pub code: String,
+  pub repeat: bool,
+  /// The value of an input after the change an `Input` record reports.
+  pub value: String,
+  /// What the change was, named as DOM `InputEvent.inputType` names it: `insertText`,
+  /// `insertLineBreak`, `insertFromPaste`, `deleteContentBackward`, `deleteContentForward`,
+  /// `deleteWordBackward`, `deleteWordForward`, `deleteSoftLineBackward`,
+  /// `deleteSoftLineForward`, `deleteByCut`, `deleteByComposition`, `historyUndo` or
+  /// `historyRedo`.
+  pub inputType: String,
+  /// The selection of an `Input` record's input after the change: UTF-8 byte offsets into
+  /// `value`, start before end.
+  pub selectionStart: usize,
+  pub selectionEnd: usize,
+}
+
+impl Event {
+  /// A record of `kind` for `target` with every payload field empty.
+  pub fn make(kind: EventKind, target: u32, path: List<u32>) -> Event {
+    return Event {
+      kind: kind,
+      target: target,
+      bounds: Rect<f32>.new(0.0, 0.0, 0.0, 0.0),
+      path: move path,
+      x: 0.0,
+      y: 0.0,
+      modifiers: 0,
+      button: 0,
+      detail: 0,
+      deltaX: 0.0,
+      deltaY: 0.0,
+      key: String.make(),
+      code: String.make(),
+      repeat: false,
+      value: String.make(),
+      inputType: String.make(),
+      selectionStart: 0,
+      selectionEnd: 0,
+    }
+  }
+}
+
+/// The paint cache of a node: the operations its subtree added to the scene of frame `frame`.
+pub struct PaintCache {
+  pub hash: u64,
+  pub start: usize,
+  pub end: usize,
+  pub frame: u64,
+  pub mask: Rect<f32>,
+  pub scale: f32,
+  /// The paint cull the subtree was painted under (see `Painter.cull`).
+  pub cull: Rect<f32>,
+}
+
+impl Copy for PaintCache {}
+
+impl PaintCache {
+  pub fn empty() -> PaintCache {
+    return PaintCache {
+      hash: 0,
+      start: 0,
+      end: 0,
+      frame: 0,
+      mask: Rect<f32>.new(0.0, 0.0, 0.0, 0.0),
+      scale: 0.0,
+      cull: Rect<f32>.new(0.0, 0.0, 0.0, 0.0),
+    }
+  }
+}
+
+pub struct Node {
+  pub id: u32,
+  pub kind: NodeKind,
+  pub live: bool,
+  /// The css-layout node.
+  pub css: usize,
+  /// An input's text node in css-layout.
+  pub inner: usize,
+  /// The parent slot, or NONE.
+  pub parent: u32,
+  pub base: List<Property>,
+  pub hover: List<Property>,
+  pub active: List<Property>,
+  pub focus: List<Property>,
+  pub focusVisible: List<Property>,
+  pub computed: Computed,
+  pub fontKey: usize,
+  pub layoutHash: u64,
+  pub paintHash: u64,
+  pub styled: bool,
+  pub text: String,
+  pub accessRole: Role,
+  pub hasValueRange: bool,
+  pub valueMin: f32,
+  pub valueMax: f32,
+  pub valueNow: f32,
+  pub label: String,
+  pub testId: String,
+  pub tabIndex: i32,
+  pub cursor: Cursor,
+  pub disabled: bool,
+  pub focusTrap: bool,
+  /// `Attribute.Checked`, `Selected` and `Expanded`.
+  pub checked: bool,
+  pub selected: bool,
+  pub expanded: bool,
+  pub listeners: u32,
+  pub layoutReported: bool,
+  pub reportedBounds: Rect<f32>,
+  pub hovered: bool,
+  pub pressed: bool,
+  /// The scroll offset of a scroll container, clamped to its range at the last frame.
+  pub scrollX: f32,
+  pub scrollY: f32,
+  pub resource: u32,
+  pub canvas: List<CanvasCommand>,
+  /// Bumped when the text, source or canvas changes, and for inputs when the caret, the
+  /// selection or the composition does.
+  pub content: u64,
+  /// An input's editing state.
+  pub edit: EditState,
+  pub cache: PaintCache,
+}
+
+/// A raster face per font key, loaded on first use.
+pub struct FaceSlot<'a> {
+  pub loaded: bool,
+  pub face: Option<FontFace<'a>>,
+}
+
+/// A tile's pixels: `length` bytes at `offset` in [`Pending.bytes`], rows tightly packed.
+pub struct Upload {
+  pub tile: AtlasTile,
+  pub offset: usize,
+  pub length: usize,
+}
+
+impl Copy for Upload {}
+
+/// The tiles a frame allocated in the atlas, gathered from the glyph cache, the icon cache and
+/// the image store so a renderer copies them in one loop.
+pub struct Pending {
+  list: List<Upload>,
+  data: List<u8>,
+}
+
+impl Pending {
+  pub fn make() -> Pending {
+    return Pending { list: List<Upload>.make(), data: List<u8>.make() }
+  }
+
+  /// Queues `tile` with `bytesPerRow`-byte rows starting at `offset` in `source`.
+  pub effect fn push(
+    self: &mut Self,
+    tile: AtlasTile,
+    source: &[u8],
+    offset: usize,
+    bytesPerRow: u32,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let rows = tile.bounds.yMax - tile.bounds.yMin
+    let length = u32.toUsize(bytesPerRow) * u32.toUsize(rows)
+    let at = self.data.length()
+    run self.data.appendSlice(Slice.view(source, offset, length))
+    run self.list.append(Upload { tile: tile, offset: at, length: length })
+  }
+
+  pub fn entries(self: &Self) -> &[Upload] {
+    return self.list.asSlice()
+  }
+
+  /// Queues every upload of `other` after this one's, in order, for a renderer that takes a
+  /// copy of a frame's uploads to another thread.
+  pub effect fn appendAll(self: &mut Self, other: &Pending) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let base = self.data.length()
+    run self.data.appendSlice(other.data.asSlice())
+    let list = other.list.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      run self.list.append(
+        Upload { tile: list[i].tile, offset: base + list[i].offset, length: list[i].length },
+      )
+      i = i + 1
+    }
+  }
+
+  /// The pixels of `upload`.
+  pub fn pixels(self: &Self, upload: Upload) -> &[u8] {
+    return Slice.view(self.data.asSlice(), upload.offset, upload.length)
+  }
+
+  pub fn clear(self: &mut Self) -> () {
+    self.list.clear()
+    self.data.clear()
+  }
+}

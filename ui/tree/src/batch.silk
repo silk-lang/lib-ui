@@ -1,0 +1,258 @@
+//! [`Batch`]: a small builder for mutation batches, for Silk clients and tests.
+import virtual_list { VirtualOptions, VirtualItem }
+import codec.image { Image }
+import mutation { Mutation, NodeKind, StyleState, Property, Attribute, CanvasCommand }
+import grid { Grid }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.string { String }
+
+pub struct Batch {
+  pub mutations: List<Mutation>,
+}
+
+impl Batch {
+  pub fn make() -> Batch {
+    return Batch { mutations: List<Mutation>.make() }
+  }
+
+  /// Configures tree-owned variable-height virtualization for a bounded column.
+  pub effect fn virtualList(self: &mut Self, id: u32, count: usize, options: VirtualOptions) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.push(Mutation.SetVirtualList { id: id, count: count, options: options })
+  }
+
+  /// Binds sorted direct child boxes to logical indices; copies the item records.
+  pub effect fn virtualItems(self: &mut Self, id: u32, items: &[VirtualItem]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut copy = List<VirtualItem>.make()
+    run copy.appendSlice(items)
+    run self.push(Mutation.SetVirtualItems { id: id, items: move copy })
+  }
+
+  /// Removes virtualization and private spacers while preserving client child nodes.
+  pub effect fn clearVirtualList(self: &mut Self, id: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.push(Mutation.ClearVirtualList { id: id })
+  }
+
+  /// The mutations so far; the batch is empty afterwards.
+  pub effect fn take(self: &mut Self) -> List<Mutation>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut reversed = List<Mutation>.make()
+    while true {
+      match self.mutations.pop() {
+        Option<Mutation>.Some { value } => {
+          run reversed.append(move value)
+        }
+        Option<Mutation>.None => {
+          break
+        }
+      }
+    }
+    let mut taken = List<Mutation>.make()
+    while true {
+      match reversed.pop() {
+        Option<Mutation>.Some { value } => {
+          run taken.append(move value)
+        }
+        Option<Mutation>.None => {
+          break
+        }
+      }
+    }
+    return move taken
+  }
+
+  pub fn length(self: &Self) -> usize {
+    return self.mutations.length()
+  }
+
+  pub effect fn push(self: &mut Self, mutation: Mutation) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.mutations.append(move mutation)
+  }
+
+  pub effect fn create(self: &mut Self, id: u32, kind: NodeKind) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.push(Mutation.Create { id: id, kind: kind })
+  }
+
+  /// Appends `child` as the last child of `parent`.
+  pub effect fn append(self: &mut Self, parent: u32, child: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.push(Mutation.InsertBefore { parent: parent, child: child, before: Option<u32>.None })
+  }
+
+  pub effect fn insertBefore(self: &mut Self, parent: u32, child: u32, before: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.push(
+      Mutation.InsertBefore {
+        parent: parent,
+        child: child,
+        before: Option<u32>.Some { value: before },
+      },
+    )
+  }
+
+  /// Creates a box `id` under `parent` with base style `properties`.
+  pub effect fn box(self: &mut Self, parent: u32, id: u32, properties: &[Property]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.create(id, NodeKind.Box)
+    run self.style(id, properties)
+    run self.append(parent, id)
+  }
+
+  /// Creates a text node `id` under `parent` holding `value`.
+  pub effect fn text(self: &mut Self, parent: u32, id: u32, value: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.create(id, NodeKind.Text)
+    run self.setText(id, value)
+    run self.append(parent, id)
+  }
+
+  pub effect fn setText(self: &mut Self, id: u32, value: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.push(Mutation.SetText { id: id, value: run String.copy(value) })
+  }
+
+  pub effect fn style(self: &mut Self, id: u32, properties: &[Property]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.styleFor(id, StyleState.Base, properties)
+  }
+
+  pub effect fn styleFor(self: &mut Self, id: u32, state: StyleState, properties: &[Property]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut list = List<Property>.make()
+    run list.appendSlice(properties)
+    run self.push(Mutation.SetStyle { id: id, state: state, properties: move list })
+  }
+
+  pub effect fn attribute(self: &mut Self, id: u32, attribute: Attribute) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.push(Mutation.SetAttribute { id: id, attribute: move attribute })
+  }
+
+  pub effect fn testId(self: &mut Self, id: u32, value: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.attribute(id, Attribute.TestId { value: run String.copy(value) })
+  }
+
+  pub effect fn label(self: &mut Self, id: u32, value: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.attribute(id, Attribute.Label { value: run String.copy(value) })
+  }
+
+  pub effect fn root(self: &mut Self, id: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.push(Mutation.SetRoot { id: id })
+  }
+
+  pub effect fn fontFamily(self: &mut Self, family: u32, names: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.push(Mutation.DefineFontFamily { family: family, names: run String.copy(names) })
+  }
+
+  pub effect fn image(self: &mut Self, resource: u32, data: &[u8]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut bytes = Bytes.make()
+    run Bytes.append(&mut bytes, data)
+    run self.push(Mutation.DefineImage { resource: resource, data: move bytes })
+  }
+
+  /// Installs already decoded premultiplied sRGB pixels.
+  pub effect fn decodedImage(self: &mut Self, resource: u32, image: Image) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.push(Mutation.DefineDecodedImage { resource: resource, image: move image })
+  }
+
+  /// Releases image or icon storage owned by a resource id.
+  pub effect fn releaseResource(self: &mut Self, resource: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.push(Mutation.ReleaseResource { resource: resource })
+  }
+
+  pub effect fn icon(self: &mut Self, resource: u32, data: &[u8]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut bytes = Bytes.make()
+    run Bytes.append(&mut bytes, data)
+    run self.push(Mutation.DefineIcon { resource: resource, data: move bytes })
+  }
+
+  /// Sets Grid tracks, named areas, repeats, subgrid and placement on a node.
+  pub effect fn grid(self: &mut Self, id: u32, value: &Grid) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.push(Mutation.SetGrid { id: id, value: run value.copy() })
+  }
+
+  pub effect fn source(self: &mut Self, id: u32, resource: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.push(Mutation.SetSource { id: id, resource: resource })
+  }
+
+  pub effect fn canvas(self: &mut Self, id: u32, commands: &[CanvasCommand]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut list = List<CanvasCommand>.make()
+    run list.appendSlice(commands)
+    run self.push(Mutation.SetCanvas { id: id, commands: move list })
+  }
+
+  /// Sets the `LISTEN_*` flags of `id`.
+  pub effect fn listen(self: &mut Self, id: u32, flags: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.push(Mutation.SetListeners { id: id, flags: flags })
+  }
+
+  pub effect fn focus(self: &mut Self, id: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.push(Mutation.Focus { id: id })
+  }
+
+  /// Selects the UTF-8 byte range from `anchor` to `focus` of input `id`.
+  pub effect fn select(self: &mut Self, id: u32, anchor: usize, focus: usize) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.push(Mutation.SetSelection { id: id, anchor: anchor, focus: focus })
+  }
+
+  pub effect fn scrollTo(self: &mut Self, id: u32, x: f32, y: f32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.push(Mutation.ScrollTo { id: id, x: x, y: y })
+  }
+
+  pub effect fn scrollIntoView(self: &mut Self, id: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.push(Mutation.ScrollIntoView { id: id })
+  }
+}

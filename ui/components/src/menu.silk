@@ -1,0 +1,506 @@
+//! Popup lists: [`menu`] (a button that opens a list of actions) and [`select`] (a button
+//! showing a value that opens the list of choices). Both keep their state in a [`MenuState`]
+//! the app stores in its model; their messages are [`MenuMessage`]s the app wraps in one of its
+//! own and hands to [`MenuState.update`], which says when an item was chosen.
+//!
+//! Keyboard: Enter, Space or Down on the button opens the list and focuses it; Up, Down, Home
+//! and End move the highlight; Enter or Space chooses (Space when it comes up); Escape or Tab closes. Focus goes back to
+//! the button when the list closes. A press outside the list closes it.
+import placement { anchored }
+import theme { Theme, raised, padding2, corners }
+import button { Tone, buttonLook }
+import ui_app.ui { Ui, Reply }
+import ui_tree.mutation { Property, Length, Side, Position, Role, Cursor, Align, CanvasCommand }
+import ui_tree.node { Event, EventKind }
+import silk.color.rgba { Rgba }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.geometry.rect { Rect }
+import silk.num.usize
+import silk.text.string { String }
+
+/// The state of a menu or select.
+pub struct MenuState {
+  pub open: bool,
+  /// The highlighted item while open.
+  pub active: usize,
+  /// Focus goes back to the button: set when the list closes, cleared when it opens.
+  pub returnFocus: bool,
+  /// The list lines up with the button's right edge instead of its left, for a button at the
+  /// right edge of the window (the list would run past it otherwise).
+  pub alignEnd: bool,
+  /// The button has the ghost look (no border until hovered) instead of the secondary one.
+  pub ghost: bool,
+}
+
+impl Copy for MenuState {}
+
+/// What a menu or select sends.
+pub union MenuMessage {
+  /// Opens the list with item `at` highlighted.
+  Open { pub at: usize },
+  Close,
+  /// Highlights item `to`.
+  Move { pub to: usize },
+  /// Chooses item `index`, which closes the list.
+  Choose { pub index: usize },
+}
+
+impl Copy for MenuMessage {}
+
+impl MenuState {
+  pub fn make() -> MenuState {
+    return MenuState { open: false, active: 0, returnFocus: false, alignEnd: false, ghost: false }
+  }
+
+  /// A menu whose list lines up with the button's right edge.
+  pub fn endAligned() -> MenuState {
+    return MenuState { open: false, active: 0, returnFocus: false, alignEnd: true, ghost: false }
+  }
+
+  /// The same state with a ghost button: quiet until hovered, for toolbars.
+  pub fn ghosted(self: Self) -> MenuState {
+    let mut state = self
+    state.ghost = true
+    return state
+  }
+
+  /// Applies `message`. Returns the item chosen, if one was.
+  pub fn update(self: &mut Self, message: MenuMessage) -> Option<usize> {
+    match message {
+      MenuMessage.Open { at } => {
+        self.open = true
+        self.active = at
+        self.returnFocus = false
+      }
+      MenuMessage.Close => {
+        self.open = false
+        self.returnFocus = true
+      }
+      MenuMessage.Move { to } => {
+        self.active = to
+      }
+      MenuMessage.Choose { index } => {
+        self.open = false
+        self.returnFocus = true
+        return Option<usize>.Some { value: index }
+      }
+    }
+    return Option<usize>.None
+  }
+}
+
+/// What a key does in an open list of `count` items with `active` highlighted.
+pub fn listKey(event: &Event, active: usize, count: usize) -> Option<MenuMessage> {
+  if count == 0 {
+    return Option<MenuMessage>.Some { value: MenuMessage.Close }
+  }
+  let key = String.view(&event.key)
+  if key == "Escape" || key == "Tab" {
+    return Option<MenuMessage>.Some { value: MenuMessage.Close }
+  }
+  if event.modifiers != 0 {
+    return Option<MenuMessage>.None
+  }
+  if key == "ArrowDown" {
+    return Option<MenuMessage>.Some { value: MenuMessage.Move { to: (active + 1) % count } }
+  }
+  if key == "ArrowUp" {
+    return Option<MenuMessage>.Some { value: MenuMessage.Move { to: (active + count - 1) % count } }
+  }
+  if key == "Home" {
+    return Option<MenuMessage>.Some { value: MenuMessage.Move { to: 0 } }
+  }
+  if key == "End" {
+    return Option<MenuMessage>.Some { value: MenuMessage.Move { to: count - 1 } }
+  }
+  if key == "Enter" {
+    return Option<MenuMessage>.Some { value: MenuMessage.Choose { index: active } }
+  }
+  return Option<MenuMessage>.None
+}
+
+/// Whether `event` is a Space key: it chooses when it comes up, so the release does not
+/// land on the button that takes focus back.
+pub fn isSpace(event: &Event) -> bool {
+  return event.modifiers == 0 && String.view(&event.key) == " "
+}
+
+/// Whether a key on the closed button opens the list (Down; Enter and Space click it).
+pub fn opensList(event: &Event) -> bool {
+  return event.modifiers == 0 && String.view(&event.key) == "ArrowDown"
+}
+
+/// A small downward chevron, 10 by 10.
+fn chevron(color: Rgba<f32>) -> [CanvasCommand; 4] {
+  return [
+    CanvasCommand.MoveTo { x: 1.5, y: 3.5 },
+    CanvasCommand.LineTo { x: 5.0, y: 7.0 },
+    CanvasCommand.LineTo { x: 8.5, y: 3.5 },
+    CanvasCommand.Stroke { color: color, width: 1.5 },
+  ]
+}
+
+/// The button that opens the list. `body` adds its content.
+fn trigger<M>(
+  ui: &mut Ui<M>,
+  theme: &Theme,
+  key: u64,
+  state: &MenuState,
+  label: string,
+  openAt: usize,
+  toMessage: fn(MenuMessage) -> M,
+  body: fn(&mut Ui<M>) -> (),
+) -> () {
+  let open = state.open
+  ui.pressable(
+    || toMessage(
+      if open {
+        MenuMessage.Close
+      } else {
+        MenuMessage.Open { at: openAt }
+      },
+    ),
+    |ui| {
+      buttonLook(
+        &mut ui,
+        &theme,
+        if state.ghost {
+          Tone.Ghost
+        } else {
+          Tone.Secondary
+        },
+        false,
+      )
+      ui.anchor(key)
+      ui.label(label)
+      ui.expanded(open)
+      ui.style(&[Property.ColumnGap { value: Length.px(8.0) }])
+      if !open && state.returnFocus {
+        ui.takeFocus()
+      }
+      ui.onKeyDown(
+        |event| if !open && opensList(event) {
+          Reply<M>.EmitAndStop { message: toMessage(MenuMessage.Open { at: openAt }) }
+        } else {
+          Reply<M>.Pass
+        },
+      )
+      body(&mut ui)
+      let mark = chevron(theme.mutedText)
+      ui.canvas(
+        &mark,
+        |ui| {
+          ui.width(Length.px(10.0))
+          ui.height(Length.px(10.0))
+        },
+      )
+    },
+  )
+}
+
+/// The open list in the overlay layer under the button anchored as `key`. Item `chosen` (or
+/// none, `usize.MAX`) is marked selected.
+fn popupList<M>(
+  ui: &mut Ui<M>,
+  theme: &Theme,
+  key: u64,
+  state: &MenuState,
+  label: string,
+  items: &[string],
+  listRole: Role,
+  itemRole: Role,
+  chosen: usize,
+  toMessage: fn(MenuMessage) -> M,
+) -> () {
+  let active = state.active
+  let count = items.length
+  ui.overlay(
+    key,
+    |ui| {
+      // A press anywhere else closes the list.
+      ui.box(
+        |ui| {
+          ui.style(
+            &[
+              Property.Position { value: Position.Fixed },
+              Property.Inset { side: Side.Top, value: Length.px(0.0) },
+              Property.Inset { side: Side.Right, value: Length.px(0.0) },
+              Property.Inset { side: Side.Bottom, value: Length.px(0.0) },
+              Property.Inset { side: Side.Left, value: Length.px(0.0) },
+            ],
+          )
+          ui.onPointerDown(|event| Reply<M>.EmitAndStop { message: toMessage(MenuMessage.Close) })
+          listBody(
+            &mut ui,
+            &theme,
+            &state,
+            label,
+            items,
+            listRole,
+            itemRole,
+            chosen,
+            key,
+            toMessage,
+          )
+        },
+      )
+    },
+  )
+}
+
+/// The list itself, inside the backdrop (a fixed box is drawn after the boxes around it, so the
+/// list must be its child to be above it).
+fn listBody<M>(
+  ui: &mut Ui<M>,
+  theme: &Theme,
+  state: &MenuState,
+  label: string,
+  items: &[string],
+  listRole: Role,
+  itemRole: Role,
+  chosen: usize,
+  key: u64,
+  toMessage: fn(MenuMessage) -> M,
+) -> () {
+  let active = state.active
+  let count = items.length
+  ui.column(
+    |ui| {
+      ui.accessRole(listRole)
+      ui.label(label)
+      ui.tabIndex(-1)
+      ui.takeFocus()
+      anchored(
+        &mut ui,
+        key,
+        4.0,
+        usize.toF32(count) * (theme.fontSize + 16.0) + 8.0,
+        state.alignEnd,
+        true,
+      )
+      raised(&mut ui, &theme)
+      ui.style(&[Property.FontFamily { family: theme.font }])
+      ui.fontSize(theme.fontSize)
+      ui.color(theme.text)
+      ui.padding(4.0)
+      ui.gap(1.0)
+
+      // Presses inside stop here, so they do not reach the backdrop.
+      ui.onPointerDown(|event| Reply<M>.Stop)
+      ui.onKeyDown(
+        |event| match listKey(event, active, count) {
+          Option<MenuMessage>.Some { value: message } => Reply<M>.EmitAndStop {
+            message: toMessage(message),
+          }
+          Option<MenuMessage>.None => if isSpace(event) {
+            Reply<M>.Stop
+          } else {
+            Reply<M>.Pass
+          }
+        },
+      )
+      ui.on(
+        EventKind.KeyUp,
+        |event| if isSpace(event) {
+          Reply<M>.EmitAndStop { message: toMessage(MenuMessage.Choose { index: active }) }
+        } else {
+          Reply<M>.Pass
+        },
+      )
+      let mut index: usize = 0
+      while index < count {
+        let at = index
+        let text = items[index]
+        ui.key(usize.toU64(index))
+        ui.row(
+          |ui| {
+            ui.accessRole(itemRole)
+            ui.label(text)
+            ui.cursor(Cursor.Pointer)
+            if itemRole == Role.Option {
+              ui.selected(at == chosen)
+            }
+            padding2(&mut ui, 5.0, 10.0)
+            ui.style(&[Property.BorderRadius { value: corners(theme.radius - 2.0) }])
+            if at == active {
+              ui.background(theme.highlight)
+            }
+            if at == chosen {
+              ui.style(&[Property.FontWeight { value: 600.0 }])
+            }
+            ui.on(
+              EventKind.PointerEnter,
+              |event| if at != active {
+                Reply<M>.Emit { message: toMessage(MenuMessage.Move { to: at }) }
+              } else {
+                Reply<M>.Pass
+              },
+            )
+            ui.onClick(|| toMessage(MenuMessage.Choose { index: at }))
+            ui.text(text)
+          },
+        )
+        index = index + 1
+      }
+    },
+  )
+}
+
+/// A menu button labeled `label` opening `items`; `key` names it (unique in the view). The app
+/// keeps `state` and turns the [`MenuMessage`]s `toMessage` wraps back into
+/// `state.update(message)`; a chosen item comes back from there.
+pub fn menu<M>(
+  ui: &mut Ui<M>,
+  theme: &Theme,
+  key: u64,
+  state: &MenuState,
+  label: string,
+  items: &[string],
+  toMessage: fn(MenuMessage) -> M,
+) -> () {
+  trigger(
+    &mut ui,
+    &theme,
+    key,
+    &state,
+    label,
+    0,
+    toMessage,
+    |ui| {
+      ui.text(label)
+    },
+  )
+  if state.open {
+    popupList(
+      &mut ui,
+      &theme,
+      key,
+      &state,
+      label,
+      items,
+      Role.Menu,
+      Role.MenuItem,
+      usize.MAX,
+      toMessage,
+    )
+  }
+}
+
+/// A select labeled `label` showing option `selected` of `options`; opening it highlights the
+/// selected option. Choosing comes back from `state.update(message)` as the option's index.
+pub fn select<M>(
+  ui: &mut Ui<M>,
+  theme: &Theme,
+  key: u64,
+  state: &MenuState,
+  label: string,
+  options: &[string],
+  selected: usize,
+  toMessage: fn(MenuMessage) -> M,
+) -> () {
+  let shown = if selected < options.length {
+    options[selected]
+  } else {
+    ""
+  }
+  ui.column(
+    |ui| {
+      ui.gap(4.0)
+      ui.style(&[Property.AlignItems { value: Align.Start }])
+      ui.box(
+        |ui| {
+          ui.fontSize(theme.smallSize)
+          ui.color(theme.mutedText)
+          ui.text(label)
+        },
+      )
+      trigger(
+        &mut ui,
+        &theme,
+        key,
+        &state,
+        label,
+        if selected < options.length {
+          selected
+        } else {
+          0
+        },
+        toMessage,
+        |ui| {
+          ui.style(&[Property.MinWidth { value: Length.px(120.0) }])
+          ui.style(&[Property.JustifyContent { value: Align.SpaceBetween }])
+          ui.text(shown)
+        },
+      )
+    },
+  )
+  if state.open {
+    popupList(
+      &mut ui,
+      &theme,
+      key,
+      &state,
+      label,
+      options,
+      Role.ListBox,
+      Role.Option,
+      selected,
+      toMessage,
+    )
+  }
+}
+
+/// A full-width select without a visible caption. The caller supplies the surrounding
+/// label/layout; `label` remains its accessible name. Uses the same keyboard, focus and
+/// outside-press behavior as [`select`].
+pub fn selectControl<M>(
+  ui: &mut Ui<M>,
+  theme: &Theme,
+  key: u64,
+  state: &MenuState,
+  label: string,
+  options: &[string],
+  selected: usize,
+  toMessage: fn(MenuMessage) -> M,
+) -> () {
+  trigger(
+    &mut ui,
+    &theme,
+    key,
+    &state,
+    label,
+    if selected < options.length {
+      selected
+    } else {
+      0
+    },
+    toMessage,
+    |ui| {
+      ui.width(Length.percent(100.0))
+      ui.height(Length.px(theme.controlHeight))
+      ui.style(&[Property.JustifyContent { value: Align.SpaceBetween }])
+      ui.text(
+        if selected < options.length {
+          options[selected]
+        } else {
+          ""
+        },
+      )
+    },
+  )
+  if state.open {
+    popupList(
+      &mut ui,
+      &theme,
+      key,
+      &state,
+      label,
+      options,
+      Role.ListBox,
+      Role.Option,
+      selected,
+      toMessage,
+    )
+  }
+}

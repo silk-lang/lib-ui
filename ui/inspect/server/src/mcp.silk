@@ -1,0 +1,969 @@
+//! The Model Context Protocol bridge: MCP tool calls in, inspector protocol requests out, so an
+//! agent (Claude Code, or any MCP client) can snapshot, inspect and drive a running Silk UI.
+//!
+//! [`Bridge`] does no I/O. The driver (ui-inspect-mcp) reads JSON-RPC messages, one per line,
+//! from standard input and hands each to [`Bridge.handle`]. The returned [`Action`] says what to
+//! do with `out`: write it to standard output as the response, or send it to the app as an
+//! inspector request line and give the reply to [`Bridge.answer`], which returns the next
+//! action. A `wait` that does not hold yet answers [`Action.Retry`]: ask the same request again
+//! a little later. Tests drive the bridge with `Protocol.handle` in place of a socket.
+//!
+//! Tools are the inspector commands with a `ui_` prefix (`hello` is `ui_status`). Their
+//! arguments are the command's request members, passed on unchanged, so the protocol README
+//! documents them all. Results are text (the reply line, or the text of `snapshot` and
+//! `inspect`), except `ui_screenshot`, which returns the PNG as image content.
+import reply { appendNumber, writeString }
+import capture { Capture }
+import codec.png { PngError }
+import codec.image { ImageError }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.json.scanner { JsonError }
+import silk.json.value { Json, Value }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.string { String }
+import ui_tree.inspect { writeInt }
+import silk.num.u32
+
+/// The MCP revision this server implements; an initialize request asking for another known
+/// revision gets that one back.
+pub const PROTOCOL_VERSION: string = "2025-06-18"
+
+/// The server name in `initialize`.
+pub const SERVER_NAME: string = "silk-ui-inspect"
+
+/// How long `ui_wait` waits when the call names no `timeout`, in milliseconds.
+pub const WAIT_TIMEOUT: u64 = 5000
+
+/// How long to pause before asking a pending `wait` again, in milliseconds.
+pub const RETRY_PAUSE: u64 = 50
+
+const KNOWN_VERSIONS: [string<'static>; 4] = [
+  "2024-11-05",
+  "2025-03-26",
+  "2025-06-18",
+  "2025-11-25",
+]
+
+const INSTRUCTIONS: string = r"""Inspects and drives a running Silk UI (ui-tree) app through its inspector socket. The app must be a debug build started with SILK_UI_INSPECT set (1 means silk-ui-inspect.sock in its working directory). Start with ui_snapshot to see the tree as text (kind, #id, role, label, text, rect), then target nodes by node id, role, name, label, text or testId. Text matches are trimmed, case-insensitive substrings and the first match in tree order wins. Input tools (ui_click, ui_type, ui_press, ui_scroll, ui_hover) wait for the app to draw its answer before the next call, so a snapshot right after a click shows the result; use ui_wait for slower changes. ui_screenshot returns a PNG."""
+
+/// The target members every node-picking tool takes.
+const TARGET: string = r"""
+"node":{"type":"integer","description":"The node's client id, the #id in a snapshot."},
+"role":{"type":"string","description":"ARIA role as the snapshot prints it: button, link, listitem, textbox, checkbox, heading, ..."},
+"name":{"type":"string","description":"Accessible name: the label, or the text inside."},
+"label":{"type":"string","description":"The node's label attribute."},
+"text":{"type":"string","description":"Text content."},
+"testId":{"type":"string","description":"The node's testId attribute."},
+"within":{"type":"integer","description":"Only match inside this node's subtree."},
+"exact":{"type":"boolean","description":"Match whole values, with case, instead of substrings."},
+"hidden":{"type":"boolean","description":"Also match hidden nodes."}"""
+
+const POINT: string = r"""
+"x":{"type":"number","description":"X in CSS pixels, instead of a target."},
+"y":{"type":"number","description":"Y in CSS pixels, instead of a target."}"""
+
+const MODIFIERS: string = r"""
+"modifiers":{"type":"array","items":{"type":"string","enum":["shift","control","alt","meta"]},"description":"Modifier keys held during the input."}"""
+
+/// What the driver does with `out` after [`Bridge.handle`] or [`Bridge.answer`].
+pub enum Action {
+  /// Write `out` (a JSON-RPC response) to standard output, followed by a newline.
+  Respond,
+  /// Send `out` to the app as an inspector request and pass the reply to [`Bridge.answer`].
+  Ask,
+  /// Pause `bridge.retryDelay(elapsed)` milliseconds, then send `out` again and pass the
+  /// reply to [`Bridge.answer`].
+  Retry,
+  /// Nothing to write (a notification).
+  Nothing,
+}
+
+/// The MCP side of one session. Calls are answered one at a time, in order.
+pub struct Bridge {
+  /// The JSON text of the pending call's id.
+  callId: String,
+  /// The pending call's inspector command.
+  cmd: String,
+  /// The pending call's inspector request line, kept for retries.
+  request: String,
+  /// For `wait`: how long the call may wait, in milliseconds.
+  timeout: u64,
+  capture: Capture,
+  /// Where the app is expected, for error messages (such as `unix:/path`).
+  pub address: String,
+}
+
+impl Bridge {
+  /// A bridge whose error messages name `address`.
+  pub effect fn make(address: string) -> Bridge
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return Bridge {
+      callId: String.make(),
+      cmd: String.make(),
+      request: String.make(),
+      timeout: WAIT_TIMEOUT,
+      capture: Capture.make(),
+      address: run String.copy(address),
+    }
+  }
+
+  /// Delay before retrying, accounting for decoding/composition time in the client.
+  /// `elapsed` is monotonic milliseconds since this tool call began.
+  pub fn retryDelay(self: &Self, elapsed: u64) -> u64 {
+    if String.view(&self.cmd) == "capture" {
+      let due = u32.toU64(self.capture.taken) * self.capture.interval
+      return if due > elapsed {
+        due - elapsed
+      } else {
+        0
+      }
+    }
+    return RETRY_PAUSE
+  }
+
+  /// Handles one JSON-RPC message from the client and writes what to send into `out`.
+  pub effect fn handle(self: &mut Self, line: &[u8], out: &mut String) -> Action
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    out.clear()
+    let parsed = run Effect.result(Json.parse(line))
+    let message = match move parsed {
+      Result<Value, JsonError | OutOfMemoryError>.Success { value } => move value
+      Result<Value, JsonError | OutOfMemoryError>.Failure { error } => {
+        drop error
+        run rpcError(&mut out, "null", 32700, "Parse error")
+        return Action.Respond
+      }
+    }
+    let mut id = String.make()
+    let hasId = match Json.field(&message, "id") {
+      Option<&Value>.Some { value } => {
+        run writeValue(&mut id, value)
+        true
+      }
+      Option<&Value>.None => false
+    }
+    let method = match Json.asString(Json.field(&message, "method")) {
+      Option<string>.Some { value } => value
+      Option<string>.None => {
+        if !hasId {
+          // A response to a request we never sent, or junk without an id.
+          return Action.Nothing
+        }
+        run rpcError(&mut out, String.view(&id), 32600, "Invalid Request")
+        return Action.Respond
+      }
+    }
+    if !hasId {
+      // Notifications (initialized, cancelled, ...) get no response.
+      return Action.Nothing
+    }
+    let params = Json.field(&message, "params")
+    if method == "initialize" {
+      run initialize(&mut out, String.view(&id), params)
+      return Action.Respond
+    }
+    if method == "ping" {
+      run result(&mut out, String.view(&id), "{}")
+      return Action.Respond
+    }
+    if method == "tools/list" {
+      run startResult(&mut out, String.view(&id))
+      run toolList(&mut out)
+      run out.append("}}")
+      return Action.Respond
+    }
+    if method == "tools/call" {
+      return run self.call(String.view(&id), params, &mut out)
+    }
+    run rpcError(&mut out, String.view(&id), 32601, "Method not found")
+    return Action.Respond
+  }
+
+  /// Starts a `tools/call`: writes the inspector request into `out`.
+  effect fn call(self: &mut Self, id: string, params: Option<&Value>, out: &mut String) -> Action
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let name = match Json.asString(Json.fieldAt(params, "name")) {
+      Option<string>.Some { value } => value
+      Option<string>.None => {
+        run rpcError(&mut out, id, 32602, "tools/call needs a tool name")
+        return Action.Respond
+      }
+    }
+    let cmd = commandOf(name)
+    if cmd == "" {
+      let mut message = run String.copy("Unknown tool: ")
+      run message.append(name)
+      run rpcError(&mut out, id, 32602, String.view(&message))
+      return Action.Respond
+    }
+    let arguments = Json.fieldAt(params, "arguments")
+    match arguments {
+      Option<&Value>.Some { value } => {
+        match &value.* {
+          Value.Object { entries } => {}
+          Value.Null => {}
+          _ => {
+            run rpcError(&mut out, id, 32602, "tool arguments must be an object")
+            return Action.Respond
+          }
+        }
+      }
+      Option<&Value>.None => {}
+    }
+    self.capture = Capture.make()
+    if cmd == "capture" && !self.capture.configure(arguments) {
+      run rpcError(
+        &mut out,
+        id,
+        32602,
+        "capture requires count 1..24, intervalMs 16..60000, columns 1..6 (at most count), tileWidth 160..800",
+      )
+      return Action.Respond
+    }
+    self.callId.clear()
+    run self.callId.append(id)
+    self.cmd.clear()
+    run self.cmd.append(cmd)
+    self.timeout = match Json.asU64(Json.fieldAt(arguments, "timeout")) {
+      Option<u64>.Some { value } => value
+      Option<u64>.None => WAIT_TIMEOUT
+    }
+    self.request.clear()
+    run self.request.append("{\"cmd\":")
+    run writeString(
+      &mut self.request,
+      if cmd == "capture" {
+        "screenshot"
+      } else {
+        cmd
+      },
+    )
+    match arguments {
+      Option<&Value>.Some { value } => {
+        match &value.* {
+          Value.Object { entries } => {
+            let items = entries.asSlice()
+            let mut i: usize = 0
+            while i < items.length {
+              let key = String.view(&items[i].key)
+              if key != "cmd" && key != "id" {
+                run self.request.append(",")
+                run writeString(&mut self.request, key)
+                run self.request.append(":")
+                run writeValue(&mut self.request, &items[i].value)
+              }
+              i = i + 1
+            }
+          }
+          _ => {}
+        }
+      }
+      Option<&Value>.None => {}
+    }
+    if cmd == "wait" && !has(arguments, "timeout") {
+      run self.request.append(",\"timeout\":")
+      run writeInt(&mut self.request, WAIT_TIMEOUT)
+    }
+    if cmd == "capture" {
+      run self.request.append(",\"maxWidth\":")
+      run writeInt(&mut self.request, u32.toU64(self.capture.tileWidth))
+    }
+    run self.request.append("}")
+    out.clear()
+    run out.append(String.view(&self.request))
+    return Action.Ask
+  }
+
+  /// Takes the app's reply to the pending call's request (`reached` false when the app could
+  /// not be reached; `waited` is how long the call has been running, in milliseconds) and
+  /// writes the tool result, or the request again, into `out`.
+  pub effect fn answer(
+    self: &mut Self,
+    reply: &[u8],
+    reached: bool,
+    waited: u64,
+    out: &mut String,
+  ) -> Action
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    out.clear()
+    let id = String.view(&self.callId)
+    if !reached {
+      let mut message = run String.copy("Could not reach the Silk UI at ")
+      run message.append(String.view(&self.address))
+      run message.append(
+        ". Is the app running as a debug build with SILK_UI_INSPECT set? Both sides must agree on the address (1 means silk-ui-inspect.sock in the app's working directory; ui-inspect-mcp takes --connect ADDRESS).",
+      )
+      run toolText(&mut out, id, String.view(&message), true)
+      return Action.Respond
+    }
+    let parsed = run Effect.result(Json.parse(reply))
+    let document = match move parsed {
+      Result<Value, JsonError | OutOfMemoryError>.Success { value } => move value
+      Result<Value, JsonError | OutOfMemoryError>.Failure { error } => {
+        drop error
+        run toolText(&mut out, id, "The app's reply is not JSON.", true)
+        return Action.Respond
+      }
+    }
+    if !flag(&document, "ok") {
+      if flag(&document, "pending") {
+        if waited < self.timeout {
+          run out.append(String.view(&self.request))
+          return Action.Retry
+        }
+        let mut message = run String.copy("Timed out after ")
+        run writeInt(&mut message, self.timeout)
+        run message.append(" ms: the condition did not hold.")
+        run toolText(&mut out, id, String.view(&message), true)
+        return Action.Respond
+      }
+      let error = match Json.asString(Json.field(&document, "error")) {
+        Option<string>.Some { value } => value
+        Option<string>.None => "the command failed"
+      }
+      run toolText(&mut out, id, error, true)
+      return Action.Respond
+    }
+    let cmd = String.view(&self.cmd)
+    if cmd == "capture" {
+      let added = run Effect.result(self.capture.append(&document, waited))
+      match move added {
+        Result<(), PngError | ImageError | OutOfMemoryError>.Failure { error } => {
+          run toolText(&mut out, id, "Could not decode a capture frame; sequence aborted.", true)
+          return Action.Respond
+        }
+        Result<(), PngError | ImageError | OutOfMemoryError>.Success { value } => {}
+      }
+      if self.capture.taken < self.capture.count {
+        run out.append(String.view(&self.request))
+        return Action.Retry
+      }
+      let mut mosaic = String.make()
+      let finished = run Effect.result(self.capture.finish(&mut mosaic))
+      match move finished {
+        Result<(), ImageError | OutOfMemoryError>.Failure { error } => {
+          run toolText(&mut out, id, "Could not encode the capture mosaic.", true)
+          return Action.Respond
+        }
+        Result<(), ImageError | OutOfMemoryError>.Success { value } => {}
+      }
+      self.cmd = run String.copy("screenshot")
+      return run self.answer(mosaic.ownedUtf8Bytes(), true, waited, &mut out)
+    }
+    if cmd == "snapshot" || cmd == "inspect" {
+      match Json.asString(Json.field(&document, "text")) {
+        Option<string>.Some { value } => {
+          run toolText(&mut out, id, value, false)
+          return Action.Respond
+        }
+        Option<string>.None => {}
+      }
+    }
+    if cmd == "screenshot" {
+      match Json.asString(Json.field(&document, "png")) {
+        Option<string>.Some { value } => {
+          run startResult(&mut out, id)
+          run out.append("\"content\":[{\"type\":\"image\",\"mimeType\":\"image/png\",\"data\":")
+          run writeString(&mut out, value)
+          run out.append("},{\"type\":\"text\",\"text\":")
+          let mut summary = run String.copy("PNG ")
+          run writeNumberField(&mut summary, &document, "width")
+          run summary.append("x")
+          run writeNumberField(&mut summary, &document, "height")
+          run summary.append(" device pixels at scale ")
+          run writeNumberField(&mut summary, &document, "scale")
+          if self.capture.taken != 0 {
+            run summary.append(
+              ". Contact sheet in reading order. Captions: sample +elapsed milliseconds, f=source frame. CPU reference captures, not a GPU/FPS benchmark. Samples: [",
+            )
+            run summary.append(self.capture.timings())
+            run summary.append("]")
+          }
+          run writeString(&mut out, String.view(&summary))
+          run out.append("}],\"isError\":false}}")
+          return Action.Respond
+        }
+        Option<string>.None => {
+          run toolText(&mut out, id, "The reply has no PNG.", true)
+          return Action.Respond
+        }
+      }
+    }
+    run toolText(&mut out, id, unsafe String.fromUtf8Unchecked(reply), false)
+    return Action.Respond
+  }
+}
+
+/// The inspector command for tool `name`, or "" when there is no such tool.
+pub fn commandOf(name: string) -> string<'static> {
+  let mut i: usize = 0
+  while i < TOOLS.length {
+    if TOOLS[i] == name {
+      return COMMANDS[i]
+    }
+    i = i + 1
+  }
+  return ""
+}
+
+const TOOLS: [string<'static>; 18] = [
+  "ui_status",
+  "ui_snapshot",
+  "ui_query",
+  "ui_inspect",
+  "ui_pick",
+  "ui_highlight",
+  "ui_screenshot",
+  "ui_click",
+  "ui_hover",
+  "ui_scroll",
+  "ui_press",
+  "ui_type",
+  "ui_wait",
+  "ui_stats",
+  "ui_events",
+  "ui_pointer",
+  "ui_key",
+  "ui_capture",
+]
+
+const COMMANDS: [string<'static>; 18] = [
+  "hello",
+  "snapshot",
+  "query",
+  "inspect",
+  "pick",
+  "highlight",
+  "screenshot",
+  "click",
+  "hover",
+  "scroll",
+  "press",
+  "type",
+  "wait",
+  "stats",
+  "events",
+  "pointer",
+  "key",
+  "capture",
+]
+
+fn has(value: Option<&Value>, key: string) -> bool {
+  return match Json.fieldAt(value, key) {
+    Option<&Value>.Some { value: member } => true
+    Option<&Value>.None => false
+  }
+}
+
+fn flag(document: &Value, key: string) -> bool {
+  return match Json.field(document, key) {
+    Option<&Value>.Some { value } => match &value.* {
+      Value.Bool { value: b } => b
+      _ => false
+    }
+    Option<&Value>.None => false
+  }
+}
+
+/// Appends number member `key` of `document`, or "?".
+effect fn writeNumberField(out: &mut String, document: &Value, key: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if let Option<&Value>.Some { value } = Json.field(document, key) {
+    if let Value.Number { value: number } = &value.* {
+      run appendNumber(&mut out, &number)
+      return ()
+    }
+  }
+  run out.append("?")
+}
+
+/// Appends `value` as JSON.
+pub effect fn writeValue(out: &mut String, value: &Value) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match &value.* {
+    Value.Null => {
+      run out.append("null")
+    }
+    Value.Bool { value: b } => {
+      if b {
+        run out.append("true")
+      } else {
+        run out.append("false")
+      }
+    }
+    Value.Number { value: number } => {
+      run appendNumber(&mut out, &number)
+    }
+    Value.String { text } => {
+      run writeString(&mut out, String.view(&text))
+    }
+    Value.Array { values } => {
+      run out.append("[")
+      let items = values.asSlice()
+      let mut i: usize = 0
+      while i < items.length {
+        if i > 0 {
+          run out.append(",")
+        }
+        run writeValue(&mut out, &items[i])
+        i = i + 1
+      }
+      run out.append("]")
+    }
+    Value.Object { entries } => {
+      run out.append("{")
+      let items = entries.asSlice()
+      let mut i: usize = 0
+      while i < items.length {
+        if i > 0 {
+          run out.append(",")
+        }
+        run writeString(&mut out, String.view(&items[i].key))
+        run out.append(":")
+        run writeValue(&mut out, &items[i].value)
+        i = i + 1
+      }
+      run out.append("}")
+    }
+  }
+}
+
+/// Appends `text` without its line breaks (MCP messages are one line each).
+effect fn appendFlat(out: &mut String, text: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let bytes = String.utf8Bytes(text)
+  let mut start: usize = 0
+  let mut i: usize = 0
+  while i <= bytes.length {
+    if i == bytes.length || bytes[i] == 10 || bytes[i] == 13 {
+      if i > start {
+        run out.append(String.slice(text, start, i - start))
+      }
+      start = i + 1
+    }
+    i = i + 1
+  }
+}
+
+effect fn startResult(out: &mut String, id: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  run out.append("{\"jsonrpc\":\"2.0\",\"id\":")
+  run out.append(id)
+  run out.append(",\"result\":{")
+}
+
+effect fn result(out: &mut String, id: string, body: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  run out.append("{\"jsonrpc\":\"2.0\",\"id\":")
+  run out.append(id)
+  run out.append(",\"result\":")
+  run out.append(body)
+  run out.append("}")
+}
+
+effect fn rpcError(out: &mut String, id: string, code: u64, message: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  run out.append("{\"jsonrpc\":\"2.0\",\"id\":")
+  run out.append(id)
+  run out.append(",\"error\":{\"code\":")
+  run out.append("-")
+  run writeInt(&mut out, code)
+  run out.append(",\"message\":")
+  run writeString(&mut out, message)
+  run out.append("}}")
+}
+
+/// A tool result with one text item.
+effect fn toolText(out: &mut String, id: string, text: string, isError: bool) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run startResult(&mut out, id)
+  run out.append("\"content\":[{\"type\":\"text\",\"text\":")
+  run writeString(&mut out, text)
+  run out.append("}],\"isError\":")
+  if isError {
+    run out.append("true}}")
+  } else {
+    run out.append("false}}")
+  }
+}
+
+effect fn initialize(out: &mut String, id: string, params: Option<&Value>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let asked = match Json.asString(Json.fieldAt(params, "protocolVersion")) {
+    Option<string>.Some { value } => value
+    Option<string>.None => ""
+  }
+  let mut version = PROTOCOL_VERSION
+  let mut i: usize = 0
+  while i < KNOWN_VERSIONS.length {
+    if KNOWN_VERSIONS[i] == asked {
+      version = KNOWN_VERSIONS[i]
+    }
+    i = i + 1
+  }
+  run startResult(&mut out, id)
+  run out.append("\"protocolVersion\":")
+  run writeString(&mut out, version)
+  run out.append(",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":")
+  run writeString(&mut out, SERVER_NAME)
+  run out.append(",\"version\":\"0.1.0\"},\"instructions\":")
+  run writeString(&mut out, INSTRUCTIONS)
+  run out.append("}}")
+}
+
+/// Appends one tool: `properties` is the inside of the schema's properties object (it may
+/// span lines; they are dropped) and `required` the inside of its required array.
+effect fn tool(
+  out: &mut String,
+  first: bool,
+  name: string,
+  title: string,
+  description: string,
+  properties: &String,
+  required: string,
+  readOnly: bool,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !first {
+    run out.append(",")
+  }
+  run out.append("{\"name\":")
+  run writeString(&mut out, name)
+  run out.append(",\"title\":")
+  run writeString(&mut out, title)
+  run out.append(",\"description\":")
+  run writeString(&mut out, description)
+  run out.append(",\"inputSchema\":{\"type\":\"object\",\"properties\":{")
+  run appendFlat(&mut out, String.view(&properties))
+  run out.append("}")
+  if required != "" {
+    run out.append(",\"required\":[")
+    run out.append(required)
+    run out.append("]")
+  }
+  run out.append("},\"annotations\":{\"readOnlyHint\":")
+  if readOnly {
+    run out.append("true")
+  } else {
+    run out.append("false")
+  }
+  run out.append(",\"openWorldHint\":false}}")
+}
+
+/// Joins schema property fragments with commas.
+effect fn props(parts: &[string]) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = String.make()
+  let mut i: usize = 0
+  while i < parts.length {
+    if parts[i] != "" {
+      if out.ownedByteLength() != 0 {
+        run out.append(",")
+      }
+      run out.append(parts[i])
+    }
+    i = i + 1
+  }
+  return move out
+}
+
+/// Appends `"tools":[...]`.
+effect fn toolList(out: &mut String) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.append("\"tools\":[")
+  let none = String.make()
+  run tool(
+    &mut out,
+    true,
+    "ui_status",
+    "App status",
+    "Checks that the app is reachable. Returns the inspector protocol version, the viewport size (CSS pixels) and scale, the frame number, the root node and the node count.",
+    &none,
+    "",
+    true,
+  )
+  let snapshot = run props(
+    &[
+      TARGET,
+      r""" "styles":{"type":"boolean","description":"Also list each node's non-default style."}""",
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_snapshot",
+    "Snapshot the UI tree",
+    "The UI tree as indented text, one line per node: kind, #id, role, label, testId, text and rect (x, y, width, height in CSS pixels). Read this first to find nodes. With a target, only that node's subtree.",
+    &snapshot,
+    "",
+    true,
+  )
+  let query = run props(
+    &[TARGET, r""" "limit":{"type":"integer","description":"At most this many nodes."}"""],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_query",
+    "Find nodes",
+    "All nodes a target matches, in tree order, as JSON objects with id, kind, role, name, testId, rect, focused and hovered.",
+    &query,
+    "",
+    true,
+  )
+  let inspect = run props(
+    &[
+      TARGET,
+      r""" "computed":{"type":"boolean","description":"Include the computed style section (default true)."}""",
+      r""" "patches":{"type":"boolean","description":"Include the style patches the client set (default true)."}""",
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_inspect",
+    "Inspect a node",
+    "A devtools-style view of the first node the target matches: attributes, box model (content, padding, border, margin), styles, text and layout fragments.",
+    &inspect,
+    "",
+    true,
+  )
+  let pick = run props(
+    &[
+      r""" "x":{"type":"number","description":"X in CSS pixels."},"y":{"type":"number","description":"Y in CSS pixels."}""",
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_pick",
+    "Node at a point",
+    "The node the element picker selects at a point, and the ids hit testing reaches from the root.",
+    &pick,
+    "\"x\",\"y\"",
+    true,
+  )
+  let highlight = run props(
+    &[
+      TARGET,
+      r""" "nodes":{"type":"array","items":{"type":"integer"},"description":"Node ids to highlight, instead of a target."}""",
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_highlight",
+    "Highlight nodes",
+    "Draws the devtools box model overlay over nodes in the app's window (and in later screenshots): the listed ids, or every node the target matches. Without either, clears the highlight.",
+    &highlight,
+    "",
+    false,
+  )
+  let screenshot = run props(
+    &[
+      TARGET,
+      r""" "highlight":{"type":"boolean","description":"Include the highlight overlay (default true)."},"maxWidth":{"type":"integer","minimum":1,"maximum":4096,"description":"Reduce before encoding, preserving aspect ratio; omitted for full device resolution."}""",
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_screenshot",
+    "Screenshot",
+    "A PNG of the app's last frame (the CPU reference rendering, over a transparent background). With a target, that node alone, cropped.",
+    &screenshot,
+    "",
+    true,
+  )
+  let click = run props(
+    &[
+      TARGET,
+      POINT,
+      r""" "count":{"type":"integer","description":"Clicks in a row (2 for a double click)."}""",
+      MODIFIERS,
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_click",
+    "Click",
+    "Clicks the centre of the node's visible box (or a point). Fails when the node is hidden, scrolled out of view or covered. Returns the node and the point clicked.",
+    &click,
+    "",
+    false,
+  )
+  let hover = run props(&[TARGET, POINT, MODIFIERS])
+  run tool(
+    &mut out,
+    false,
+    "ui_hover",
+    "Hover",
+    "Moves the pointer over the node (or a point), so hover styles and tooltips show.",
+    &hover,
+    "",
+    false,
+  )
+  let scroll = run props(
+    &[
+      TARGET,
+      POINT,
+      r""" "dx":{"type":"number","description":"Horizontal scroll in CSS pixels."},"dy":{"type":"number","description":"Vertical scroll in CSS pixels; positive scrolls down."}""",
+      MODIFIERS,
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_scroll",
+    "Scroll",
+    "Sends wheel input over the node (or a point); the nearest scroll container under it scrolls.",
+    &scroll,
+    "",
+    false,
+  )
+  let press = run props(
+    &[
+      r""" "key":{"type":"string","description":"UI Events key value: Enter, Tab, Escape, ArrowDown, Backspace, a, ..."},"code":{"type":"string","description":"UI Events code; defaults to the key."},"times":{"type":"integer","description":"How many presses."}""",
+      MODIFIERS,
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_press",
+    "Press a key",
+    "Presses a key in the focused node (Tab moves focus, Enter activates, and so on).",
+    &press,
+    "\"key\"",
+    false,
+  )
+  let mut typing = run String.copy(
+    r""" "text":{"type":"string","description":"The text. Newlines and tabs are sent as Enter and Tab."},"query":{"type":"object","description":"A target to click first (to focus an input), with the members node, role, name, label, text, testId, within, exact, hidden.","properties":{""",
+  )
+  run typing.append(TARGET)
+  run typing.append("}}")
+  run tool(
+    &mut out,
+    false,
+    "ui_type",
+    "Type text",
+    "Types text into the focused input, or into the node in query after clicking it.",
+    &typing,
+    "\"text\"",
+    false,
+  )
+  let wait = run props(
+    &[
+      TARGET,
+      r""" "gone":{"type":"boolean","description":"Wait until no node matches instead."},"timeout":{"type":"integer","description":"Milliseconds to wait (default 5000)."}""",
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_wait",
+    "Wait for a node",
+    "Waits until a node matches the target (or, with gone, until none does). Returns the node. Fails after the timeout.",
+    &wait,
+    "",
+    true,
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_stats",
+    "Frame stats",
+    "Counters for the last frame: nodes, fragments, layout passes and cache hits, replayed and repainted subtrees, glyphs and primitives.",
+    &none,
+    "",
+    true,
+  )
+  let events = run props(
+    &[
+      r""" "since":{"type":"integer","description":"Only records after this seq (the reply's next minus one reads on from the last call)."}""",
+      r""" "limit":{"type":"integer","description":"At most this many of the newest records."}""",
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_events",
+    "Event log",
+    "The event records the app took from the UI tree (click, keydown, input, focus, scroll and so on), oldest first, each with seq, frame, kind, target id, the id path from the root and, where they apply, position, key and input value. Only kinds some node listens for are recorded. next is the seq the next record will get.",
+    &events,
+    "",
+    true,
+  )
+  let pointer = run props(
+    &[
+      TARGET,
+      POINT,
+      MODIFIERS,
+      r""" "phase":{"type":"string","enum":["down","move","up"]},"button":{"type":"integer","minimum":0,"maximum":5},"count":{"type":"integer","description":"Native click count on down; defaults to 1."}""",
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_pointer",
+    "Pointer event",
+    "Sends a single native-equivalent pointer input through hit testing, focus and capture. Use down, moves, then up to drag. Positions are viewport CSS pixels.",
+    &pointer,
+    "\"phase\"",
+    false,
+  )
+  let key = run props(
+    &[
+      MODIFIERS,
+      r""" "phase":{"type":"string","enum":["down","up"]},"key":{"type":"string"},"code":{"type":"string"},"repeat":{"type":"boolean"}""",
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_key",
+    "Key event",
+    "Sends a key down or up through the normal focused-node input dispatcher. Allows holding Space or modifier keys across pointer commands.",
+    &key,
+    "\"phase\",\"key\"",
+    false,
+  )
+  let capture = run props(
+    &[
+      TARGET,
+      r""" "count":{"type":"integer","minimum":1,"maximum":24,"default":10},"intervalMs":{"type":"integer","minimum":16,"maximum":60000,"default":100},"columns":{"type":"integer","minimum":1,"maximum":6},"tileWidth":{"type":"integer","minimum":160,"maximum":800,"default":480},"highlight":{"type":"boolean"}""",
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_capture",
+    "Timed capture mosaic",
+    "Captures a sequence of the app's last composed frames and returns one PNG mosaic. Defaults to 10 samples at 100 ms intervals, 5 columns. Captions show actual elapsed milliseconds and source frame numbers. Sampling is in the client; the app keeps handling input. Slow captures may exceed the requested interval. CPU reference rendering; not an FPS benchmark.",
+    &capture,
+    "",
+    true,
+  )
+  run out.append("]")
+}

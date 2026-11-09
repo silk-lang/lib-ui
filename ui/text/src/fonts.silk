@@ -1,0 +1,561 @@
+//! Font keys, font instances, line metrics and the shaping call.
+//!
+//! A text style (family list, size, weight, width, style) gets a font key for css-layout's
+//! `Style.fontKey`. When fallback draws some characters with another face, that face at the
+//! style's size gets a key of its own, so `Measure.font` can give its metrics too.
+import font_collection.lib {
+  FontCollection,
+  FontMatcher,
+  Family,
+  Request,
+  Selection,
+  Style,
+  AXIS_WEIGHT,
+  AXIS_WIDTH,
+  AXIS_ITALIC,
+  AXIS_SLANT,
+  AXIS_OPTICAL
+}
+import layout.lib { FontMetrics, BaselineSet }
+import harfrust.lib {
+  Buffer,
+  ShaperData,
+  ConfiguredShaper,
+  DefaultFontFuncs,
+  GlyphInfo,
+  GlyphPosition,
+  ShapePlan,
+  ShapeOptions,
+  ShapeError,
+  Direction,
+  Feature,
+  Variation,
+  shape
+}
+import read_fonts.lib { FontRef }
+import read_fonts.model.metrics { Metrics, LineBox }
+import font_types.lib { F2Dot14, F48Dot16, Tag }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.unicode_script { Script }
+import silk.text.string { String }
+import silk.num.f32
+import silk.num.f64
+import silk.num.i32
+import silk.num.u16
+import silk.num.u32
+import silk.num.usize
+
+const TAG_WGHT: u32 = 0x77676874
+
+const TAG_WDTH: u32 = 0x77647468
+
+const TAG_ITAL: u32 = 0x6974616c
+
+const TAG_SLNT: u32 = 0x736c6e74
+
+/// What text asks for: CSS `font-family`, `font-size`, `font-weight`, `font-width` and
+/// `font-style`.
+pub struct TextStyle {
+  pub families: List<Family>,
+  /// font-size in CSS pixels.
+  pub size: f32,
+  pub request: Request,
+}
+
+impl TextStyle {
+  /// A style of `size` pixels in the first available of `families`, at normal weight, width
+  /// and style.
+  pub fn make(families: List<Family>, size: f32) -> TextStyle {
+    return TextStyle {
+      families: move families,
+      size: size,
+      request: Request { weight: 400.0, width: 100.0, style: Style.Normal },
+    }
+  }
+}
+
+struct StyleEntry {
+  size: f32,
+  request: Request,
+  chain: List<Selection>,
+}
+
+struct Instance {
+  face: usize,
+  selection: Selection,
+  opticalSize: f32,
+  coords: List<F2Dot14>,
+  unitsPerEm: f32,
+}
+
+/// What a font key stands for: a style, and the face instance drawing it.
+pub struct KeyInfo {
+  pub style: usize,
+  pub instance: usize,
+  pub face: usize,
+  pub size: f32,
+}
+
+impl Copy for KeyInfo {}
+
+struct PlanEntry<'a> {
+  vertical: bool,
+  instance: usize,
+  script: u32,
+  rtl: bool,
+  plan: ShapePlan<'a>,
+}
+
+/// A glyph straight from the shaper, in font units.
+pub struct RawGlyph {
+  pub glyph: u32,
+  pub cluster: u32,
+  pub xAdvance: i32,
+  pub yAdvance: i32,
+  pub xOffset: i32,
+  pub yOffset: i32,
+}
+
+impl Copy for RawGlyph {}
+
+pub struct FontState<'a> {
+  pub matcher: FontMatcher<'a>,
+  styles: List<StyleEntry>,
+  keys: List<KeyInfo>,
+  metrics: List<FontMetrics>,
+  instances: List<Instance>,
+  data: List<Option<ShaperData<'a>>>,
+  plans: List<PlanEntry<'a>>,
+  buffer: Buffer,
+  /// Round ascent, descent and line gap to whole pixels, as Blink does on every platform.
+  pub roundMetrics: bool,
+}
+
+fn sameSelection(left: &Selection, right: &Selection) -> bool {
+  return left.face == right.face && left.weight == right.weight && left.width == right.width
+    && optionalEqual(left.italic, right.italic)
+    && optionalEqual(left.oblique, right.oblique)
+}
+
+fn optionalEqual(left: Option<f64>, right: Option<f64>) -> bool {
+  return match left {
+    Option<f64>.Some { value: a } => match right {
+      Option<f64>.Some { value: b } => a == b
+      Option<f64>.None => false
+    }
+    Option<f64>.None => right.isNone()
+  }
+}
+
+fn metric(value: F48Dot16) -> f32 {
+  return f64.toF32(F48Dot16.toF64(value))
+}
+
+effect fn makePlan<'a>(data: &ShaperData<'a>, coords: &[F2Dot14], buffer: &Buffer) -> ShapePlan<'a>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut shaper = ConfiguredShaper.new(data)
+  run shaper.coords.appendSlice(coords)
+  let none: [Feature; 0] = []
+  return run ShapePlan.new(&shaper, buffer, &none)
+}
+
+impl<'a> FontState<'a> {
+  pub fn make(collection: &'a FontCollection) -> FontState<'a> {
+    return FontState {
+      matcher: FontMatcher.make(collection),
+      styles: List<StyleEntry>.make(),
+      keys: List<KeyInfo>.make(),
+      metrics: List<FontMetrics>.make(),
+      instances: List<Instance>.make(),
+      data: List<Option<ShaperData<'a>>>.make(),
+      plans: List<PlanEntry<'a>>.make(),
+      buffer: Buffer.new(),
+      roundMetrics: true,
+    }
+  }
+
+  pub fn keyCount(self: &Self) -> usize {
+    return self.keys.length()
+  }
+
+  pub fn key(self: &Self, key: usize) -> KeyInfo {
+    return self.keys.get(key)
+  }
+
+  pub fn metricsOf(self: &Self, key: usize) -> FontMetrics {
+    return self.metrics.get(key)
+  }
+
+  /// The variation coordinates of key `key`'s face instance.
+  pub fn coords(self: &Self, key: usize) -> &[F2Dot14] {
+    let info = self.keys.get(key)
+    return self.instances.asSlice()[info.instance].coords.asSlice()
+  }
+
+  /// The faces text in style `style` tries before fallback, primary first.
+  pub fn chain(self: &Self, style: usize) -> &[Selection] {
+    return self.styles.asSlice()[style].chain.asSlice()
+  }
+
+  pub fn request(self: &Self, style: usize) -> Request {
+    return self.styles.asSlice()[style].request
+  }
+
+  /// The key of style `style` drawn with `selection`, made on first use.
+  pub effect fn keyFor(self: &mut Self, style: usize, selection: Selection) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let opticalSize = self.styles.asSlice()[style].size
+    let instance = run self.instanceFor(selection, opticalSize)
+    let mut index: usize = 0
+    while index < self.keys.length() {
+      let info = self.keys.get(index)
+      if info.style == style && info.instance == instance {
+        return index
+      }
+      index = index + 1
+    }
+    let size = self.styles.asSlice()[style].size
+    let info = KeyInfo { style: style, instance: instance, face: selection.face, size: size }
+    run self.keys.append(info)
+    let computed = run self.computeMetrics(instance, size)
+    run self.metrics.append(computed)
+    return self.keys.length() - 1
+  }
+
+  /// Adds a style and returns its font key.
+  pub effect fn addStyle(self: &mut Self, style: TextStyle) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut chain = List<Selection>.make()
+    run self.matcher.fonts().chain(style.families.asSlice(), style.request, &mut chain)
+    if chain.length() == 0 {
+      // No requested family has faces: the fallbacks decide, starting with the first face.
+      if let Option<Selection>.Some { value } = run self.matcher.select(
+        chain.asSlice(),
+        style.request,
+        0x41,
+        Script.common(),
+      ) {
+        run chain.append(value)
+      }
+    }
+    let index = self.styles.length()
+    run self.styles.append(
+      StyleEntry { size: style.size, request: style.request, chain: move chain },
+    )
+    if self.styles.asSlice()[index].chain.length() == 0 {
+      // An empty collection: a key without a face, with zero metrics.
+      run self.keys.append(
+        KeyInfo { style: index, instance: usize.MAX, face: usize.MAX, size: style.size },
+      )
+      run self.metrics.append(FontMetrics.zero())
+      return self.keys.length() - 1
+    }
+    let primary = self.styles.asSlice()[index].chain.get(0)
+    return run self.keyFor(index, primary)
+  }
+
+  effect fn loadFace(self: &mut Self, face: usize) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    while self.data.length() <= face {
+      run self.data.append(Option<ShaperData<'a>>.None)
+    }
+    if self.data.asSlice()[face].isSome() {
+      return true
+    }
+    if let Option<FontRef<'a>>.Some { value: font } = self.matcher.fonts().font(face) {
+      self.data.set(face, Option<ShaperData<'a>>.Some { value: ShaperData.new(&font) })
+      return true
+    }
+    return false
+  }
+
+  effect fn instanceFor(self: &mut Self, selection: Selection, size: f32) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let opticalSize: f32 = if (self.matcher.fonts().face(selection.face).axes & AXIS_OPTICAL) != 0 {
+      size
+    } else {
+      0.0
+    }
+    let mut index: usize = 0
+    while index < self.instances.length() {
+      if sameSelection(&self.instances.asSlice()[index].selection, &selection)
+        && self.instances.asSlice()[index].opticalSize == opticalSize {
+        return index
+      }
+      index = index + 1
+    }
+    let mut coords = List<F2Dot14>.make()
+    let mut unitsPerEm: f32 = 1000.0
+    if run self.loadFace(selection.face) {
+      let axes = self.matcher.fonts().face(selection.face).axes
+      let mut wanted = List<Variation>.make()
+      if opticalSize > 0.0 {
+        run wanted.append(Variation { tag: Tag.fromU32(0x6f70737a), value: opticalSize })
+      }
+      if (axes & AXIS_WEIGHT) != 0 {
+        run wanted.append(
+          Variation { tag: Tag.fromU32(TAG_WGHT), value: f64.toF32(selection.weight) },
+        )
+      }
+      if (axes & AXIS_WIDTH) != 0 {
+        run wanted.append(
+          Variation { tag: Tag.fromU32(TAG_WDTH), value: f64.toF32(selection.width) },
+        )
+      }
+      if (axes & AXIS_ITALIC) != 0 {
+        if let Option<f64>.Some { value } = selection.italic {
+          run wanted.append(Variation { tag: Tag.fromU32(TAG_ITAL), value: f64.toF32(value) })
+        }
+      }
+      if (axes & AXIS_SLANT) != 0 {
+        if let Option<f64>.Some { value } = selection.oblique {
+          run wanted.append(Variation { tag: Tag.fromU32(TAG_SLNT), value: f64.toF32(-value) })
+        }
+      }
+      if let Option<ShaperData<'a>>.Some { value: data } = &self.data.asSlice()[selection.face] {
+        unitsPerEm = u16.toF32(data.upem)
+        if wanted.length() > 0 {
+          let mut shaper = ConfiguredShaper.new(&data)
+          run shaper.setVariations(wanted.asSlice())
+          run coords.appendSlice(shaper.coords.asSlice())
+        }
+      }
+    }
+    run self.instances.append(
+      Instance {
+        face: selection.face,
+        selection: selection,
+        opticalSize: opticalSize,
+        coords: move coords,
+        unitsPerEm: unitsPerEm,
+      },
+    )
+    return self.instances.length() - 1
+  }
+
+  effect fn computeMetrics(self: &mut Self, instance: usize, size: f32) -> FontMetrics
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let face = self.instances.asSlice()[instance].face
+    let upem = self.instances.asSlice()[instance].unitsPerEm
+    let scale = size / upem
+    let mut ascent: f32 = size * 0.8
+    let mut descent: f32 = size * 0.2
+    let mut lineGap: f32 = 0.0
+    let mut xHeight: f32 = size * 0.5
+    let mut capHeight: f32 = size * 0.7
+    if let Option<FontRef<'a>>.Some { value: font } = self.matcher.fonts().font(face) {
+      let metrics = Metrics.fromSfnt(&font, self.instances.asSlice()[instance].coords.asSlice())
+      if let Option<LineBox<F48Dot16>>.Some { value: line } = metrics.hLine() {
+        ascent = metric(line.ascender) * scale
+        descent = -metric(line.descender) * scale
+        lineGap = metric(line.lineGap) * scale
+      }
+      if let Option<F48Dot16>.Some { value } = metrics.xHeight {
+        if metric(value) > 0.0 {
+          xHeight = metric(value) * scale
+        }
+      }
+      if let Option<F48Dot16>.Some { value } = metrics.capHeight {
+        if metric(value) > 0.0 {
+          capHeight = metric(value) * scale
+        }
+      }
+    }
+    if self.roundMetrics {
+      ascent = f32.round(ascent)
+      descent = f32.round(descent)
+      lineGap = f32.round(lineGap)
+    }
+    let space = (run self.advanceOf(instance, " ")) * scale
+    let zero = (run self.advanceOf(instance, "0")) * scale
+    return FontMetrics {
+      fontSize: size,
+      ascent: ascent,
+      descent: descent,
+      lineGap: lineGap,
+      xHeight: xHeight,
+      capHeight: capHeight,
+      spaceAdvance: space,
+      zeroAdvance: zero,
+      // Blink's vertical-align shifts (InlineBoxStyle: font-size / 5 + 1 and / 3 + 1).
+      subscriptOffset: size / 5.0 + 1.0,
+      superscriptOffset: size / 3.0 + 1.0,
+      baselines: BaselineSet {
+        alphabetic: ascent,
+        ideographic: ascent + descent,
+        central: (ascent + descent) / 2.0,
+        mathematical: ascent - xHeight / 2.0,
+        xMiddle: ascent - xHeight / 2.0,
+        textOver: 0.0,
+        textUnder: ascent + descent,
+      },
+    }
+  }
+
+  effect fn advanceOf(self: &mut Self, instance: usize, text: string) -> f32
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut glyphs = List<RawGlyph>.make()
+    run self.shapeText(
+      instance,
+      text,
+      0,
+      String.byteLength(text),
+      false,
+      Script.common(),
+      &mut glyphs,
+    )
+    let mut total: i32 = 0
+    let mut index: usize = 0
+    while index < glyphs.length() {
+      total = total + glyphs.get(index).xAdvance
+      index = index + 1
+    }
+    return i32.toF32(total)
+  }
+
+  /// Shapes `text[start..end)` with instance `instance`, the rest of `text` serving as
+  /// context, and appends the glyphs in visual order with clusters relative to `text`.
+  pub effect fn shapeText(
+    self: &mut Self,
+    instance: usize,
+    text: string,
+    start: usize,
+    end: usize,
+    rtl: bool,
+    script: Script,
+    out: &mut List<RawGlyph>,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.shapeTextOriented(instance, text, start, end, rtl, script, false, &mut out)
+  }
+
+  pub effect fn shapeTextOriented(
+    self: &mut Self,
+    instance: usize,
+    text: string,
+    start: usize,
+    end: usize,
+    rtl: bool,
+    script: Script,
+    vertical: bool,
+    out: &mut List<RawGlyph>,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let face = self.instances.asSlice()[instance].face
+    if !run self.loadFace(face) {
+      return
+    }
+    self.buffer.clear()
+    run self.buffer.setPreContext(String.slice(text, 0, start))
+    run self.buffer.setPostContext(String.slice(text, end, String.byteLength(text) - end))
+    run self.buffer.pushStr(String.slice(text, start, end - start))
+    if vertical {
+      self.buffer.setDirection(Direction.TopToBottom)
+    } else if rtl {
+      self.buffer.setDirection(Direction.RightToLeft)
+    } else {
+      self.buffer.setDirection(Direction.LeftToRight)
+    }
+    let tag = script.value
+    if tag == Script.common().value || tag == Script.inherited().value
+      || tag == Script.unknown().value {
+      self.buffer.setScript(Option<Script>.None)
+    } else {
+      self.buffer.setScript(Option<Script>.Some { value: script })
+    }
+    self.buffer.guessSegmentProperties()
+    let mut plan = usize.MAX
+    let mut index: usize = 0
+    while index < self.plans.length() {
+      let entry = &self.plans.asSlice()[index]
+      if entry.instance == instance && entry.script == tag && entry.rtl == rtl
+        && entry.vertical == vertical {
+        plan = index
+        break
+      }
+      index = index + 1
+    }
+    if plan == usize.MAX {
+      if let Option<ShaperData<'a>>.Some { value: data } = &self.data.asSlice()[face] {
+        let made = run makePlan(
+          &data,
+          self.instances.asSlice()[instance].coords.asSlice(),
+          &self.buffer,
+        )
+        run self.plans.append(
+          PlanEntry {
+            vertical: vertical,
+            instance: instance,
+            script: tag,
+            rtl: rtl,
+            plan: move made,
+          },
+        )
+        plan = self.plans.length() - 1
+      } else {
+        return
+      }
+    }
+    if let Option<ShaperData<'a>>.Some { value: data } = &self.data.asSlice()[face] {
+      let mut shaper = ConfiguredShaper.new(&data)
+      run shaper.coords.appendSlice(self.instances.asSlice()[instance].coords.asSlice())
+      let none: [Feature; 0] = []
+      let shaped = run shape(
+        &shaper,
+        &mut self.buffer,
+        ShapeOptions.forPlan(&self.plans.asSlice()[plan].plan, &none),
+      )
+      if let Result<(), ShapeError>.Failure { error: _ } = move shaped {
+        return
+      }
+    }
+    let infos = self.buffer.glyphInfos()
+    let positions = self.buffer.glyphPositions()
+    run out.reserve(infos.len())
+    index = 0
+    while index < infos.len() {
+      if let Option<GlyphInfo>.Some { value: info } = infos.get(index) {
+        if let Option<GlyphPosition>.Some { value: position } = positions.get(index) {
+          run out.append(
+            RawGlyph {
+              glyph: info.glyphId,
+              cluster: info.cluster + usize.toU32(start),
+              xAdvance: position.xAdvance,
+              yAdvance: position.yAdvance,
+              xOffset: position.xOffset,
+              yOffset: position.yOffset,
+            },
+          )
+        }
+      }
+      index = index + 1
+    }
+  }
+
+  /// CSS pixels per font unit for key `key`.
+  pub fn scale(self: &Self, key: usize) -> f32 {
+    let info = self.keys.get(key)
+    if info.instance == usize.MAX {
+      return 0.0
+    }
+    return info.size / self.instances.asSlice()[info.instance].unitsPerEm
+  }
+
+  /// The face of `instance`, for `font-raster`.
+  pub fn instanceOf(self: &Self, key: usize) -> usize {
+    return self.keys.get(key).instance
+  }
+}

@@ -1,0 +1,240 @@
+//! Exercises virtualization through the retained-tree protocol, without ui-app.
+import ui_tree.lib {
+  UiTree,
+  TreeError,
+  Batch,
+  FrameInput,
+  NodeKind,
+  Property,
+  Length,
+  Display,
+  FlexDirection,
+  Overflow,
+  Attribute,
+  Mutation,
+  VirtualItem,
+  VirtualOptions,
+  VirtualRange
+}
+import ui_tree.inspect { info, NodeInfo }
+import ui_fixtures.fixtures as fixtures
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.num.usize
+import silk.num.u32
+import silk.num.f32
+
+fn viewport(width: f32) -> FrameInput {
+  return FrameInput { width: width, height: 400.0, scale: 1.0, time: 0.0 }
+}
+
+fn desired(range: VirtualRange, index: usize) -> bool {
+  return index >= range.first && index < range.end || index == range.pinned
+}
+
+// This is all a binding client does: reconcile requested indices to ordinary node IDs.
+// No heights, spacers, scroll correction or overscan calculations live in this client.
+effect fn mount(tree: &mut UiTree<'_>, current: &mut List<VirtualItem>) -> ()
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let range = tree.virtualRange(1).unwrapOr(
+    VirtualRange { count: 0, first: 0, end: 0, pinned: usize.MAX, pinnedId: 0 },
+  )
+  let mut batch = Batch.make()
+  let mut r: usize = 0
+  while r < current.length() {
+    let row = current.get(r)
+    if !desired(range, row.index) {
+      run batch.push(Mutation.Destroy { id: row.id })
+    }
+    r = r + 1
+  }
+  current.clear()
+  let mut i = if range.pinned < range.first {
+    range.pinned
+  } else {
+    range.first
+  }
+  while i < range.end || (i == range.pinned && i < range.count) {
+    let id = 100 + usize.toU32(i) * 2
+    if !tree.contains(id) {
+      run batch.box(
+        1,
+        id,
+        &[
+          Property.Height { value: Length.px(40.0 + usize.toF32(i % 3) * 30.0) },
+          Property.FlexShrink { value: 0.0 },
+        ],
+      )
+      run batch.attribute(id, Attribute.TabIndex { value: 0 })
+    } else {
+      run batch.push(Mutation.InsertBefore { parent: 1, child: id, before: Option<u32>.None })
+    }
+    run current.append(VirtualItem { index: i, id: id })
+    let next = i + 1
+    if i < range.first {
+      i = range.first
+    } else if next == range.end && range.pinned >= range.end && range.pinned < range.count {
+      i = range.pinned
+    } else {
+      i = next
+    }
+  }
+  run batch.virtualItems(1, current.asSlice())
+  run tree.apply(run batch.take())
+}
+
+effect fn settle(tree: &mut UiTree<'_>, current: &mut List<VirtualItem>, width: f32) -> ()
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut pass: usize = 0
+  while pass < 6 {
+    run tree.frame(viewport(width))
+    run mount(&mut tree, &mut current)
+    pass = pass + 1
+  }
+  run tree.frame(viewport(width))
+}
+
+effect fn applied(tree: &mut UiTree<'_>, mutation: Mutation) -> bool
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut batch = Batch.make()
+  run batch.push(move mutation)
+  run tree.apply(run batch.take())
+  return false
+}
+
+effect fn invalid(error: TreeError) -> bool {
+  return match error {
+    TreeError.BadVirtualList { index, id } => index == 0 && id == 1
+    _ => false
+  }
+}
+
+effect fn body() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.style(
+    1,
+    &[
+      Property.Display { value: Display.Flex },
+      Property.FlexDirection { value: FlexDirection.Column },
+      Property.Height { value: Length.px(300.0) },
+      Property.Width { value: Length.percent(100.0) },
+      Property.OverflowY { value: Overflow.Auto },
+    ],
+  )
+  run batch.virtualList(
+    1,
+    10000,
+    VirtualOptions { estimatedHeight: 80.0, overscan: 150.0, gap: 5.0, revision: 0 },
+  )
+  run tree.apply(run batch.take())
+  let mut current = List<VirtualItem>.make()
+  run mount(&mut tree, &mut current)
+  run settle(&mut tree, &mut current, 400.0)
+  run Testing.expect(tree.nodeCount() < 20, "a direct tree client mounts only requested rows")
+  let mut invalidItems = List<VirtualItem>.make()
+  run invalidItems.appendSlice(current.asSlice())
+  invalidItems.set(1, VirtualItem { index: current.get(0).index, id: current.get(1).id })
+  run Testing.expect(
+    run Effect.catch<TreeError>(
+      applied(&mut tree, Mutation.SetVirtualItems { id: 1, items: move invalidItems }),
+      invalid,
+    ),
+    "duplicate item indices are rejected with the mutation index and container ID",
+  )
+  run Testing.expect(
+    tree.virtualLists.asSlice()[0].rows.get(1).index == current.get(1).index,
+    "invalid bindings preserve the previous valid bindings",
+  )
+  run Testing.expect(
+    run Effect.catch<TreeError>(
+      applied(
+        &mut tree,
+        Mutation.SetVirtualList {
+          id: 1,
+          count: 10000,
+          options: VirtualOptions { estimatedHeight: 0.0, overscan: 100.0, gap: 0.0, revision: 0 },
+        },
+      ),
+      invalid,
+    ),
+    "invalid estimates cannot corrupt an existing controller",
+  )
+  let focus = current.get(1).id
+  run batch.focus(focus)
+  run batch.scrollTo(1, 0.0, 200000.0)
+  run tree.apply(run batch.take())
+  run settle(&mut tree, &mut current, 400.0)
+  let range = tree.virtualRange(1).unwrapOr(
+    VirtualRange { count: 0, first: 0, end: 0, pinned: usize.MAX, pinnedId: 0 },
+  )
+  run Testing.expect(
+    range.first > 1000 && range.pinnedId == focus,
+    "tree owns distant range and focus retention",
+  )
+  run Testing.expect(tree.node(tree.focused).id == focus, "focus survives client reconciliation")
+  run Testing.expect(
+    tree.nodeCount() < 20 && tree.layout.nodes.length() < 60,
+    "UI and private spacer storage remain bounded",
+  )
+  let mut visible = false
+  let mut i: usize = 0
+  while i < current.length() {
+    if let Option<NodeInfo>.Some { value } = run info(&tree, current.get(i).id) {
+      if value.bounds.yMin < 300.0 && value.bounds.yMax > 0.0 {
+        visible = true
+      }
+    }
+    i = i + 1
+  }
+  run Testing.expect(visible, "measured content covers the viewport after a distant jump")
+  let anchor = tree.virtualLists.asSlice()[0].locate(tree.scrollOffset(1).y)
+  run settle(&mut tree, &mut current, 600.0)
+  run Testing.expect(
+    tree.virtualLists.asSlice()[0].locate(tree.scrollOffset(1).y) == anchor,
+    "tree preserves the visible index when width invalidates measurements",
+  )
+  run batch.push(Mutation.Blur)
+  run batch.scrollTo(1, 0.0, 0.0)
+  run tree.apply(run batch.take())
+  run settle(&mut tree, &mut current, 600.0)
+  run Testing.expect(tree.scrollOffset(1).y == 0.0, "return to top is exact")
+  let nodes = tree.nodeCount()
+  run batch.clearVirtualList(1)
+  run tree.apply(run batch.take())
+  run Testing.expect(
+    tree.virtualRange(1).isNone() && tree.nodeCount() == nodes,
+    "clearing virtualization preserves ordinary client nodes",
+  )
+  run batch.virtualList(
+    1,
+    10000,
+    VirtualOptions { estimatedHeight: 80.0, overscan: 150.0, gap: 5.0, revision: 0 },
+  )
+  run batch.virtualItems(1, current.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(viewport(600.0))
+  run batch.push(Mutation.Destroy { id: 1 })
+  run tree.apply(run batch.take())
+  run Testing.expect(
+    tree.virtualLists.length() == 0 && tree.nodeCount() == 0,
+    "destroying the container releases its controller and all private spacers",
+  )
+}
+
+test effect fn directTreeVirtualization() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run body() |> Effect.provideMut<Allocator>(&mut allocator)
+}

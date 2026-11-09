@@ -1,0 +1,242 @@
+//! Goldens for the gallery: each scene runs it headless through scripted input, then compares
+//! the tree's `describe` snapshot (exactly) and its CPU drawing (each channel may differ by 2)
+//! with `<scene>.txt` and `<scene>.png` in the goldens directory.
+//!
+//! `ui-components-tests <goldens directory> [--update]`, from the repository root. With
+//! `--update` it writes the files instead. Exits 0 when everything matches, 1 on a mismatch, 2
+//! on an error.
+import tests { viewport }
+import ui_gallery.lib { Gallery, Message, SANS }
+import ui_app.app { NoCommand }
+import ui_app.runtime { Runtime }
+import ui_app.harness { click, clickRole, press }
+import ui_fixtures.fixtures as fixtures
+import ui_tree.lib {
+  UiTree,
+  TreeError,
+  Batch,
+  CpuSnapshot,
+  DescribeOptions,
+  Role,
+  describe,
+  encodePng
+}
+import font_collection.lib { FontCollection }
+import codec.png
+import codec.png { PngError }
+import codec.image { ImageError }
+import vector.geometry_error { GeometryError }
+import vector.pixmap { Pixmap }
+import silk.collections.bytes { Bytes }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.io.writer { Writer, WriterError }
+import silk.io.writer_native { StderrWriter }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.u8
+import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.system.filesystem_machine { MachineFileSystem }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.text.string { String }
+
+const TOLERANCE: u32 = 2
+
+const SCENES: u32 = 4
+
+fn sceneName(index: u32) -> string<'static> {
+  return match index {
+    0 => "gallery-start"
+    1 => "gallery-menu"
+    2 => "gallery-dialog"
+    _ => "gallery-lists"
+  }
+}
+
+effect fn say(text: string) -> ()
+  ! WriterError {
+  let mut writer = StderrWriter.make()
+  run Writer.writeString(text) |> Effect.provideMut<Writer>(&mut writer)
+  run Writer.flush() |> Effect.provideMut<Writer>(&mut writer)
+}
+
+fn mismatches(actual: &[u8], expected: &[u8]) -> u32 {
+  if actual.length != expected.length {
+    return 4294967295
+  }
+  let mut count: u32 = 0
+  let mut i: usize = 0
+  while i < actual.length {
+    let a = u8.toU32(actual[i])
+    let b = u8.toU32(expected[i])
+    let d = if a > b {
+      a - b
+    } else {
+      b - a
+    }
+    if d > TOLERANCE {
+      count = count + 1
+    }
+    i = i + 1
+  }
+  return count
+}
+
+fn sameBytes(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < a.length {
+    if a[i] != b[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+/// Runs scene `index` in `tree`.
+effect fn script(index: u32, tree: &mut UiTree<'_>) -> ()
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut app = Runtime<Gallery, Message, NoCommand>.make(Gallery.make())
+  run app.start(&mut tree, 0.0)
+  if index == 1 {
+    // The File menu open from the keyboard, the second item highlighted; the switch off.
+    drop run clickRole(&mut app, &mut tree, viewport(), Role.Switch, "Notifications")
+    drop run clickRole(&mut app, &mut tree, viewport(), Role.Button, "File")
+    run press(&mut app, &mut tree, viewport(), "ArrowDown", 0)
+  } else if index == 2 {
+    // A name typed and the delete dialog open.
+    drop run clickRole(&mut app, &mut tree, viewport(), Role.Checkbox, "I agree")
+    drop run clickRole(&mut app, &mut tree, viewport(), Role.Button, "Delete draft")
+  } else if index == 3 {
+    // The select list with a row chosen.
+    drop run clickRole(&mut app, &mut tree, viewport(), Role.Tab, "Select")
+    drop run click(&mut app, &mut tree, viewport(), "Cherry")
+    drop run clickRole(&mut app, &mut tree, viewport(), Role.Button, "Size")
+  }
+}
+
+/// Runs scene `index` and returns its pixels and snapshot.
+effect fn draw(index: u32, collection: &FontCollection, text: &mut String) -> Pixmap
+  ! TreeError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut tree = run UiTree.make(collection)
+  let mut batch = Batch.make()
+  run batch.fontFamily(SANS, "Noto Sans, sans-serif")
+  run tree.apply(run batch.take())
+  run script(index, &mut tree)
+  run tree.frame(viewport())
+  let mut snapshot = CpuSnapshot.make()
+  run snapshot.sync(&mut tree)
+  run describe(&tree, DescribeOptions.plain(), &mut text)
+  return run snapshot.render(&tree)
+}
+
+effect fn check(directory: &Path, update: bool) -> u32
+  ! TreeError
+    | GeometryError
+    | OutOfMemoryError
+    | WriterError
+    | FileError
+    | HostInputError
+    | ImageError
+    | PngError
+  ? &mut FileSystem | &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut failures: u32 = 0
+  let mut index: u32 = 0
+  while index < SCENES {
+    let mut text = String.make()
+    let pixels = run draw(index, &collection, &mut text)
+    let mut pngName = String.make()
+    run pngName.append(sceneName(index))
+    run pngName.append(".png")
+    let mut textName = String.make()
+    run textName.append(sceneName(index))
+    run textName.append(".txt")
+    let pngFile = run Path.join(directory, String.view(&pngName))
+    let textFile = run Path.join(directory, String.view(&textName))
+    let encoded = run encodePng(&pixels)
+    if update {
+      run FileSystem.writeFile(&pngFile, Bytes.asSlice(&encoded))
+      run FileSystem.writeFile(&textFile, String.utf8Bytes(String.view(&text)))
+      run say("wrote ")
+    } else {
+      let golden = run png.decode(Bytes.asSlice(&run FileSystem.readFile(&pngFile)))
+      let actual = run png.decode(Bytes.asSlice(&encoded))
+      let bad = mismatches(actual.data(), golden.data())
+      let expected = run FileSystem.readFile(&textFile)
+      let sameText = sameBytes(String.utf8Bytes(String.view(&text)), Bytes.asSlice(&expected))
+      if bad == 0 && sameText {
+        run say("ok ")
+      } else {
+        failures = failures + 1
+        if bad != 0 {
+          run say("PIXELS DIFFER ")
+        }
+        if !sameText {
+          run say("SNAPSHOT DIFFERS ")
+          run say(String.view(&text))
+        }
+      }
+    }
+    run say(sceneName(index))
+    run say("\n")
+    index = index + 1
+  }
+  return failures
+}
+
+effect fn process() -> i32
+  ! TreeError
+    | GeometryError
+    | OutOfMemoryError
+    | WriterError
+    | FileError
+    | HostInputError
+    | ImageError
+    | PngError
+  ? &mut HostInput | &mut Allocator {
+  let count = run HostInput.argumentCount()
+  if count < 2 {
+    run say("usage: ui-components-tests <goldens directory> [--update]\n")
+    return 2
+  }
+  let update = count > 2
+  let raw = match run HostInput.argument(1) {
+    Option<Bytes>.Some { value } => move value
+    Option<Bytes>.None => Bytes.make()
+  }
+  let cwd = run HostInput.workingDirectory()
+  let base = run Path.fromBytes(Bytes.asSlice(&cwd))
+  let directory = run Path.resolveBytes(&base, Bytes.asSlice(&raw))
+  let mut files = run MachineFileSystem.make()
+  let failures = run check(&directory, update) |> Effect.provideMut<FileSystem>(&mut files)
+  return if failures == 0 {
+    0
+  } else {
+    1
+  }
+}
+
+effect fn failed<E>(error: E) -> i32
+  ! WriterError {
+  drop error
+  run say("ui-components-tests: running a scene, drawing, file access or PNG coding failed\n")
+  return 2
+}
+
+effect fn failedQuietly<E>(error: E) -> i32 {
+  drop error
+  return 2
+}
+
+pub effect fn main() -> i32
+  ? &mut HostInput {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(Effect.catchAll(process(), failed), failedQuietly)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}

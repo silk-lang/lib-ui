@@ -1,0 +1,163 @@
+//! Virtual list integration tests through real layout, scrolling, focus, and view diff.
+import ui_app.app { App, Context, NoCommand }
+import ui_app.runtime { Runtime, pump, frame }
+import ui_app.ui { Ui }
+import ui_app.virtual_list { VirtualOptions }
+import ui_tree.lib { UiTree, TreeError, Batch, FrameInput, findAll }
+import ui_tree.mutation { Length, Mutation }
+import ui_fixtures.fixtures as fixtures
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.num.f32
+import silk.num.usize
+
+struct Example {
+  count: usize,
+  revision: u64,
+  visible: bool
+}
+
+union Message {
+  Nothing
+}
+
+impl App<Message, NoCommand> for Example {
+  fn update(self: &mut Self, message: Message, cx: &mut Context<NoCommand>) -> () {
+    drop message
+  }
+
+  fn view(self: &Self, ui: &mut Ui<Message>) -> () {
+    // A lazy ancestor must not freeze the runtime's mounted range.
+    ui.lazy(
+      1,
+      |ui| {
+        ui.column(
+          |ui| {
+            ui.testId("port")
+            ui.height(Length.px(300.0))
+            if !self.visible {
+              return ()
+            }
+            ui.virtualItems(
+              1,
+              self.count,
+              VirtualOptions {
+                estimatedHeight: 80.0,
+                overscan: 150.0,
+                gap: 5.0,
+                revision: self.revision,
+              },
+              |i| usize.toU64(
+                if self.revision == 0 {
+                  i
+                } else {
+                  self.count - 1 - i
+                },
+              ),
+              |ui, i| {
+                ui.testId("row")
+                ui.height(Length.px(40.0 + usize.toF32(i % 3) * 30.0))
+                ui.tabIndex(0)
+              },
+            )
+          },
+        )
+      },
+    )
+  }
+}
+
+fn viewport() -> FrameInput {
+  return FrameInput { width: 400.0, height: 400.0, scale: 1.0, time: 0.0 }
+}
+
+effect fn body() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut app = Runtime<Example, Message, NoCommand>.make(
+    Example { count: 10000, revision: 0, visible: true },
+  )
+  run app.start(&mut tree, 0.0)
+  run frame(&mut app, &mut tree, viewport())
+  let mut found = List<u32>.make()
+  run findAll(&tree, "port", &mut found)
+  let port = found.get(0)
+  found.clear()
+  run findAll(&tree, "row", &mut found)
+  run Testing.expect(found.length() > 2 && found.length() < 20, "only nearby rows are mounted")
+  let focused = found.get(1)
+  let mut batch = Batch.make()
+  run batch.push(Mutation.Focus { id: focused })
+  run tree.apply(run batch.take())
+  drop run pump(&mut app, &mut tree)
+  run batch.push(Mutation.ScrollTo { id: port, x: 0.0, y: 200000.0 })
+  run tree.apply(run batch.take())
+  drop run pump(&mut app, &mut tree)
+  run frame(&mut app, &mut tree, viewport())
+  run Testing.expect(
+    tree.node(tree.focused).id == focused,
+    "focused row remains mounted across a distant jump",
+  )
+  run Testing.expect(
+    app.ui.virtualLists.asSlice()[0].first > 1000,
+    "distant jump updates the range inside a lazy ancestor",
+  )
+  run Testing.expect(tree.stats.nodes < 50, "distant jump keeps the UI tree bounded")
+  let list = &tree.virtualLists.asSlice()[0]
+  run Testing.expect(
+    list.prefix(list.first) <= list.scroll && list.prefix(list.end) >= list.scroll + list.height,
+    "mounted rows cover the viewport after measurement corrections",
+  )
+  let anchor = list.locate(list.scroll)
+  let offset = list.scroll - list.prefix(anchor)
+  run frame(&mut app, &mut tree, FrameInput { width: 600.0, height: 400.0, scale: 1.0, time: 0.0 })
+  let resized = &tree.virtualLists.asSlice()[0]
+  run Testing.expect(
+    resized.locate(resized.scroll) == anchor
+      && f32.abs(resized.scroll - resized.prefix(anchor) - offset) < 0.5,
+    "width invalidation preserves the visible item and its offset",
+  )
+  app.model.revision = 1
+  run app.render(&mut tree)
+  drop run pump(&mut app, &mut tree)
+  run Testing.expect(
+    tree.node(tree.focused).id == focused,
+    "focus follows its stable key across reordering before another layout",
+  )
+  run frame(&mut app, &mut tree, viewport())
+  let revised = &tree.virtualLists.asSlice()[0]
+  run Testing.expect(
+    revised.locate(revised.scroll) == anchor,
+    "content revision preserves the visible logical index",
+  )
+  run batch.push(Mutation.Blur)
+  run batch.push(Mutation.ScrollTo { id: port, x: 0.0, y: 0.0 })
+  run tree.apply(run batch.take())
+  drop run pump(&mut app, &mut tree)
+  run frame(&mut app, &mut tree, viewport())
+  run Testing.expect(tree.scrollOffset(port).y == 0.0, "return to top is exact")
+  app.model.count = 0
+  run app.render(&mut tree)
+  run frame(&mut app, &mut tree, viewport())
+  run Testing.expect(tree.stats.nodes < 10, "empty list releases mounted rows")
+  app.model.visible = false
+  run app.render(&mut tree)
+  run Testing.expect(
+    tree.contains(port),
+    "ordinary scroll container survives removing virtual content",
+  )
+  run Testing.expect(
+    app.ui.virtualLists.length() == 0 && tree.virtualLists.length() == 0,
+    "removing a list releases view bookkeeping and tree measurements",
+  )
+}
+
+test effect fn measuredList() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run body() |> Effect.provideMut<Allocator>(&mut allocator)
+}

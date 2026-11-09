@@ -1,0 +1,815 @@
+//! Scripted editing tests on the editor fixture: typing, deleting and moving by grapheme, word
+//! and line, undo and redo, the clipboard requests, pointer selection from the layout's text
+//! fragments, multiline movement, input method composition, controlled values, caret blinking
+//! and caret scrolling. Every input listens for every record.
+import ui_fixtures.fixtures as fixtures
+import ui_tree.lib {
+  UiTree,
+  TreeError,
+  Batch,
+  FrameInput,
+  Mutation,
+  Attribute,
+  Event,
+  EventKind,
+  Input,
+  HostRequest,
+  Keymap,
+  ImeArea,
+  NONE,
+  MOD_SHIFT,
+  MOD_CONTROL,
+  MOD_ALT,
+  MOD_META,
+  BUTTON_PRIMARY,
+  DescribeOptions,
+  CpuSnapshot,
+  describeNodeById
+}
+import vector.geometry_error { GeometryError }
+import vector.pixmap { Pixmap }
+import font_collection.lib { FontCollection }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.geometry.rect { Rect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+fn viewport() -> FrameInput {
+  return fixtures.viewport(3)
+}
+
+fn at(time: f64) -> FrameInput {
+  let mut input = viewport()
+  input.time = time
+  return input
+}
+
+/// A fresh editor after its first frame, with the standard keymap.
+effect fn editor(collection: &FontCollection) -> UiTree<'_>
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut tree = run UiTree.make(collection)
+  tree.keymap = Keymap.Standard
+  let mut batch = Batch.make()
+  run fixtures.editor(&mut batch)
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  return move tree
+}
+
+effect fn drain(tree: &mut UiTree<'_>) -> List<Event>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut events = List<Event>.make()
+  run tree.takeEvents(&mut events)
+  return move events
+}
+
+effect fn requests(tree: &mut UiTree<'_>) -> List<HostRequest>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = List<HostRequest>.make()
+  run tree.takeRequests(&mut out)
+  return move out
+}
+
+effect fn key(tree: &mut UiTree<'_>, name: string, modifiers: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run tree.dispatch(
+    Input.KeyDown {
+      key: run String.copy(name),
+      code: run String.copy(name),
+      modifiers: modifiers,
+      repeat: false,
+    },
+  )
+  run tree.dispatch(
+    Input.KeyUp { key: run String.copy(name), code: run String.copy(name), modifiers: modifiers },
+  )
+}
+
+effect fn typeText(tree: &mut UiTree<'_>, text: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run tree.dispatch(Input.TextInput { text: run String.copy(text) })
+}
+
+effect fn preedit(tree: &mut UiTree<'_>, text: string, start: usize, end: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run tree.dispatch(
+    Input.ImePreedit { text: run String.copy(text), selectionStart: start, selectionEnd: end },
+  )
+}
+
+effect fn press(tree: &mut UiTree<'_>, x: f32, y: f32, clicks: u32, modifiers: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run tree.dispatch(
+    Input.PointerDown {
+      x: x,
+      y: y,
+      button: BUTTON_PRIMARY,
+      modifiers: modifiers,
+      clickCount: clicks,
+    },
+  )
+}
+
+effect fn release(tree: &mut UiTree<'_>, x: f32, y: f32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run tree.dispatch(Input.PointerUp { x: x, y: y, button: BUTTON_PRIMARY, modifiers: 0 })
+}
+
+effect fn click(tree: &mut UiTree<'_>, x: f32, y: f32, clicks: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run press(&mut tree, x, y, clicks, 0)
+  run release(&mut tree, x, y)
+}
+
+fn value<'t>(tree: &'t UiTree<'_>, id: u32) -> string<'t> {
+  return String.view(&tree.node(tree.slotOf(id)).text)
+}
+
+fn selected(tree: &UiTree<'_>, id: u32, anchor: usize, focus: usize) -> bool {
+  let s = tree.selection(id)
+  return s.x == anchor && s.y == focus
+}
+
+effect fn focus(tree: &mut UiTree<'_>, id: u32) -> ()
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut batch = Batch.make()
+  run batch.focus(id)
+  run tree.apply(run batch.take())
+}
+
+effect fn setSelection(tree: &mut UiTree<'_>, id: u32, anchor: usize, focus: usize) -> ()
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut batch = Batch.make()
+  run batch.select(id, anchor, focus)
+  run tree.apply(run batch.take())
+}
+
+effect fn setValue(tree: &mut UiTree<'_>, id: u32, text: string) -> ()
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut batch = Batch.make()
+  run batch.setText(id, text)
+  run tree.apply(run batch.take())
+}
+
+/// The number of `Input` records, and whether the last one says `value` and `inputType`.
+fn lastInput(events: &List<Event>, value: string, inputType: string) -> bool {
+  let values = events.asSlice()
+  let mut i = values.length
+  while i > 0 {
+    i = i - 1
+    if values[i].kind == EventKind.Input {
+      return String.view(&values[i].value) == value
+        && String.view(&values[i].inputType) == inputType
+    }
+  }
+  return false
+}
+
+fn inputCount(events: &List<Event>) -> usize {
+  let values = events.asSlice()
+  let mut found: usize = 0
+  let mut i: usize = 0
+  while i < values.length {
+    if values[i].kind == EventKind.Input {
+      found = found + 1
+    }
+    i = i + 1
+  }
+  return found
+}
+
+effect fn describeOf(tree: &UiTree<'_>, id: u32) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = String.make()
+  run describeNodeById(tree, id, DescribeOptions.plain(), &mut out)
+  return move out
+}
+
+fn near(a: f32, b: f32) -> bool {
+  return f32.abs(a - b) < 0.01
+}
+
+// Typing and undo.
+
+effect fn typingBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run editor(&collection)
+  run focus(&mut tree, fixtures.NAME)
+  drop run drain(&mut tree)
+  let shown = run describeOf(&tree, fixtures.NAME)
+  run Testing.expect(
+    String.contains(String.view(&shown), "placeholder=\"Your name\" selection=0 focused"),
+    "the empty input shows its placeholder and a caret",
+  )
+  run typeText(&mut tree, "A")
+  run typeText(&mut tree, "d")
+  run typeText(&mut tree, "a")
+  let events = run drain(&mut tree)
+  run Testing.expect(inputCount(&events) == 3, "each keystroke queues an input record")
+  run Testing.expect(lastInput(&events, "Ada", "insertText"), "with the whole value")
+  run Testing.expect(selected(&tree, fixtures.NAME, 3, 3), "the caret follows the text")
+  run typeText(&mut tree, " Lovelace")
+  run key(&mut tree, "Backspace", 0)
+  run key(&mut tree, "Backspace", 0)
+  run Testing.expect(value(&tree, fixtures.NAME) == "Ada Lovela", "Backspace deletes")
+  let deleted = run drain(&mut tree)
+  run Testing.expect(
+    lastInput(&deleted, "Ada Lovela", "deleteContentBackward"),
+    "and names the deletion",
+  )
+
+  // Consecutive deletions undo together, then consecutive typing.
+  run key(&mut tree, "z", MOD_CONTROL)
+  run Testing.expect(value(&tree, fixtures.NAME) == "Ada Lovelace", "undo restores both")
+  run Testing.expect(selected(&tree, fixtures.NAME, 12, 12), "with the caret where it was")
+  run key(&mut tree, "z", MOD_CONTROL)
+  run Testing.expect(value(&tree, fixtures.NAME) == "", "undo again removes the typing")
+  let undone = run drain(&mut tree)
+  run Testing.expect(lastInput(&undone, "", "historyUndo"), "undo queues an input record")
+  run key(&mut tree, "z", MOD_CONTROL + MOD_SHIFT)
+  run Testing.expect(value(&tree, fixtures.NAME) == "Ada Lovelace", "Shift+Control+Z redoes")
+  run key(&mut tree, "y", MOD_CONTROL)
+  run Testing.expect(value(&tree, fixtures.NAME) == "Ada Lovela", "Control+Y redoes")
+
+  // An edit after undo clears the redo history; a selection is replaced by typing.
+  run key(&mut tree, "z", MOD_CONTROL)
+  run typeText(&mut tree, "!")
+  run key(&mut tree, "y", MOD_CONTROL)
+  run Testing.expect(value(&tree, fixtures.NAME) == "Ada Lovelace!", "nothing left to redo")
+  run key(&mut tree, "a", MOD_CONTROL)
+  run Testing.expect(selected(&tree, fixtures.NAME, 0, 13), "Control+A selects all")
+  run typeText(&mut tree, "Grace")
+  run Testing.expect(value(&tree, fixtures.NAME) == "Grace", "typing replaces the selection")
+
+  // Single-line inputs turn typed line breaks into spaces; Enter is left to the client.
+  run typeText(&mut tree, "\nHopper")
+  run Testing.expect(value(&tree, fixtures.NAME) == "Grace Hopper", "a line break becomes a space")
+  drop run drain(&mut tree)
+  run key(&mut tree, "Enter", 0)
+  let entered = run drain(&mut tree)
+  run Testing.expect(
+    inputCount(&entered) == 0 && value(&tree, fixtures.NAME) == "Grace Hopper",
+    "Enter does not edit a single-line input",
+  )
+
+  // Read-only inputs ignore typing.
+  run focus(&mut tree, fixtures.LOCKED)
+  run typeText(&mut tree, "x")
+  run key(&mut tree, "Backspace", 0)
+  run Testing.expect(
+    value(&tree, fixtures.LOCKED) == "Read only",
+    "read-only inputs keep their value",
+  )
+}
+
+test effect fn typingDeletingAndUndo() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run typingBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Graphemes and words.
+
+effect fn movementBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run editor(&collection)
+
+  // "e" with a combining acute (3 bytes), a family emoji joined with ZWJs (18 bytes), "x".
+  run setValue(&mut tree, fixtures.SEARCH, "e\u{301}\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}x")
+  run Testing.expect(
+    selected(&tree, fixtures.SEARCH, 22, 22),
+    "a new value puts the caret at the end",
+  )
+  run key(&mut tree, "ArrowLeft", 0)
+  run Testing.expect(selected(&tree, fixtures.SEARCH, 21, 21), "left over x")
+  run key(&mut tree, "ArrowLeft", 0)
+  run Testing.expect(selected(&tree, fixtures.SEARCH, 3, 3), "left over the whole family")
+  run key(&mut tree, "ArrowLeft", MOD_SHIFT)
+  run Testing.expect(selected(&tree, fixtures.SEARCH, 3, 0), "Shift extends over the accented e")
+  run key(&mut tree, "ArrowRight", 0)
+  run Testing.expect(selected(&tree, fixtures.SEARCH, 3, 3), "an arrow collapses to the edge")
+  run key(&mut tree, "Delete", 0)
+  run Testing.expect(value(&tree, fixtures.SEARCH) == "e\u{301}x", "Delete removes a grapheme")
+  run key(&mut tree, "Backspace", 0)
+  run Testing.expect(value(&tree, fixtures.SEARCH) == "x", "and so does Backspace")
+
+  // Words.
+  run setValue(&mut tree, fixtures.SEARCH, fixtures.SEARCH_VALUE)
+  run key(&mut tree, "ArrowLeft", MOD_CONTROL)
+  run Testing.expect(selected(&tree, fixtures.SEARCH, 16, 16), "Control+Left to the word start")
+  run key(&mut tree, "ArrowLeft", MOD_CONTROL)
+  run Testing.expect(selected(&tree, fixtures.SEARCH, 6, 6), "and the one before")
+  run key(&mut tree, "ArrowRight", MOD_CONTROL + MOD_SHIFT)
+  run Testing.expect(selected(&tree, fixtures.SEARCH, 6, 15), "Control+Shift+Right selects a word")
+  run key(&mut tree, "Home", 0)
+  run Testing.expect(selected(&tree, fixtures.SEARCH, 0, 0), "Home")
+  run key(&mut tree, "ArrowRight", MOD_CONTROL)
+  run Testing.expect(selected(&tree, fixtures.SEARCH, 5, 5), "Control+Right to the word end")
+  run key(&mut tree, "End", MOD_SHIFT)
+  run Testing.expect(selected(&tree, fixtures.SEARCH, 5, 21), "Shift+End")
+  run key(&mut tree, "End", 0)
+  run key(&mut tree, "Backspace", MOD_CONTROL)
+  run Testing.expect(value(&tree, fixtures.SEARCH) == "Hello wonderful ", "Control+Backspace")
+  run key(&mut tree, "Home", 0)
+  run key(&mut tree, "Delete", MOD_CONTROL)
+  run Testing.expect(value(&tree, fixtures.SEARCH) == " wonderful ", "Control+Delete")
+
+  // The macOS keymap: Option for words, Command for line ends and shortcuts.
+  tree.keymap = Keymap.Mac
+  run setValue(&mut tree, fixtures.SEARCH, fixtures.SEARCH_VALUE)
+  run key(&mut tree, "ArrowLeft", MOD_ALT)
+  run Testing.expect(selected(&tree, fixtures.SEARCH, 16, 16), "Option+Left")
+  run key(&mut tree, "ArrowLeft", MOD_META)
+  run Testing.expect(selected(&tree, fixtures.SEARCH, 0, 0), "Command+Left")
+  run key(&mut tree, "a", MOD_META)
+  run Testing.expect(selected(&tree, fixtures.SEARCH, 0, 21), "Command+A")
+  run key(&mut tree, "a", MOD_CONTROL)
+  run Testing.expect(selected(&tree, fixtures.SEARCH, 0, 21), "Control+A is no shortcut there")
+}
+
+test effect fn movingByGraphemeWordAndLine() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run movementBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Clipboard.
+
+fn writes(list: &List<HostRequest>, text: string) -> bool {
+  let values = list.asSlice()
+  if values.length != 1 {
+    return false
+  }
+  return match &values[0] {
+    HostRequest.WriteClipboard { text: written } => String.view(&written) == text
+    HostRequest.ReadClipboard { .. } => false
+  }
+}
+
+fn reads(list: &List<HostRequest>, id: u32) -> bool {
+  let values = list.asSlice()
+  if values.length != 1 {
+    return false
+  }
+  return match &values[0] {
+    HostRequest.WriteClipboard { .. } => false
+    HostRequest.ReadClipboard { target } => target == id
+  }
+}
+
+effect fn clipboardBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run editor(&collection)
+  run key(&mut tree, "c", MOD_CONTROL)
+  let copied = run requests(&mut tree)
+  run Testing.expect(writes(&copied, "wonderful"), "Control+C asks to write the selection")
+  run key(&mut tree, "x", MOD_CONTROL)
+  let cut = run requests(&mut tree)
+  run Testing.expect(writes(&cut, "wonderful"), "Control+X writes it too")
+  run Testing.expect(value(&tree, fixtures.SEARCH) == "Hello  world", "and deletes it")
+  let events = run drain(&mut tree)
+  run Testing.expect(lastInput(&events, "Hello  world", "deleteByCut"), "as a cut")
+  run key(&mut tree, "v", MOD_CONTROL)
+  let pasting = run requests(&mut tree)
+  run Testing.expect(reads(&pasting, fixtures.SEARCH), "Control+V asks for the clipboard")
+  run tree.dispatch(Input.Paste { target: fixtures.SEARCH, text: run String.copy("big\nnew") })
+  run Testing.expect(
+    value(&tree, fixtures.SEARCH) == "Hello big new world",
+    "the answer is pasted, line breaks as spaces",
+  )
+  let pasted = run drain(&mut tree)
+  run Testing.expect(lastInput(&pasted, "Hello big new world", "insertFromPaste"), "as a paste")
+  run tree.dispatch(Input.Paste { target: fixtures.NAME, text: run String.copy("stale") })
+  run Testing.expect(
+    value(&tree, fixtures.SEARCH) == "Hello big new world" && value(&tree, fixtures.NAME) == "",
+    "a paste for an input without focus is dropped",
+  )
+  run key(&mut tree, "c", MOD_CONTROL)
+  let nothing = run requests(&mut tree)
+  run Testing.expect(nothing.length() == 0, "copying a caret asks nothing")
+
+  // Read-only inputs copy but neither cut nor paste.
+  run focus(&mut tree, fixtures.LOCKED)
+  run key(&mut tree, "a", MOD_CONTROL)
+  run key(&mut tree, "x", MOD_CONTROL)
+  let locked = run requests(&mut tree)
+  run Testing.expect(writes(&locked, "Read only"), "a read-only input copies")
+  run Testing.expect(value(&tree, fixtures.LOCKED) == "Read only", "but does not cut")
+  run key(&mut tree, "v", MOD_CONTROL)
+  let none = run requests(&mut tree)
+  run Testing.expect(none.length() == 0, "nor paste")
+}
+
+test effect fn clipboardGoesThroughHostRequests() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run clipboardBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Pointer selection.
+
+effect fn caretAt(tree: &mut UiTree<'_>, id: u32, offset: usize) -> Rect<f32>
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  run setSelection(&mut tree, id, offset, offset)
+  run tree.frame(viewport())
+  return run tree.caretRect(id)
+}
+
+effect fn pointerBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run editor(&collection)
+
+  // Caret positions come from the glyph advances: they grow with the offset.
+  let start = run caretAt(&mut tree, fixtures.SEARCH, 0)
+  let six = run caretAt(&mut tree, fixtures.SEARCH, 6)
+  let seven = run caretAt(&mut tree, fixtures.SEARCH, 7)
+  let end = run caretAt(&mut tree, fixtures.SEARCH, 21)
+  run Testing.expect(near(start.xMin, 29.0), "the caret starts at the content box")
+  run Testing.expect(
+    six.xMin > start.xMin && seven.xMin > six.xMin && end.xMin > seven.xMin,
+    "and moves right",
+  )
+  run Testing.expect(start.yMin > 20.0 && start.yMax < 54.0, "inside the input")
+
+  // A click goes to the nearest boundary.
+  let middle = (six.yMin + six.yMax) * 0.5
+  run click(&mut tree, six.xMin + (seven.xMin - six.xMin) * 0.3, middle, 1)
+  run Testing.expect(selected(&tree, fixtures.SEARCH, 6, 6), "a click left of a glyph's middle")
+  run click(&mut tree, six.xMin + (seven.xMin - six.xMin) * 0.7, middle, 1)
+  run Testing.expect(selected(&tree, fixtures.SEARCH, 7, 7), "and right of it")
+  run click(&mut tree, 335.0, middle, 1)
+  run Testing.expect(selected(&tree, fixtures.SEARCH, 21, 21), "past the end")
+
+  // Shift extends, a drag selects, double and triple clicks select a word and everything.
+  run press(&mut tree, six.xMin, middle, 1, MOD_SHIFT)
+  run release(&mut tree, six.xMin, middle)
+  run Testing.expect(selected(&tree, fixtures.SEARCH, 21, 6), "Shift+click extends")
+  run press(&mut tree, start.xMin, middle, 1, 0)
+  run tree.dispatch(Input.PointerMove { x: seven.xMin, y: middle, modifiers: 0 })
+  run release(&mut tree, seven.xMin, middle)
+  run Testing.expect(selected(&tree, fixtures.SEARCH, 0, 7), "a drag selects")
+  run click(&mut tree, seven.xMin + 2.0, middle, 2)
+  run Testing.expect(selected(&tree, fixtures.SEARCH, 6, 15), "a double click selects the word")
+  run press(&mut tree, six.xMin + 1.0, middle, 2, 0)
+  run tree.dispatch(Input.PointerMove { x: end.xMin - 1.0, y: middle, modifiers: 0 })
+  run release(&mut tree, end.xMin - 1.0, middle)
+  run Testing.expect(selected(&tree, fixtures.SEARCH, 6, 21), "a double click drag selects words")
+  run click(&mut tree, seven.xMin, middle, 3)
+  run Testing.expect(selected(&tree, fixtures.SEARCH, 0, 21), "a triple click selects the line")
+
+  // A click into another input focuses it and places its caret.
+  let field = tree.node(tree.slotOf(fixtures.LOCKED)).id
+  run click(&mut tree, 29.0, 239.0, 1)
+  run Testing.expect(tree.focused == tree.slotOf(field), "the click focuses the input")
+  run Testing.expect(selected(&tree, fixtures.LOCKED, 0, 0), "with the caret at the start")
+}
+
+test effect fn pointerSelectionUsesTheTextFragments() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run pointerBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Multiline.
+
+effect fn multilineBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run editor(&collection)
+  run focus(&mut tree, fixtures.NOTES)
+  run setSelection(&mut tree, fixtures.NOTES, 3, 3)
+  run tree.frame(viewport())
+  let first = run tree.caretRect(fixtures.NOTES)
+  run key(&mut tree, "ArrowDown", 0)
+  run tree.frame(viewport())
+  let second = run tree.caretRect(fixtures.NOTES)
+  run Testing.expect(second.yMin > first.yMin, "Down moves a line down")
+  run Testing.expect(f32.abs(second.xMin - first.xMin) < 6.0, "keeping its x")
+  let down = tree.selection(fixtures.NOTES).y
+  run Testing.expect(down > 11 && down < 17, "into the second line")
+
+  // The second line wraps: End stops at the end of its visual line, not at the line break.
+  run key(&mut tree, "End", 0)
+  let wrapEnd = tree.selection(fixtures.NOTES).y
+  run Testing.expect(wrapEnd == 52, "End goes to the end of the wrapped line, before its space")
+  run key(&mut tree, "ArrowDown", 0)
+  run key(&mut tree, "End", 0)
+  run Testing.expect(
+    selected(&tree, fixtures.NOTES, 70, 70),
+    "the last line ends at the line break",
+  )
+  run key(&mut tree, "ArrowDown", 0)
+  run Testing.expect(selected(&tree, fixtures.NOTES, 71, 71), "and the empty line after it")
+  run tree.frame(viewport())
+  let last = run tree.caretRect(fixtures.NOTES)
+  run Testing.expect(last.yMin > second.yMin && near(last.xMin, 29.0), "the empty line has a caret")
+  run key(&mut tree, "ArrowDown", 0)
+  run Testing.expect(
+    selected(&tree, fixtures.NOTES, 71, 71),
+    "Down on the last line stays at the end",
+  )
+  run key(&mut tree, "ArrowUp", MOD_CONTROL + MOD_SHIFT)
+  run Testing.expect(tree.selection(fixtures.NOTES).x == 71, "Shift keeps the anchor")
+
+  // Enter breaks the line.
+  run setSelection(&mut tree, fixtures.NOTES, 5, 5)
+  run key(&mut tree, "Enter", 0)
+  run Testing.expect(
+    String.startsWith(value(&tree, fixtures.NOTES), "First\n line"),
+    "Enter inserts a line break",
+  )
+  let events = run drain(&mut tree)
+  run Testing.expect(inputCount(&events) == 1, "as one input record")
+  run Testing.expect(
+    lastInput(&events, value(&tree, fixtures.NOTES), "insertLineBreak"),
+    "named insertLineBreak",
+  )
+  run key(&mut tree, "Home", 0)
+  run Testing.expect(selected(&tree, fixtures.NOTES, 6, 6), "Home goes to the line's start")
+}
+
+test effect fn multilineMovesByVisualLines() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run multilineBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Composition.
+
+effect fn compositionBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run editor(&collection)
+  run setSelection(&mut tree, fixtures.SEARCH, 5, 5)
+  run tree.frame(viewport())
+  let before = run tree.caretRect(fixtures.SEARCH)
+  let area = run tree.imeArea()
+  run Testing.expect(area.enabled && near(area.rect.xMin, before.xMin), "the IME area is the caret")
+  drop run drain(&mut tree)
+
+  // "にほ" (6 bytes), caret at its end: drawn in the text, not in the value.
+  run preedit(&mut tree, "\u{306b}\u{307b}", 6, 6)
+  run Testing.expect(value(&tree, fixtures.SEARCH) == fixtures.SEARCH_VALUE, "the value waits")
+  let shown = run describeOf(&tree, fixtures.SEARCH)
+  run Testing.expect(
+    String.contains(String.view(&shown), "preedit=\"\u{306b}\u{307b}\""),
+    "describe shows it",
+  )
+  run tree.frame(viewport())
+  let inside = run tree.caretRect(fixtures.SEARCH)
+  run Testing.expect(inside.xMin > before.xMin + 4.0, "the caret moves past the composition")
+  let composingArea = run tree.imeArea()
+  run Testing.expect(near(composingArea.rect.xMin, before.xMin), "the IME area stays at its start")
+  let events = run drain(&mut tree)
+  run Testing.expect(inputCount(&events) == 0, "composing queues no input records")
+
+  // Converting: the whole text selected as one clause, then committed.
+  run preedit(&mut tree, "\u{65e5}\u{672c}", 0, 6)
+  run tree.frame(viewport())
+  run typeText(&mut tree, "\u{65e5}\u{672c}")
+  run Testing.expect(
+    value(&tree, fixtures.SEARCH) == "Hello\u{65e5}\u{672c} wonderful world",
+    "the commit inserts the text",
+  )
+  run Testing.expect(selected(&tree, fixtures.SEARCH, 11, 11), "with the caret after it")
+  let committed = run drain(&mut tree)
+  run Testing.expect(inputCount(&committed) == 1, "as one input record")
+  let after = run describeOf(&tree, fixtures.SEARCH)
+  run Testing.expect(
+    !String.contains(String.view(&after), "preedit="),
+    "and the composition is over",
+  )
+
+  // An empty preedit cancels; a composition replaces the selection.
+  run preedit(&mut tree, "x", 1, 1)
+  run preedit(&mut tree, "", 0, 0)
+  run Testing.expect(
+    value(&tree, fixtures.SEARCH) == "Hello\u{65e5}\u{672c} wonderful world",
+    "cancel leaves the value",
+  )
+  run setSelection(&mut tree, fixtures.SEARCH, 0, 5)
+  run preedit(&mut tree, "\u{304b}", 3, 3)
+  run Testing.expect(
+    value(&tree, fixtures.SEARCH) == "\u{65e5}\u{672c} wonderful world",
+    "the selection goes",
+  )
+  let replaced = run drain(&mut tree)
+  run Testing.expect(
+    lastInput(&replaced, "\u{65e5}\u{672c} wonderful world", "deleteByComposition"),
+    "as a deletion",
+  )
+
+  // Keys pass to the input method while it composes; a click commits.
+  run key(&mut tree, "Backspace", 0)
+  run Testing.expect(
+    value(&tree, fixtures.SEARCH) == "\u{65e5}\u{672c} wonderful world",
+    "keys do not edit",
+  )
+  run tree.frame(viewport())
+  run click(&mut tree, 335.0, 37.0, 1)
+  run Testing.expect(
+    value(&tree, fixtures.SEARCH) == "\u{304b}\u{65e5}\u{672c} wonderful world",
+    "a click commits",
+  )
+
+  // Focus leaving ends a composition without committing it.
+  run preedit(&mut tree, "\u{304b}", 3, 3)
+  run focus(&mut tree, fixtures.NAME)
+  run Testing.expect(
+    value(&tree, fixtures.SEARCH) == "\u{304b}\u{65e5}\u{672c} wonderful world",
+    "blur drops it",
+  )
+  let moved = run tree.imeArea()
+  run Testing.expect(moved.enabled, "the IME follows the new focus")
+}
+
+test effect fn compositionIsDrawnInTheTextAndCommitted() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run compositionBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Controlled values, blinking and scrolling.
+
+effect fn controlBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run editor(&collection)
+
+  // Echoing the value back changes nothing; another value puts the caret at the end.
+  run typeText(&mut tree, "!")
+  let echoed = run String.copy(value(&tree, fixtures.SEARCH))
+  run setValue(&mut tree, fixtures.SEARCH, String.view(&echoed))
+  run Testing.expect(selected(&tree, fixtures.SEARCH, 7, 7), "an echoed value keeps the caret")
+  run key(&mut tree, "z", MOD_CONTROL)
+  run Testing.expect(value(&tree, fixtures.SEARCH) == fixtures.SEARCH_VALUE, "and the undo history")
+  run setValue(&mut tree, fixtures.SEARCH, "HELLO")
+  run Testing.expect(
+    selected(&tree, fixtures.SEARCH, 5, 5),
+    "a new value moves the caret to the end",
+  )
+  run key(&mut tree, "z", MOD_CONTROL)
+  run Testing.expect(value(&tree, fixtures.SEARCH) == "HELLO", "and forgets the history")
+
+  // SetSelection clamps and keeps to character boundaries.
+  run setValue(&mut tree, fixtures.SEARCH, "a\u{e9}b")
+  run setSelection(&mut tree, fixtures.SEARCH, 2, 99)
+  run Testing.expect(
+    selected(&tree, fixtures.SEARCH, 1, 4),
+    "inside a character goes back to its start",
+  )
+
+  // The caret blinks with frame time, repainting only its input; edits restart the blink.
+  run tree.frame(at(0.0))
+  run Testing.expect(tree.nextBlink() == 0.5, "the caret turns off at 0.5")
+  run tree.frame(at(0.2))
+  run Testing.expect(tree.stats.repaintedSubtrees == 0, "nothing repaints while it is on")
+  run tree.frame(at(0.6))
+  run Testing.expect(!tree.node(tree.slotOf(fixtures.SEARCH)).edit.caretOn, "off")
+  run Testing.expect(tree.stats.repaintedSubtrees == 2, "repainting the input and the root")
+  run Testing.expect(tree.nextBlink() == 1.0, "and on again at 1.0")
+  run typeText(&mut tree, "c")
+  run Testing.expect(tree.needsFrame(), "an edit needs a frame")
+  run tree.frame(at(0.7))
+  run Testing.expect(tree.node(tree.slotOf(fixtures.SEARCH)).edit.caretOn, "typing shows the caret")
+  run Testing.expect(tree.nextBlink() == 1.2, "for another half second")
+  run key(&mut tree, "ArrowLeft", 0)
+  run Testing.expect(tree.needsFrame(), "a caret move needs a frame")
+
+  // A long value scrolls to keep the caret in view, and back.
+  run setValue(
+    &mut tree,
+    fixtures.SEARCH,
+    "A long value that does not fit in the search field at all, not even close",
+  )
+  run tree.frame(viewport())
+  let scrolled = tree.scrollOffset(fixtures.SEARCH).x
+  run Testing.expect(scrolled > 100.0, "the end is scrolled into view")
+  let caret = run tree.caretRect(fixtures.SEARCH)
+
+  // Scrolled content draws at whole device pixels (scale 3): within one of the edge.
+  run Testing.expect(
+    caret.xMax <= 340.01 + 1.0 / 3.0 && caret.xMin > 300.0,
+    "with the caret at the right edge",
+  )
+  run key(&mut tree, "Home", 0)
+  run tree.frame(viewport())
+  run Testing.expect(tree.scrollOffset(fixtures.SEARCH).x == 0.0, "Home scrolls back")
+  run key(&mut tree, "End", 0)
+  run tree.frame(viewport())
+  run focus(&mut tree, fixtures.NAME)
+  run tree.frame(viewport())
+  run Testing.expect(tree.scrollOffset(fixtures.SEARCH).x == 0.0, "losing focus shows the start")
+
+  // Tab into an input selects its text.
+  run focus(&mut tree, fixtures.NOTES)
+  run key(&mut tree, "Tab", 0)
+  run Testing.expect(tree.focused == tree.slotOf(fixtures.NAME), "Tab moves on")
+  run focus(&mut tree, fixtures.NAME)
+  run key(&mut tree, "Tab", 0)
+  run Testing.expect(selected(&tree, fixtures.LOCKED, 0, 9), "and selects the next input's text")
+}
+
+test effect fn controlledValuesBlinkingAndScrolling() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run controlBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Pixels.
+
+fn samePixels(a: &Pixmap, b: &Pixmap) -> bool {
+  let x = a.data()
+  let y = b.data()
+  if a.width() != b.width() || a.height() != b.height() || x.length != y.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < x.length {
+    if x[i] != y[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+effect fn render(tree: &mut UiTree<'_>) -> Pixmap
+  ! GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut snapshot = CpuSnapshot.make()
+  run snapshot.sync(&mut tree)
+  return run snapshot.render(&tree)
+}
+
+effect fn pixelsBody() -> ()
+  ! AssertionError<'static> | TreeError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+
+  // Edited through input, frame by frame, the editor draws what a fresh one with the same
+  // value and selection draws.
+  let mut tree = run editor(&collection)
+  run key(&mut tree, "End", 0)
+  run tree.frame(viewport())
+  run typeText(&mut tree, "s")
+  run tree.frame(viewport())
+  run key(&mut tree, "ArrowLeft", MOD_CONTROL + MOD_SHIFT)
+  run tree.frame(viewport())
+  let edited = run render(&mut tree)
+  let mut fresh = run editor(&collection)
+  let mut batch = Batch.make()
+  run batch.setText(fixtures.SEARCH, "Hello wonderful worlds")
+  run batch.select(fixtures.SEARCH, 22, 16)
+  run fresh.apply(run batch.take())
+  run fresh.frame(viewport())
+  let expected = run render(&mut fresh)
+  run Testing.expect(samePixels(&edited, &expected), "edited pixels match a fresh tree")
+
+  // A composition draws its text and underline; cancelling it draws the input as before.
+  run key(&mut tree, "End", 0)
+  run tree.frame(viewport())
+  let plain = run render(&mut tree)
+  run preedit(&mut tree, "ab", 2, 2)
+  run tree.frame(viewport())
+  let composing = run render(&mut tree)
+  run Testing.expect(!samePixels(&plain, &composing), "the composition shows")
+  run preedit(&mut tree, "", 0, 0)
+  run tree.frame(viewport())
+  let cancelled = run render(&mut tree)
+  run Testing.expect(samePixels(&plain, &cancelled), "and goes away when cancelled")
+}
+
+test effect fn editsDrawWhatAFreshTreeDraws() -> ()
+  ! AssertionError<'static> | TreeError | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run pixelsBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}

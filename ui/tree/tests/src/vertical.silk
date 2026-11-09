@@ -1,0 +1,97 @@
+//! Vertical layout must shape and paint glyphs along the inline axis.
+import ui_fixtures.fixtures as fixtures
+import ui_tree.lib {
+  UiTree,
+  TreeError,
+  Batch,
+  FrameInput,
+  CpuSnapshot,
+  Property,
+  NodeKind,
+  Length,
+  WritingMode,
+  TextOrientation
+}
+import vector.geometry_error { GeometryError }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+
+effect fn body() -> ()
+  ! TreeError | GeometryError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.style(
+    1,
+    &[
+      Property.Width { value: Length.px(100.0) },
+      Property.Height { value: Length.px(180.0) },
+      Property.FontSize { value: 24.0 },
+      Property.WritingMode { value: WritingMode.VerticalRl },
+      Property.TextOrientation { value: TextOrientation.Upright },
+    ],
+  )
+  run batch.text(1, 2, "ABC")
+  run tree.apply(run batch.take())
+  let input = FrameInput { width: 100.0, height: 180.0, scale: 1.0, time: 0.0 }
+  run tree.frame(input)
+  let mut count: usize = 0
+  let mut index: usize = 0
+  while index < tree.output.fragments.texts.length() {
+    let fragment = tree.output.fragments.texts.get(index)
+    let glyphs = tree.provider.text.runGlyphs(fragment.shapeKey)
+    let mut i: usize = 0
+    while i < glyphs.length {
+      run Testing.expect(
+        glyphs[i].upright && glyphs[i].advance > 0.0,
+        "vertical upright shaping uses vertical advances",
+      )
+      if i > 0 {
+        run Testing.expect(
+          glyphs[i].x > glyphs[i - 1].x,
+          "vertical glyphs advance down the inline axis",
+        )
+      }
+      count = count + 1
+      i = i + 1
+    }
+    index = index + 1
+  }
+  run Testing.expect(
+    count == 3 && tree.stats.glyphs == 3,
+    "all vertical glyphs are shaped and painted",
+  )
+  let mut snapshot = CpuSnapshot.make()
+  run snapshot.sync(&mut tree)
+  let upright = run snapshot.render(&tree)
+  let mut change = Batch.make()
+  run change.style(1, &[Property.TextOrientation { value: TextOrientation.Sideways }])
+  run tree.apply(run change.take())
+  run tree.frame(input)
+  run snapshot.sync(&mut tree)
+  let sideways = run snapshot.render(&tree)
+  let a = upright.data()
+  let b = sideways.data()
+  let mut different = false
+  index = 0
+  while index < a.length {
+    if a[index] != b[index] {
+      different = true
+    }
+    index = index + 1
+  }
+  run Testing.expect(
+    different && tree.stats.glyphs == 3,
+    "changing text orientation repaints rotated glyphs",
+  )
+}
+
+test effect fn verticalGlyphs() -> ()
+  ! TreeError | GeometryError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run body() |> Effect.provideMut<Allocator>(&mut allocator)
+}

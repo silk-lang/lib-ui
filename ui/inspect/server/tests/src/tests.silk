@@ -1,0 +1,1159 @@
+import ui_tree_window.lib { feed }
+import ui_tree.mutation { LISTEN_ALL }
+import window.event { Event as WindowEvent, MouseButton, Modifiers, Key }
+import window.keys { KeyCode }
+import window.types { WindowId }
+import silk.geometry.point { Point2 }
+import ui_tree.mutation { Attribute }
+import ui_scene.scene { Scene }
+import ui_scene.primitives { Quad, ContentMask, Background }
+import ui_scene.color as color
+import silk.geometry.rect { Rect }
+//! Inspector protocol tests over the inbox fixture: every command through `Protocol.handle`,
+//! and requests over a real Unix socket through `Inspector.poll`. Run from the repository root
+//! (the fixtures read fonts from there; the socket file is made there and removed). The MCP
+//! bridge is driven over the same fixture, with `Protocol.handle` in place of the socket.
+import ui_fixtures.fixtures as fixtures
+import ui_inspect_server.lib {
+  Protocol,
+  Outcome,
+  Inspector,
+  Address,
+  parseAddress,
+  describeAddress,
+  roleNamed,
+  Bridge,
+  Action,
+  writeValue
+}
+import ui_inspect.lib { InspectOptions, inspectNode }
+import ui_tree.lib {
+  UiTree,
+  TreeError,
+  Batch,
+  FrameInput,
+  DescribeOptions,
+  Role,
+  Event,
+  EventKind,
+  NONE,
+  describe
+}
+import ui_tree.inspect { writeInt }
+import font_collection.lib { FontCollection }
+import codec.png
+import codec.png { PngError }
+import codec.image { ImageError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.encoding.base64 { Base64, Base64Error }
+import silk.io.byte_duplex { ByteDuplex, ByteIoError, ReadTransfer }
+import silk.io.writer { Writer }
+import silk.io.writer_native { StderrWriter }
+import silk.json.scanner { JsonError }
+import silk.json.value { Json, Value }
+import silk.num.usize
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.net.socket_native { ConnectOptions, Connection, NativeSocketError, connectUnixOwned }
+import silk.num.u64
+import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.system.filesystem_machine { MachineFileSystem }
+import silk.system.host_input { HostInputError }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
+import silk.system.system_clock { Instant }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+effect fn say(text: string) -> () {
+  let mut writer = StderrWriter.make()
+  drop run Effect.result(Writer.writeString(text) |> Effect.provideMut<Writer>(&mut writer))
+}
+
+effect fn inbox(collection: &FontCollection) -> UiTree<'_>
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut tree = run UiTree.make(collection)
+  let mut batch = Batch.make()
+  run fixtures.inbox(&mut batch)
+  run tree.apply(run batch.take())
+  run tree.frame(FrameInput { width: 360.0, height: 440.0, scale: 2.0, time: 0.0 })
+  return move tree
+}
+
+/// Runs one request line and parses the reply.
+effect fn ask(protocol: &mut Protocol, tree: &mut UiTree<'_>, line: string) -> Value
+  ! JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  let request = run Json.parse(String.utf8Bytes(line))
+  let mut out = String.make()
+  let outcome = run protocol.handle(&mut tree, &request, 0, &mut out)
+  while run protocol.dispatchNext(&mut tree) {}
+  if outcome == Outcome.Pending {
+    return run Json.parse(b"{\"pending\":true}")
+  }
+  let reply = run Json.parse(out.ownedUtf8Bytes())
+  return move reply
+}
+
+/// Runs one request line and returns the reply line as it was written.
+effect fn raw(protocol: &mut Protocol, tree: &mut UiTree<'_>, line: string) -> String
+  ! JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  let request = run Json.parse(String.utf8Bytes(line))
+  let mut out = String.make()
+  drop run protocol.handle(&mut tree, &request, 0, &mut out)
+  while run protocol.dispatchNext(&mut tree) {}
+  return move out
+}
+
+/// How many times `needle` occurs in `text`.
+fn occurrences(text: string, needle: string) -> usize {
+  let mut count: usize = 0
+  let mut rest = text
+  while true {
+    match String.find(rest, needle) {
+      Option<usize>.Some { value } => {
+        count = count + 1
+        let from = value + String.byteLength(needle)
+        rest = String.slice(rest, from, String.byteLength(rest) - from)
+      }
+      Option<usize>.None => {
+        break
+      }
+    }
+  }
+  return count
+}
+
+fn ok(reply: &Value) -> bool {
+  return match Json.field(reply, "ok") {
+    Option<&Value>.Some { value } => match &value.* {
+      Value.Bool { value: b } => b
+      _ => false
+    }
+    Option<&Value>.None => false
+  }
+}
+
+fn pending(reply: &Value) -> bool {
+  return match Json.field(reply, "pending") {
+    Option<&Value>.Some { value } => true
+    Option<&Value>.None => false
+  }
+}
+
+fn text<'a>(reply: &'a Value, key: string) -> string<'a> {
+  return match Json.asString(Json.field(reply, key)) {
+    Option<string>.Some { value } => value
+    Option<string>.None => ""
+  }
+}
+
+fn int(reply: &Value, key: string) -> i64 {
+  return match Json.asI64(Json.field(reply, key)) {
+    Option<i64>.Some { value } => value
+    Option<i64>.None => -1
+  }
+}
+
+fn nodeId(reply: &Value) -> i64 {
+  return match Json.asI64(Json.fieldAt(Json.field(reply, "node"), "id")) {
+    Option<i64>.Some { value } => value
+    Option<i64>.None => -1
+  }
+}
+
+fn sameBytes(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < a.length {
+    if a[i] != b[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn same(a: string, b: string) -> bool {
+  return a == b
+}
+
+effect fn readOnlyBody() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run inbox(&collection)
+  let mut protocol = Protocol.make()
+
+  let hello = run ask(&mut protocol, &mut tree, "{\"id\":7,\"cmd\":\"hello\"}")
+  run Testing.expect(ok(&hello) && int(&hello, "id") == 7, "hello echoes the id")
+  run Testing.expect(int(&hello, "protocol") == 1, "protocol version 1")
+  run Testing.expect(int(&hello, "root") == 1, "the inbox panel is the root")
+
+  let snap = run ask(&mut protocol, &mut tree, "{\"cmd\":\"snapshot\"}")
+  let mut expected = String.make()
+  run describe(&tree, DescribeOptions.plain(), &mut expected)
+  run Testing.expect(same(text(&snap, "text"), String.view(&expected)), "snapshot is describe")
+  let part = run ask(&mut protocol, &mut tree, "{\"cmd\":\"snapshot\",\"node\":10}")
+  run Testing.expect(String.startsWith(text(&part, "text"), "box #10"), "a subtree snapshot")
+
+  let buttons = run ask(&mut protocol, &mut tree, "{\"cmd\":\"query\",\"role\":\"button\"}")
+  run Testing.expect(int(&buttons, "count") == 3, "three buttons")
+  let archive = run ask(
+    &mut protocol,
+    &mut tree,
+    "{\"cmd\":\"query\",\"query\":{\"role\":\"button\",\"name\":\"archive\"}}",
+  )
+  run Testing.expect(int(&archive, "count") == 1, "Archive by role and name, nested query")
+  let none = run ask(&mut protocol, &mut tree, "{\"cmd\":\"query\",\"role\":\"wizard\"}")
+  run Testing.expect(!ok(&none) && same(text(&none, "error"), "unknown role"), "unknown role")
+
+  let view = run ask(
+    &mut protocol,
+    &mut tree,
+    "{\"cmd\":\"inspect\",\"role\":\"button\",\"name\":\"New\"}",
+  )
+  let mut panel = String.make()
+  run inspectNode(&tree, fixtures.NEW_BUTTON, InspectOptions.all(), &mut panel)
+  run Testing.expect(same(text(&view, "text"), String.view(&panel)), "inspect is the node view")
+  run Testing.expect(nodeId(&view) == 10, "inspect names the node")
+  run Testing.expect(
+    same(text(Json.field(&view, "node") |> Option<&Value>.unwrapOr(&view), "name"), "New"),
+    "with its accessible name",
+  )
+
+  // The element tree: every node in tree order with its parent, depth and child count.
+  let elements = run raw(&mut protocol, &mut tree, "{\"cmd\":\"tree\"}")
+  let list = String.view(&elements)
+  run Testing.expect(String.contains(list, "\"nodes\":[{\"id\":1,\"kind\":\"box\""), "root first")
+  run Testing.expect(occurrences(list, "\"depth\":") == tree.nodeCount(), "one entry per node")
+  run Testing.expect(String.contains(list, "\"parent\":1,\"depth\":1,"), "children of the root")
+  let branch = run raw(&mut protocol, &mut tree, "{\"cmd\":\"tree\",\"node\":20}")
+  run Testing.expect(
+    String.contains(String.view(&branch), "\"depth\":0,\"children\":1}"),
+    "a subtree starts at depth 0",
+  )
+  run Testing.expect(occurrences(String.view(&branch), "\"depth\":") == 2, "Archive and its text")
+
+  // inspect carries the box model as numbers.
+  let boxed = run raw(&mut protocol, &mut tree, "{\"cmd\":\"inspect\",\"node\":20}")
+  run Testing.expect(
+    String.contains(
+      String.view(&boxed),
+      "\"box\":{\"margin\":{\"x\":75.36,\"y\":12,\"width\":76.64,\"height\":31},",
+    ),
+    "the margin box",
+  )
+  run Testing.expect(
+    String.contains(
+      String.view(&boxed),
+      "\"content\":{\"x\":87.36,\"y\":18,\"width\":52.64,\"height\":19},\"fragments\":1}",
+    ),
+    "the content box",
+  )
+
+  let picked = run ask(&mut protocol, &mut tree, "{\"cmd\":\"pick\",\"x\":40,\"y\":27}")
+  run Testing.expect(ok(&picked) && nodeId(&picked) != -1, "pick finds a node under New")
+
+  let missing = run ask(&mut protocol, &mut tree, "{\"cmd\":\"inspect\",\"node\":999}")
+  run Testing.expect(!ok(&missing) && same(text(&missing, "error"), "no node matches"), "no node")
+  let unknown = run ask(&mut protocol, &mut tree, "{\"cmd\":\"fly\"}")
+  run Testing.expect(!ok(&unknown) && same(text(&unknown, "error"), "unknown cmd"), "unknown cmd")
+  let array = run ask(&mut protocol, &mut tree, "[1]")
+  run Testing.expect(!ok(&array), "a request must be an object")
+
+  let stats = run ask(&mut protocol, &mut tree, "{\"cmd\":\"stats\"}")
+  run Testing.expect(ok(&stats) && int(&stats, "nodes") > 10, "stats count the nodes")
+  let item = match roleNamed("listitem") {
+    Option<Role>.Some { value } => value == Role.ListItem
+    Option<Role>.None => false
+  }
+  run Testing.expect(item, "roles by ARIA name")
+}
+
+test effect fn readOnlyCommandsDescribeTheTree() -> ()
+  ! AssertionError<'static>
+    | TreeError
+    | JsonError
+    | FileError
+    | HostInputError
+    | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run readOnlyBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn decodePng(reply: &Value) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let encoded = String.utf8Bytes(text(reply, "png"))
+  let length = match Base64.decodedLength(encoded) {
+    Result<usize, Base64Error>.Success { value } => value
+    Result<usize, Base64Error>.Failure { error } => 0
+  }
+  let mut bytes = run Bytes.zeroed(length)
+  drop Base64.decodeInto(bytes.asMutSlice(), encoded)
+  return move bytes
+}
+
+effect fn inputBody() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | ImageError | PngError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run inbox(&collection)
+  let mut protocol = Protocol.make()
+  run protocol.afterFrame(&tree)
+
+  // Screenshots: the frame, the frame with a highlight, one node.
+  let plain = run ask(&mut protocol, &mut tree, "{\"cmd\":\"screenshot\"}")
+  run Testing.expect(int(&plain, "width") == 720 && int(&plain, "height") == 880, "device size")
+  let first = run png.decode(Bytes.asSlice(&run decodePng(&plain)))
+  run Testing.expect(first.width() == 720, "a PNG of the frame")
+  let lit = run ask(&mut protocol, &mut tree, "{\"cmd\":\"highlight\",\"nodes\":[20,999]}")
+  run Testing.expect(ok(&lit) && protocol.repaint && protocol.highlighting(), "highlight on")
+  let marked = run ask(&mut protocol, &mut tree, "{\"cmd\":\"screenshot\"}")
+  let second = run png.decode(Bytes.asSlice(&run decodePng(&marked)))
+  run Testing.expect(!sameBytes(first.data(), second.data()), "the highlight is in the screenshot")
+  let node = run ask(&mut protocol, &mut tree, "{\"cmd\":\"screenshot\",\"node\":20}")
+  run Testing.expect(int(&node, "node") == 20 && int(&node, "width") < 720, "a node crop")
+  let off = run ask(&mut protocol, &mut tree, "{\"cmd\":\"highlight\",\"nodes\":[]}")
+  run Testing.expect(ok(&off) && !protocol.highlighting(), "highlight off")
+
+  // Click New by role and name: the tree queues a click on it.
+  let clicked = run ask(
+    &mut protocol,
+    &mut tree,
+    "{\"cmd\":\"click\",\"role\":\"button\",\"name\":\"New\"}",
+  )
+  run Testing.expect(ok(&clicked) && int(&clicked, "node") == 10, "click New")
+  run Testing.expect(protocol.dispatched, "input waits for the app")
+  let empty = run raw(&mut protocol, &mut tree, "{\"cmd\":\"events\"}")
+  run Testing.expect(
+    String.contains(String.view(&empty), "\"next\":1,\"events\":[]"),
+    "nothing logged before the app takes records",
+  )
+  run protocol.observe(&tree)
+  let log = run raw(&mut protocol, &mut tree, "{\"cmd\":\"events\"}")
+  run Testing.expect(
+    String.contains(String.view(&log), "\"kind\":\"click\",\"target\":10,\"path\":[1,2,10]"),
+    "the click on New is logged with its path",
+  )
+  let logged = protocol.log.length()
+  run Testing.expect(logged >= 1 && protocol.nextSeq == usize.toU64(logged) + 1, "numbered from 1")
+  let mut sinceLine = run String.copy("{\"cmd\":\"events\",\"since\":")
+  run writeInt(&mut sinceLine, usize.toU64(logged))
+  run sinceLine.append("}")
+  let none = run raw(&mut protocol, &mut tree, String.view(&sinceLine))
+  run Testing.expect(String.contains(String.view(&none), "\"events\":[]"), "since skips them")
+  let newest = run raw(&mut protocol, &mut tree, "{\"cmd\":\"events\",\"limit\":1}")
+  run Testing.expect(occurrences(String.view(&newest), "\"seq\":") == 1, "limit keeps the newest")
+  let mut records = List<Event>.make()
+  run tree.takeEvents(&mut records)
+  let mut sawClick = false
+  let values = records.asSlice()
+  let mut i: usize = 0
+  while i < values.length {
+    if values[i].kind == EventKind.Click && values[i].target == fixtures.NEW_BUTTON {
+      sawClick = true
+    }
+    i = i + 1
+  }
+  run Testing.expect(sawClick, "the app sees a click record on New")
+
+  // Tab moves focus; scroll moves the list.
+  let tabbed = run ask(&mut protocol, &mut tree, "{\"cmd\":\"press\",\"key\":\"Tab\"}")
+  run Testing.expect(ok(&tabbed) && tree.focused != NONE, "Tab focuses something")
+  let scrolled = run ask(
+    &mut protocol,
+    &mut tree,
+    "{\"cmd\":\"scroll\",\"x\":340,\"y\":112,\"dy\":60}",
+  )
+  run Testing.expect(ok(&scrolled), "scroll the list")
+  run tree.frame(FrameInput { width: 360.0, height: 440.0, scale: 2.0, time: 0.1 })
+  run protocol.afterFrame(&tree)
+  run Testing.expect(tree.scrollOffset(fixtures.INBOX_LIST).y == 60.0, "the list scrolled by 60")
+  let typed = run ask(&mut protocol, &mut tree, "{\"cmd\":\"type\",\"text\":\"hé\\n\"}")
+  run Testing.expect(int(&typed, "typed") == 3, "three characters, one of them Enter")
+  let point = run ask(&mut protocol, &mut tree, "{\"cmd\":\"hover\",\"x\":5,\"y\":5}")
+  run Testing.expect(ok(&point), "hover at a point")
+  let nowhere = run ask(&mut protocol, &mut tree, "{\"cmd\":\"click\"}")
+  run Testing.expect(!ok(&nowhere), "click needs a target or a point")
+
+  // wait: holds now, does not hold yet, timed out.
+  let there = run ask(
+    &mut protocol,
+    &mut tree,
+    "{\"cmd\":\"wait\",\"role\":\"button\",\"name\":\"Archive\"}",
+  )
+  run Testing.expect(ok(&there) && nodeId(&there) == 20, "wait for a node that is there")
+  let later = run ask(&mut protocol, &mut tree, "{\"cmd\":\"wait\",\"name\":\"nothing like it\"}")
+  run Testing.expect(pending(&later), "wait for a node that is not there yet")
+  let gone = run ask(
+    &mut protocol,
+    &mut tree,
+    "{\"cmd\":\"wait\",\"name\":\"nothing like it\",\"gone\":true}",
+  )
+  run Testing.expect(ok(&gone), "wait for a node to be gone")
+  let expired = run ask(
+    &mut protocol,
+    &mut tree,
+    "{\"cmd\":\"wait\",\"name\":\"nothing like it\",\"timeout\":0}",
+  )
+  run Testing.expect(same(text(&expired, "error"), "timed out"), "wait times out")
+}
+
+test effect fn inputCommandsDriveTheTree() -> ()
+  ! AssertionError<'static>
+    | TreeError
+    | JsonError
+    | ImageError
+    | PngError
+    | FileError
+    | HostInputError
+    | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run inputBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn addressBody() -> ()
+  ! AssertionError<'static> | OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = String.make()
+  match run parseAddress("tcp:4100") {
+    Option<Address>.Some { value } => {
+      run describeAddress(&value, &mut text)
+    }
+    Option<Address>.None => {}
+  }
+  run Testing.expect(same(String.view(&text), "tcp:127.0.0.1:4100"), "tcp addresses")
+  text.clear()
+  match run parseAddress("1") {
+    Option<Address>.Some { value } => {
+      run describeAddress(&value, &mut text)
+    }
+    Option<Address>.None => {}
+  }
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    run Testing.expect(same(String.view(&text), "tcp:127.0.0.1:7357"), "the default")
+  } else {
+    run Testing.expect(same(String.view(&text), "unix:silk-ui-inspect.sock"), "the default")
+  }
+  let bad = match run parseAddress("tcp:http") {
+    Option<Address>.Some { value } => false
+    Option<Address>.None => true
+  }
+  run Testing.expect(bad, "a tcp port must be a number")
+  run Testing.expect(!Inspector.off().enabled(), "off by default")
+}
+
+test effect fn addressesParse() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run addressBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Over a socket.
+
+const SOCKET: string = "/tmp/ui-inspect-server-test.sock"
+
+effect fn send(line: string) -> Connection
+  ! NativeSocketError | ByteIoError
+  ? &mut MonotonicClock {
+  let start = run MonotonicClock.now()
+  let mut c = run connectUnixOwned(
+    String.utf8Bytes(SOCKET),
+    ConnectOptions.defaults(),
+    Option<Instant>.some(MonotonicClock.deadlineAfter(&start, 2000000000)),
+  )
+  let bytes = String.utf8Bytes(line)
+  drop run ByteDuplex.writeSome(
+    bytes,
+    Option<Instant>.some(MonotonicClock.deadlineAfter(&start, 2000000000)),
+  )
+    |> Effect.provideMut<ByteDuplex>(&mut c)
+  return move c
+}
+
+effect fn receive(c: &mut Connection) -> Value
+  ! ByteIoError | JsonError | OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator {
+  let start = run MonotonicClock.now()
+  let mut all = Bytes.make()
+  let mut chunk: [u8; 4096] = [0; 4096]
+  while true {
+    match run ByteDuplex.readSome(
+      &mut chunk,
+      Option<Instant>.some(MonotonicClock.deadlineAfter(&start, 2000000000)),
+    )
+      |> Effect.provideMut<ByteDuplex>(&mut c.*) {
+      ReadTransfer.Data { count } => {
+        run all.append(Slice.view(&chunk, 0, count))
+      }
+      ReadTransfer.End => {
+        break
+      }
+    }
+  }
+  let reply = run Json.parse(all.asSlice())
+  return move reply
+}
+
+effect fn socketBody() -> ()
+  ! AssertionError<'static>
+    | TreeError
+    | JsonError
+    | NativeSocketError
+    | ByteIoError
+    | FileError
+    | OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock {
+  let collection = run fixtures.fonts()
+  let mut tree = run inbox(&collection)
+  let mut inspector = run Inspector.listenAt(Address.Unix { path: run String.copy(SOCKET) }, false)
+  run Testing.expect(inspector.enabled(), "listening")
+  run Testing.expect(!run inspector.poll(&mut tree), "nothing to serve yet")
+
+  let mut a = run send("{\"id\":1,\"cmd\":\"hello\"}\n")
+  run Testing.expect(!run inspector.poll(&mut tree), "hello changes nothing")
+  let hello = run receive(&mut a)
+  run Testing.expect(ok(&hello) && int(&hello, "protocol") == 1, "hello over the socket")
+
+  // A click, then a query sent before the app drew a frame: the query waits for the frame.
+  let mut b = run send("{\"id\":2,\"cmd\":\"click\",\"node\":10}\n")
+  let mut c = run send("{\"id\":3,\"cmd\":\"query\",\"role\":\"button\"}\n")
+  run Testing.expect(run inspector.poll(&mut tree), "a click is work for the app")
+  while run inspector.dispatchNext(&mut tree) {}
+  run Testing.expect(inspector.served == 2, "one request served")
+  run Testing.expect(!run inspector.poll(&mut tree), "the next waits for a frame")
+  run Testing.expect(inspector.served == 2, "still one")
+  let click = run receive(&mut b)
+  run Testing.expect(ok(&click) && int(&click, "id") == 2, "the click reply")
+  run tree.frame(FrameInput { width: 360.0, height: 440.0, scale: 2.0, time: 0.1 })
+  run inspector.afterFrame(&tree)
+  drop run inspector.poll(&mut tree)
+  let query = run receive(&mut c)
+  run Testing.expect(int(&query, "id") == 3 && int(&query, "count") == 3, "served after it")
+
+  // A wait that does not hold yet answers pending; bad JSON is an error.
+  let mut d = run send("{\"cmd\":\"wait\",\"name\":\"never\"}\n")
+  drop run inspector.poll(&mut tree)
+  let wait = run receive(&mut d)
+  run Testing.expect(pending(&wait), "pending over the socket")
+  let mut e = run send("{oops\n")
+  drop run inspector.poll(&mut tree)
+  let bad = run receive(&mut e)
+  run Testing.expect(!ok(&bad), "bad JSON")
+
+  run inspector.close()
+  let mut files = run MachineFileSystem.make()
+  let path = run Path.make(SOCKET)
+
+  // exists() fails with WrongType on a socket file, so a clean answer means it is gone.
+  let left = run Effect.result(
+    FileSystem.exists(&path) |> Effect.provideMut<FileSystem>(&mut files),
+  )
+  let gone = match move left {
+    Result<bool, FileError>.Success { value } => !value
+    Result<bool, FileError>.Failure { error } => false
+  }
+  run Testing.expect(gone, "close removes the socket file")
+}
+
+test effect fn requestsOverAUnixSocket() -> ()
+  ! AssertionError<'static>
+    | TreeError
+    | JsonError
+    | NativeSocketError
+    | ByteIoError
+    | FileError
+    | HostInputError
+    | OutOfMemoryError {
+  // std has no Unix sockets on Windows; the protocol itself is covered above.
+  static if Intrinsic.targetOperatingSystem() != "windows" {
+    let mut allocator = Allocator.systemAllocatorProvider()
+    let mut clock = OsMonotonicClock.make()
+    run socketBody()
+      |> Effect.provideMut<Allocator>(&mut allocator)
+      |> Effect.provideMut<MonotonicClock>(&mut clock)
+  }
+}
+
+// The MCP bridge: tool calls become protocol requests, run here with `Protocol.handle`.
+
+/// Runs one JSON-RPC message through `bridge`, answering its requests with `protocol` (a
+/// pending `wait` is retried with 50 ms more each time). Returns the response, or `null` when
+/// there is none.
+effect fn mcp(
+  bridge: &mut Bridge,
+  protocol: &mut Protocol,
+  tree: &mut UiTree<'_>,
+  line: string,
+) -> Value
+  ! JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = String.make()
+  let mut reply = String.make()
+  let mut action = run bridge.handle(String.utf8Bytes(line), &mut out)
+  let mut waited: u64 = 0
+  while action == Action.Ask || action == Action.Retry {
+    if action == Action.Retry {
+      waited = waited + bridge.retryDelay(waited)
+    }
+    let request = run Json.parse(out.ownedUtf8Bytes())
+    let outcome = run protocol.handle(&mut tree, &request, 0, &mut reply)
+    while run protocol.dispatchNext(&mut tree) {}
+    if outcome == Outcome.Pending {
+      reply.clear()
+      run reply.append("{\"ok\":false,\"pending\":true,\"error\":\"not yet\"}")
+    }
+    action = run bridge.answer(reply.ownedUtf8Bytes(), true, waited, &mut out)
+  }
+  if action == Action.Nothing {
+    return run Json.parse(b"null")
+  }
+  let response = run Json.parse(out.ownedUtf8Bytes())
+  return move response
+}
+
+/// The first content item's member `key` of a tool result.
+fn content<'a>(response: &'a Value, key: string) -> string<'a> {
+  let items = Json.fieldAt(Json.field(response, "result"), "content")
+  let first = match items {
+    Option<&'a Value>.Some { value } => match &value.* {
+      Value.Array { values } => {
+        let list = values.asSlice()
+        if list.length == 0 {
+          return ""
+        }
+        Option<&'a Value>.Some { value: &list[0] }
+      }
+      _ => Option<&'a Value>.None
+    }
+    Option<&'a Value>.None => Option<&'a Value>.None
+  }
+  return match Json.asString(Json.fieldAt(first, key)) {
+    Option<string>.Some { value } => value
+    Option<string>.None => ""
+  }
+}
+
+fn isError(response: &Value) -> bool {
+  return match Json.fieldAt(Json.field(response, "result"), "isError") {
+    Option<&Value>.Some { value } => match &value.* {
+      Value.Bool { value: b } => b
+      _ => false
+    }
+    Option<&Value>.None => false
+  }
+}
+
+fn errorCode(response: &Value) -> i64 {
+  return match Json.asI64(Json.fieldAt(Json.field(response, "error"), "code")) {
+    Option<i64>.Some { value } => value
+    Option<i64>.None => 0
+  }
+}
+
+/// The number of tools `tools/list` returns, -1 when the shape is wrong.
+fn toolCount(response: &Value) -> i64 {
+  return match Json.fieldAt(Json.field(response, "result"), "tools") {
+    Option<&Value>.Some { value } => match &value.* {
+      Value.Array { values } => {
+        return usize.toI64(values.length())
+      }
+      _ => -1
+    }
+    Option<&Value>.None => -1
+  }
+}
+
+effect fn mcpBody() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | ImageError | PngError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run inbox(&collection)
+  let mut protocol = Protocol.make()
+  run protocol.afterFrame(&tree)
+  let mut bridge = run Bridge.make("unix:/tmp/test.sock")
+
+  let init = run mcp(
+    &mut bridge,
+    &mut protocol,
+    &mut tree,
+    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"1\"}}}",
+  )
+  let result = Json.field(&init, "result")
+  run Testing.expect(
+    same(
+      Json.asString(Json.fieldAt(result, "protocolVersion")) |> Option<string>.unwrapOr(""),
+      "2025-03-26",
+    ),
+    "initialize answers the client's protocol version",
+  )
+  run Testing.expect(
+    same(
+      Json.asString(Json.fieldAt(Json.fieldAt(result, "serverInfo"), "name"))
+        |> Option<string>.unwrapOr(""),
+      "silk-ui-inspect",
+    ),
+    "and names the server",
+  )
+  let other = run mcp(
+    &mut bridge,
+    &mut protocol,
+    &mut tree,
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"1999-01-01\"}}",
+  )
+  run Testing.expect(
+    same(
+      Json.asString(Json.fieldAt(Json.field(&other, "result"), "protocolVersion"))
+        |> Option<string>.unwrapOr(""),
+      "2025-06-18",
+    ),
+    "an unknown version gets the server's own",
+  )
+  let note = run mcp(
+    &mut bridge,
+    &mut protocol,
+    &mut tree,
+    "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}",
+  )
+  run Testing.expect(
+    match &note {
+      Value.Null => true
+      _ => false
+    },
+    "notifications get no response",
+  )
+  let tools = run mcp(
+    &mut bridge,
+    &mut protocol,
+    &mut tree,
+    "{\"jsonrpc\":\"2.0\",\"id\":\"t\",\"method\":\"tools/list\"}",
+  )
+  run Testing.expect(toolCount(&tools) == 18, "eighteen tools")
+  run Testing.expect(same(text(&tools, "id"), "t"), "string ids are echoed")
+
+  // Snapshot is describe; inspect is the node view.
+  let snap = run mcp(
+    &mut bridge,
+    &mut protocol,
+    &mut tree,
+    "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"ui_snapshot\",\"arguments\":{}}}",
+  )
+  let mut expected = String.make()
+  run describe(&tree, DescribeOptions.plain(), &mut expected)
+  run Testing.expect(
+    same(content(&snap, "text"), String.view(&expected)) && !isError(&snap),
+    "ui_snapshot is describe",
+  )
+  let view = run mcp(
+    &mut bridge,
+    &mut protocol,
+    &mut tree,
+    "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"ui_inspect\",\"arguments\":{\"role\":\"button\",\"name\":\"New\"}}}",
+  )
+  let mut panel = String.make()
+  run inspectNode(&tree, fixtures.NEW_BUTTON, InspectOptions.all(), &mut panel)
+  run Testing.expect(
+    same(content(&view, "text"), String.view(&panel)),
+    "ui_inspect is the node view",
+  )
+
+  // Find the button by its label and click it: the app sees the click.
+  let found = run mcp(
+    &mut bridge,
+    &mut protocol,
+    &mut tree,
+    "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"ui_query\",\"arguments\":{\"label\":\"New\",\"exact\":true}}}",
+  )
+  let foundReply = run Json.parse(String.utf8Bytes(content(&found, "text")))
+  run Testing.expect(int(&foundReply, "count") == 1, "ui_query finds the button by its label")
+  let clicked = run mcp(
+    &mut bridge,
+    &mut protocol,
+    &mut tree,
+    "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"ui_click\",\"arguments\":{\"label\":\"New\",\"modifiers\":[\"shift\"]}}}",
+  )
+  let clickReply = run Json.parse(String.utf8Bytes(content(&clicked, "text")))
+  run Testing.expect(
+    !isError(&clicked) && int(&clickReply, "node") == 10,
+    "ui_click clicks it, arguments passed through",
+  )
+  let mut records = List<Event>.make()
+  run tree.takeEvents(&mut records)
+  let mut sawClick = false
+  let values = records.asSlice()
+  let mut i: usize = 0
+  while i < values.length {
+    if values[i].kind == EventKind.Click && values[i].target == fixtures.NEW_BUTTON {
+      sawClick = true
+    }
+    i = i + 1
+  }
+  run Testing.expect(sawClick, "the app sees a click record on New")
+  run tree.frame(FrameInput { width: 360.0, height: 440.0, scale: 2.0, time: 0.1 })
+  run protocol.afterFrame(&tree)
+
+  // Screenshots come back as image content.
+  let shot = run mcp(
+    &mut bridge,
+    &mut protocol,
+    &mut tree,
+    "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"ui_screenshot\",\"arguments\":{\"node\":20}}}",
+  )
+  run Testing.expect(
+    same(content(&shot, "type"), "image") && same(content(&shot, "mimeType"), "image/png"),
+    "ui_screenshot returns image content",
+  )
+  let encoded = String.utf8Bytes(content(&shot, "data"))
+  let length = match Base64.decodedLength(encoded) {
+    Result<usize, Base64Error>.Success { value } => value
+    Result<usize, Base64Error>.Failure { error } => 0
+  }
+  let mut bytes = run Bytes.zeroed(length)
+  drop Base64.decodeInto(bytes.asMutSlice(), encoded)
+  let image = run png.decode(bytes.asSlice())
+  run Testing.expect(image.width() > 0 && image.width() < 720, "a PNG of the node")
+
+  // wait: holds, then times out after retries; errors are tool errors.
+  let there = run mcp(
+    &mut bridge,
+    &mut protocol,
+    &mut tree,
+    "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\",\"params\":{\"name\":\"ui_wait\",\"arguments\":{\"role\":\"button\",\"name\":\"Archive\"}}}",
+  )
+  run Testing.expect(!isError(&there), "ui_wait for a node that is there")
+  let late = run mcp(
+    &mut bridge,
+    &mut protocol,
+    &mut tree,
+    "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":{\"name\":\"ui_wait\",\"arguments\":{\"name\":\"nothing like it\",\"timeout\":200}}}",
+  )
+  run Testing.expect(
+    isError(&late) && String.startsWith(content(&late, "text"), "Timed out after 200 ms"),
+    "ui_wait retries until its timeout",
+  )
+  let missing = run mcp(
+    &mut bridge,
+    &mut protocol,
+    &mut tree,
+    "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"tools/call\",\"params\":{\"name\":\"ui_click\",\"arguments\":{\"name\":\"no such button\"}}}",
+  )
+  run Testing.expect(
+    isError(&missing) && same(content(&missing, "text"), "no node matches"),
+    "a missing node is a tool error",
+  )
+
+  // Protocol errors.
+  let unknown = run mcp(
+    &mut bridge,
+    &mut protocol,
+    &mut tree,
+    "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/call\",\"params\":{\"name\":\"fly\"}}",
+  )
+  run Testing.expect(errorCode(&unknown) == -32602, "an unknown tool")
+  let method = run mcp(
+    &mut bridge,
+    &mut protocol,
+    &mut tree,
+    "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"fly\"}",
+  )
+  run Testing.expect(errorCode(&method) == -32601, "an unknown method")
+  let junk = run mcp(&mut bridge, &mut protocol, &mut tree, "not json")
+  run Testing.expect(errorCode(&junk) == -32700, "a parse error")
+
+  // An app that cannot be reached.
+  let mut out = String.make()
+  let asked = run bridge.handle(
+    b"{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"tools/call\",\"params\":{\"name\":\"ui_status\"}}",
+    &mut out,
+  )
+  run Testing.expect(
+    asked == Action.Ask && same(String.view(&out), "{\"cmd\":\"hello\"}"),
+    "ui_status asks hello",
+  )
+  let gone = run bridge.answer(b"", false, 0, &mut out)
+  let unreachable = run Json.parse(out.ownedUtf8Bytes())
+  run Testing.expect(
+    gone == Action.Respond && isError(&unreachable)
+      && String.startsWith(
+        content(&unreachable, "text"),
+        "Could not reach the Silk UI at unix:/tmp/test.sock",
+      ),
+    "an unreachable app is a tool error naming the address",
+  )
+
+  // writeValue round-trips JSON. Numbers come back in their shortest form, so this one has no
+  // exponent.
+  let source = "{\"a\":[1,-2500.5,true,false,null],\"b\":\"q\\\"\\n\",\"c\":{}}"
+  let value = run Json.parse(String.utf8Bytes(source))
+  let mut written = String.make()
+  run writeValue(&mut written, &value)
+  run Testing.expect(same(String.view(&written), source), "writeValue writes JSON back")
+}
+
+test effect fn mcpToolsDriveTheTree() -> ()
+  ! AssertionError<'static>
+    | TreeError
+    | JsonError
+    | ImageError
+    | PngError
+    | FileError
+    | HostInputError
+    | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run mcpBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// This exercises the actual bridge state machine, composed-scene capture, PNG decoder,
+// contact sheet composition and timing; a static UI frame must remain visible as a repeat.
+effect fn captureBody() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | ImageError | PngError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run inbox(&collection)
+  let mut protocol = Protocol.make()
+  let mut bridge = run Bridge.make("test")
+  let mut wire = String.make()
+  let mut reply = String.make()
+  let mut scene = Scene.make()
+  let full = Rect<f32>.new(0.0, 0.0, 720.0, 880.0)
+  drop run scene.quad(Quad.fill(full, ContentMask.new(full), Background.solid(color.rgb(0xff0000))))
+  run scene.finish()
+  run protocol.afterFrameScene(&tree, &scene)
+  let started = run bridge.handle(
+    b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"ui_capture\",\"arguments\":{\"count\":2,\"intervalMs\":100,\"columns\":2,\"tileWidth\":160}}}",
+    &mut wire,
+  )
+  run Testing.expect(started == Action.Ask, "capture asks for the first screenshot immediately")
+  let request = run Json.parse(wire.ownedUtf8Bytes())
+  drop run protocol.handle(&mut tree, &request, 0, &mut reply)
+  let next = run bridge.answer(reply.ownedUtf8Bytes(), true, 12, &mut wire)
+  run Testing.expect(
+    next == Action.Retry && bridge.retryDelay(12) == 88 && bridge.retryDelay(99) == 1,
+    "capture interval accounts for screenshot latency",
+  )
+  scene.clear()
+  drop run scene.quad(Quad.fill(full, ContentMask.new(full), Background.solid(color.rgb(0x0000ff))))
+  run scene.finish()
+  run tree.frame(FrameInput { width: 360.0, height: 440.0, scale: 2.0, time: 0.1 })
+  run protocol.afterFrameScene(&tree, &scene)
+  let second = run Json.parse(wire.ownedUtf8Bytes())
+  drop run protocol.handle(&mut tree, &second, 0, &mut reply)
+  let done = run bridge.answer(reply.ownedUtf8Bytes(), true, 112, &mut wire)
+  run Testing.expect(done == Action.Respond, "capture returns a mosaic after exactly two samples")
+  run Testing.expect(
+    String.contains(String.view(&wire), "elapsedMs\\\":112"),
+    "actual sample timestamps are preserved",
+  )
+  let result = run Json.parse(wire.ownedUtf8Bytes())
+  run Testing.expect(
+    !isError(&result) && content(&result, "type") == "image",
+    "MCP returns an image, not a filename",
+  )
+  let encoded = String.utf8Bytes(content(&result, "data"))
+  let length = Base64.decodedLength(encoded).unwrapOr(0)
+  let mut bytes = run Bytes.zeroed(length)
+  drop Base64.decodeInto(bytes.asMutSlice(), encoded)
+  let image = run png.decode(bytes.asSlice())
+  run Testing.expect(image.width() == 344, "two requested columns plus gutters")
+  let pixels = image.data()
+  let firstAt: usize = (100 * 344 + 88) * 4
+  let secondAt: usize = (100 * 344 + 256) * 4
+  run Testing.expect(
+    pixels[firstAt] == 255 && pixels[firstAt + 2] == 0,
+    "first cell contains the composed red canvas",
+  )
+  run Testing.expect(
+    pixels[secondAt] == 0 && pixels[secondAt + 2] == 255,
+    "second cell contains the newer blue canvas",
+  )
+
+  let invalid = run mcp(
+    &mut bridge,
+    &mut protocol,
+    &mut tree,
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"ui_capture\",\"arguments\":{\"count\":100000}}}",
+  )
+  run Testing.expect(
+    errorCode(&invalid) == -32602,
+    "capture limits reject excessive allocation before requesting frames",
+  )
+}
+
+test effect fn timedCapturesReturnComposedMosaics() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | ImageError | PngError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run captureBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// A click must give the host a chance to react to down before up is dispatched.
+effect fn orderedBody() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run inbox(&collection)
+  let mut protocol = Protocol.make()
+  tree.events.clear()
+  let request = run Json.parse(b"{\"cmd\":\"click\",\"node\":10}")
+  let mut reply = String.make()
+  drop run protocol.handle(&mut tree, &request, 0, &mut reply)
+  run Testing.expect(
+    tree.events.length() == 0,
+    "preparing input cannot bypass the host's event pump",
+  )
+  run Testing.expect(run protocol.dispatchNext(&mut tree), "move")
+  run Testing.expect(run protocol.dispatchNext(&mut tree), "down")
+
+  // Simulate the application's down handler disabling the button before the release.
+  let mut batch = Batch.make()
+  run batch.attribute(10, Attribute.Disabled { value: true })
+  run tree.apply(run batch.take())
+  tree.events.clear()
+  run Testing.expect(run protocol.dispatchNext(&mut tree), "up")
+  let events = tree.events.asSlice()
+  let mut i: usize = 0
+  while i < events.length {
+    run Testing.expect(
+      events[i].kind != EventKind.Click,
+      "up observes the view changed by the down handler",
+    )
+    i = i + 1
+  }
+  run Testing.expect(!run protocol.dispatchNext(&mut tree), "no extra input")
+}
+
+test effect fn compoundInputAllowsHostReactionsBetweenEvents() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run orderedBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn equivalentInputBody() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut nativeTree = run inbox(&collection)
+  let mut inspectTree = run inbox(&collection)
+  let mut nativeBatch = Batch.make()
+  let mut inspectBatch = Batch.make()
+  run nativeBatch.listen(1, LISTEN_ALL)
+  run inspectBatch.listen(1, LISTEN_ALL)
+  run nativeTree.apply(run nativeBatch.take())
+  run inspectTree.apply(run inspectBatch.take())
+  nativeTree.events.clear()
+  inspectTree.events.clear()
+  let mut nativeLog = Protocol.make()
+  let mut inspectLog = Protocol.make()
+  let owner = WindowId { value: 1 }
+  let modifiers = Modifiers.none()
+  let mut events = List<WindowEvent>.make()
+  run events.append(
+    WindowEvent.MouseMoved {
+      window: owner,
+      position: Point2<f64> { x: 40.0, y: 27.0 },
+      modifiers: modifiers,
+    },
+  )
+  run events.append(
+    WindowEvent.MouseDown {
+      window: owner,
+      button: MouseButton.Left,
+      position: Point2<f64> { x: 40.0, y: 27.0 },
+      modifiers: modifiers,
+      clickCount: 1,
+    },
+  )
+  run events.append(
+    WindowEvent.MouseMoved {
+      window: owner,
+      position: Point2<f64> { x: 320.0, y: 420.0 },
+      modifiers: modifiers,
+    },
+  )
+  run events.append(
+    WindowEvent.MouseUp {
+      window: owner,
+      button: MouseButton.Left,
+      position: Point2<f64> { x: 320.0, y: 420.0 },
+      modifiers: modifiers,
+    },
+  )
+  run events.append(
+    WindowEvent.KeyDown {
+      window: owner,
+      key: Key.Character { text: run String.copy(" ") },
+      code: KeyCode.Space,
+      modifiers: modifiers,
+      repeat: false,
+      imeHandled: false,
+    },
+  )
+  run events.append(
+    WindowEvent.KeyUp {
+      window: owner,
+      key: Key.Character { text: run String.copy(" ") },
+      code: KeyCode.Space,
+      modifiers: modifiers,
+    },
+  )
+  let commands: [string; 6] = [
+    r"""{"cmd":"pointer","phase":"move","x":40,"y":27}""",
+    r"""{"cmd":"pointer","phase":"down","x":40,"y":27}""",
+    r"""{"cmd":"pointer","phase":"move","x":320,"y":420}""",
+    r"""{"cmd":"pointer","phase":"up","x":320,"y":420}""",
+    r"""{"cmd":"key","phase":"down","key":" ","code":"Space"}""",
+    r"""{"cmd":"key","phase":"up","key":" ","code":"Space"}""",
+  ]
+  let mut out = String.make()
+  let mut i: usize = 0
+  while i < commands.length {
+    drop run feed(&mut nativeTree, &events.asSlice()[i])
+    let request = run Json.parse(String.utf8Bytes(commands[i]))
+    drop run inspectLog.handle(&mut inspectTree, &request, 0, &mut out)
+    run Testing.expect(
+      run inspectLog.dispatchNext(&mut inspectTree),
+      "one inspector input per phase",
+    )
+    run Testing.expect(
+      !run inspectLog.dispatchNext(&mut inspectTree),
+      "no hidden extra pointer moves",
+    )
+    run nativeLog.observe(&nativeTree)
+    run inspectLog.observe(&inspectTree)
+    nativeTree.events.clear()
+    inspectTree.events.clear()
+    i = i + 1
+  }
+  run Testing.expect(
+    nativeLog.log.length() == inspectLog.log.length() && nativeLog.log.length() > 0,
+    "native and inspector paths emit the same event count",
+  )
+  let left = nativeLog.log.asSlice()
+  let right = inspectLog.log.asSlice()
+  i = 0
+  while i < left.length {
+    run Testing.expect(
+      left[i].kind == right[i].kind && left[i].target == right[i].target && left[i].x == right[i].x
+        && left[i].y == right[i].y
+        && left[i].modifiers == right[i].modifiers
+        && String.view(&left[i].key) == String.view(&right[i].key),
+      "native mouse/key adapter and inspector produce indistinguishable routed records",
+    )
+    i = i + 1
+  }
+}
+
+test effect fn inspectorInputMatchesNativeWindowAdapter() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run equivalentInputBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}

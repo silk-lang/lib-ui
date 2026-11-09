@@ -1,0 +1,578 @@
+//! The view diff: compares a render's arena with the last one and writes the tree mutations
+//! that turn the last into the new one.
+//!
+//! Entries were already matched while the view ran (same parent, then the same key or position
+//! among unkeyed siblings, and the same kind). The diff then walks the new arena from the root:
+//!
+//! - an entry with no match is created, with everything set, and inserted;
+//! - a matched entry keeps its tree id and gets only what changed: `SetStyle` with the
+//!   properties that changed (or `ClearStyle` first when one was removed), `SetText`,
+//!   `SetAttribute`, `SetListeners`, `SetSource` and `SetCanvas`;
+//! - old children that nothing matched are destroyed, with their subtrees;
+//! - children are put in order with the fewest moves: the longest run of matched children
+//!   whose old order is already right stays, and the others move with `InsertBefore`;
+//! - an entry `lazy` copied from the last render is skipped with its subtree;
+//! - last, a node that asks for focus (`takeFocus`) and did not in the last render gets it.
+import ui_tree.grid { Grid }
+import ui { Arena, Entry, Span, NO_ENTRY, ROOT_ID }
+import equal { sameProperty, sameCommand }
+import ui_tree.mutation {
+  Mutation,
+  NodeKind,
+  StyleState,
+  Property,
+  Attribute,
+  Role,
+  Cursor,
+  CanvasCommand,
+  NOT_FOCUSABLE,
+  propertyKey
+}
+import silk.collections.hash { Hash, Word }
+import silk.collections.hash_map { HashMap }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.usize
+import silk.text.string { String, InvalidUtf8 }
+import silk.core.result { Result }
+
+/// What the diff keeps between renders: the next tree id to hand out, and which tree id is
+/// which entry of the newest render.
+pub struct DiffState {
+  pub nextId: u32,
+  /// Tree id to entry index in the newest render.
+  pub ids: HashMap<Word, u32>,
+  used: List<bool>,
+  newStyle: List<Property>,
+  oldStyle: List<Property>,
+  changed: List<Property>,
+  children: List<u32>,
+  positions: List<u32>,
+  stable: List<bool>,
+  tails: List<usize>,
+  previous: List<usize>,
+}
+
+impl DiffState {
+  pub fn make() -> DiffState {
+    return DiffState {
+      nextId: ROOT_ID + 1,
+      ids: HashMap<Word, u32>.make(Hash.seed(0xD1FF)),
+      used: List<bool>.make(),
+      newStyle: List<Property>.make(),
+      oldStyle: List<Property>.make(),
+      changed: List<Property>.make(),
+      children: List<u32>.make(),
+      positions: List<u32>.make(),
+      stable: List<bool>.make(),
+      tails: List<usize>.make(),
+      previous: List<usize>.make(),
+    }
+  }
+
+  /// The entry of the newest render with tree id `id`, or `NO_ENTRY`.
+  pub fn entryOf(self: &Self, id: u32) -> u32 {
+    return match self.ids.get(Hash.word(u32.toU64(id))) {
+      Option<u32>.Some { value } => value
+      Option<u32>.None => NO_ENTRY
+    }
+  }
+}
+
+/// Writes the mutations that turn the tree from `old` (the last render, empty at first) into
+/// `next`, and gives every entry of `next` its tree id. The root entry is the runtime's root
+/// box, which the runtime created.
+pub effect fn diff(
+  next: &mut Arena,
+  old: &Arena,
+  state: &mut DiffState,
+  out: &mut List<Mutation>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  state.ids.clear()
+  state.used.clear()
+  run state.used.appendRepeated(false, u32.toUsize(old.length()))
+  let count = next.length()
+  let mut i: u32 = 0
+  while i < count {
+    let entry = next.entry(i)
+    if entry.old != NO_ENTRY {
+      state.used.set(u32.toUsize(entry.old), true)
+    }
+    i = i + 1
+  }
+  let mut root = next.entry(0)
+  root.id = ROOT_ID
+  next.setEntry(0, root)
+  drop run state.ids.insert(Hash.word(u32.toU64(ROOT_ID)), 0)
+  run props(&next, 0, &old, root.old, ROOT_ID, &mut state, &mut out)
+  run children(&mut next, 0, &old, root.old, &mut state, &mut out)
+
+  // Focus requests, once every node is in place: the last node that asks now and did not ask
+  // in the last render.
+  let mut focus: u32 = 0
+  let mut f: u32 = 0
+  while f < count {
+    let entry = next.entry(f)
+    if entry.wantsFocus && (entry.old == NO_ENTRY || !old.entry(entry.old).wantsFocus) {
+      focus = entry.id
+    }
+    f = f + 1
+  }
+  let mut f2: u32 = 0
+  while f2 < count {
+    let entry = next.entry(f2)
+    if entry.wantsReveal && (entry.old == NO_ENTRY || !old.entry(entry.old).wantsReveal) {
+      run out.append(Mutation.ScrollIntoView { id: entry.id })
+    }
+    f2 = f2 + 1
+  }
+  if focus != 0 {
+    run out.append(Mutation.Focus { id: focus })
+  }
+}
+
+/// Creates entry `index` and its subtree. Returns its id.
+effect fn create(
+  next: &mut Arena,
+  index: u32,
+  old: &Arena,
+  state: &mut DiffState,
+  out: &mut List<Mutation>,
+) -> u32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let id = state.nextId
+  state.nextId = state.nextId + 1
+  let mut entry = next.entry(index)
+  entry.id = id
+  next.setEntry(index, entry)
+  drop run state.ids.insert(Hash.word(u32.toU64(id)), index)
+  run out.append(Mutation.Create { id: id, kind: entry.kind })
+  run props(&next, index, &old, NO_ENTRY, id, &mut state, &mut out)
+  let mut child = entry.firstChild
+  while child != NO_ENTRY {
+    let childId = run create(&mut next, child, &old, &mut state, &mut out)
+    run out.append(Mutation.InsertBefore { parent: id, child: childId, before: Option<u32>.None })
+    child = next.entry(child).next
+  }
+  return id
+}
+
+/// Brings matched entry `index` up to date with its old entry. Returns its id.
+effect fn update(
+  next: &mut Arena,
+  index: u32,
+  old: &Arena,
+  state: &mut DiffState,
+  out: &mut List<Mutation>,
+) -> u32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut entry = next.entry(index)
+  let before = old.entry(entry.old)
+  let id = before.id
+  entry.id = id
+  next.setEntry(index, entry)
+  drop run state.ids.insert(Hash.word(u32.toU64(id)), index)
+  if entry.copied {
+    // Copied by `lazy`: same ids, nothing to send. Its subtree still needs its ids known.
+    run register(&next, entry.firstChild, &mut state)
+    return id
+  }
+  run props(&next, index, &old, entry.old, id, &mut state, &mut out)
+  run children(&mut next, index, &old, entry.old, &mut state, &mut out)
+  return id
+}
+
+/// Records the ids of a copied subtree, starting at its first child `first`.
+effect fn register(next: &Arena, first: u32, state: &mut DiffState) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut child = first
+  while child != NO_ENTRY {
+    let entry = next.entry(child)
+    drop run state.ids.insert(Hash.word(u32.toU64(entry.id)), child)
+    run register(&next, entry.firstChild, &mut state)
+    child = entry.next
+  }
+}
+
+/// Reconciles the children of `index` with those of its old entry `before` (or none).
+effect fn children(
+  next: &mut Arena,
+  index: u32,
+  old: &Arena,
+  before: u32,
+  state: &mut DiffState,
+  out: &mut List<Mutation>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let parentId = next.entry(index).id
+  if before != NO_ENTRY {
+    let mut child = old.entry(before).firstChild
+    while child != NO_ENTRY {
+      let entry = old.entry(child)
+      if !state.used.get(u32.toUsize(child)) {
+        run out.append(Mutation.Destroy { id: entry.id })
+      }
+      child = entry.next
+    }
+  }
+
+  // The new children, and which of the matched ones can stay where they are.
+  let start = state.children.length()
+  let mut child = next.entry(index).firstChild
+  while child != NO_ENTRY {
+    run state.children.append(child)
+    child = next.entry(child).next
+  }
+  let end = state.children.length()
+  let stableStart = state.stable.length()
+  run stableRun(&next, &old, start, end, &mut state)
+
+  let mut after = Option<u32>.None
+  let mut i = end
+  while i > start {
+    i = i - 1
+    let current = state.children.get(i)
+    let matched = next.entry(current).old
+    if matched == NO_ENTRY {
+      let id = run create(&mut next, current, &old, &mut state, &mut out)
+      run out.append(Mutation.InsertBefore { parent: parentId, child: id, before: after })
+      after = Option<u32>.Some { value: id }
+    } else {
+      let id = run update(&mut next, current, &old, &mut state, &mut out)
+      if !state.stable.get(stableStart + (i - start)) {
+        run out.append(Mutation.InsertBefore { parent: parentId, child: id, before: after })
+      }
+      after = Option<u32>.Some { value: id }
+    }
+  }
+  state.children.truncate(start)
+  state.stable.truncate(stableStart)
+}
+
+/// Appends to `state.stable` one flag per child in `state.children[start..end]`: true for the
+/// matched children in the longest run whose old positions increase, which need no move.
+effect fn stableRun(
+  next: &Arena,
+  old: &Arena,
+  start: usize,
+  end: usize,
+  state: &mut DiffState,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let stableStart = state.stable.length()
+  run state.stable.appendRepeated(false, end - start)
+
+  // Longest increasing subsequence of old positions over the matched children (patience
+  // sorting): `tails[k]` is the child (offset from `start`) ending the best run of length k + 1,
+  // `previous` the child before it.
+  state.tails.clear()
+  state.previous.clear()
+  state.positions.clear()
+  let mut i: usize = 0
+  while i < end - start {
+    let matched = next.entry(state.children.get(start + i)).old
+    let position = if matched == NO_ENTRY {
+      0
+    } else {
+      old.entry(matched).position
+    }
+    run state.positions.append(position)
+    run state.previous.append(usize.MAX)
+    if matched != NO_ENTRY {
+      let mut low: usize = 0
+      let mut high = state.tails.length()
+      while low < high {
+        let middle = (low + high) / 2
+        if state.positions.get(state.tails.get(middle)) < position {
+          low = middle + 1
+        } else {
+          high = middle
+        }
+      }
+      if low > 0 {
+        state.previous.set(i, state.tails.get(low - 1))
+      }
+      if low == state.tails.length() {
+        run state.tails.append(i)
+      } else {
+        state.tails.set(low, i)
+      }
+    }
+    i = i + 1
+  }
+  if state.tails.length() == 0 {
+    return ()
+  }
+  let mut at = state.tails.get(state.tails.length() - 1)
+  while true {
+    state.stable.set(stableStart + at, true)
+    let back = state.previous.get(at)
+    if back == usize.MAX {
+      break
+    }
+    at = back
+  }
+}
+
+/// Writes what differs between entry `index` and old entry `before` (or everything when there
+/// is none) for tree node `id`.
+effect fn props(
+  next: &Arena,
+  index: u32,
+  old: &Arena,
+  before: u32,
+  id: u32,
+  state: &mut DiffState,
+  out: &mut List<Mutation>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let entry = next.entry(index)
+  let fresh = before == NO_ENTRY
+  let prior = if fresh {
+    Entry.make(entry.kind, NO_ENTRY, entry.identity)
+  } else {
+    old.entry(before)
+  }
+  run styles(&next, index, &old, before, id, StyleState.Base, &mut state, &mut out)
+  run styles(&next, index, &old, before, id, StyleState.Hover, &mut state, &mut out)
+  run styles(&next, index, &old, before, id, StyleState.Active, &mut state, &mut out)
+  run styles(&next, index, &old, before, id, StyleState.Focus, &mut state, &mut out)
+  run styles(&next, index, &old, before, id, StyleState.FocusVisible, &mut state, &mut out)
+
+  if entry.kind == NodeKind.Text || entry.kind == NodeKind.Input {
+    let text = next.text(entry.text)
+    if !sameBytes(text, old.text(prior.text))
+      || (fresh && entry.kind == NodeKind.Input && text.length != 0) {
+      run out.append(Mutation.SetText { id: id, value: run copyText(text) })
+    }
+  }
+  if entry.accessRole != prior.accessRole {
+    run out.append(
+      Mutation.SetAttribute { id: id, attribute: Attribute.Role { value: entry.accessRole } },
+    )
+  }
+  if entry.hasValueRange != prior.hasValueRange || entry.valueMin != prior.valueMin
+    || entry.valueMax != prior.valueMax
+    || entry.valueNow != prior.valueNow {
+    let attribute = if entry.hasValueRange {
+      Attribute.ValueRange { min: entry.valueMin, max: entry.valueMax, value: entry.valueNow }
+    } else {
+      Attribute.ClearValueRange
+    }
+    run out.append(Mutation.SetAttribute { id: id, attribute: move attribute })
+  }
+  let label = next.text(entry.label)
+  if !sameBytes(label, old.text(prior.label)) {
+    run out.append(
+      Mutation.SetAttribute { id: id, attribute: Attribute.Label { value: run copyText(label) } },
+    )
+  }
+  let testId = next.text(entry.testId)
+  if !sameBytes(testId, old.text(prior.testId)) {
+    run out.append(
+      Mutation.SetAttribute { id: id, attribute: Attribute.TestId { value: run copyText(testId) } },
+    )
+  }
+  if entry.hasTabIndex != prior.hasTabIndex || entry.tabIndex != prior.tabIndex {
+    let value = if entry.hasTabIndex {
+      entry.tabIndex
+    } else {
+      defaultTabIndex(entry.kind)
+    }
+    run out.append(Mutation.SetAttribute { id: id, attribute: Attribute.TabIndex { value: value } })
+  }
+  if entry.hasCursor != prior.hasCursor || entry.cursor != prior.cursor {
+    run out.append(
+      Mutation.SetAttribute { id: id, attribute: Attribute.Cursor { value: entry.cursor } },
+    )
+  }
+  if entry.disabled != prior.disabled {
+    run out.append(
+      Mutation.SetAttribute { id: id, attribute: Attribute.Disabled { value: entry.disabled } },
+    )
+  }
+  if entry.focusTrap != prior.focusTrap {
+    run out.append(
+      Mutation.SetAttribute { id: id, attribute: Attribute.FocusTrap { value: entry.focusTrap } },
+    )
+  }
+  if entry.checked != prior.checked {
+    run out.append(
+      Mutation.SetAttribute { id: id, attribute: Attribute.Checked { value: entry.checked } },
+    )
+  }
+  if entry.selected != prior.selected {
+    run out.append(
+      Mutation.SetAttribute { id: id, attribute: Attribute.Selected { value: entry.selected } },
+    )
+  }
+  if entry.expanded != prior.expanded {
+    run out.append(
+      Mutation.SetAttribute { id: id, attribute: Attribute.Expanded { value: entry.expanded } },
+    )
+  }
+  if entry.kind == NodeKind.Input {
+    if entry.multiline != prior.multiline {
+      run out.append(
+        Mutation.SetAttribute { id: id, attribute: Attribute.Multiline { value: entry.multiline } },
+      )
+    }
+    if entry.readOnly != prior.readOnly {
+      run out.append(
+        Mutation.SetAttribute { id: id, attribute: Attribute.ReadOnly { value: entry.readOnly } },
+      )
+    }
+    let placeholder = next.text(entry.placeholder)
+    if !sameBytes(placeholder, old.text(prior.placeholder)) {
+      run out.append(
+        Mutation.SetAttribute {
+          id: id,
+          attribute: Attribute.Placeholder { value: run copyText(placeholder) },
+        },
+      )
+    }
+  }
+  if entry.listeners != prior.listeners {
+    run out.append(Mutation.SetListeners { id: id, flags: entry.listeners })
+  }
+  if entry.source != prior.source && entry.source != NO_ENTRY {
+    run out.append(Mutation.SetSource { id: id, resource: entry.source })
+  }
+  if entry.grid != NO_ENTRY {
+    let grid = &next.grids.asSlice()[u32.toUsize(entry.grid)]
+    if prior.grid == NO_ENTRY || !grid.same(&old.grids.asSlice()[u32.toUsize(prior.grid)]) {
+      run out.append(Mutation.SetGrid { id: id, value: run grid.copy() })
+    }
+  } else if prior.grid != NO_ENTRY {
+    run out.append(Mutation.SetGrid { id: id, value: Grid.make() })
+  }
+  if entry.hasCanvas || prior.hasCanvas {
+    let commands = next.commands(entry.canvas)
+    if !sameCommands(commands, old.commands(prior.canvas)) || fresh {
+      let mut list = List<CanvasCommand>.make()
+      run list.appendSlice(commands)
+      run out.append(Mutation.SetCanvas { id: id, commands: move list })
+    }
+  }
+}
+
+/// The tab index a node of `kind` has when none is set.
+fn defaultTabIndex(kind: NodeKind) -> i32 {
+  return if kind == NodeKind.Input {
+    0
+  } else {
+    NOT_FOCUSABLE
+  }
+}
+
+/// Writes the `state` style changes of entry `index` against old entry `before`.
+effect fn styles(
+  next: &Arena,
+  index: u32,
+  old: &Arena,
+  before: u32,
+  id: u32,
+  state: StyleState,
+  differ: &mut DiffState,
+  out: &mut List<Mutation>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run next.effectiveStyle(index, state, &mut differ.newStyle)
+  if before == NO_ENTRY {
+    differ.oldStyle.clear()
+  } else {
+    run old.effectiveStyle(before, state, &mut differ.oldStyle)
+  }
+  let fresh = differ.newStyle.asSlice()
+  let stale = differ.oldStyle.asSlice()
+
+  // A property that is gone needs the whole look set again.
+  let mut removed = false
+  let mut i: usize = 0
+  while i < stale.length {
+    if find(fresh, propertyKey(stale[i])) == usize.MAX {
+      removed = true
+      break
+    }
+    i = i + 1
+  }
+  if removed {
+    run out.append(Mutation.ClearStyle { id: id, state: state })
+    if fresh.length != 0 {
+      let mut all = List<Property>.make()
+      run all.appendSlice(fresh)
+      run out.append(Mutation.SetStyle { id: id, state: state, properties: move all })
+    }
+    return ()
+  }
+  let mut changed = List<Property>.make()
+  let mut j: usize = 0
+  while j < fresh.length {
+    let at = find(stale, propertyKey(fresh[j]))
+    if at == usize.MAX || !sameProperty(fresh[j], stale[at]) {
+      run changed.append(fresh[j])
+    }
+    j = j + 1
+  }
+  if changed.length() != 0 {
+    run out.append(Mutation.SetStyle { id: id, state: state, properties: move changed })
+  }
+}
+
+fn find(properties: &[Property], key: u32) -> usize {
+  let mut i: usize = 0
+  while i < properties.length {
+    if propertyKey(properties[i]) == key {
+      return i
+    }
+    i = i + 1
+  }
+  return usize.MAX
+}
+
+fn sameBytes(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < a.length {
+    if a[i] != b[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn sameCommands(a: &[CanvasCommand], b: &[CanvasCommand]) -> bool {
+  if a.length != b.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < a.length {
+    if !sameCommand(a[i], b[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+effect fn copyText(bytes: &[u8]) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut value = String.make()
+  run value.append(String.fromUtf8(bytes) |> Result<string, InvalidUtf8>.unwrapOr(""))
+  return move value
+}

@@ -1,0 +1,378 @@
+//! Integration coverage of layout capabilities through the app builder and diff.
+import ui_app.app { App, Context, NoCommand }
+import ui_app.runtime { Runtime, pump }
+import ui_app.ui { Ui }
+import ui_app.harness { locate }
+import ui_tree.lib { UiTree, TreeError, FrameInput, NodeInfo }
+import ui_tree.mutation { Property, Length, Position, Side }
+import ui_tree.grid { Grid }
+import ui_fixtures.fixtures as fixtures
+import silk.core.option { Option }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+
+struct Example {
+  columns: usize,
+  lazy: bool,
+  reports: u32,
+  measured: f32
+}
+
+union Message {
+  Bounds { width: f32 }
+}
+
+impl App<Message, NoCommand> for Example {
+  fn update(self: &mut Self, message: Message, cx: &mut Context<NoCommand>) -> () {
+    match move message {
+      Message.Bounds { width } => {
+        self.measured = width
+        self.reports = self.reports + 1
+      }
+    }
+  }
+
+  fn view(self: &Self, ui: &mut Ui<Message>) -> () {
+    let grid = ui.alloc(Grid.columns(self.columns))
+    ui.box(
+      |ui| {
+        ui.width(Length.px(300.0))
+        ui.height(Length.px(200.0))
+        ui.lazy(
+          if self.lazy {
+            1
+          } else {
+            0
+          },
+          |ui| {
+            ui.grid(
+              &grid,
+              |ui| {
+                ui.testId("grid")
+                ui.onLayout(|bounds| Message.Bounds { width: bounds.width() })
+                ui.width(Length.calc(-20.0, 100.0))
+                ui.gap(10.0)
+                ui.box(
+                  |ui| {
+                    ui.testId("a")
+                    ui.height(Length.px(20.0))
+                  },
+                )
+                ui.box(
+                  |ui| {
+                    ui.testId("b")
+                    ui.height(Length.px(20.0))
+                  },
+                )
+              },
+            )
+          },
+        )
+        ui.box(
+          |ui| {
+            ui.testId("absolute")
+            ui.style(
+              &[
+                Property.Position { value: Position.Absolute },
+                Property.Inset { side: Side.Left, value: Length.px(17.0) },
+                Property.Inset { side: Side.Top, value: Length.px(31.0) },
+                Property.Width { value: Length.px(10.0) },
+                Property.Height { value: Length.px(10.0) },
+              ],
+            )
+          },
+        )
+      },
+    )
+  }
+}
+
+fn viewport() -> FrameInput {
+  return FrameInput { width: 400.0, height: 300.0, scale: 1.0, time: 0.0 }
+}
+
+effect fn node(tree: &mut UiTree<'_>, name: string) -> NodeInfo
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  return match run locate(&mut tree, viewport(), name) {
+    Option<NodeInfo>.Some { value } => value
+    Option<NodeInfo>.None => Intrinsic.trap("missing layout fixture node")
+  }
+}
+
+effect fn body() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut app = Runtime<Example, Message, NoCommand>.make(
+    Example { columns: 2, lazy: false, reports: 0, measured: 0.0 },
+  )
+  run app.start(&mut tree, 0.0)
+  run tree.frame(viewport())
+  drop run pump(&mut app, &mut tree)
+  run Testing.expect(
+    app.model.reports == 1 && app.model.measured == 280.0,
+    "layout callbacks deliver measured bounds through the app",
+  )
+  let a = run node(&mut tree, "a")
+  let b = run node(&mut tree, "b")
+  run Testing.expect(
+    a.bounds.width() == 135.0 && b.bounds.xMin == a.bounds.xMin + 145.0,
+    "Grid fractions, gap and calc dimensions reach layout through a view",
+  )
+  let positioned = run node(&mut tree, "absolute")
+  run Testing.expect(
+    positioned.bounds.xMin == 17.0 && positioned.bounds.yMin == 31.0,
+    "absolute positioning reaches the app",
+  )
+  run app.render(&mut tree)
+  run Testing.expect(
+    app.stats.mutations == 0,
+    "a lazy Grid retains its owned template without mutations",
+  )
+  run tree.frame(viewport())
+  drop run pump(&mut app, &mut tree)
+  run Testing.expect(app.model.reports == 1, "stable layout does not send repeated measurements")
+  app.model.columns = 1
+  app.model.lazy = true
+  run app.render(&mut tree)
+  run tree.frame(viewport())
+  let changed = run node(&mut tree, "a")
+  let below = run node(&mut tree, "b")
+  run Testing.expect(
+    changed.bounds.width() == 280.0 && below.bounds.yMin > changed.bounds.yMin,
+    "changing a Grid template changes layout through the diff",
+  )
+  run app.render(&mut tree)
+  run Testing.expect(
+    app.stats.mutations == 0,
+    "an unchanged template remains stable after lazy copying",
+  )
+}
+
+test effect fn gridAndSizingThroughApp() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run body() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+import ui_tree.grid { GridArea, GridLine, GridLineKind, GridError }
+
+struct Named {
+  enabled: bool
+}
+
+enum NamedMessage {
+  Change
+}
+
+effect fn namedGrids() -> Grid
+  ! GridError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut parent = run Grid.columns(2)
+  let name = run parent.areaName("side")
+  parent.template.areaRows = 1
+  parent.template.areaColumns = 2
+  run parent.template.areas.append(
+    GridArea { name: name, rowStart: 0, rowEnd: 1, columnStart: 1, columnEnd: 2 },
+  )
+  return move parent
+}
+
+effect fn namedPlacement() -> Grid
+  ! GridError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut child = Grid.make()
+  drop run child.name("unused")
+  let name = run child.name("side")
+  child.template.placement.columnStart = GridLine { kind: GridLineKind.Line, number: 0, name: name }
+  child.template.placement.columnEnd = GridLine { kind: GridLineKind.Line, number: 0, name: name }
+  return move child
+}
+
+impl App<NamedMessage, NoCommand> for Named {
+  fn update(self: &mut Self, message: NamedMessage, cx: &mut Context<NoCommand>) -> () {}
+
+  fn view(self: &Self, ui: &mut Ui<NamedMessage>) -> () {
+    let parent = ui.alloc(Effect.catch<GridError>(namedGrids(), invalidGrid))
+    let placement = ui.alloc(Effect.catch<GridError>(namedPlacement(), invalidGrid))
+    let mut subgrid = Grid.make()
+    subgrid.template.columns.subgrid = true
+    subgrid.template.placement.columnStart = GridLine {
+      kind: GridLineKind.Line,
+      number: 1,
+      name: 0,
+    }
+    subgrid.template.placement.columnEnd = GridLine { kind: GridLineKind.Line, number: 3, name: 0 }
+    ui.grid(
+      &parent,
+      |ui| {
+        ui.width(Length.px(220.0))
+        ui.gap(20.0)
+        ui.box(
+          |ui| {
+            ui.testId("named")
+            if self.enabled {
+              ui.gridTemplate(&placement)
+            }
+            ui.height(Length.px(20.0))
+          },
+        )
+        ui.grid(
+          &subgrid,
+          |ui| {
+            ui.gap(20.0)
+            ui.box(
+              |ui| {
+                ui.testId("sub-a")
+                ui.height(Length.px(20.0))
+              },
+            )
+            ui.box(
+              |ui| {
+                ui.testId("sub-b")
+                ui.height(Length.px(20.0))
+              },
+            )
+          },
+        )
+      },
+    )
+  }
+}
+
+effect fn namedBody() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut app = Runtime<Named, NamedMessage, NoCommand>.make(Named { enabled: true })
+  run app.start(&mut tree, 0.0)
+  run tree.frame(viewport())
+  let side = run node(&mut tree, "named")
+  let first = run node(&mut tree, "sub-a")
+  let second = run node(&mut tree, "sub-b")
+  run Testing.expect(
+    side.bounds.xMin == 120.0 && side.bounds.width() == 100.0,
+    "local named-area handles are remapped across parent and child templates",
+  )
+  run Testing.expect(
+    first.bounds.width() == 100.0 && second.bounds.xMin == 120.0,
+    "subgrid inherits parent tracks through the app",
+  )
+  app.model.enabled = false
+  run app.render(&mut tree)
+  run tree.frame(viewport())
+  let cleared = run node(&mut tree, "named")
+  run Testing.expect(cleared.bounds.xMin == 0.0, "omitting a previous grid placement clears it")
+}
+
+test effect fn namedAreasSubgridAndRemoval() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run namedBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn invalidGrid(error: GridError) -> never {
+  drop error
+  Intrinsic.trap("invalid fixture grid")
+}
+
+import ui_tree.mutation { Overflow }
+import ui_tree.lib { Input }
+
+struct Positioned {}
+
+impl App<NamedMessage, NoCommand> for Positioned {
+  fn update(self: &mut Self, message: NamedMessage, cx: &mut Context<NoCommand>) -> () {}
+
+  fn view(self: &Self, ui: &mut Ui<NamedMessage>) -> () {
+    ui.box(
+      |ui| {
+        ui.testId("scroll")
+        ui.width(Length.px(200.0))
+        ui.height(Length.px(100.0))
+        ui.style(&[Property.OverflowY { value: Overflow.Auto }])
+        ui.box(
+          |ui| {
+            ui.height(Length.px(400.0))
+            ui.box(
+              |ui| {
+                ui.testId("sticky")
+                ui.width(Length.px(40.0))
+                ui.height(Length.px(20.0))
+                ui.style(
+                  &[
+                    Property.Position { value: Position.Sticky },
+                    Property.Inset { side: Side.Top, value: Length.px(0.0) },
+                  ],
+                )
+              },
+            )
+            ui.box(
+              |ui| {
+                ui.testId("flow")
+                ui.height(Length.px(30.0))
+              },
+            )
+            ui.box(
+              |ui| {
+                ui.testId("fixed")
+                ui.width(Length.px(20.0))
+                ui.height(Length.px(20.0))
+                ui.style(
+                  &[
+                    Property.Position { value: Position.Fixed },
+                    Property.Inset { side: Side.Left, value: Length.px(250.0) },
+                    Property.Inset { side: Side.Top, value: Length.px(11.0) },
+                  ],
+                )
+              },
+            )
+          },
+        )
+      },
+    )
+  }
+}
+
+effect fn positionedBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut app = Runtime<Positioned, NamedMessage, NoCommand>.make(Positioned {})
+  run app.start(&mut tree, 0.0)
+  run tree.frame(viewport())
+  let fixed = run node(&mut tree, "fixed")
+  run Testing.expect(
+    fixed.bounds.xMin == 250.0 && fixed.bounds.yMin == 11.0,
+    "fixed descendants use viewport coordinates",
+  )
+  run tree.dispatch(Input.Wheel { x: 80.0, y: 70.0, deltaX: 0.0, deltaY: 60.0, modifiers: 0 })
+  run tree.frame(viewport())
+  let scroll = run node(&mut tree, "scroll")
+  let sticky = run node(&mut tree, "sticky")
+  let flow = run node(&mut tree, "flow")
+  let after = run node(&mut tree, "fixed")
+  run Testing.expect(
+    tree.scrollOffset(scroll.id).y > 0.0 && flow.bounds.yMin < 0.0,
+    "the parent scrolls ordinary content",
+  )
+  run Testing.expect(
+    sticky.bounds.yMin == scroll.bounds.yMin,
+    "sticky children stay at the scrollport edge",
+  )
+  run Testing.expect(
+    after.bounds.xMin == fixed.bounds.xMin && after.bounds.yMin == fixed.bounds.yMin,
+    "fixed descendants remain stationary when ancestors scroll",
+  )
+}
+
+test effect fn fixedAndStickyThroughApp() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run positionedBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}

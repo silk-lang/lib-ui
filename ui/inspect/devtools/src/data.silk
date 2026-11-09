@@ -1,0 +1,454 @@
+//! What the devtools window shows, read out of the inspector protocol's JSON replies: the
+//! element tree (`tree`), a node's view and box model (`inspect`), the event log (`events`), the
+//! frame stats (`stats`) and the status line (`hello`). Display text is made here, once per
+//! reply, so the view only lays it out.
+import ui_inspect_server.reply { appendNumber, textField, numberField, idField, has }
+import ui_tree.inspect { writeInt, writeNumber }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.json.value { Json, Value }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.i64
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.text.string { String }
+
+/// The parent of the top row.
+pub const NO_PARENT: u32 = 4294967295
+
+/// The longest accessible name a row shows, in bytes; longer names are cut at a character.
+const NAME_LIMIT: usize = 48
+
+/// One node of the element tree.
+pub struct Row {
+  pub id: u32,
+  pub parent: u32,
+  pub depth: u32,
+  pub children: u32,
+  /// What devtools prints for an element: the role (or the kind), the accessible name in
+  /// quotes, and the test id in brackets: `button "Add"`, `box [items]`, `text "Buy milk"`.
+  pub label: String,
+  /// The id and the size: `#12  64 × 28`.
+  pub detail: String,
+  /// Whether no collapsed ancestor hides it.
+  pub visible: bool,
+}
+
+/// The four sides of one box of the box model, in CSS pixels.
+pub struct Sides {
+  pub top: f32,
+  pub right: f32,
+  pub bottom: f32,
+  pub left: f32,
+}
+
+impl Copy for Sides {}
+
+/// The box model of a node's first fragment: margin, border and padding widths around the
+/// content box.
+pub struct BoxNumbers {
+  pub margin: Sides,
+  pub border: Sides,
+  pub padding: Sides,
+  pub width: f32,
+  pub height: f32,
+  pub x: f32,
+  pub y: f32,
+  /// How many fragments the node has (more than one for text and inline boxes split across
+  /// lines; the numbers are the first one's).
+  pub fragments: u32,
+}
+
+impl Copy for BoxNumbers {}
+
+/// The inspected node.
+pub struct Detail {
+  /// The node, or NO_PARENT when nothing is inspected.
+  pub id: u32,
+  /// The row label of the node.
+  pub title: String,
+  /// The devtools node view (`inspect`'s text), one entry per line.
+  pub lines: List<String>,
+  /// Whether the node has a box (`box` holds its numbers).
+  pub hasBox: bool,
+  pub box: BoxNumbers,
+}
+
+/// One record of the event log.
+pub struct LogRow {
+  pub seq: u64,
+  pub target: u32,
+  /// `click`, `keydown`, ...
+  pub kind: String,
+  /// The rest: target, key or value, and position.
+  pub text: String,
+}
+
+/// One frame stat.
+pub struct Stat {
+  pub name: String,
+  pub value: String,
+}
+
+/// What one refresh read from the app.
+pub struct Snapshot {
+  pub status: String,
+  pub rows: List<Row>,
+  pub stats: List<Stat>,
+  pub events: List<LogRow>,
+  /// The `seq` the next event record will get.
+  pub next: u64,
+  /// The inspected node again, when one was selected and still exists.
+  pub detail: Option<Detail>,
+}
+
+fn zeroSides() -> Sides {
+  return Sides { top: 0.0, right: 0.0, bottom: 0.0, left: 0.0 }
+}
+
+impl BoxNumbers {
+  pub fn zero() -> BoxNumbers {
+    return BoxNumbers {
+      margin: zeroSides(),
+      border: zeroSides(),
+      padding: zeroSides(),
+      width: 0.0,
+      height: 0.0,
+      x: 0.0,
+      y: 0.0,
+      fragments: 0,
+    }
+  }
+}
+
+impl Detail {
+  /// Nothing inspected.
+  pub fn none() -> Detail {
+    return Detail {
+      id: NO_PARENT,
+      title: String.make(),
+      lines: List<String>.make(),
+      hasBox: false,
+      box: BoxNumbers.zero(),
+    }
+  }
+}
+
+/// The elements of array `value`, or None when it is not an array.
+fn items<'a>(value: Option<&'a Value>) -> Option<&'a List<Value>> {
+  return match value {
+    Option<&Value>.Some { value: v } => match &v.* {
+      Value.Array { values } => Option<&List<Value>>.Some { value: &values }
+      _ => Option<&List<Value>>.None
+    }
+    Option<&Value>.None => Option<&List<Value>>.None
+  }
+}
+
+fn u32Field(value: &Value, key: string, fallback: u32) -> u32 {
+  return match idField(value, key) {
+    Option<u32>.Some { value: n } => n
+    Option<u32>.None => fallback
+  }
+}
+
+fn u64Field(value: &Value, key: string) -> u64 {
+  return match Json.asU64(Json.field(value, key)) {
+    Option<u64>.Some { value: n } => n
+    Option<u64>.None => 0
+  }
+}
+
+/// `text` cut to at most `limit` bytes at a character boundary, with an ellipsis when cut.
+effect fn appendCut(out: &mut String, text: string, limit: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if String.byteLength(text) <= limit {
+    run out.append(text)
+    return ()
+  }
+  let mut end = limit
+  while end > 0 && !String.isCharBoundary(text, end) {
+    end = end - 1
+  }
+  run out.append(String.slice(text, 0, end))
+  run out.append("...")
+}
+
+/// The row label of node object `node`.
+pub effect fn labelOf(node: &Value, out: &mut String) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let roleText = textField(node, "role")
+  if roleText != "" {
+    run out.append(roleText)
+  } else {
+    run out.append(textField(node, "kind"))
+  }
+  let name = textField(node, "name")
+  if name != "" {
+    run out.append(" \"")
+    run appendCut(&mut out, name, NAME_LIMIT)
+    run out.append("\"")
+  }
+  let testId = textField(node, "testId")
+  if testId != "" {
+    run out.append(" [")
+    run out.append(testId)
+    run out.append("]")
+  }
+}
+
+/// Writes `value` with at most one decimal, as devtools prints box sizes.
+pub effect fn writeSize(out: &mut String, value: f32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let tenths = f32.floor(value * 10.0 + 0.5) / 10.0
+  run writeNumber(&mut out, tenths)
+}
+
+/// The rows of a `tree` reply, in tree order.
+pub effect fn parseTree(reply: &Value, out: &mut List<Row>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  let array = match items(Json.field(reply, "nodes")) {
+    Option<&List<Value>>.Some { value } => value
+    Option<&List<Value>>.None => {
+      return ()
+    }
+  }
+  let list = array.asSlice()
+  let mut i: usize = 0
+  while i < list.length {
+    let node = &list[i]
+    let mut label = String.make()
+    run labelOf(node, &mut label)
+    let mut detail = run String.copy("#")
+    let id = u32Field(node, "id", 0)
+    run writeInt(&mut detail, u32.toU64(id))
+    if has(node, "width") {
+      run detail.append("  ")
+      run writeSize(&mut detail, numberField(node, "width", 0.0))
+      run detail.append(" × ")
+      run writeSize(&mut detail, numberField(node, "height", 0.0))
+    }
+    run out.append(
+      Row {
+        id: id,
+        parent: u32Field(node, "parent", NO_PARENT),
+        depth: u32Field(node, "depth", 0),
+        children: u32Field(node, "children", 0),
+        label: move label,
+        detail: move detail,
+        visible: true,
+      },
+    )
+    i = i + 1
+  }
+}
+
+fn rectOf(box: &Value, key: string) -> [f32; 4] {
+  return match Json.field(box, key) {
+    Option<&Value>.Some { value: r } => [
+      numberField(r, "x", 0.0),
+      numberField(r, "y", 0.0),
+      numberField(r, "width", 0.0),
+      numberField(r, "height", 0.0),
+    ]
+    Option<&Value>.None => [0.0, 0.0, 0.0, 0.0]
+  }
+}
+
+/// The widths between rect `outer` and rect `inner` (x, y, width, height).
+fn between(outer: [f32; 4], inner: [f32; 4]) -> Sides {
+  return Sides {
+    top: inner[1] - outer[1],
+    right: outer[0] + outer[2] - (inner[0] + inner[2]),
+    bottom: outer[1] + outer[3] - (inner[1] + inner[3]),
+    left: inner[0] - outer[0],
+  }
+}
+
+/// The inspected node out of an `inspect` reply.
+pub effect fn parseDetail(reply: &Value) -> Detail
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut detail = Detail.none()
+  match Json.field(reply, "node") {
+    Option<&Value>.Some { value: node } => {
+      detail.id = u32Field(node, "id", NO_PARENT)
+      run labelOf(node, &mut detail.title)
+    }
+    Option<&Value>.None => {}
+  }
+  let text = textField(reply, "text")
+  let mut lines = String.split(text, "\n")
+  while true {
+    match lines.next() {
+      Option<string>.Some { value: line } => {
+        if line != "" {
+          run detail.lines.append(run String.copy(line))
+        }
+      }
+      Option<string>.None => {
+        break
+      }
+    }
+  }
+  match Json.field(reply, "box") {
+    Option<&Value>.Some { value: box } => {
+      let margin = rectOf(box, "margin")
+      let border = rectOf(box, "border")
+      let padding = rectOf(box, "padding")
+      let content = rectOf(box, "content")
+      detail.hasBox = true
+      detail.box = BoxNumbers {
+        margin: between(margin, border),
+        border: between(border, padding),
+        padding: between(padding, content),
+        width: content[2],
+        height: content[3],
+        x: border[0],
+        y: border[1],
+        fragments: u32Field(box, "fragments", 1),
+      }
+    }
+    Option<&Value>.None => {}
+  }
+  return move detail
+}
+
+/// The records of an `events` reply, appended to `out` oldest first. Returns the reply's `next`.
+pub effect fn parseEvents(reply: &Value, out: &mut List<LogRow>) -> u64
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let array = match items(Json.field(reply, "events")) {
+    Option<&List<Value>>.Some { value } => value
+    Option<&List<Value>>.None => {
+      return u64Field(reply, "next")
+    }
+  }
+  let list = array.asSlice()
+  let mut i: usize = 0
+  while i < list.length {
+    let e = &list[i]
+    let target = u32Field(e, "target", NO_PARENT)
+    let mut text = run String.copy("#")
+    run writeInt(&mut text, u32.toU64(target))
+    let key = textField(e, "key")
+    if key != "" {
+      run text.append("  key ")
+      run text.append(key)
+    }
+    if has(e, "value") {
+      run text.append("  value \"")
+      run appendCut(&mut text, textField(e, "value"), NAME_LIMIT)
+      run text.append("\"")
+    }
+    if has(e, "x") {
+      run text.append("  at ")
+      run writeSize(&mut text, numberField(e, "x", 0.0))
+      run text.append(", ")
+      run writeSize(&mut text, numberField(e, "y", 0.0))
+    }
+    run out.append(
+      LogRow {
+        seq: u64Field(e, "seq"),
+        target: target,
+        kind: run String.copy(textField(e, "kind")),
+        text: move text,
+      },
+    )
+    i = i + 1
+  }
+  return u64Field(reply, "next")
+}
+
+/// Appends `name` and the value of JSON `value` (numbers in their shortest form, flags as yes or no).
+effect fn addStat(out: &mut List<Stat>, name: string, value: &Value) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = String.make()
+  match &value.* {
+    Value.Number { value: number } => {
+      run appendNumber(&mut text, &number)
+    }
+    Value.Bool { value: b } => {
+      run text.append(
+        if b {
+          "yes"
+        } else {
+          "no"
+        },
+      )
+    }
+    Value.String { text: s } => {
+      run text.append(String.view(&s))
+    }
+    _ => {
+      return ()
+    }
+  }
+  run out.append(Stat { name: run String.copy(name), value: move text })
+}
+
+/// The stats of a `stats` reply in reply order; nested objects (`layout`) give `layout passes`
+/// and so on.
+pub effect fn parseStats(reply: &Value, out: &mut List<Stat>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  match &reply.* {
+    Value.Object { entries } => {
+      let members = entries.asSlice()
+      let mut i: usize = 0
+      while i < members.length {
+        let entry = &members[i]
+        let key = String.view(&entry.key)
+        if key != "ok" && key != "id" {
+          match &entry.value {
+            Value.Object { entries: inner } => {
+              let nested = inner.asSlice()
+              let mut j: usize = 0
+              while j < nested.length {
+                let sub = &nested[j]
+                let mut name = run String.copy(key)
+                run name.append(" ")
+                run name.append(String.view(&sub.key))
+                run addStat(&mut out, String.view(&name), &sub.value)
+                j = j + 1
+              }
+            }
+            _ => {
+              run addStat(&mut out, key, &entry.value)
+            }
+          }
+        }
+        i = i + 1
+      }
+    }
+    _ => {}
+  }
+}
+
+/// The status line out of a `hello` reply: frame, viewport and node count.
+pub effect fn parseStatus(reply: &Value, out: &mut String) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  run out.append("frame ")
+  run writeInt(&mut out, u64Field(reply, "frame"))
+  run out.append("  ·  ")
+  run writeSize(&mut out, numberField(reply, "width", 0.0))
+  run out.append(" × ")
+  run writeSize(&mut out, numberField(reply, "height", 0.0))
+  run out.append(" @")
+  run writeSize(&mut out, numberField(reply, "scale", 1.0))
+  run out.append("x  ·  ")
+  run writeInt(&mut out, u64Field(reply, "nodes"))
+  run out.append(" nodes")
+}

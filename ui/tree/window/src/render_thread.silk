@@ -1,0 +1,999 @@
+//! The window host's render thread. It owns the GPU: the Dawn instance, the device, the window's
+//! surface, the renderer and the atlas textures, all created on that thread, so no GPU object
+//! crosses threads. The UI thread lays out and paints as before, then hands each finished frame
+//! over with [`RenderThread.submit`]: a copy of the scene, the atlas texture list and the new
+//! atlas pixels. The render thread uploads, waits for a drawable, draws and presents, so waiting
+//! for the display never blocks input.
+//!
+//! The hand-over is a one-slot mailbox where the newest frame wins. A frame the render thread
+//! has not taken yet is replaced, and its uploads are kept in front of the new frame's, so no
+//! atlas pixels are lost. The replaced scene's storage is reused for the next copy.
+//!
+//! The render thread also scrolls on its own, as a browser compositor does: the window host
+//! hands each frame's [`FastScroll`] (which scrollers the user may scroll, and where wheel
+//! listeners are) with it, and the platform thread scrolls through a [`Compositor`] when a wheel
+//! event can go no further than a scroller. The render thread draws the last frame again with the
+//! new offsets and the UI thread learns them afterwards. Offsets a frame of the UI thread already
+//! took ([`RenderThread.submit`]'s `fastSeq`) are dropped.
+//!
+//! Everything a frame carries lives in the process heap, never in a caller's arena: the copies
+//! are made with the system allocator, whatever allocator the caller provides.
+import ui_scene.scene { Scene }
+import ui_scene.scroll { Placements, ScrollGroup, ScrollPosition }
+import ui_scene.color as color
+import ui_tree.lib { Pending }
+import atlas.atlas { Atlas, TextureInfo }
+import ui_renderer.atlas_textures { GpuAtlas }
+import ui_renderer.compare { Tolerance, compare }
+import ui_renderer.readback { copyOut, isBgra, pickFormat, readbackSize, unpack }
+import ui_renderer.renderer { UiRenderer }
+import ui_renderer.text { TextSettings }
+import window.types { RawSurface, WindowId }
+import webgpu.runtime { Device, GpuError, Instance, RequestAdapterOptions }
+import webgpu.runtime as runtime
+import webgpu.resources { Queue, Texture, getQueue }
+import webgpu.surface { Surface, SurfaceConfiguration, SurfaceTarget }
+import webgpu.descriptors { DeviceDescriptor, TextureViewDescriptor }
+import webgpu_sys.generated_webgpu as flags
+import silk.collections.list { List }
+import silk.concurrency.sync { Arc, Mutex, Parker, Unparker }
+import silk.concurrency.thread { Transferable }
+import silk.concurrency.thread_native { JoinHandle, NativeThread, SpawnError }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import console { StderrWriter }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import clock { Clock }
+import silk.text.string { String }
+import silk.num.f64
+import silk.num.u64
+import silk.num.i32
+import silk.num.u32
+import silk.num.usize
+import silk.num.f32
+import silk.geometry.rect { Rect }
+
+/// How the render thread sets up the surface.
+pub struct RenderSettings {
+  /// Check mode: the surface can be read back, and text uses no gamma correction, like the CPU
+  /// reference.
+  pub check: bool,
+}
+
+impl Copy for RenderSettings {}
+
+/// What the render thread last did, for frame timings and the check.
+pub struct RenderReport {
+  /// Frames presented so far.
+  pub frames: u64,
+  /// Of those, the frames the UI thread painted; the rest the compositor drew again.
+  pub painted: u64,
+  /// The result of the last compared frame: 0 within tolerance, 1 outside, -1 none yet.
+  pub status: i32,
+  /// Milliseconds the last frame spent writing atlas pixels, waiting for a drawable, encoding
+  /// and submitting the draw, and presenting.
+  pub upload: f64,
+  pub acquire: f64,
+  pub draw: f64,
+  pub present: f64,
+  /// Milliseconds between the last two presents, 0 before the second.
+  pub interval: f64,
+}
+
+impl Copy for RenderReport {}
+
+impl RenderReport {
+  fn none() -> RenderReport {
+    return RenderReport {
+      frames: 0,
+      painted: 0,
+      status: -1,
+      upload: 0.0,
+      acquire: 0.0,
+      draw: 0.0,
+      present: 0.0,
+      interval: 0.0,
+    }
+  }
+}
+
+/// The window's native surface, sent once to the render thread. The pointers it holds belong to
+/// the window, which outlives the render thread: [`RenderThread.stop`] joins it before the
+/// window closes.
+struct SurfaceHandle {
+  raw: RawSurface,
+  window: WindowId,
+}
+
+impl Transferable for SurfaceHandle {}
+
+/// One frame for the render thread.
+struct FrameJob {
+  scene: Scene,
+  textures: List<TextureInfo>,
+  uploads: Pending,
+  width: u32,
+  height: u32,
+  /// The CPU reference to compare the drawn surface with, when `compare` is set.
+  expected: List<u8>,
+  compare: bool,
+  fast: FastScroll,
+  /// The last compositor scroll the UI thread took before painting this frame.
+  fastSeq: u64,
+}
+
+impl Transferable for FrameJob {}
+
+/// Which scrollers of a frame the compositor may scroll, and where it must not.
+pub struct FastScroll {
+  /// The scroll containers the user can scroll, with the axes they scroll on.
+  pub scrollers: List<ScrollerAxes>,
+  /// Window rectangles, in device pixels, where a wheel listener must see the event first.
+  pub blocked: List<Rect<f32>>,
+}
+
+impl FastScroll {
+  pub fn make() -> FastScroll {
+    return FastScroll { scrollers: List<ScrollerAxes>.make(), blocked: List<Rect<f32>>.make() }
+  }
+
+  fn axes(self: &Self, node: u32) -> ScrollerAxes {
+    let list = self.scrollers.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      if list[i].node == node {
+        return list[i]
+      }
+      i = i + 1
+    }
+    return ScrollerAxes { node: node, x: false, y: false }
+  }
+}
+
+/// A scroll container the user can scroll: on `x`, on `y`, or both.
+pub struct ScrollerAxes {
+  pub node: u32,
+  pub x: bool,
+  pub y: bool,
+}
+
+impl Copy for ScrollerAxes {}
+
+/// An offset the compositor gave node `node`, in device pixels, as its `seq`th scroll.
+pub struct FastScrolled {
+  pub node: u32,
+  pub x: f32,
+  pub y: f32,
+  pub seq: u64,
+}
+
+impl Copy for FastScrolled {}
+
+struct State {
+  job: Option<FrameJob>,
+  /// Draw the current frame again: the compositor moved a scroller.
+  redraw: bool,
+  /// The current frame's scroll groups and offsets, for the compositor's hit test.
+  groups: List<ScrollGroup>,
+  painted: List<ScrollPosition>,
+  fast: FastScroll,
+  /// Offsets the compositor set since the frames it was told about, with their sequence.
+  newer: List<ScrollPosition>,
+  newerSeq: List<u64>,
+  seq: u64,
+  placements: Placements,
+  /// Storage of a drawn or replaced scene, reused for the next copy.
+  spare: Option<Scene>,
+  quit: bool,
+  ready: bool,
+  format: u32,
+  failure: Option<GpuError>,
+  report: RenderReport,
+}
+
+impl Transferable for State {}
+
+/// The GPU side of one window, running on its own thread.
+pub struct RenderThread {
+  shared: Arc<Mutex<State>>,
+  /// The UI thread sleeps here while it waits for the render thread.
+  parker: Parker,
+  /// Wakes the render thread.
+  wake: Unparker,
+  handle: Option<JoinHandle<i32>>,
+}
+
+impl RenderThread {
+  /// Starts the render thread for the window's surface `raw`, then waits until its GPU device
+  /// is ready. Fails with the thread's error when the surface or device cannot be made.
+  pub effect fn start(raw: RawSurface, window: WindowId, settings: RenderSettings) -> RenderThread
+    ! GpuError | OutOfMemoryError {
+    let mut heap = Allocator.systemAllocatorProvider()
+    let shared = run makeShared() |> Effect.provideMut<Allocator>(&mut heap)
+    let parker = run Parker.make() |> Effect.provideMut<Allocator>(&mut heap)
+    let theirParker = run Parker.make() |> Effect.provideMut<Allocator>(&mut heap)
+    let wake = theirParker.unparker()
+    let wakeUi = parker.unparker()
+    let theirs = shared.clone()
+    let surface = SurfaceHandle { raw: raw, window: window }
+    let spawned = run Effect.result(
+      NativeThread.spawn(
+        fn() -> i32 {
+          let shared = move theirs
+          let surface = move surface
+          let parker = move theirParker
+          let wakeUi = move wakeUi
+          return renderMain(&surface, &shared, &parker, &wakeUi, settings)
+        },
+      ),
+    )
+      |> Effect.provideMut<Allocator>(&mut heap)
+    let handle = match move spawned {
+      Result.Success { value } => move value
+      Result.Failure { error } => match move error {
+        SpawnError failure => {
+          StderrWriter.print("ui-tree: the render thread could not start\n", &())
+          fail GpuError.status(i32.wrappingToU32(failure.code))
+        }
+        OutOfMemoryError failure => {
+          fail move failure
+        }
+      }
+    }
+    let mut thread = RenderThread {
+      shared: move shared,
+      parker: move parker,
+      wake: move wake,
+      handle: Option<JoinHandle<i32>>.some(move handle),
+    }
+    run thread.waitReady()
+    return move thread
+  }
+
+  /// The surface's texture format, chosen by the render thread.
+  pub fn format(self: &Self) -> u32 {
+    return self.shared.get().lock().get().format
+  }
+
+  effect fn waitReady(self: &mut Self) -> ()
+    ! GpuError {
+    while true {
+      let ready = readyOrFailed(&self.shared)
+      if ready {
+        break
+      }
+      self.parker.park()
+    }
+    run raise(&self.shared)
+  }
+
+  /// Hands a finished frame to the render thread and returns at once. `scene` is copied, with
+  /// `atlas`'s texture list and `uploads`'s pixels, so the caller keeps using all three. A
+  /// frame the render thread has not taken yet is replaced; its uploads go first. With
+  /// `compare` set (check mode), the drawn surface is compared with the RGBA pixels `expected`
+  /// and the result shows in [`RenderThread.report`]. Fails with the render thread's error if it has
+  /// stopped on one.
+  pub effect fn submit(
+    self: &mut Self,
+    scene: &Scene,
+    atlas: &Atlas,
+    uploads: &Pending,
+    width: u32,
+    height: u32,
+    compare: bool,
+    expected: &[u8],
+    fast: FastScroll,
+    fastSeq: u64,
+  ) -> ()
+    ! GpuError | OutOfMemoryError {
+    run raise(&self.shared)
+    let mut heap = Allocator.systemAllocatorProvider()
+    let mut copy = match move takeSpare(&self.shared) {
+      Option<Scene>.Some { value } => move value
+      Option<Scene>.None => Scene.make()
+    }
+    run copy.copyFrom(scene) |> Effect.provideMut<Allocator>(&mut heap)
+    let mut textures = List<TextureInfo>.make()
+    let mut i: usize = 0
+    while i < atlas.textureCount() {
+      run textures.append(atlas.texture(i)) |> Effect.provideMut<Allocator>(&mut heap)
+      i = i + 1
+    }
+    let mut reference = List<u8>.make()
+    if compare {
+      run reference.appendSlice(expected) |> Effect.provideMut<Allocator>(&mut heap)
+    }
+    let job = FrameJob {
+      scene: move copy,
+      textures: move textures,
+      uploads: Pending.make(),
+      width: width,
+      height: height,
+      expected: move reference,
+      compare: compare,
+      fast: move fast,
+      fastSeq: fastSeq,
+    }
+    run post(&self.shared, move job, uploads) |> Effect.provideMut<Allocator>(&mut heap)
+    self.wake.unpark()
+  }
+
+  /// The handle the platform thread scrolls through.
+  pub fn compositor(self: &Self) -> Compositor {
+    return Compositor { shared: self.shared.clone(), wake: self.wake.clone() }
+  }
+
+  /// What the render thread last reported.
+  pub fn report(self: &Self) -> RenderReport {
+    return self.shared.get().lock().get().report
+  }
+
+  /// Waits until `frames` frames have been presented, or the render thread stopped on an error,
+  /// which this then fails with.
+  pub effect fn waitFrames(self: &mut Self, frames: u64) -> RenderReport
+    ! GpuError {
+    while true {
+      if presentedOrStopped(&self.shared, frames) {
+        break
+      }
+      self.parker.park()
+    }
+    run raise(&self.shared)
+    return self.report()
+  }
+
+  /// Stops the render thread and waits for it, after any frame it is drawing. Call it before
+  /// the window closes.
+  pub fn stop(self: &mut Self) -> () {
+    requestQuit(&self.shared)
+    self.wake.unpark()
+    match move Intrinsic.replace(self.handle, Option<JoinHandle<i32>>.None) {
+      Option<JoinHandle<i32>>.Some { value } => {
+        drop value.join()
+      }
+      Option<JoinHandle<i32>>.None => ()
+    }
+  }
+}
+
+fn readyOrFailed(shared: &Arc<Mutex<State>>) -> bool {
+  let guard = shared.get().lock()
+  return guard.get().ready || Option<GpuError>.isSome(&guard.get().failure) || guard.get().quit
+}
+
+fn presentedOrStopped(shared: &Arc<Mutex<State>>, frames: u64) -> bool {
+  let guard = shared.get().lock()
+  let state = guard.get()
+  return state.report.frames >= frames || Option<GpuError>.isSome(&state.failure) || state.quit
+}
+
+fn requestQuit(shared: &Arc<Mutex<State>>) -> () {
+  let mut guard = shared.get().lock()
+  let state = guard.getMut()
+  state.quit = true
+}
+
+fn takeSpare(shared: &Arc<Mutex<State>>) -> Option<Scene> {
+  let mut guard = shared.get().lock()
+  return Intrinsic.replace(guard.getMut().spare, Option<Scene>.None)
+}
+
+/// Fails with the render thread's error, if it stopped on one.
+effect fn raise(shared: &Arc<Mutex<State>>) -> ()
+  ! GpuError {
+  let failure = takeFailure(shared)
+  match move failure {
+    Option<GpuError>.Some { value } => {
+      fail move value
+    }
+    Option<GpuError>.None => ()
+  }
+}
+
+fn takeFailure(shared: &Arc<Mutex<State>>) -> Option<GpuError> {
+  let mut guard = shared.get().lock()
+  return Intrinsic.replace(guard.getMut().failure, Option<GpuError>.None)
+}
+
+/// Puts `job` in the mailbox. A job still waiting there is replaced: its uploads go in front of
+/// `uploads`, and its scene's storage becomes the spare.
+effect fn post(shared: &Arc<Mutex<State>>, job: FrameJob, uploads: &Pending) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut next = move job
+  let mut guard = shared.get().lock()
+  let state = guard.getMut()
+  let replaced = Intrinsic.replace(state.job, Option<FrameJob>.None)
+  match move replaced {
+    Option<FrameJob>.Some { value } => {
+      run next.uploads.appendAll(&value.uploads)
+      let FrameJob {
+        scene: old,
+        textures: t,
+        uploads: u,
+        width: w,
+        height: h,
+        expected: e,
+        compare: c,
+        fast: f,
+        fastSeq: q
+      } = move value
+      drop t
+      drop u
+      drop e
+      state.spare = Option<Scene>.some(move old)
+    }
+    Option<FrameJob>.None => ()
+  }
+  run next.uploads.appendAll(uploads)
+  state.job = Option<FrameJob>.some(move next)
+}
+
+effect fn makeShared() -> Arc<Mutex<State>>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let state = State {
+    job: Option<FrameJob>.None,
+    redraw: false,
+    groups: List<ScrollGroup>.make(),
+    painted: List<ScrollPosition>.make(),
+    fast: FastScroll.make(),
+    newer: List<ScrollPosition>.make(),
+    newerSeq: List<u64>.make(),
+    seq: 0,
+    placements: Placements.make(),
+    spare: Option<Scene>.None,
+    quit: false,
+    ready: false,
+    format: 0,
+    failure: Option<GpuError>.None,
+    report: RenderReport.none(),
+  }
+  return run Arc<Mutex<State>>.make(run Mutex<State>.make(move state))
+}
+
+/// The thread's body: runs the loop and passes its error, if any, to the UI thread.
+fn renderMain(
+  surface: &SurfaceHandle,
+  shared: &Arc<Mutex<State>>,
+  parker: &Parker,
+  wakeUi: &Unparker,
+  settings: RenderSettings,
+) -> i32 {
+  let mut heap = Allocator.systemAllocatorProvider()
+  let result = run Effect.result(renderLoop(surface, shared, parker, wakeUi, settings))
+    |> Effect.provideMut<Allocator>(&mut heap)
+  let failure = match move result {
+    Result.Success { value } => {
+      drop value
+      requestQuit(shared)
+      wakeUi.unpark()
+      return 0
+    }
+    Result.Failure { error } => match move error {
+      GpuError failure => move failure
+      OutOfMemoryError failure => {
+        drop failure
+        GpuError.status(0)
+      }
+    }
+  }
+  recordFailure(shared, move failure)
+  wakeUi.unpark()
+  return 2
+}
+
+fn recordFailure(shared: &Arc<Mutex<State>>, failure: GpuError) -> () {
+  let mut guard = shared.get().lock()
+  let values = guard.getMut()
+  values.failure = Option<GpuError>.some(move failure)
+  values.quit = true
+}
+
+/// What the render thread does next.
+union Work {
+  /// Draw a new frame.
+  Job { job: FrameJob },
+  /// Draw the current frame again at newer scroll offsets.
+  Redraw,
+  Quit
+}
+
+/// Waits for the next work.
+fn nextWork(shared: &Arc<Mutex<State>>, parker: &Parker) -> Work {
+  while true {
+    let taken = takeWork(shared)
+    match move taken {
+      Option<Work>.Some { value } => {
+        return move value
+      }
+      Option<Work>.None => {
+        parker.park()
+      }
+    }
+  }
+  return Work.Quit
+}
+
+fn takeWork(shared: &Arc<Mutex<State>>) -> Option<Work> {
+  let mut guard = shared.get().lock()
+  let state = guard.getMut()
+  if state.quit {
+    return Option<Work>.some(Work.Quit)
+  }
+  return match move Intrinsic.replace(state.job, Option<FrameJob>.None) {
+    Option<FrameJob>.Some { value } => {
+      state.redraw = false
+      Option<Work>.some(Work.Job { job: move value })
+    }
+    Option<FrameJob>.None => if state.redraw {
+      state.redraw = false
+      Option<Work>.some(Work.Redraw)
+    } else {
+      Option<Work>.None
+    }
+  }
+}
+
+/// Makes `job` the frame the compositor scrolls: its groups and offsets, and the offsets it
+/// already took dropped from the compositor's.
+effect fn adopt(shared: &Arc<Mutex<State>>, job: &mut FrameJob) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut guard = shared.get().lock()
+  let state = guard.getMut()
+  state.groups.clear()
+  run state.groups.appendSlice(job.scene.scrollGroups())
+  state.painted.clear()
+  run state.painted.appendSlice(job.scene.scrolls())
+  state.fast = Intrinsic.replace(job.fast, FastScroll.make())
+  let mut i: usize = 0
+  while i < state.newer.length() {
+    if state.newerSeq.get(i) <= job.fastSeq {
+      drop state.newer.remove(i)
+      drop state.newerSeq.remove(i)
+    } else {
+      i = i + 1
+    }
+  }
+}
+
+/// The compositor's offsets, to draw with.
+effect fn newerScrolls(shared: &Arc<Mutex<State>>, out: &mut List<ScrollPosition>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  let guard = shared.get().lock()
+  run out.appendSlice(guard.get().newer.asSlice())
+}
+
+fn markReady(shared: &Arc<Mutex<State>>, format: u32) -> () {
+  let mut guard = shared.get().lock()
+  let values = guard.getMut()
+  values.format = format
+  values.ready = true
+}
+
+/// Records a presented frame.
+fn recordFrame(shared: &Arc<Mutex<State>>, report: RenderReport) -> () {
+  let mut guard = shared.get().lock()
+  let values = guard.getMut()
+  let previous = values.report
+  values.report = report
+  values.report.frames = previous.frames + 1
+  values.report.painted = previous.painted + report.painted
+  if report.status < 0 {
+    values.report.status = previous.status
+  }
+}
+
+/// Keeps the storage of a frame that is no longer drawn for the next copy.
+fn retire(shared: &Arc<Mutex<State>>, job: FrameJob) -> () {
+  let mut guard = shared.get().lock()
+  let values = guard.getMut()
+  if Option<Scene>.isNone(&values.spare) {
+    let FrameJob {
+      scene: used,
+      textures: t,
+      uploads: u,
+      width: w,
+      height: h,
+      expected: e,
+      compare: c,
+      fast: f,
+      fastSeq: q
+    } = move job
+    drop t
+    drop u
+    drop e
+    drop f
+    values.spare = Option<Scene>.some(move used)
+  } else {
+    drop job
+  }
+}
+
+/// The window's surface target, by backend.
+unsafe fn targetOf<'w>(owner: &'w WindowId, raw: RawSurface) -> Option<SurfaceTarget<'w>> {
+  return match raw {
+    RawSurface.MetalLayer { layer } => Option<SurfaceTarget<'w>>.some(
+      unsafe SurfaceTarget.metalLayer(owner, layer),
+    )
+    RawSurface.Win32 { hwnd, hinstance } => Option<SurfaceTarget<'w>>.some(
+      unsafe SurfaceTarget.windows(owner, hwnd, hinstance),
+    )
+    RawSurface.Wayland { display, surface } => Option<SurfaceTarget<'w>>.some(
+      unsafe SurfaceTarget.wayland(owner, display, surface),
+    )
+    RawSurface.Xlib { display, window } => Option<SurfaceTarget<'w>>.some(
+      unsafe SurfaceTarget.x11(owner, display, window),
+    )
+    _ => Option<SurfaceTarget<'w>>.None
+  }
+}
+
+/// Seconds on the monotonic clock.
+effect fn seconds(clock: &mut Clock) -> f64 {
+  return run clock.seconds()
+}
+
+effect fn renderLoop(
+  surface: &SurfaceHandle,
+  shared: &Arc<Mutex<State>>,
+  parker: &Parker,
+  wakeUi: &Unparker,
+  settings: RenderSettings,
+) -> ()
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut clock = Clock.make()
+  let owner = surface.window
+  let target = match unsafe targetOf(&owner, surface.raw) {
+    Option<SurfaceTarget>.Some { value } => move value
+    Option<SurfaceTarget>.None => {
+      StderrWriter.print("ui-tree: this backend has no GPU surface\n", &())
+      fail GpuError.status(0)
+    }
+  }
+  let instance = run Instance.create()
+  let gpuSurface = run Surface.create(&instance, &target, String.utf8Bytes("ui tree"))
+  let adapter = run instance.requestAdapter(&RequestAdapterOptions.forSurface(&gpuSurface))
+  let capabilities = run gpuSurface.getCapabilities(&adapter)
+  let format = pickFormat(capabilities.formats())
+  if format == 0 {
+    StderrWriter.print("ui-tree: the surface offers neither BGRA8 nor RGBA8 unorm\n", &())
+    fail GpuError.status(0)
+  }
+  let device = run adapter.requestDevice(&DeviceDescriptor.default())
+  let queue = run getQueue(&device)
+  let mut renderer = run UiRenderer.make(&device, format)
+  let mut textures = GpuAtlas.make()
+  let mut configuration = SurfaceConfiguration.make(&device, format, 1, 1)
+  if settings.check {
+    let canCopy = u64.bitAnd(capabilities.usages(), flags.WGPUTextureUsage_CopySrc) != 0
+    if !canCopy {
+      StderrWriter.print("ui-tree: the surface cannot be read back\n", &())
+      fail GpuError.status(0)
+    }
+    configuration.setUsage(flags.WGPUTextureUsage_RenderAttachment | flags.WGPUTextureUsage_CopySrc)
+    renderer.setTextSettings(TextSettings.none())
+  }
+  if capabilities.alphaModes().length != 0 {
+    configuration.setAlphaMode(capabilities.alphaModes()[0])
+  }
+  markReady(shared, format)
+  wakeUi.unpark()
+
+  let mut configuredWidth: u32 = 0
+  let mut configuredHeight: u32 = 0
+  let mut previousPresented = 0.0
+  let mut current = Option<FrameJob>.None
+  let mut newer = List<ScrollPosition>.make()
+  while true {
+    let work = nextWork(shared, parker)
+    let fresh = match move work {
+      Work.Job { job } => {
+        let mut next = move job
+        run adopt(shared, &mut next)
+        match move Intrinsic.replace(current, Option<FrameJob>.some(move next)) {
+          Option<FrameJob>.Some { value } => retire(shared, move value)
+          Option<FrameJob>.None => ()
+        }
+        true
+      }
+      Work.Redraw => false
+      Work.Quit => {
+        break
+      }
+    }
+    run newerScrolls(shared, &mut newer)
+    let mut job = match move Intrinsic.replace(current, Option<FrameJob>.None) {
+      Option<FrameJob>.Some { value } => move value
+      Option<FrameJob>.None => {
+        continue
+      }
+    }
+    if job.width == 0 || job.height == 0 {
+      current = Option<FrameJob>.some(move job)
+      recordFrame(shared, RenderReport.none())
+      wakeUi.unpark()
+      continue
+    }
+    if job.width != configuredWidth || job.height != configuredHeight {
+      gpuSurface.resize(&mut configuration, job.width, job.height)
+      configuredWidth = job.width
+      configuredHeight = job.height
+    }
+    let start = run seconds(&mut clock)
+    if fresh {
+      run textures.syncInfos(&device, job.textures.asSlice())
+      let list = job.uploads.entries()
+      let mut i: usize = 0
+      while i < list.length {
+        textures.write(&queue, list[i].tile, job.uploads.pixels(list[i]))
+        i = i + 1
+      }
+      job.uploads.clear()
+    }
+    let uploaded = run seconds(&mut clock)
+    let texture = run gpuSurface.getCurrentTexture()
+    let view = run texture.texture.createView(&TextureViewDescriptor.default())
+    let acquired = run seconds(&mut clock)
+    run renderer.setScrolls(newer.asSlice())
+    run renderer.draw(
+      &device,
+      &queue,
+      &job.scene,
+      &textures,
+      &view,
+      job.width,
+      job.height,
+      color.white(),
+    )
+    let drawn = run seconds(&mut clock)
+    let mut status: i32 = -1
+    if fresh && job.compare {
+      status = run checkFrame(
+        &device,
+        &queue,
+        &texture.texture,
+        isBgra(format),
+        job.expected.asSlice(),
+        job.width,
+        job.height,
+      )
+    }
+    run gpuSurface.present()
+    run device.checkErrors()
+    let presented = run seconds(&mut clock)
+    let report = RenderReport {
+      frames: 0,
+      painted: if fresh {
+        1
+      } else {
+        0
+      },
+      status: status,
+      upload: (uploaded - start) * 1000.0,
+      acquire: (acquired - uploaded) * 1000.0,
+      draw: (drawn - acquired) * 1000.0,
+      present: (presented - drawn) * 1000.0,
+      interval: if previousPresented == 0.0 {
+        0.0
+      } else {
+        (presented - previousPresented) * 1000.0
+      },
+    }
+    current = Option<FrameJob>.some(move job)
+    recordFrame(shared, report)
+    wakeUi.unpark()
+    previousPresented = presented
+  }
+  gpuSurface.unconfigure()
+}
+
+/// Compares the drawn surface with the CPU reference of the same frame. Returns 0 within
+/// tolerance and 1 outside.
+effect fn checkFrame(
+  device: &Device,
+  queue: &Queue,
+  surfaceTexture: &Texture,
+  bgra: bool,
+  expected: &[u8],
+  width: u32,
+  height: u32,
+) -> i32
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let buffer = run copyOut(device, queue, surfaceTexture, width, height)
+  let padded = run runtime.mapRead(device, &buffer, 0, readbackSize(width, height))
+  let pixels = run unpack(padded.asSlice(), width, height, bgra)
+  let result = compare(expected, pixels.asSlice(), width)
+  let ok = result.within(Tolerance.frame())
+  StderrWriter.print(
+    "check: {} x {} surface, max delta {} at ({}, {}), {} of {} channels over 8, mean {}: {}\n",
+    &(
+      width,
+      height,
+      result.max,
+      result.worstX,
+      result.worstY,
+      result.over,
+      result.channels,
+      result.mean,
+      if ok {
+        "pass"
+      } else {
+        "FAIL"
+      }
+    ),
+  )
+  return if ok {
+    0
+  } else {
+    1
+  }
+}
+
+/// The platform thread's handle to the render thread's compositor: it scrolls the last frame
+/// without the UI thread.
+pub struct Compositor {
+  shared: Arc<Mutex<State>>,
+  wake: Unparker,
+}
+
+impl Transferable for Compositor {}
+
+impl Compositor {
+  pub fn clone(self: &Self) -> Compositor {
+    return Compositor { shared: self.shared.clone(), wake: self.wake.clone() }
+  }
+
+  /// Frames the render thread presented so far.
+  pub fn presented(self: &Self) -> u64 {
+    return self.shared.get().lock().get().report.frames
+  }
+
+  /// Frames the UI thread painted that the render thread presented so far.
+  pub fn painted(self: &Self) -> u64 {
+    return self.shared.get().lock().get().report.painted
+  }
+
+  /// Scrolls by (`dx`, `dy`) device pixels the scrollers under (`x`, `y`) (window device pixels)
+  /// of the frame on screen, the innermost first, as far as each goes; then draws the frame
+  /// again. Appends each offset it set to `moved`. Returns false, scrolling nothing, when a
+  /// wheel listener is there or no scroller under the point can move: the UI thread must see
+  /// the event.
+  pub effect fn scroll(
+    self: &Self,
+    x: f32,
+    y: f32,
+    dx: f32,
+    dy: f32,
+    moved: &mut List<FastScrolled>,
+  ) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut guard = self.shared.get().lock()
+    let state = guard.getMut()
+    let blocked = state.fast.blocked.asSlice()
+    let mut b: usize = 0
+    while b < blocked.length {
+      let r = blocked[b]
+      if x >= r.xMin && x < r.xMax && y >= r.yMin && y < r.yMax {
+        return false
+      }
+      b = b + 1
+    }
+    run state.placements.resolve(
+      state.groups.asSlice(),
+      state.painted.asSlice(),
+      state.newer.asSlice(),
+    )
+    let count = state.groups.length()
+
+    // The innermost content group under the point: the last one in paint order.
+    let mut at: usize = count
+    let mut g: usize = count
+    while g > 1 {
+      g = g - 1
+      if isContent(&state.groups.get(g)) {
+        let clip = state.placements.get(usize.toU32(g)).clip
+        if x >= clip.xMin && x < clip.xMax && y >= clip.yMin && y < clip.yMax {
+          at = g
+          break
+        }
+      }
+    }
+    if at == count {
+      return false
+    }
+    let mut restX = dx
+    let mut restY = dy
+    let mut any = false
+    let start = moved.length()
+    while at != 0 && (restX != 0.0 || restY != 0.0) {
+      let group = state.groups.get(at)
+      if isContent(&group) {
+        let node = group.link.node
+        let axes = state.fast.axes(node)
+        if let Option<ScrollPosition>.Some { value: position } = current(&state.*, node) {
+          let wantX: f32 = if axes.x {
+            restX
+          } else {
+            0.0
+          }
+          let wantY: f32 = if axes.y {
+            restY
+          } else {
+            0.0
+          }
+          let next = position.movedBy(wantX, wantY)
+          if next.x != position.x || next.y != position.y {
+            restX = restX - (next.x - position.x)
+            restY = restY - (next.y - position.y)
+            let seq = state.seq + 1
+            state.seq = seq
+            run setNewer(&mut state, next, seq)
+            run moved.append(FastScrolled { node: node, x: next.x, y: next.y, seq: seq })
+            any = true
+          }
+        }
+      }
+      at = u32.toUsize(group.parent)
+    }
+    if !any {
+      moved.truncate(start)
+      return false
+    }
+    state.redraw = true
+    drop guard
+    self.wake.unpark()
+    return true
+  }
+}
+
+/// Whether `group` is the scrolled content of a scroll container (not a sticky box or thumb).
+fn isContent(group: &ScrollGroup) -> bool {
+  return group.link.x.factor == -1.0 && group.link.y.factor == -1.0
+}
+
+/// Node `node`'s offset now: the compositor's, else the frame's.
+fn current(state: &State, node: u32) -> Option<ScrollPosition> {
+  let newer = state.newer.asSlice()
+  let mut i: usize = 0
+  while i < newer.length {
+    if newer[i].node == node {
+      return Option<ScrollPosition>.some(newer[i])
+    }
+    i = i + 1
+  }
+  let painted = state.painted.asSlice()
+  i = 0
+  while i < painted.length {
+    if painted[i].node == node {
+      return Option<ScrollPosition>.some(painted[i])
+    }
+    i = i + 1
+  }
+  return Option<ScrollPosition>.None
+}
+
+effect fn setNewer(state: &mut State, position: ScrollPosition, seq: u64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let newer = state.newer.asMutSlice()
+  let mut i: usize = 0
+  while i < newer.length {
+    if newer[i].node == position.node {
+      newer[i] = position
+      state.newerSeq.set(i, seq)
+      return ()
+    }
+    i = i + 1
+  }
+  run state.newer.append(position)
+  run state.newerSeq.append(seq)
+}

@@ -1,0 +1,168 @@
+//! Scroll geometry shared by paint and input: which axes of a box scroll, the range of its
+//! scroll offset after a layout, and the overlay scrollbar thumbs.
+import mutation { Overflow, ScrollbarWidth }
+import style { Computed }
+import paint { paddingBox }
+import layout.lib { Fragment }
+import silk.core.ownership { Copy }
+import silk.geometry.rect { Rect }
+import silk.num.f32
+
+/// Inset of a thumb from the scrollport's edge, its thickness and shortest length, in CSS
+/// pixels.
+pub const THUMB_INSET: f32 = 2.0
+
+pub const THUMB_THICKNESS: f32 = 6.0
+
+pub const THUMB_MIN_LENGTH: f32 = 24.0
+
+/// Whether an overflow value makes a scroll container (`hidden` scrolls by `ScrollTo` and
+/// `ScrollIntoView`, but not by the user).
+pub fn scrolls(value: Overflow) -> bool {
+  return value == Overflow.Scroll || value == Overflow.Auto || value == Overflow.Hidden
+}
+
+/// Whether the user scrolls the axis with the wheel and its thumb.
+pub fn userScrolls(value: Overflow) -> bool {
+  return value == Overflow.Scroll || value == Overflow.Auto
+}
+
+/// The used overflow of an axis: `visible` beside a scrolling axis becomes `auto`, as CSS
+/// Overflow 3 and css-layout have it.
+pub fn usedOverflow(c: &Computed, horizontal: bool) -> Overflow {
+  let own = if horizontal {
+    c.overflowX
+  } else {
+    c.overflowY
+  }
+  let other = if horizontal {
+    c.overflowY
+  } else {
+    c.overflowX
+  }
+  if own == Overflow.Visible && scrolls(other) {
+    return Overflow.Auto
+  }
+  if own == Overflow.Clip && scrolls(other) {
+    return Overflow.Hidden
+  }
+  return own
+}
+
+/// The offsets a scroll container can take, in CSS pixels. Both bounds are 0 on an axis that
+/// does not scroll.
+pub struct ScrollRange {
+  pub minX: f32,
+  pub maxX: f32,
+  pub minY: f32,
+  pub maxY: f32,
+}
+
+impl Copy for ScrollRange {}
+
+impl ScrollRange {
+  pub fn none() -> ScrollRange {
+    return ScrollRange { minX: 0.0, maxX: 0.0, minY: 0.0, maxY: 0.0 }
+  }
+
+  pub fn clampX(self: &Self, x: f32) -> f32 {
+    return f32.max(self.minX, f32.min(self.maxX, x))
+  }
+
+  pub fn clampY(self: &Self, y: f32) -> f32 {
+    return f32.max(self.minY, f32.min(self.maxY, y))
+  }
+}
+
+/// The scroll range of a box with style `c` laid out as fragment `f`: its scrollable overflow
+/// against its padding box, as css-layout clamps.
+pub fn rangeOf(c: &Computed, f: &Fragment) -> ScrollRange {
+  let mut range = ScrollRange.none()
+  let overflow = f.scrollableOverflow
+  let port = f.paddingRect
+  if scrolls(usedOverflow(c, true)) {
+    range.minX = f32.min(0.0, overflow.x - port.x)
+    range.maxX = f32.max(0.0, overflow.x + overflow.width - port.x - port.width)
+  }
+  if scrolls(usedOverflow(c, false)) {
+    range.minY = f32.min(0.0, overflow.y - port.y)
+    range.maxY = f32.max(0.0, overflow.y + overflow.height - port.y - port.height)
+  }
+  return range
+}
+
+/// An overlay scrollbar thumb: where it is in CSS pixels of the viewport, and how many pixels
+/// of scrolling one pixel of thumb movement makes.
+pub struct Thumb {
+  pub visible: bool,
+  pub rect: Rect<f32>,
+  pub ratio: f32,
+}
+
+impl Copy for Thumb {}
+
+/// The vertical or horizontal thumb of a box with style `c`, fragment `f` and scroll offset
+/// `offset` on that axis. Only user-scrollable axes with something to scroll have one.
+pub fn thumbOf(c: &Computed, f: &Fragment, offset: f32, vertical: bool) -> Thumb {
+  let none = Thumb { visible: false, rect: Rect<f32>.new(0.0, 0.0, 0.0, 0.0), ratio: 0.0 }
+  if c.scrollbarWidth == ScrollbarWidth.None || !userScrolls(usedOverflow(c, !vertical)) {
+    return none
+  }
+  let thickness: f32 = if c.scrollbarWidth == ScrollbarWidth.Thin {
+    3.0
+  } else {
+    THUMB_THICKNESS
+  }
+  let range = rangeOf(c, f)
+  let min = if vertical {
+    range.minY
+  } else {
+    range.minX
+  }
+  let span = if vertical {
+    range.maxY - range.minY
+  } else {
+    range.maxX - range.minX
+  }
+  if span < 0.5 {
+    return none
+  }
+  let port = paddingBox(f)
+  let portLength = if vertical {
+    port.height()
+  } else {
+    port.width()
+  }
+  let track = portLength - 2.0 * THUMB_INSET - thickness
+  if track < THUMB_MIN_LENGTH {
+    return none
+  }
+  let length = f32.min(track, f32.max(THUMB_MIN_LENGTH, track * portLength / (portLength + span)))
+  let travel = track - length
+  let along: f32 = if travel > 0.0 {
+    (f32.max(min, f32.min(min + span, offset)) - min) / span * travel
+  } else {
+    0.0
+  }
+  let ratio: f32 = if travel > 0.0 {
+    span / travel
+  } else {
+    0.0
+  }
+  let rect = if vertical {
+    Rect<f32>.new(
+      port.xMax - THUMB_INSET - thickness,
+      port.yMin + THUMB_INSET + along,
+      port.xMax - THUMB_INSET,
+      port.yMin + THUMB_INSET + along + length,
+    )
+  } else {
+    Rect<f32>.new(
+      port.xMin + THUMB_INSET + along,
+      port.yMax - THUMB_INSET - thickness,
+      port.xMin + THUMB_INSET + along + length,
+      port.yMax - THUMB_INSET,
+    )
+  }
+  return Thumb { visible: true, rect: rect, ratio: ratio }
+}

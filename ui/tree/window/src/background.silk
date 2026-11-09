@@ -1,0 +1,100 @@
+//! Owned native work with nonblocking completion and cooperative cancellation.
+//! Inputs and outputs must own process-heap storage; never capture a UI arena or a borrowed view.
+//! Poll from the host loop. Dropping an unfinished job joins it, so retain cancelled jobs until
+//! ready. Cancellation prevents publication; blocking OS operations finish within their deadline.
+import silk.concurrency.thread { Transferable }
+import silk.concurrency.thread_native { NativeThread, JoinHandle, SpawnError }
+import silk.concurrency.sync { Arc, Mutex }
+import silk.core.option { Option }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+
+/// Shared cooperative cancellation flag for native image and background jobs.
+pub struct Cancellation {
+  flag: Arc<Mutex<bool>>
+}
+
+impl Transferable for Cancellation {}
+
+impl Cancellation {
+  /// Creates an unset cancellation flag.
+  pub effect fn make() -> Cancellation
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return Cancellation { flag: run Arc<Mutex<bool>>.make(run Mutex<bool>.make(false)) }
+  }
+
+  /// Returns another handle to the same cancellation flag.
+  pub fn clone(self: &Self) -> Cancellation {
+    return Cancellation { flag: self.flag.clone() }
+  }
+
+  /// Sets the shared cancellation flag.
+  pub fn cancel(self: &Self) -> () {
+    let mut guard = self.flag.get().lock()
+    let state = guard.getMut()
+    state.* = true
+  }
+
+  /// Returns whether cancellation has been requested.
+  pub fn cancelled(self: &Self) -> bool {
+    return self.flag.get().lock().get().*
+  }
+}
+
+/// A single detached operation. `poll` never waits for unfinished work.
+pub struct Background<T> {
+  handle: Option<JoinHandle<T>>,
+  done: Arc<Mutex<bool>>,
+}
+
+impl<T: 'static + Transferable> Background<T> {
+  /// Starts a native worker with owned, transferable inputs and output.
+  pub effect<'static> fn start<F: 'static + once fn() -> T + Intrinsic.Detached + Transferable>(
+    work: F,
+  ) -> Background<T>
+    ! OutOfMemoryError | SpawnError {
+    let mut allocator = Allocator.systemAllocatorProvider()
+    let mutex = run Mutex<bool>.make(false) |> Effect.provideMut<Allocator>(&mut allocator)
+    let done = run Arc<Mutex<bool>>.make(move mutex) |> Effect.provideMut<Allocator>(&mut allocator)
+    let signal = done.clone()
+    let handle = run NativeThread.spawn(
+      fn() -> T {
+        let action = move work
+        let signal = move signal
+        let result = action()
+        let mut guard = signal.get().lock()
+        let state = guard.getMut()
+        state.* = true
+        return move result
+      },
+    )
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    return Background<T> { handle: Option<JoinHandle<T>>.some(move handle), done: move done }
+  }
+
+  /// Returns whether the worker has completed.
+  pub fn ready(self: &Self) -> bool {
+    return self.done.get().lock().get().*
+  }
+
+  /// Takes a completed result once, or returns None without waiting.
+  pub fn poll(self: &mut Self) -> Option<T> {
+    if !self.ready() {
+      return Option<T>.None
+    }
+    return self.take()
+  }
+
+  /// Waits for a result, for explicit saves or application shutdown.
+  pub fn wait(self: &mut Self) -> Option<T> {
+    return self.take()
+  }
+
+  fn take(self: &mut Self) -> Option<T> {
+    return match move Intrinsic.replace(self.handle, Option<JoinHandle<T>>.None) {
+      Option<JoinHandle<T>>.Some { value } => Option<T>.some(value.join())
+      Option<JoinHandle<T>>.None => Option<T>.None
+    }
+  }
+}

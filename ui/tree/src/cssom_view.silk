@@ -1,0 +1,1237 @@
+//! CSSOM View over UiTree's last completed layout, in CSS pixels, not device pixels.
+//! Call layoutNow/frame before querying after mutations. The tree owns no browsing context:
+//! callers supply active-document state, and Window/Screen/VisualViewport state belongs to
+//! cssom_view_window. Native nodes have no HTML body/table or shadow-root identity.
+//! Scroll/sticky geometry is exactly visualFragment; hit queries use interact's paint walk.
+//! Native style currently has no CSS transforms or content-visibility suppression. Geometry
+//! adapters must not invent these; add them to the renderer before exposing them here.
+import tree { UiTree }
+import node { NONE, NO_INDEX }
+import mutation { NodeKind, Position, Direction, Display }
+import paint { borderBox, paddingBox, contentBox, styleSlot }
+import scrollbar { rangeOf, scrolls, usedOverflow }
+import interact
+import caret
+import layout.lib { FragmentKind, WritingMode }
+import svg_css.cssom_geometry { DOMRect, DOMPoint }
+import svg_css.cssom_view {
+  ScrollBehavior,
+  ScrollIntoViewOptions,
+  ScrollToOptions,
+  CheckVisibilityOptions,
+  VisibilityState,
+  BoundingRects
+}
+import svg_css.cssom_view as algorithms
+import svg_css.cssom_view_window { ScrollRequest, ScrollResult, ViewTarget, ViewTargetKind }
+import svg_css.cssom_error { CssomError }
+import svg_css.cssom_view_geometry {
+  GeometryHost,
+  GeometryNodeKind,
+  GeometryStep,
+  GeometryFragment,
+  NO_GEOMETRY_NODE
+}
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.geometry.rect { Rect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.num.u32
+import silk.num.usize
+import silk.text.segmentation
+import silk.text.string { String }
+
+fn domRect(rect: Rect<f32>) -> DOMRect {
+  return DOMRect.make(
+    f32.toF64(rect.xMin),
+    f32.toF64(rect.yMin),
+    f32.toF64(rect.width()),
+    f32.toF64(rect.height()),
+  )
+}
+
+fn firstFragment(tree: &UiTree<'_>, slot: u32) -> usize {
+  if slot == NONE {
+    return NO_INDEX
+  }
+  let source = tree.node(slot).css
+  return if source < tree.fragmentOf.length() {
+    tree.fragmentOf.get(source)
+  } else {
+    NO_INDEX
+  }
+}
+
+fn attached(tree: &UiTree<'_>, slot: u32) -> bool {
+  let mut ancestor = slot
+  while ancestor != NONE {
+    if ancestor == tree.root {
+      return true
+    }
+    ancestor = tree.node(ancestor).parent
+  }
+  return false
+}
+
+/// Element boxes only: an input's internal text is not another element border rectangle.
+pub effect fn getClientRects(tree: &UiTree<'_>, id: u32, out: &mut List<DOMRect>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  let slot = tree.slotOf(id)
+  if slot == NONE || !attached(tree, slot) || tree.node(slot).kind == NodeKind.Text {
+    return ()
+  }
+  let mut index = firstFragment(tree, slot)
+  while index != NO_INDEX {
+    let fragment = tree.visualFragment(index)
+    if !fragment.positioningShell && fragment.kind != FragmentKind.Line
+      && fragment.kind != FragmentKind.Text {
+      run out.append(domRect(borderBox(&fragment)))
+    }
+    index = tree.nextSourceFragment.get(index)
+  }
+}
+
+pub effect fn getBoundingClientRect(tree: &UiTree<'_>, id: u32) -> DOMRect
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let slot = tree.slotOf(id)
+  if slot == NONE || !attached(tree, slot) || tree.node(slot).kind == NodeKind.Text {
+    return DOMRect.zero()
+  }
+  let mut result = BoundingRects.make()
+  let mut index = firstFragment(tree, slot)
+  while index != NO_INDEX {
+    let fragment = tree.visualFragment(index)
+    if !fragment.positioningShell && fragment.kind != FragmentKind.Line
+      && fragment.kind != FragmentKind.Text {
+      result.append(domRect(borderBox(&fragment)))
+    }
+    index = tree.nextSourceFragment.get(index)
+  }
+  return result.bounds()
+}
+
+/// Root fallback follows CSSOM View even when root pointer-events is none.
+pub fn elementFromPoint(tree: &UiTree<'_>, x: f64, y: f64) -> u32 {
+  if !algorithms.pointInViewport(x, y, f32.toF64(tree.input.width), f32.toF64(tree.input.height)) {
+    return NONE
+  }
+  let found = tree.hitTest(f64.toF32(x), f64.toF32(y))
+  if found != NONE {
+    return found
+  }
+  return if tree.root == NONE {
+    NONE
+  } else {
+    tree.node(tree.root).id
+  }
+}
+
+pub effect fn elementsFromPoint(tree: &UiTree<'_>, x: f64, y: f64, out: &mut List<u32>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  if !algorithms.pointInViewport(x, y, f32.toF64(tree.input.width), f32.toF64(tree.input.height)) {
+    return ()
+  }
+  run interact.hitSlots(tree, f64.toF32(x), f64.toF32(y), &mut out.*)
+  let mut index: usize = 0
+  while index < out.length() {
+    let id = tree.node(out.get(index)).id
+    out.set(index, id)
+    index = index + 1
+  }
+  if tree.root != NONE {
+    let rootId = tree.node(tree.root).id
+    if out.length() == 0 || out.get(out.length() - 1) != rootId {
+      run out.append(rootId)
+    }
+  }
+}
+
+pub fn checkVisibility(tree: &UiTree<'_>, id: u32, options: CheckVisibilityOptions) -> bool {
+  let slot = tree.slotOf(id)
+  if slot == NONE || !attached(tree, slot) {
+    return false
+  }
+  let node = tree.node(slot)
+  let mut zeroOpacity = false
+  let mut ancestor = slot
+  while ancestor != NONE {
+    if tree.node(ancestor).computed.opacity == 0.0 {
+      zeroOpacity = true
+    }
+    ancestor = tree.node(ancestor).parent
+  }
+  return algorithms.checkVisibility(
+    VisibilityState {
+      hasBox: firstFragment(tree, slot) != NO_INDEX && node.kind != NodeKind.Text
+        && node.computed.display != Display.Contents
+        && node.computed.display != Display.None,
+      ancestorContentHidden: false,
+      ancestorContentAutoSkipped: false,
+      zeroOpacity: zeroOpacity,
+      visible: node.computed.text.visible,
+    },
+    options,
+  )
+}
+
+pub struct ElementMetrics {
+  pub clientLeft: f64,
+  pub clientTop: f64,
+  pub clientWidth: f64,
+  pub clientHeight: f64,
+  pub scrollWidth: f64,
+  pub scrollHeight: f64,
+  pub scrollLeft: f64,
+  pub scrollTop: f64,
+  pub offsetParent: u32,
+  pub offsetLeft: f64,
+  pub offsetTop: f64,
+  pub offsetWidth: f64,
+  pub offsetHeight: f64,
+}
+
+impl Copy for ElementMetrics {}
+
+/// UiTree uses overlay scrollbars, so no scrollbar gutter is subtracted here. Offset
+/// coordinates use unscrolled layout fragments, unlike client rectangles. The host may apply
+/// HTML root/body viewport forwarding separately; a native root is not an HTML body.
+pub fn metrics(tree: &UiTree<'_>, id: u32) -> ElementMetrics {
+  let mut result = ElementMetrics {
+    clientLeft: 0.0,
+    clientTop: 0.0,
+    clientWidth: 0.0,
+    clientHeight: 0.0,
+    scrollWidth: 0.0,
+    scrollHeight: 0.0,
+    scrollLeft: 0.0,
+    scrollTop: 0.0,
+    offsetParent: NONE,
+    offsetLeft: 0.0,
+    offsetTop: 0.0,
+    offsetWidth: 0.0,
+    offsetHeight: 0.0,
+  }
+  let slot = tree.slotOf(id)
+  let first = firstFragment(tree, slot)
+  if first == NO_INDEX || !attached(tree, slot) {
+    return result
+  }
+  let node = tree.node(slot)
+  if node.kind == NodeKind.Text || node.computed.display == Display.Contents {
+    return result
+  }
+  let fragment = tree.output.fragments.values.asSlice()[first]
+  let border = borderBox(&fragment)
+  let padding = paddingBox(&fragment)
+  if node.computed.display != Display.Inline {
+    result.clientLeft = f32.toF64(padding.xMin - border.xMin)
+    result.clientTop = f32.toF64(padding.yMin - border.yMin)
+    result.clientWidth = f32.toF64(padding.width())
+    result.clientHeight = f32.toF64(padding.height())
+  }
+  let overflow = fragment.scrollableOverflow
+  result.scrollWidth = f32.toF64(
+    f32.max(fragment.paddingRect.x + fragment.paddingRect.width, overflow.x + overflow.width)
+      - f32.min(fragment.paddingRect.x, overflow.x),
+  )
+  result.scrollHeight = f32.toF64(
+    f32.max(fragment.paddingRect.y + fragment.paddingRect.height, overflow.y + overflow.height)
+      - f32.min(fragment.paddingRect.y, overflow.y),
+  )
+  result.scrollLeft = f32.toF64(node.scrollX)
+  result.scrollTop = f32.toF64(node.scrollY)
+  let mut offsetX = border.xMin
+  let mut offsetY = border.yMin
+  if slot != tree.root && node.computed.position != Position.Fixed {
+    let mut ancestor = node.parent
+    while ancestor != NONE {
+      if tree.node(ancestor).computed.position != Position.Static {
+        let ancestorFragment = firstFragment(tree, ancestor)
+        if ancestorFragment != NO_INDEX {
+          let ancestorPadding = paddingBox(
+            &tree.output.fragments.values.asSlice()[ancestorFragment],
+          )
+          offsetX = offsetX - ancestorPadding.xMin
+          offsetY = offsetY - ancestorPadding.yMin
+          result.offsetParent = tree.node(ancestor).id
+          break
+        }
+      }
+      ancestor = tree.node(ancestor).parent
+    }
+  }
+  result.offsetLeft = f32.toF64(offsetX)
+  result.offsetTop = f32.toF64(offsetY)
+  let mut left = border.xMin
+  let mut top = border.yMin
+  let mut right = border.xMax
+  let mut bottom = border.yMax
+  let mut next = tree.nextSourceFragment.get(first)
+  while next != NO_INDEX {
+    let nextBox = borderBox(&tree.output.fragments.values.asSlice()[next])
+    left = f32.min(left, nextBox.xMin)
+    top = f32.min(top, nextBox.yMin)
+    right = f32.max(right, nextBox.xMax)
+    bottom = f32.max(bottom, nextBox.yMax)
+    next = tree.nextSourceFragment.get(next)
+  }
+  result.offsetWidth = f32.toF64(right - left)
+  result.offsetHeight = f32.toF64(bottom - top)
+  return result
+}
+
+pub fn scrollParent(tree: &UiTree<'_>, id: u32) -> u32 {
+  let slot = tree.slotOf(id)
+  if slot == NONE || tree.node(slot).computed.position == Position.Fixed {
+    return NONE
+  }
+  let mut ancestor = tree.node(slot).parent
+  while ancestor != NONE {
+    let computed = &tree.node(ancestor).computed
+    if firstFragment(tree, ancestor) != NO_INDEX
+      && (scrolls(usedOverflow(computed, true)) || scrolls(usedOverflow(computed, false))) {
+      return tree.node(ancestor).id
+    }
+    ancestor = tree.node(ancestor).parent
+  }
+  return NONE
+}
+
+pub fn scrollTarget(tree: &UiTree<'_>, id: u32, x: f64, y: f64) -> DOMPoint {
+  let slot = tree.slotOf(id)
+  let first = firstFragment(tree, slot)
+  if first == NO_INDEX || !attached(tree, slot) {
+    return DOMPoint.origin()
+  }
+  let range = rangeOf(&tree.node(slot).computed, &tree.output.fragments.values.asSlice()[first])
+  return DOMPoint.make(
+    f32.toF64(range.clampX(f64.toF32(algorithms.normalizeScroll(x)))),
+    f32.toF64(range.clampY(f64.toF32(algorithms.normalizeScroll(y)))),
+    0.0,
+    1.0,
+  )
+}
+
+/// Begin a scroll using the tree's single completion/event state. Smooth operations advance
+/// on frame's monotonic time, using 250ms cubic ease-out; callers schedule frames while
+/// scrollAnimating is true. Instant operations preserve existing native scroll events.
+pub effect fn requestScroll(
+  tree: &mut UiTree<'_>,
+  id: u32,
+  x: f64,
+  y: f64,
+  behavior: ScrollBehavior,
+  computedSmooth: bool,
+  honorsSmooth: bool,
+) -> ScrollRequest
+  ! CssomError | OutOfMemoryError
+  ? &mut Allocator {
+  let slot = tree.slotOf(id)
+  if slot == NONE {
+    fail CssomError.NotFoundError
+  }
+  let target = scrollTarget(&tree.*, id, x, y)
+  let offset = tree.scrollOffset(id)
+  let request = run tree.viewScrollState.begin(
+    ViewTarget { kind: ViewTargetKind.Element, id: u32.toUsize(id) },
+    f32.toF64(offset.x),
+    f32.toF64(offset.y),
+    target.x,
+    target.y,
+    behavior,
+    computedSmooth,
+    honorsSmooth,
+  )
+  if request.behavior == ScrollBehavior.Instant
+    || (target.x == f32.toF64(offset.x) && target.y == f32.toF64(offset.y)) {
+    run applyScrollUpdate(&mut tree.*, request, target.x, target.y)
+    drop run tree.viewScrollState.complete(request.id, false, false)
+  } else {
+    run tree.viewScrollAnimations.append(
+      ScrollAnimation {
+        request: request,
+        startTime: tree.input.time,
+        startX: f32.toF64(offset.x),
+        startY: f32.toF64(offset.y),
+      },
+    )
+  }
+  return request
+}
+
+pub effect fn applyScrollUpdate(tree: &mut UiTree<'_>, request: ScrollRequest, x: f64, y: f64) -> ()
+  ! CssomError | OutOfMemoryError
+  ? &mut Allocator {
+  if request.target.kind != ViewTargetKind.Element {
+    fail CssomError.InvalidAccessError
+  }
+  let id = usize.toU32(request.target.id)
+  let slot = tree.slotOf(id)
+  if slot == NONE {
+    fail CssomError.NotFoundError
+  }
+  let target = scrollTarget(&tree.*, id, x, y)
+  run tree.viewScrollState.update(request.id, target.x, target.y)
+  run interact.scrolledElsewhere(&mut tree.*, slot, f64.toF32(target.x), f64.toF32(target.y))
+}
+
+pub effect fn scrollBy(
+  tree: &mut UiTree<'_>,
+  id: u32,
+  x: f64,
+  y: f64,
+  behavior: ScrollBehavior,
+  computedSmooth: bool,
+  honorsSmooth: bool,
+) -> ScrollRequest
+  ! CssomError | OutOfMemoryError
+  ? &mut Allocator {
+  let offset = tree.scrollOffset(id)
+  return run requestScroll(
+    &mut tree.*,
+    id,
+    f32.toF64(offset.x) + algorithms.normalizeScroll(x),
+    f32.toF64(offset.y) + algorithms.normalizeScroll(y),
+    behavior,
+    computedSmooth,
+    honorsSmooth,
+  )
+}
+
+/// Innermost to outermost, using each container's writing mode. Each operation is advanced
+/// by the same frame clock and completed only after its final offset has been applied.
+pub effect fn scrollIntoView(
+  tree: &mut UiTree<'_>,
+  id: u32,
+  options: ScrollIntoViewOptions,
+  computedSmooth: bool,
+  honorsSmooth: bool,
+  requests: &mut List<ScrollRequest>,
+) -> ()
+  ! CssomError | OutOfMemoryError
+  ? &mut Allocator {
+  requests.clear()
+  let slot = tree.slotOf(id)
+  if slot == NONE || !attached(&tree.*, slot) || firstFragment(&tree.*, slot) == NO_INDEX {
+    return ()
+  }
+  let mut target = run getBoundingClientRect(&tree.*, id)
+  let mut ancestor = tree.node(slot).parent
+  while ancestor != NONE {
+    let computed = tree.node(ancestor).computed
+    let first = firstFragment(&tree.*, ancestor)
+    if first != NO_INDEX
+      && (scrolls(usedOverflow(&computed, true)) || scrolls(usedOverflow(&computed, false))) {
+      let port = domRect(paddingBox(&tree.visualFragment(first)))
+      let horizontal = computed.text.writingMode == WritingMode.HorizontalTb
+      let blockReverse = computed.text.writingMode == WritingMode.VerticalRl
+        || computed.text.writingMode == WritingMode.SidewaysRl
+      let rtl = computed.text.direction == Direction.Rtl
+      let inlineReverse = if computed.text.writingMode == WritingMode.SidewaysLr {
+        !rtl
+      } else {
+        rtl
+      }
+      let dx = algorithms.alignAxis(
+        target.left(),
+        target.right(),
+        port.left(),
+        port.right(),
+        if horizontal {
+          options.inline
+        } else {
+          options.block
+        },
+        if horizontal {
+          rtl
+        } else {
+          blockReverse
+        },
+      )
+      let dy = algorithms.alignAxis(
+        target.top(),
+        target.bottom(),
+        port.top(),
+        port.bottom(),
+        if horizontal {
+          options.block
+        } else {
+          options.inline
+        },
+        if horizontal {
+          false
+        } else {
+          inlineReverse
+        },
+      )
+      let oldX = f32.toF64(tree.node(ancestor).scrollX)
+      let oldY = f32.toF64(tree.node(ancestor).scrollY)
+      let ancestorId = tree.node(ancestor).id
+      let request = run requestScroll(
+        &mut tree.*,
+        ancestorId,
+        oldX + dx,
+        oldY + dy,
+        options.behavior,
+        computedSmooth,
+        honorsSmooth,
+      )
+      target.x = target.x - (request.left - oldX)
+      target.y = target.y - (request.top - oldY)
+      run requests.append(request)
+      if options.nearestContainer {
+        break
+      }
+    }
+    ancestor = tree.node(ancestor).parent
+  }
+}
+
+pub struct ScrollAnimation {
+  pub request: ScrollRequest,
+  pub startTime: f64,
+  pub startX: f64,
+  pub startY: f64,
+}
+
+impl Copy for ScrollAnimation {}
+
+pub fn scrollAnimating(tree: &UiTree<'_>) -> bool {
+  let mut index: usize = 0
+  while index < tree.viewScrollAnimations.length() {
+    if pending(tree, tree.viewScrollAnimations.get(index).request.id) {
+      return true
+    }
+    index = index + 1
+  }
+  return false
+}
+
+fn pending(tree: &UiTree<'_>, id: usize) -> bool {
+  return match tree.viewScrollState.result(id) {
+    Option<ScrollResult>.Some { value } => value == ScrollResult.Pending
+    Option<ScrollResult>.None => false
+  }
+}
+
+/// The single animation driver. Layout has already refreshed scroll extents before this runs.
+pub effect fn advanceScrolls(tree: &mut UiTree<'_>) -> ()
+  ! CssomError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut index: usize = 0
+  while index < tree.viewScrollAnimations.length() {
+    let animation = tree.viewScrollAnimations.get(index)
+    let request = animation.request
+    if !pending(&tree.*, request.id) {
+      drop tree.viewScrollAnimations.remove(index)
+    } else if !tree.contains(usize.toU32(request.target.id)) {
+      run tree.viewScrollState.interrupt(request.id)
+      drop tree.viewScrollAnimations.remove(index)
+    } else {
+      let fraction = f64.max(0.0, f64.min(1.0, (tree.input.time - animation.startTime) / 0.25))
+      let remaining = 1.0 - fraction
+      let progress = 1.0 - remaining * remaining * remaining
+      run applyScrollUpdate(
+        &mut tree.*,
+        request,
+        animation.startX + (request.left - animation.startX) * progress,
+        animation.startY + (request.top - animation.startY) * progress,
+      )
+      if fraction >= 1.0 {
+        drop run tree.viewScrollState.complete(request.id, false, false)
+        drop tree.viewScrollAnimations.remove(index)
+      } else {
+        index = index + 1
+      }
+    }
+  }
+}
+
+/// DOM offsets are UTF-16 code units. Native editing stores UTF-8 byte offsets; conversion
+/// happens at this boundary, not in shaping or pointer dispatch.
+pub struct CaretPosition {
+  pub offsetNode: u32,
+  pub offset: usize,
+  pub rect: DOMRect,
+}
+
+impl Copy for CaretPosition {}
+
+fn utf16Length(text: string) -> usize {
+  let bytes = String.utf8Bytes(text)
+  let mut index: usize = 0
+  let mut count: usize = 0
+  while index < bytes.length {
+    let first = bytes[index]
+    if first < 128 {
+      index = index + 1
+    } else if first < 224 {
+      index = index + 2
+    } else if first < 240 {
+      index = index + 3
+    } else {
+      index = index + 4
+    }
+    let units: usize = if first >= 240 {
+      2
+    } else {
+      1
+    }
+    count = count + units
+  }
+  return count
+}
+
+fn utf16AtByte(text: string, byte: usize) -> usize {
+  let bytes = String.utf8Bytes(text)
+  let mut index: usize = 0
+  let mut count: usize = 0
+  while index < bytes.length && index < byte {
+    let first = bytes[index]
+    if first < 128 {
+      index = index + 1
+    } else if first < 224 {
+      index = index + 2
+    } else if first < 240 {
+      index = index + 3
+    } else {
+      index = index + 4
+    }
+    let units: usize = if first >= 240 {
+      2
+    } else {
+      1
+    }
+    count = count + units
+  }
+  return count
+}
+
+/// A partial surrogate selects the whole scalar, with the start rounded down and end up.
+fn byteAtUtf16(text: string, offset: usize, end: bool) -> usize {
+  let bytes = String.utf8Bytes(text)
+  let mut index: usize = 0
+  let mut count: usize = 0
+  while index < bytes.length && count < offset {
+    let first = bytes[index]
+    let length: usize = if first < 128 {
+      1
+    } else if first < 224 {
+      2
+    } else if first < 240 {
+      3
+    } else {
+      4
+    }
+    let units: usize = if first >= 240 {
+      2
+    } else {
+      1
+    }
+    if count + units > offset && !end {
+      break
+    }
+    index = index + length
+    count = count + units
+  }
+  return index
+}
+
+fn visualPiece(tree: &UiTree<'_>, index: usize) -> caret.Piece {
+  let mut piece = caret.pieceOf(&tree.output, &tree.provider.text, index)
+  let shift = tree.shiftOf(index)
+  piece.x0 = piece.x0 + shift.x
+  piece.x1 = piece.x1 + shift.x
+  piece.top = piece.top + shift.y
+  piece.bottom = piece.bottom + shift.y
+  piece.lineTop = piece.lineTop + shift.y
+  piece.lineBottom = piece.lineBottom + shift.y
+  let source = tree.output.fragments.values.asSlice()[index].source
+  let slot = styleSlot(&tree.slotOfCss, &tree.layout, &tree.nodes, source)
+  if slot != NONE && tree.node(slot).computed.text.writingMode != WritingMode.HorizontalTb {
+    let lineBox = borderBox(&tree.visualFragment(piece.line))
+    let left = piece.x0
+    let right = piece.x1
+    piece.x0 = piece.top
+    piece.x1 = piece.bottom
+    piece.top = left
+    piece.bottom = right
+    piece.lineTop = lineBox.xMin
+    piece.lineBottom = lineBox.xMax
+    if tree.node(slot).computed.text.writingMode == WritingMode.SidewaysLr {
+      piece.rtl = !piece.rtl
+    }
+  }
+  return piece
+}
+
+effect fn textPieces(tree: &UiTree<'_>, slot: u32, pieces: &mut List<caret.Piece>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  pieces.clear()
+  let node = tree.node(slot)
+  let source = if node.kind == NodeKind.Input {
+    node.inner
+  } else {
+    node.css
+  }
+  let mut fragment = if source < tree.fragmentOf.length() {
+    tree.fragmentOf.get(source)
+  } else {
+    NO_INDEX
+  }
+  while fragment != NO_INDEX {
+    let current = tree.output.fragments.values.asSlice()[fragment]
+    if current.kind == FragmentKind.Text && current.textData != NO_INDEX {
+      run pieces.append(visualPiece(tree, fragment))
+    }
+    fragment = tree.nextSourceFragment.get(fragment)
+  }
+}
+
+pub effect fn caretPositionFromPoint(tree: &UiTree<'_>, x: f64, y: f64) -> Option<CaretPosition>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !algorithms.pointInViewport(x, y, f32.toF64(tree.input.width), f32.toF64(tree.input.height)) {
+    return Option<CaretPosition>.None
+  }
+  let target = interact.hitSlot(tree, f64.toF32(x), f64.toF32(y))
+  if target == NONE {
+    return Option<CaretPosition>.None
+  }
+  let mut textSlot = if tree.node(target).kind == NodeKind.Input {
+    target
+  } else {
+    NONE
+  }
+  if textSlot == NONE {
+    let fragments = tree.output.fragments.values.asSlice()
+    let mut index = fragments.length
+    while index > 0 {
+      index = index - 1
+      let fragment = fragments[index]
+      if fragment.kind == FragmentKind.Text && fragment.textData != NO_INDEX
+        && styleSlot(&tree.slotOfCss, &tree.layout, &tree.nodes, fragment.source) == target {
+        let bounds = borderBox(&tree.visualFragment(index))
+        if x >= f32.toF64(bounds.xMin) && x < f32.toF64(bounds.xMax) && y >= f32.toF64(bounds.yMin)
+          && y < f32.toF64(bounds.yMax)
+          && fragment.source < tree.slotOfCss.length() {
+          textSlot = tree.slotOfCss.get(fragment.source)
+          break
+        }
+      }
+    }
+  }
+  if textSlot == NONE {
+    return Option<CaretPosition>.None
+  }
+  let node = tree.node(textSlot)
+  let text = if node.kind == NodeKind.Input {
+    String.view(&node.edit.display)
+  } else {
+    String.view(&node.text)
+  }
+  let mut pieces = List<caret.Piece>.make()
+  run textPieces(tree, textSlot, &mut pieces)
+  let mut boundaries = List<usize>.make()
+  run segmentation.graphemes(text, &mut boundaries)
+  let vertical = node.computed.text.writingMode != WritingMode.HorizontalTb
+  let byte = caret.offsetNear(
+    &tree.provider.text,
+    &pieces,
+    &boundaries,
+    f64.toF32(
+      if vertical {
+        y
+      } else {
+        x
+      },
+    ),
+    f64.toF32(
+      if vertical {
+        x
+      } else {
+        y
+      },
+    ),
+  )
+  if byte == NO_INDEX {
+    return Option<CaretPosition>.None
+  }
+  let valueByte = if node.kind == NodeKind.Input {
+    node.edit.toValue(byte, String.ownedByteLength(&node.text))
+  } else {
+    byte
+  }
+  let rect = physicalRect(domRect(caret.caretRect(&tree.provider.text, &pieces, byte)), vertical)
+  return Option<CaretPosition>.Some {
+    value: CaretPosition {
+      offsetNode: node.id,
+      offset: utf16AtByte(String.view(&node.text), valueByte),
+      rect: rect,
+    }
+  }
+}
+
+pub struct BoundaryPoint {
+  pub node: u32,
+  pub offset: usize
+}
+
+impl Copy for BoundaryPoint {}
+
+pub struct Range {
+  pub start: BoundaryPoint,
+  pub end: BoundaryPoint
+}
+
+impl Copy for Range {}
+
+struct RangeNode {
+  slot: u32,
+  parent: usize,
+  before: usize,
+  contentStart: usize,
+  contentEnd: usize,
+  after: usize,
+}
+
+impl Copy for RangeNode {}
+
+effect fn rangeIndex(
+  tree: &UiTree<'_>,
+  slot: u32,
+  parent: usize,
+  entries: &mut List<RangeNode>,
+  cursor: usize,
+) -> usize
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let index = entries.length()
+  let mut entry = RangeNode {
+    slot: slot,
+    parent: parent,
+    before: cursor,
+    contentStart: cursor + 1,
+    contentEnd: cursor + 1,
+    after: cursor + 2,
+  }
+  run entries.append(entry)
+  let node = tree.node(slot)
+  let mut position = cursor + 1
+  if node.kind == NodeKind.Text || node.kind == NodeKind.Input {
+    position = position + utf16Length(String.view(&node.text))
+  } else {
+    let mut children = List<u32>.make()
+    run tree.childSlots(slot, &mut children)
+    let mut child: usize = 0
+    while child < children.length() {
+      position = run rangeIndex(tree, children.get(child), index, &mut entries.*, position)
+      child = child + 1
+    }
+  }
+  entry.contentEnd = position
+  entry.after = position + 1
+  entries.set(index, entry)
+  return entry.after
+}
+
+effect fn boundaryPosition(
+  tree: &UiTree<'_>,
+  entries: &List<RangeNode>,
+  boundary: BoundaryPoint,
+) -> usize
+  ! CssomError {
+  let mut index: usize = 0
+  while index < entries.length() {
+    let entry = entries.get(index)
+    let node = tree.node(entry.slot)
+    if node.id == boundary.node {
+      if node.kind == NodeKind.Text || node.kind == NodeKind.Input {
+        if boundary.offset > entry.contentEnd - entry.contentStart {
+          fail CssomError.IndexSizeError
+        }
+        return entry.contentStart + boundary.offset
+      }
+      let mut child: usize = 0
+      let mut next = index + 1
+      while next < entries.length() && entries.get(next).before < entry.contentEnd {
+        let nested = entries.get(next)
+        if nested.parent == index {
+          if child == boundary.offset {
+            return nested.before
+          }
+          child = child + 1
+        }
+        next = next + 1
+      }
+      if boundary.offset == child {
+        return entry.contentEnd
+      }
+      fail CssomError.IndexSizeError
+    }
+    index = index + 1
+  }
+  fail CssomError.NotFoundError
+}
+
+effect fn textRangeRects(
+  tree: &UiTree<'_>,
+  slot: u32,
+  start: usize,
+  end: usize,
+  out: &mut List<DOMRect>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let node = tree.node(slot)
+  let value = String.view(&node.text)
+  let mut low = byteAtUtf16(value, start, false)
+  let mut high = byteAtUtf16(value, end, true)
+  if node.kind == NodeKind.Input {
+    low = node.edit.toDisplay(low)
+    high = node.edit.toDisplay(high)
+  }
+  let text = if node.kind == NodeKind.Input {
+    String.view(&node.edit.display)
+  } else {
+    value
+  }
+  let mut boundaries = List<usize>.make()
+  run segmentation.graphemes(text, &mut boundaries)
+
+  // Part of a grapheme includes the full typographic unit. A truly collapsed boundary
+  // between graphemes stays zero-width.
+  let offsets = boundaries.asSlice()
+  let mut boundary: usize = 1
+  while boundary < offsets.length {
+    if low > offsets[boundary - 1] && low < offsets[boundary] {
+      low = offsets[boundary - 1]
+    }
+    if high > offsets[boundary - 1] && high < offsets[boundary] {
+      high = offsets[boundary]
+    }
+    boundary = boundary + 1
+  }
+  let mut pieces = List<caret.Piece>.make()
+  run textPieces(tree, slot, &mut pieces)
+  let mut index: usize = 0
+  while index < pieces.length() {
+    let piece = pieces.get(index)
+    if (high > piece.start && low < piece.end)
+      || (low == high && low >= piece.start && low <= piece.end) {
+      let first = if low > piece.start {
+        low
+      } else {
+        piece.start
+      }
+      let last = if high < piece.end {
+        high
+      } else {
+        piece.end
+      }
+      if first <= last {
+        let x0 = caret.caretX(&tree.provider.text, &piece, first)
+        let x1 = caret.caretX(&tree.provider.text, &piece, last)
+        let logicalRect = DOMRect.make(
+          f32.toF64(f32.min(x0, x1)),
+          f32.toF64(piece.top),
+          f32.toF64(f32.abs(x1 - x0)),
+          f32.toF64(piece.bottom - piece.top),
+        )
+        run out.append(
+          physicalRect(logicalRect, node.computed.text.writingMode != WritingMode.HorizontalTb),
+        )
+      }
+    }
+    index = index + 1
+  }
+}
+
+/// Full native DOM range traversal: selected outer elements and every selected text run,
+/// in content order, including collapsed text ranges. Offsets follow UTF-16 DOM semantics.
+pub effect fn rangeClientRects(tree: &UiTree<'_>, range: Range, out: &mut List<DOMRect>) -> ()
+  ! CssomError | OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  let startSlot = tree.slotOf(range.start.node)
+  let endSlot = tree.slotOf(range.end.node)
+  if startSlot == NONE || endSlot == NONE || !attached(tree, startSlot)
+    || !attached(tree, endSlot) {
+    return ()
+  }
+  let mut entries = List<RangeNode>.make()
+  drop run rangeIndex(tree, tree.root, NO_INDEX, &mut entries, 0)
+  let start = run boundaryPosition(tree, &entries, range.start)
+  let end = run boundaryPosition(tree, &entries, range.end)
+  if start > end {
+    fail CssomError.InvalidStateError
+  }
+  let mut elementRects = List<DOMRect>.make()
+  let mut index: usize = 0
+  while index < entries.length() {
+    let entry = entries.get(index)
+    let node = tree.node(entry.slot)
+    if node.kind == NodeKind.Text || node.kind == NodeKind.Input {
+      if start <= entry.contentEnd && end >= entry.contentStart {
+        let low = if start > entry.contentStart {
+          start - entry.contentStart
+        } else {
+          0
+        }
+        let high = if end < entry.contentEnd {
+          end - entry.contentStart
+        } else {
+          entry.contentEnd - entry.contentStart
+        }
+        run textRangeRects(tree, entry.slot, low, high, &mut out.*)
+      }
+    } else if start <= entry.before && end >= entry.after {
+      let parentSelected = entry.parent != NO_INDEX && start <= entries.get(entry.parent).before
+        && end >= entries.get(entry.parent).after
+      if !parentSelected {
+        run getClientRects(tree, node.id, &mut elementRects)
+        let mut rect: usize = 0
+        while rect < elementRects.length() {
+          run out.append(elementRects.get(rect))
+          rect = rect + 1
+        }
+      }
+    }
+    index = index + 1
+  }
+}
+
+pub effect fn rangeBoundingClientRect(tree: &UiTree<'_>, range: Range) -> DOMRect
+  ! CssomError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut rects = List<DOMRect>.make()
+  run rangeClientRects(tree, range, &mut rects)
+  return algorithms.boundingRect(rects.asSlice())
+}
+
+/// A document identity outside the native u32 node-id space.
+pub const NATIVE_DOCUMENT: usize = usize.MAX - 1
+
+/// A borrowed GeometryUtils host. UiTree is a single document, so cross-origin documents
+/// cannot be represented here. Embedding hosts implement GeometryHost themselves instead.
+pub struct NativeGeometry<'t, 'font> {
+  pub tree: &'t UiTree<'font>
+}
+
+fn geometryFragment(tree: &UiTree<'_>, node: usize, wanted: usize) -> usize {
+  if node == NATIVE_DOCUMENT {
+    return NO_INDEX
+  }
+  let slot = tree.slotOf(usize.toU32(node))
+  if slot == NONE || !attached(tree, slot) {
+    return NO_INDEX
+  }
+  let mut fragment = firstFragment(tree, slot)
+  let mut count: usize = 0
+  while fragment != NO_INDEX {
+    let value = tree.output.fragments.values.asSlice()[fragment]
+    if !value.positioningShell && value.kind != FragmentKind.Line {
+      if count == wanted {
+        return fragment
+      }
+      count = count + 1
+    }
+    fragment = tree.nextSourceFragment.get(fragment)
+  }
+  return NO_INDEX
+}
+
+impl<'t, 'font> GeometryHost for NativeGeometry<'t, 'font> {
+  fn kind(self: &Self, node: usize) -> GeometryNodeKind {
+    if node == NATIVE_DOCUMENT {
+      return GeometryNodeKind.Document
+    }
+    let slot = self.tree.slotOf(usize.toU32(node))
+    if slot != NONE && self.tree.node(slot).kind == NodeKind.Text {
+      return GeometryNodeKind.Text
+    }
+    return GeometryNodeKind.Element
+  }
+
+  fn document(self: &Self, node: usize) -> usize {
+    return NATIVE_DOCUMENT
+  }
+
+  fn containerDocument(self: &Self, document: usize) -> usize {
+    return NO_GEOMETRY_NODE
+  }
+
+  fn sameOrigin(self: &Self, first: usize, second: usize) -> bool {
+    return first == NATIVE_DOCUMENT && second == NATIVE_DOCUMENT
+  }
+
+  fn step(self: &Self, node: usize) -> GeometryStep {
+    if node == NATIVE_DOCUMENT {
+      return GeometryStep.identity(NO_GEOMETRY_NODE)
+    }
+
+    // visualFragment already resolves the complete native scroll/sticky coordinate chain.
+    // A direct edge to the document avoids applying scroll offsets a second time.
+    let mut result = GeometryStep.identity(NATIVE_DOCUMENT)
+    let first = geometryFragment(self.tree, node, 0)
+    if first != NO_INDEX {
+      let bounds = borderBox(&self.tree.visualFragment(first))
+      result.offsetX = f32.toF64(bounds.xMin)
+      result.offsetY = f32.toF64(bounds.yMin)
+    }
+    return result
+  }
+
+  fn fragmentCount(self: &Self, node: usize) -> usize {
+    if node == NATIVE_DOCUMENT {
+      return 1
+    }
+    let slot = self.tree.slotOf(usize.toU32(node))
+    if slot == NONE || !attached(self.tree, slot) {
+      return 0
+    }
+    let mut fragment = firstFragment(self.tree, slot)
+    let mut count: usize = 0
+    while fragment != NO_INDEX {
+      let value = self.tree.output.fragments.values.asSlice()[fragment]
+      if !value.positioningShell && value.kind != FragmentKind.Line {
+        count = count + 1
+      }
+      fragment = self.tree.nextSourceFragment.get(fragment)
+    }
+    return count
+  }
+
+  fn fragment(self: &Self, node: usize, index: usize) -> GeometryFragment {
+    let fragmentIndex = geometryFragment(self.tree, node, index)
+    let firstIndex = geometryFragment(self.tree, node, 0)
+    if node == NATIVE_DOCUMENT {
+      let rect = GeometryHost.viewport(self, NATIVE_DOCUMENT)
+      return GeometryFragment {
+        border: rect,
+        margin: rect,
+        padding: rect,
+        content: rect,
+        offsetX: 0.0,
+        offsetY: 0.0,
+      }
+    }
+
+    // GeometryHost requires callers to pass an index below fragmentCount.
+    let fragment = self.tree.visualFragment(fragmentIndex)
+    let first = self.tree.visualFragment(firstIndex)
+    let border = domRect(borderBox(&fragment))
+    if fragment.kind == FragmentKind.Text {
+      return GeometryFragment {
+        border: border,
+        margin: border,
+        padding: border,
+        content: border,
+        offsetX: 0.0,
+        offsetY: 0.0,
+      }
+    }
+    let padding = fragment.paddingRect
+    let content = fragment.contentRect
+    let margin = fragment.usedMargin
+    return GeometryFragment {
+      border: DOMRect.make(0.0, 0.0, border.width, border.height),
+      margin: DOMRect.make(
+        -f32.toF64(margin.left),
+        -f32.toF64(margin.top),
+        border.width + f32.toF64(margin.left + margin.right),
+        border.height + f32.toF64(margin.top + margin.bottom),
+      ),
+      padding: DOMRect.make(
+        f32.toF64(padding.x),
+        f32.toF64(padding.y),
+        f32.toF64(padding.width),
+        f32.toF64(padding.height),
+      ),
+      content: DOMRect.make(
+        f32.toF64(content.x),
+        f32.toF64(content.y),
+        f32.toF64(content.width),
+        f32.toF64(content.height),
+      ),
+      offsetX: f32.toF64(fragment.worldLocation.x - first.worldLocation.x),
+      offsetY: f32.toF64(fragment.worldLocation.y - first.worldLocation.y),
+    }
+  }
+
+  fn viewport(self: &Self, document: usize) -> DOMRect {
+    return DOMRect.make(
+      0.0,
+      0.0,
+      f32.toF64(self.tree.input.width),
+      f32.toF64(self.tree.input.height),
+    )
+  }
+}
+
+fn physicalRect(rect: DOMRect, vertical: bool) -> DOMRect {
+  return if vertical {
+    DOMRect.make(rect.y, rect.x, rect.height, rect.width)
+  } else {
+    rect
+  }
+}
+
+/// Optional coordinates preserve the other axis; scroll and scrollTo share this operation.
+pub effect fn scroll(
+  tree: &mut UiTree<'_>,
+  id: u32,
+  options: ScrollToOptions,
+  computedSmooth: bool,
+  honorsSmooth: bool,
+) -> ScrollRequest
+  ! CssomError | OutOfMemoryError
+  ? &mut Allocator {
+  let current = tree.scrollOffset(id)
+  let x = match options.left {
+    Option<f64>.Some { value } => value
+    _ => f32.toF64(current.x)
+  }
+  let y = match options.top {
+    Option<f64>.Some { value } => value
+    _ => f32.toF64(current.y)
+  }
+  return run requestScroll(&mut tree.*, id, x, y, options.behavior, computedSmooth, honorsSmooth)
+}
+
+pub effect fn scrollTo(
+  tree: &mut UiTree<'_>,
+  id: u32,
+  options: ScrollToOptions,
+  computedSmooth: bool,
+  honorsSmooth: bool,
+) -> ScrollRequest
+  ! CssomError | OutOfMemoryError
+  ? &mut Allocator {
+  return run scroll(&mut tree.*, id, options, computedSmooth, honorsSmooth)
+}
+
+pub effect fn setScrollLeft(tree: &mut UiTree<'_>, id: u32, value: f64) -> ScrollRequest
+  ! CssomError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut options = ScrollToOptions.make()
+  options.left = Option<f64>.Some { value: value }
+  return run scroll(&mut tree.*, id, options, false, true)
+}
+
+pub effect fn setScrollTop(tree: &mut UiTree<'_>, id: u32, value: f64) -> ScrollRequest
+  ! CssomError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut options = ScrollToOptions.make()
+  options.top = Option<f64>.Some { value: value }
+  return run scroll(&mut tree.*, id, options, false, true)
+}

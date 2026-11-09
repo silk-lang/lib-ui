@@ -1,0 +1,112 @@
+//! The client side of the inspector protocol: connect to a running app and exchange one request
+//! line for one reply line. ui-inspect-cli and ui-inspect-mcp both use it.
+import server { Address }
+import silk.collections.bytes { Bytes }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.io.byte_duplex { ByteDuplex, ByteIoError, ReadTransfer }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.net.address { Endpoint, IpAddress, Ipv4Address, Port }
+import silk.net.socket_native {
+  ConnectOptions,
+  Connection,
+  NativeSocketError,
+  connectResolvedOwned,
+  connectUnixOwned
+}
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.system_clock { Instant }
+import silk.text.string { String }
+
+/// How long connecting may take, in nanoseconds.
+pub const CONNECT_TIMEOUT: u64 = 5000000000
+
+/// How long one request may take, in nanoseconds.
+pub const REQUEST_TIMEOUT: u64 = 30000000000
+
+/// Opens a connection to the inspector at `address`.
+pub effect fn connect(address: &Address) -> Connection
+  ! NativeSocketError
+  ? &mut MonotonicClock {
+  let start = run MonotonicClock.now()
+  let deadline = Option<Instant>.some(MonotonicClock.deadlineAfter(&start, CONNECT_TIMEOUT))
+  return match &address.* {
+    Address.Unix { path } => run connectUnixOwned(
+      path.ownedUtf8Bytes(),
+      ConnectOptions.defaults(),
+      move deadline,
+    )
+    Address.Tcp { port } => {
+      let endpoints = [
+        Endpoint.make(
+          IpAddress.V4 { value: Ipv4Address.fromOctets([127, 0, 0, 1]) },
+          Port.fromU16(port),
+        ),
+      ]
+      return run connectResolvedOwned(&endpoints, ConnectOptions.defaults(), move deadline)
+    }
+  }
+}
+
+/// Sends one request line (`line`, without the newline) and reads the reply line into `reply`
+/// (without the newline).
+pub effect fn exchange(connection: &mut Connection, line: string, reply: &mut Bytes) -> ()
+  ! ByteIoError | OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator {
+  let start = run MonotonicClock.now()
+  let bytes = String.utf8Bytes(line)
+  let mut at: usize = 0
+  while at < bytes.length {
+    let n = run ByteDuplex.writeSome(
+      Slice.view(bytes, at, bytes.length - at),
+      Option<Instant>.some(MonotonicClock.deadlineAfter(&start, REQUEST_TIMEOUT)),
+    )
+      |> Effect.provideMut<ByteDuplex>(&mut connection.*)
+    at = at + n
+  }
+  drop run ByteDuplex.writeSome(
+    b"\n",
+    Option<Instant>.some(MonotonicClock.deadlineAfter(&start, REQUEST_TIMEOUT)),
+  )
+    |> Effect.provideMut<ByteDuplex>(&mut connection.*)
+  reply.clear()
+  let mut chunk: [u8; 65536] = [0; 65536]
+  while true {
+    match run ByteDuplex.readSome(
+      &mut chunk,
+      Option<Instant>.some(MonotonicClock.deadlineAfter(&start, REQUEST_TIMEOUT)),
+    )
+      |> Effect.provideMut<ByteDuplex>(&mut connection.*) {
+      ReadTransfer.Data { count } => {
+        let mut end = count
+        let mut done = false
+        let mut i: usize = 0
+        while i < count {
+          if chunk[i] == 10 {
+            end = i
+            done = true
+            break
+          }
+          i = i + 1
+        }
+        run reply.append(Slice.view(&chunk, 0, end))
+        if done {
+          return ()
+        }
+      }
+      ReadTransfer.End => {
+        return ()
+      }
+    }
+  }
+}
+
+/// Connects, sends `line` and reads the reply into `reply`, then closes the connection.
+pub effect fn request(address: &Address, line: string, reply: &mut Bytes) -> ()
+  ! NativeSocketError | ByteIoError | OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator {
+  let mut connection = run connect(address)
+  run exchange(&mut connection, line, &mut reply)
+  drop run Effect.result(connection.close())
+}

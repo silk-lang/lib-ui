@@ -1,0 +1,214 @@
+//! [`slider`]: a value between a minimum and a maximum, in steps. Drag the thumb or click the
+//! track with the pointer, or focus it and use the arrow keys (one step), Page Up and Page Down
+//! (ten steps), Home and End.
+import theme { Theme, border, corners, focusRing }
+import layout { spacer }
+import ui_app.ui { Ui, Reply }
+import ui_tree.mutation { Property, Length, Side, Position, Align, Role, Cursor, BoxSizing }
+import ui_tree.node { Event, EventKind }
+import silk.core.option { Option }
+import silk.geometry.rect { Rect }
+import silk.num.f32
+import silk.num.u32
+import silk.text.string { String }
+
+/// `value` kept between `min` and `max` and snapped to the nearest `step` from `min` (no
+/// snapping when `step` is not positive).
+pub fn snap(value: f32, min: f32, max: f32, step: f32) -> f32 {
+  let mut v = value
+  if step > 0.0 {
+    v = min + f32.round((v - min) / step) * step
+  }
+  if v < min {
+    v = min
+  }
+  if v > max {
+    v = max
+  }
+  return v
+}
+
+/// The value at x position `x` over a track from `left` that is `width` wide.
+pub fn valueAt(x: f32, left: f32, width: f32, min: f32, max: f32, step: f32) -> f32 {
+  if width <= 0.0 {
+    return min
+  }
+  let fraction = (x - left) / width
+  return snap(min + fraction * (max - min), min, max, step)
+}
+
+/// The value a key press gives, or none for keys the slider leaves alone.
+pub fn keyValue(event: &Event, value: f32, min: f32, max: f32, step: f32) -> Option<f32> {
+  if event.modifiers != 0 {
+    return Option<f32>.None
+  }
+  let key = String.view(&event.key)
+  let one: f32 = if step > 0.0 {
+    step
+  } else {
+    (max - min) / 100.0
+  }
+  let next = if key == "ArrowRight" || key == "ArrowUp" {
+    value + one
+  } else if key == "ArrowLeft" || key == "ArrowDown" {
+    value - one
+  } else if key == "PageUp" {
+    value + one * 10.0
+  } else if key == "PageDown" {
+    value - one * 10.0
+  } else if key == "Home" {
+    min
+  } else if key == "End" {
+    max
+  } else {
+    return Option<f32>.None
+  }
+  return Option<f32>.Some { value: snap(next, min, max, step) }
+}
+
+/// What a slider shows and does.
+pub struct SliderRange {
+  pub min: f32,
+  pub max: f32,
+  pub step: f32,
+  /// Digits shown after the point.
+  pub places: u32,
+}
+
+/// A slider labeled `label` showing `value` in `range`; changes send `onChange(newValue)`.
+/// `key` names its track (see `ui.anchor`): unique in the view.
+pub fn slider<M>(
+  ui: &mut Ui<M>,
+  theme: &Theme,
+  key: u64,
+  label: string,
+  value: f32,
+  range: SliderRange,
+  onChange: fn(f32) -> M,
+) -> () {
+  let min = range.min
+  let max = range.max
+  let step = range.step
+  let span: f32 = if max > min {
+    max - min
+  } else {
+    1.0
+  }
+  let fraction = f32.min(f32.max((value - min) / span, 0.0), 1.0)
+  let rect = ui.anchorRect(key)
+  let laidOut = rect.isSome()
+  let track = match rect {
+    Option<Rect<f32>>.Some { value: r } => r
+    Option<Rect<f32>>.None => Rect<f32>.new(0.0, 0.0, 0.0, 0.0)
+  }
+  let left = track.xMin + 8.0
+  let width = track.xMax - track.xMin - 16.0
+  let dragging = ui.anchorPressed(key)
+  ui.column(
+    |ui| {
+      ui.gap(4.0)
+      ui.row(
+        |ui| {
+          ui.text(label)
+          spacer(&mut ui)
+          ui.box(
+            |ui| {
+              ui.color(theme.mutedText)
+              ui.decimal(f32.toF64(value), range.places)
+            },
+          )
+        },
+      )
+      ui.box(
+        |ui| {
+          ui.anchor(key)
+          ui.accessRole(Role.Slider)
+          ui.valueRange(min, max, value)
+          ui.label(label)
+          ui.tabIndex(0)
+          ui.cursor(Cursor.Pointer)
+          ui.style(
+            &[
+              Property.Position { value: Position.Relative },
+              Property.Height { value: Length.px(20.0) },
+              Property.MinWidth { value: Length.px(120.0) },
+              Property.BorderRadius { value: corners(10.0) },
+            ],
+          )
+          focusRing(&mut ui, &theme)
+          ui.onPointerDown(
+            |event| if laidOut {
+              Reply<M>.EmitAndStop {
+                message: onChange(valueAt(event.x, left, width, min, max, step))
+              }
+            } else {
+              Reply<M>.Pass
+            },
+          )
+          ui.on(
+            EventKind.PointerMove,
+            |event| if laidOut && dragging {
+              Reply<M>.EmitAndStop {
+                message: onChange(valueAt(event.x, left, width, min, max, step))
+              }
+            } else {
+              Reply<M>.Pass
+            },
+          )
+          ui.onKeyDown(
+            |event| match keyValue(event, value, min, max, step) {
+              Option<f32>.Some { value: next } => Reply<M>.EmitAndStop { message: onChange(next) }
+              Option<f32>.None => Reply<M>.Pass
+            },
+          )
+
+          // The rail, the filled part and the thumb.
+          ui.box(
+            |ui| {
+              ui.style(
+                &[
+                  Property.Position { value: Position.Absolute },
+                  Property.Inset { side: Side.Left, value: Length.px(8.0) },
+                  Property.Inset { side: Side.Right, value: Length.px(8.0) },
+                  Property.Inset { side: Side.Top, value: Length.px(8.0) },
+                  Property.Height { value: Length.px(4.0) },
+                  Property.BorderRadius { value: corners(2.0) },
+                ],
+              )
+              ui.background(theme.border)
+              ui.box(
+                |ui| {
+                  ui.style(
+                    &[
+                      Property.Height { value: Length.px(4.0) },
+                      Property.Width { value: Length.percent(fraction * 100.0) },
+                      Property.BorderRadius { value: corners(2.0) },
+                    ],
+                  )
+                  ui.background(theme.accent)
+                },
+              )
+              ui.box(
+                |ui| {
+                  ui.style(
+                    &[
+                      Property.Position { value: Position.Absolute },
+                      Property.Inset { side: Side.Left, value: Length.percent(fraction * 100.0) },
+                      Property.Inset { side: Side.Top, value: Length.px(-6.0) },
+                      Property.Margin { side: Side.Left, value: Length.px(-8.0) },
+                      Property.Width { value: Length.px(16.0) },
+                      Property.Height { value: Length.px(16.0) },
+                      Property.BoxSizing { value: BoxSizing.BorderBox },
+                    ],
+                  )
+                  border(&mut ui, 2.0, theme.accent, 8.0)
+                  ui.background(theme.surface)
+                },
+              )
+            },
+          )
+        },
+      )
+    },
+  )
+}

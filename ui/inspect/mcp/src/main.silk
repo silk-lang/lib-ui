@@ -1,0 +1,203 @@
+//! `ui-inspect-mcp`: a Model Context Protocol server (stdio) for a running Silk UI, so Claude
+//! and other agents can snapshot, inspect and drive it. See the README.
+//!
+//!   ui-inspect-mcp [--connect ADDRESS]
+//!
+//! ADDRESS is in the syntax of `SILK_UI_INSPECT` (`1`, `tcp:<port>` or a socket path); without
+//! `--connect` it reads `SILK_UI_INSPECT`, and without that it uses `1` (the socket
+//! `silk-ui-inspect.sock` in the working directory). The app does not need to be running when
+//! the server starts: every tool call connects anew.
+//!
+//! JSON-RPC messages come one per line on standard input and the responses go one per line to
+//! standard output. The protocol work is `ui_inspect_server.mcp.Bridge`; this file is the I/O.
+import ui_inspect_server.server { Address, parseAddress, describeAddress, resolved }
+import ui_inspect_server.client { request }
+import ui_inspect_server.mcp { Bridge, Action }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.io.byte_duplex { ByteIoError }
+import silk.io.standard_input { StandardInput, StreamReadError, ReadOutcome }
+import silk.io.standard_input_native { OsStandardInput }
+import silk.io.writer { Writer }
+import silk.io.writer_native { StderrWriter, StdoutWriter }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.net.socket_native { NativeSocketError }
+import silk.num.i64
+import silk.system.host_input { HostInput, HostInputError }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
+import silk.system.system_clock { Instant, SystemClock }
+import silk.text.string { String, InvalidUtf8 }
+
+effect fn emit(text: string) -> () {
+  let mut writer = StdoutWriter.make()
+  drop run Effect.result(Writer.writeString(text) |> Effect.provideMut<Writer>(&mut writer))
+  drop run Effect.result(Writer.flush() |> Effect.provideMut<Writer>(&mut writer))
+}
+
+effect fn err(text: string) -> () {
+  let mut writer = StderrWriter.make()
+  drop run Effect.result(Writer.writeString(text) |> Effect.provideMut<Writer>(&mut writer))
+}
+
+fn textOf(bytes: &Bytes) -> string {
+  return match HostInput.text(bytes.asSlice()) {
+    Result<string, InvalidUtf8>.Success { value } => value
+    Result<string, InvalidUtf8>.Failure { error } => ""
+  }
+}
+
+/// Milliseconds from `start` to `now`.
+fn millisBetween(start: &Instant, now: &Instant) -> u64 {
+  let a = SystemClock.seconds(&start.*) * 1000 + SystemClock.nanoseconds(&start.*) / 1000000
+  let b = SystemClock.seconds(&now.*) * 1000 + SystemClock.nanoseconds(&now.*) / 1000000
+  if b <= a {
+    return 0
+  }
+  return i64.toU64(b - a)
+}
+
+/// Runs one message through the bridge, including the requests it makes to the app, and writes
+/// the response (if any).
+effect fn serve(bridge: &mut Bridge, address: &Address, line: &[u8], out: &mut String) -> ()
+  ! OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator {
+  let mut action = run bridge.handle(line, &mut out)
+  let start = run MonotonicClock.now()
+  let mut reply = Bytes.make()
+  while action == Action.Ask || action == Action.Retry {
+    if action == Action.Retry {
+      let now = run MonotonicClock.now()
+      run MonotonicClock.waitFor(bridge.retryDelay(millisBetween(&start, &now)) * 1000000)
+    }
+    let result = run Effect.result(request(address, String.view(&out), &mut reply))
+    let reached = match move result {
+      Result<(), NativeSocketError | ByteIoError | OutOfMemoryError>.Success { value } => true
+      Result<(), NativeSocketError | ByteIoError | OutOfMemoryError>.Failure { error } => {
+        drop error
+        false
+      }
+    }
+    let now = run MonotonicClock.now()
+    action = run bridge.answer(reply.asSlice(), reached, millisBetween(&start, &now), &mut out)
+  }
+  if action == Action.Respond {
+    run out.append("\n")
+    run emit(String.view(&out))
+  }
+}
+
+effect fn process() -> i32
+  ! HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator {
+  let args = run HostInput.arguments()
+  let list = args.asSlice()
+  let mut connectTo = String.make()
+  let mut i: usize = 1
+  while i < list.length {
+    let a = textOf(&list[i])
+    if a == "--connect" && i + 1 < list.length {
+      connectTo = run String.copy(textOf(&list[i + 1]))
+      i = i + 2
+    } else {
+      run err("usage: ui-inspect-mcp [--connect ADDRESS] (an MCP server on stdin and stdout)\n")
+      return 2
+    }
+  }
+  if connectTo.ownedByteLength() == 0 {
+    connectTo = match run HostInput.variableNamed("SILK_UI_INSPECT") {
+      Option<Bytes>.Some { value } => run String.copy(textOf(&value))
+      Option<Bytes>.None => run String.copy("1")
+    }
+  }
+  let cwd = run HostInput.workingDirectory()
+  let address = match run parseAddress(String.view(&connectTo)) {
+    Option<Address>.Some { value } => run resolved(move value, cwd.asSlice())
+    Option<Address>.None => {
+      run err("ui-inspect-mcp: the address is not 1, tcp:<port> or a socket path\n")
+      return 2
+    }
+  }
+  let mut described = String.make()
+  run describeAddress(&address, &mut described)
+  let mut bridge = run Bridge.make(String.view(&described))
+  let mut input = OsStandardInput.make()
+  let mut clock = OsMonotonicClock.make()
+  let mut pending = Bytes.make()
+  let mut line = Bytes.make()
+  let mut response = String.make()
+  let mut chunk: [u8; 65536] = [0; 65536]
+  let mut start: usize = 0
+  let mut scanned: usize = 0
+  while true {
+    // A whole line in `pending`?
+    let data = pending.asSlice()
+    let mut newline = data.length
+    while scanned < data.length {
+      if data[scanned] == 10 {
+        newline = scanned
+        break
+      }
+      scanned = scanned + 1
+    }
+    if newline < data.length {
+      let mut end = newline
+      if end > start && data[end - 1] == 13 {
+        end = end - 1
+      }
+      line.clear()
+      run line.append(Slice.view(data, start, end - start))
+      start = newline + 1
+      scanned = start
+      if start == pending.length() {
+        pending.clear()
+        start = 0
+        scanned = 0
+      }
+      if line.length() != 0 {
+        run serve(&mut bridge, &address, line.asSlice(), &mut response)
+          |> Effect.provideMut<MonotonicClock>(&mut clock)
+      }
+      continue
+    }
+
+    // Keep the partial line, then read more.
+    if start > 0 {
+      let mut rest = run Bytes.copy(Slice.view(pending.asSlice(), start, pending.length() - start))
+      pending = move rest
+      scanned = scanned - start
+      start = 0
+    }
+    let outcome = run Effect.result(StandardInput.receive(&mut chunk))
+      |> Effect.provideMut<StandardInput>(&mut input)
+    let count = match move outcome {
+      Result<ReadOutcome, StreamReadError>.Success { value } => {
+        if StandardInput.isEndOfInput(&value) {
+          return 0
+        }
+        StandardInput.count(&value)
+      }
+      Result<ReadOutcome, StreamReadError>.Failure { error } => {
+        return 0
+      }
+    }
+    run pending.append(Slice.view(&chunk, 0, count))
+  }
+  return 0
+}
+
+effect fn failed<E>(error: E) -> i32 {
+  drop error
+  run err("ui-inspect-mcp: failed\n")
+  return 2
+}
+
+pub effect fn main() -> i32
+  ? &mut HostInput {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(process(), failed) |> Effect.provideMut<Allocator>(&mut allocator)
+}

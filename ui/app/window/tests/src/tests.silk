@@ -1,0 +1,209 @@
+import font_collection.system as systemFonts
+import font_collection.system { Options as FontOptions, Report as FontReport }
+import font_collection.lib { FontCollection }
+import ui_app.app { App, Context, Perform }
+import ui_app.ui { Ui }
+import ui_app.runtime { Runtime, drain }
+import ui_app_window.lib { WindowContent }
+import ui_app_window.commands { Commands }
+import silk.concurrency.thread { Transferable }
+import window.types { WindowError }
+import silk.collections.bytes { Bytes }
+import silk.system.host_input { HostInput, HostInputError }
+
+static if Intrinsic.targetOperatingSystem() == "windows" {
+  import silk.platform.windows.host_input { WindowsHostInput }
+  import silk.platform.windows.path { WindowsPath }
+} else {
+  import silk.platform.native.host_input { NativeHostInput }
+}
+
+import ui_assets.assets as assets
+import silk.system.filesystem { FileSystem, Path, FileError }
+import silk.system.filesystem_machine { MachineFileSystem }
+import silk.text.string { String }
+import ui_app_window.background { Background }
+import ui_app_window.images { Images, ImageState, ImageError }
+import ui_tree.lib { UiTree, TreeError }
+import ui_fixtures.fixtures as fixtures
+import silk.concurrency.thread_native { NativeThread, SpawnError }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+
+effect fn body() -> ()
+  ! TreeError
+    | OutOfMemoryError
+    | AssertionError<'static>
+    | SpawnError
+    | FileError
+    | HostInputError
+    | WindowError
+  ? &mut Allocator {
+  let mut work = run Background<i32>.start(
+    fn() -> i32 {
+      return 42
+    },
+  )
+  let result = work.wait().unwrapOr(0)
+  run Testing.expect(
+    result == 42 && work.poll().isNone(),
+    "a background result is delivered exactly once",
+  )
+  let mut files = run MachineFileSystem.make()
+  let cwd = run directory()
+  let parent = run Path.fromBytes(cwd.asSlice())
+  let temporary = run FileSystem.temporaryDirectory(&parent, "native-images-")
+    |> Effect.provideMut<FileSystem>(&mut files)
+  let path = run Path.joinUtf8(&temporary.path, b"sample.png")
+  run FileSystem.writeFile(&path, assets.photo(0)) |> Effect.provideMut<FileSystem>(&mut files)
+  let name = Path.view(&path).unwrapOr("")
+  let fonts = run fixtures.fonts()
+  let fontPath = run Path.joinUtf8(&temporary.path, b"fixture.ttf")
+  run FileSystem.writeFile(&fontPath, fonts.data(0)) |> Effect.provideMut<FileSystem>(&mut files)
+  let mut discovered = FontCollection.make()
+  let mut report = FontReport.empty()
+  let options = FontOptions { maxFiles: 1, maxBytes: 16777216, maxDepth: 2 }
+  run systemFonts.file(&mut discovered, &fontPath, &options, &mut report)
+    |> Effect.provideMut<FileSystem>(&mut files)
+  run Testing.expect(
+    discovered.faceCount() > 0 && report.files == 1,
+    "platform discovery reads installed or packaged font files",
+  )
+  let faces = discovered.faceCount()
+  run systemFonts.file(&mut discovered, &fontPath, &options, &mut report)
+    |> Effect.provideMut<FileSystem>(&mut files)
+  run Testing.expect(
+    discovered.faceCount() == faces,
+    "priority and directory discovery do not retain duplicate font bytes",
+  )
+  run systemFonts.directory(&mut discovered, &temporary.path, &options, &mut report, 0)
+    |> Effect.provideMut<FileSystem>(&mut files)
+  run Testing.expect(report.truncated, "discovery reports when its file budget is exhausted")
+  let mut tree = run UiTree.make(&fonts)
+  let mut images = Images.make()
+  run images.file(
+    1,
+    String.slice(name, cwd.length() + 1, String.byteLength(name) - cwd.length() - 1),
+  )
+  run Testing.expect(images.state(1) == ImageState.Loading, "a queued image is loading")
+  run images.file(2, "/no-such-silk-image")
+  run images.url(4, "ftp://invalid.example/image.png")
+  run images.file(3, name)
+  images.cancel(3)
+  while images.pending() {
+    drop run images.poll(&mut tree)
+    NativeThread.yieldNow()
+  }
+  run Testing.expect(
+    images.state(1) == ImageState.Ready && tree.resources.images.length() == 1,
+    "a native file is read, decoded and installed asynchronously",
+  )
+  run Testing.expect(
+    images.state(2) == ImageState.Failed && images.error(2) == ImageError.File,
+    "file failures become an app-visible error",
+  )
+  run Testing.expect(
+    images.state(3) == ImageState.Cancelled,
+    "a cancelled queued image is never installed",
+  )
+  run images.file(1, name)
+  drop run images.poll(&mut tree)
+  run images.file(1, name)
+  while images.pending() {
+    drop run images.poll(&mut tree)
+    NativeThread.yieldNow()
+  }
+  run Testing.expect(
+    images.state(1) == ImageState.Ready && tree.resources.images.length() == 1,
+    "replacement discards stale work and releases previous pixels",
+  )
+  run Testing.expect(
+    images.state(4) == ImageState.Failed && images.error(4) == ImageError.Network,
+    "unsupported URL schemes report a network error",
+  )
+  run images.release(&mut tree, 1)
+  run Testing.expect(
+    images.state(1) == ImageState.Empty && tree.resources.images.length() == 0,
+    "release clears both state and decoded storage",
+  )
+  let mut app = Runtime<Example, Message, Command>.make(Example { value: 0 })
+  app.deferCommands()
+  run app.start(&mut tree, 0.0)
+  app.send(Message { value: 0 })
+  run drain(&mut app, &mut tree)
+  let mut commands = Commands<Example, Message, Command>.make()
+  drop run commands.poll(&mut app, &mut tree, 0.0)
+  while commands.wakeAfter().isSome() {
+    drop run commands.poll(&mut app, &mut tree, 0.0)
+    NativeThread.yieldNow()
+  }
+  run Testing.expect(
+    app.model.value == 42,
+    "the standard host executor delivers command results to the app",
+  )
+  run FileSystem.release(move temporary) |> Effect.provideMut<FileSystem>(&mut files)
+}
+
+test effect fn managedNativeImages() -> ()
+  ! TreeError
+    | OutOfMemoryError
+    | AssertionError<'static>
+    | SpawnError
+    | FileError
+    | HostInputError
+    | WindowError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run body() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// The working directory as a machine path (`/C:/...` on Windows).
+effect fn directory() -> Bytes
+  ! HostInputError | FileError | OutOfMemoryError
+  ? &mut Allocator {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    let mut inputs = run WindowsHostInput.capture()
+    let native = run HostInput.workingDirectory() |> Effect.provideMut<HostInput>(&mut inputs)
+    let path = run WindowsPath.fromNativeBytes(native.asSlice())
+    return run Bytes.copy(Path.rawBytes(&path))
+  } else {
+    return run NativeHostInput.workingDirectory()
+  }
+}
+
+struct Example {
+  value: i32
+}
+
+struct Message {
+  value: i32
+}
+
+struct Command {
+  value: i32
+}
+
+impl Transferable for Message {}
+
+impl Transferable for Command {}
+
+impl App<Message, Command> for Example {
+  fn view(self: &Self, ui: &mut Ui<Message>) -> () {
+    ui.text("Worker test")
+  }
+
+  fn update(self: &mut Self, message: Message, cx: &mut Context<Command>) -> () {
+    if message.value == 0 {
+      cx.command(Command { value: 42 })
+    } else {
+      self.value = message.value
+    }
+  }
+}
+
+impl Perform<Message, never ? never> for Command {
+  effect fn perform(self: Self) -> Message {
+    return Message { value: self.value }
+  }
+}

@@ -1,0 +1,106 @@
+//! The standard window host with owned blocking commands executed on native workers.
+//! Commands implement `Perform<M, never, never>` and construct their own file/network services
+//! on the worker. Encode operational failures as messages. Captures and returned messages must
+//! be Transferable and own process-heap storage. At most four jobs execute concurrently.
+import lib { WindowContent }
+import background { Background }
+import ui_app.app { App, Perform }
+import ui_app.runtime { Runtime, drain }
+import ui_tree.lib { UiTree, TreeError }
+import window.types { WindowError }
+import silk.concurrency.thread { Transferable }
+import silk.concurrency.thread_native { SpawnError }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+
+pub struct Commands<A, M, C> {
+  jobs: List<Background<M>>
+}
+
+impl<A, M, C> Commands<A, M, C> {
+  pub fn make() -> Commands<A, M, C> {
+    return Commands<A, M, C> { jobs: List<Background<M>>.make() }
+  }
+}
+
+effect fn spawnFailed(error: SpawnError) -> never
+  ! WindowError {
+  drop error
+  fail WindowError.CreationFailed
+}
+
+impl<
+  A: App<M, C>,
+  M: 'static + Transferable,
+  C: 'static + Transferable + Perform<M, never, never>
+> Commands<A, M, C> {
+  pub fn wakeAfter(self: &Self) -> Option<f64> {
+    return if self.jobs.length() > 0 {
+      Option<f64>.some(0.008)
+    } else {
+      Option<f64>.None
+    }
+  }
+
+  pub effect fn poll(
+    self: &mut Self,
+    app: &mut Runtime<A, M, C>,
+    tree: &mut UiTree<'_>,
+    time: f64,
+  ) -> bool
+    ! WindowError | TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut changed = false
+    let mut i: usize = 0
+    while i < self.jobs.length() {
+      if self.jobs.asSlice()[i].ready() {
+        let mut job = self.jobs.remove(i)
+        if let Option<M>.Some { value } = move job.poll() {
+          app.send(move value)
+          changed = true
+        }
+      } else {
+        i = i + 1
+      }
+    }
+    if changed {
+      run drain(&mut app, &mut tree)
+    }
+    while self.jobs.length() < 4 && app.deferred() > 0 {
+      let command = app.takeDeferred()
+      let job = run Effect.catch<SpawnError>(
+        Background<M>.start(
+          fn() -> M {
+            return run Perform<M, never, never>.perform(move command)
+          },
+        ),
+        spawnFailed,
+      )
+      run self.jobs.append(move job)
+    }
+    return changed
+  }
+}
+
+impl<
+  A: App<M, C>,
+  M: 'static + Transferable,
+  C: 'static + Transferable + Perform<M, never, never>
+> WindowContent<A, M, C> for Commands<A, M, C> {
+  fn wakeAfter(self: &Self) -> Option<f64> {
+    return Commands<A, M, C>.wakeAfter(self)
+  }
+
+  effect fn poll(
+    self: &mut Self,
+    app: &mut Runtime<A, M, C>,
+    tree: &mut UiTree<'_>,
+    time: f64,
+  ) -> bool
+    ! WindowError | TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    return run Commands<A, M, C>.poll(&mut self, &mut app, &mut tree, time)
+  }
+}

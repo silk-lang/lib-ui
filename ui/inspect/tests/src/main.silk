@@ -1,0 +1,183 @@
+//! Inspector goldens over the inbox fixture, drawn by the CPU reference renderer.
+//!
+//! `ui-inspect-tests <goldens directory> [--update]` builds the inbox at scale 2, highlights
+//! the Archive button and the nested scroll box, and compares `highlight.png` (each channel may
+//! differ by 2) and `inspect.txt` (the full node view of both, exactly) with the files in the
+//! directory. With `--update` it writes them instead. Run it from the repository root. Exits 0
+//! when everything matches, 1 on a mismatch, 2 on an error.
+import ui_fixtures.fixtures as fixtures
+import ui_inspect.lib { Highlight, InspectOptions, compose, inspectNode }
+import ui_tree.lib { UiTree, TreeError, Batch, FrameInput, CpuSnapshot, encodePng }
+import ui_scene.scene { Scene }
+import codec.png
+import codec.png { PngError }
+import codec.image { ImageError }
+import vector.geometry_error { GeometryError }
+import silk.collections.bytes { Bytes }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.io.writer { Writer, WriterError }
+import silk.io.writer_native { StderrWriter }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.u8
+import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.system.filesystem_machine { MachineFileSystem }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.text.string { String }
+
+const TOLERANCE: u32 = 2
+
+effect fn say(text: string) -> ()
+  ! WriterError {
+  let mut writer = StderrWriter.make()
+  run Writer.writeString(text) |> Effect.provideMut<Writer>(&mut writer)
+  run Writer.flush() |> Effect.provideMut<Writer>(&mut writer)
+}
+
+fn mismatches(actual: &[u8], expected: &[u8]) -> u32 {
+  if actual.length != expected.length {
+    return 4294967295
+  }
+  let mut count: u32 = 0
+  let mut i: usize = 0
+  while i < actual.length {
+    let a = u8.toU32(actual[i])
+    let b = u8.toU32(expected[i])
+    let d = if a > b {
+      a - b
+    } else {
+      b - a
+    }
+    if d > TOLERANCE {
+      count = count + 1
+    }
+    i = i + 1
+  }
+  return count
+}
+
+fn sameBytes(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < a.length {
+    if a[i] != b[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+effect fn check(directory: &Path, update: bool) -> u32
+  ! TreeError
+    | GeometryError
+    | OutOfMemoryError
+    | WriterError
+    | FileError
+    | HostInputError
+    | ImageError
+    | PngError
+  ? &mut FileSystem | &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  let mut batch = Batch.make()
+  run fixtures.inbox(&mut batch)
+  run tree.apply(run batch.take())
+  run tree.frame(FrameInput { width: 360.0, height: 440.0, scale: 2.0, time: 0.0 })
+  let mut snapshot = CpuSnapshot.make()
+  run snapshot.sync(&mut tree)
+  let mut highlight = Highlight.make()
+  run highlight.nodes.append(fixtures.ARCHIVE_BUTTON)
+  run highlight.nodes.append(fixtures.NESTED)
+  let mut scene = Scene.make()
+  run compose(&tree, &highlight, &mut scene)
+  let pixels = run snapshot.renderScene(&tree, &scene)
+  let encoded = run encodePng(&pixels)
+  let mut text = String.make()
+  run inspectNode(&tree, fixtures.ARCHIVE_BUTTON, InspectOptions.all(), &mut text)
+  run text.append("\n")
+  run inspectNode(&tree, fixtures.NESTED, InspectOptions.all(), &mut text)
+  run text.append("\n")
+  run inspectNode(&tree, fixtures.NESTED + 11, InspectOptions.all(), &mut text)
+
+  let pngFile = run Path.join(directory, "highlight.png")
+  let textFile = run Path.join(directory, "inspect.txt")
+  if update {
+    run FileSystem.writeFile(&pngFile, Bytes.asSlice(&encoded))
+    run FileSystem.writeFile(&textFile, String.utf8Bytes(String.view(&text)))
+    run say("wrote highlight.png and inspect.txt\n")
+    return 0
+  }
+  let mut failures: u32 = 0
+  let golden = run png.decode(Bytes.asSlice(&run FileSystem.readFile(&pngFile)))
+  let actual = run png.decode(Bytes.asSlice(&encoded))
+  if mismatches(actual.data(), golden.data()) != 0 {
+    failures = failures + 1
+    run say("PIXELS DIFFER highlight.png\n")
+  } else {
+    run say("ok highlight.png\n")
+  }
+  let expected = run FileSystem.readFile(&textFile)
+  if sameBytes(String.utf8Bytes(String.view(&text)), Bytes.asSlice(&expected)) {
+    run say("ok inspect.txt\n")
+  } else {
+    failures = failures + 1
+    run say("SNAPSHOT DIFFERS inspect.txt\n")
+    run say(String.view(&text))
+  }
+  return failures
+}
+
+effect fn process() -> i32
+  ! TreeError
+    | GeometryError
+    | OutOfMemoryError
+    | WriterError
+    | FileError
+    | HostInputError
+    | ImageError
+    | PngError
+  ? &mut HostInput | &mut Allocator {
+  let count = run HostInput.argumentCount()
+  if count < 2 {
+    run say("usage: ui-inspect-tests <goldens directory> [--update]\n")
+    return 2
+  }
+  let update = count > 2
+  let raw = match run HostInput.argument(1) {
+    Option<Bytes>.Some { value } => move value
+    Option<Bytes>.None => Bytes.make()
+  }
+  let cwd = run HostInput.workingDirectory()
+  let base = run Path.fromBytes(Bytes.asSlice(&cwd))
+  let directory = run Path.resolveBytes(&base, Bytes.asSlice(&raw))
+  let mut files = run MachineFileSystem.make()
+  let failures = run check(&directory, update) |> Effect.provideMut<FileSystem>(&mut files)
+  return if failures == 0 {
+    0
+  } else {
+    1
+  }
+}
+
+effect fn failed<E>(error: E) -> i32
+  ! WriterError {
+  drop error
+  run say("ui-inspect-tests: building, drawing, file access or PNG coding failed\n")
+  return 2
+}
+
+effect fn failedQuietly<E>(error: E) -> i32 {
+  drop error
+  return 2
+}
+
+pub effect fn main() -> i32
+  ? &mut HostInput {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(Effect.catchAll(process(), failed), failedQuietly)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}

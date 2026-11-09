@@ -1,0 +1,1954 @@
+//! [`Ui`]: the builder a view writes its nodes into, and the arena it records them in.
+//!
+//! A view is a plain function of the model that calls `Ui` methods. Child content is a lambda
+//! that the builder calls at once, so nothing is stored but plain data: every node becomes an
+//! [`Entry`] in a flat arena, with its style properties, attributes, text and listener flags.
+//!
+//! The same view runs in two modes:
+//!
+//! - **Render.** Every node is recorded. Each new entry is matched with the entry of the last
+//!   render at the same place: same parent, then the same key, or the same position among the
+//!   unkeyed siblings. The diff (`diff.silk`) turns the two arenas into tree mutations.
+//! - **Dispatch.** An event record from the tree names the path of node ids from the root to
+//!   its target. The view runs again, but a node's children run only when the node is on that
+//!   path, and handlers (`on`, `onClick`, ...) are called only there. Their replies bubble from
+//!   the target up. Handlers are lambdas that are never stored.
+pub import ui_tree.grid { Grid }
+import ui_tree.anchoring { AnchorOptions }
+import virtual_list { VirtualList, VirtualOptions, VirtualRow }
+import equal
+import heap { Heap }
+import ui_tree.mutation {
+  NodeKind,
+  StyleState,
+  Property,
+  Length,
+  Side,
+  Display,
+  FlexDirection,
+  Position,
+  Overflow,
+  Role,
+  Cursor,
+  CanvasCommand,
+  NOT_FOCUSABLE,
+  LISTEN_POINTER_DOWN,
+  LISTEN_POINTER_UP,
+  LISTEN_CLICK,
+  LISTEN_POINTER_MOVE,
+  LISTEN_POINTER_ENTER,
+  LISTEN_POINTER_LEAVE,
+  LISTEN_WHEEL,
+  LISTEN_KEY_DOWN,
+  LISTEN_KEY_UP,
+  LISTEN_FOCUS,
+  LISTEN_BLUR,
+  LISTEN_INPUT,
+  LISTEN_SCROLL,
+  LISTEN_LAYOUT
+}
+import ui_tree.mutation { propertyKey as keyOf }
+import ui_tree.node { Event, EventKind }
+import silk.collections.hash { Hash, Word }
+import silk.collections.hash_map { HashMap }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.color.rgba { Rgba }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.geometry.rect { Rect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.num.u8
+import silk.num.i64
+import silk.num.f64
+import silk.text.string { String }
+
+/// No entry.
+pub const NO_ENTRY: u32 = 4294967295
+
+/// The tree id of the runtime's root box. A view's top-level nodes are its children.
+pub const ROOT_ID: u32 = 1
+
+/// Who a node is among its siblings: its key, or its position among the unkeyed ones.
+pub struct Identity {
+  pub keyed: bool,
+  pub value: u64,
+}
+
+impl Copy for Identity {}
+
+impl Identity {
+  pub fn same(self: &Self, other: &Identity) -> bool {
+    return self.keyed == other.keyed && self.value == other.value
+  }
+}
+
+/// `span` moved by `shift` (wrapping), or left alone when empty.
+fn shifted(span: Span, shift: u32) -> Span {
+  if span.length == 0 {
+    return Span.empty()
+  }
+  return Span { start: u32.wrappingAdd(span.start, shift), length: span.length }
+}
+
+/// A byte range in the arena's text pool, or a range in its canvas pool.
+pub struct Span {
+  pub start: u32,
+  pub length: u32,
+}
+
+impl Copy for Span {}
+
+impl Span {
+  pub fn empty() -> Span {
+    return Span { start: 0, length: 0 }
+  }
+}
+
+/// One node of a render.
+pub struct Entry {
+  pub parent: u32,
+  pub firstChild: u32,
+  pub lastChild: u32,
+  pub next: u32,
+  pub childCount: u32,
+  /// The index among its siblings.
+  pub position: u32,
+  pub kind: NodeKind,
+  pub identity: Identity,
+  /// How many unkeyed children it has so far, and how many `lazy` regions.
+  pub unkeyed: u32,
+  pub lazies: u32,
+  pub firstStyle: u32,
+  pub lastStyle: u32,
+  pub text: Span,
+  pub label: Span,
+  pub testId: Span,
+  pub accessRole: Role,
+  pub hasValueRange: bool,
+  pub valueMin: f32,
+  pub valueMax: f32,
+  pub valueNow: f32,
+  pub hasTabIndex: bool,
+  pub tabIndex: i32,
+  pub hasCursor: bool,
+  pub cursor: Cursor,
+  pub disabled: bool,
+  pub focusTrap: bool,
+  /// `Attribute.Checked`, `Selected` and `Expanded`.
+  pub checked: bool,
+  pub selected: bool,
+  pub expanded: bool,
+  /// Input attributes.
+  pub placeholder: Span,
+  pub multiline: bool,
+  pub readOnly: bool,
+  /// `takeFocus` was called: the diff focuses the node when this render asks and the last
+  /// did not.
+  pub wantsFocus: bool,
+  /// `reveal` was called, the same way.
+  pub wantsReveal: bool,
+  /// `anchor` was called with `anchor`: the runtime reads the node's layout box for
+  /// `anchorRect`.
+  pub hasAnchor: bool,
+  pub anchor: u64,
+  /// Whether this node has tree-managed anchor placement.
+  pub hasPlacement: bool,
+  /// View key of the anchor used for placement.
+  pub placementTarget: u64,
+  /// Placement preferences forwarded to the backend.
+  pub placementOptions: AnchorOptions,
+  /// The image or icon resource, or `NO_ENTRY`.
+  pub source: u32,
+  pub grid: u32,
+  pub hasCanvas: bool,
+  pub canvas: Span,
+  pub listeners: u32,
+  /// The matching entry of the last render, or `NO_ENTRY`.
+  pub old: u32,
+  /// The tree id, given by the diff.
+  pub id: u32,
+  /// Copied by `lazy` from the last render, with everything below it: nothing to diff.
+  pub copied: bool,
+}
+
+impl Copy for Entry {}
+
+impl Entry {
+  pub fn make(kind: NodeKind, parent: u32, identity: Identity) -> Entry {
+    return Entry {
+      parent: parent,
+      firstChild: NO_ENTRY,
+      lastChild: NO_ENTRY,
+      next: NO_ENTRY,
+      childCount: 0,
+      position: 0,
+      kind: kind,
+      identity: identity,
+      unkeyed: 0,
+      lazies: 0,
+      firstStyle: NO_ENTRY,
+      lastStyle: NO_ENTRY,
+      text: Span.empty(),
+      label: Span.empty(),
+      testId: Span.empty(),
+      accessRole: Role.None,
+      hasValueRange: false,
+      valueMin: 0.0,
+      valueMax: 0.0,
+      valueNow: 0.0,
+      hasTabIndex: false,
+      tabIndex: 0,
+      hasCursor: false,
+      cursor: Cursor.Default,
+      disabled: false,
+      focusTrap: false,
+      checked: false,
+      selected: false,
+      expanded: false,
+      placeholder: Span.empty(),
+      multiline: false,
+      readOnly: false,
+      wantsFocus: false,
+      wantsReveal: false,
+      hasAnchor: false,
+      anchor: 0,
+      hasPlacement: false,
+      placementTarget: 0,
+      placementOptions: AnchorOptions {
+        gap: 0.0,
+        preferredHeight: 0.0,
+        alignEnd: false,
+        matchWidth: false,
+      },
+      source: NO_ENTRY,
+      grid: NO_ENTRY,
+      hasCanvas: false,
+      canvas: Span.empty(),
+      listeners: 0,
+      old: NO_ENTRY,
+      id: 0,
+      copied: false,
+    }
+  }
+}
+
+/// One style property of an entry, in a list per entry.
+pub struct StyleRecord {
+  pub entry: u32,
+  pub state: StyleState,
+  pub property: Property,
+  pub next: u32,
+}
+
+impl Copy for StyleRecord {}
+
+/// A `lazy` region of a render: the entries, styles, text and canvas commands its body made.
+pub struct LazyRecord {
+  pub parent: u32,
+  pub ordinal: u32,
+  pub hash: u64,
+  pub entryStart: u32,
+  pub entryEnd: u32,
+  pub styleStart: u32,
+  pub styleEnd: u32,
+  pub byteStart: u32,
+  pub byteEnd: u32,
+  pub canvasStart: u32,
+  pub canvasEnd: u32,
+}
+
+impl Copy for LazyRecord {}
+
+/// The flat record of one render. Entry 0 is the runtime's root box.
+pub struct Arena {
+  pub entries: List<Entry>,
+  pub styles: List<StyleRecord>,
+  pub bytes: List<u8>,
+  pub grids: List<Grid>,
+  pub canvas: List<CanvasCommand>,
+  pub lazies: List<LazyRecord>,
+}
+
+impl Arena {
+  pub fn make() -> Arena {
+    return Arena {
+      entries: List<Entry>.make(),
+      styles: List<StyleRecord>.make(),
+      bytes: List<u8>.make(),
+      grids: List<Grid>.make(),
+      canvas: List<CanvasCommand>.make(),
+      lazies: List<LazyRecord>.make(),
+    }
+  }
+
+  pub fn clear(self: &mut Self) -> () {
+    self.entries.clear()
+    self.styles.clear()
+    self.bytes.clear()
+    self.grids.clear()
+    self.canvas.clear()
+    self.lazies.clear()
+  }
+
+  pub fn length(self: &Self) -> u32 {
+    return usize.toU32(self.entries.length())
+  }
+
+  pub fn entry(self: &Self, index: u32) -> Entry {
+    return self.entries.get(u32.toUsize(index))
+  }
+
+  pub fn setEntry(self: &mut Self, index: u32, entry: Entry) -> () {
+    self.entries.set(u32.toUsize(index), entry)
+  }
+
+  /// The bytes of `span`.
+  pub fn text(self: &Self, span: Span) -> &[u8] {
+    if span.length == 0 {
+      return Slice.view(self.bytes.asSlice(), 0, 0)
+    }
+    return Slice.view(self.bytes.asSlice(), u32.toUsize(span.start), u32.toUsize(span.length))
+  }
+
+  pub fn commands(self: &Self, span: Span) -> &[CanvasCommand] {
+    if span.length == 0 {
+      return Slice.view(self.canvas.asSlice(), 0, 0)
+    }
+    return Slice.view(self.canvas.asSlice(), u32.toUsize(span.start), u32.toUsize(span.length))
+  }
+
+  /// Makes this arena a copy of `other`.
+  pub effect fn copyFrom(self: &mut Self, other: &Arena) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.clear()
+    let mut g: usize = 0
+    while g < other.grids.length() {
+      run self.grids.append(run other.grids.asSlice()[g].copy())
+      g = g + 1
+    }
+    run self.entries.appendSlice(other.entries.asSlice())
+    run self.styles.appendSlice(other.styles.asSlice())
+    run self.bytes.appendSlice(other.bytes.asSlice())
+    run self.canvas.appendSlice(other.canvas.asSlice())
+    run self.lazies.appendSlice(other.lazies.asSlice())
+  }
+
+  /// The effective `state` properties of `index`, later ones replacing earlier ones.
+  pub effect fn effectiveStyle(
+    self: &Self,
+    index: u32,
+    state: StyleState,
+    out: &mut List<Property>,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    out.clear()
+    let mut at = self.entry(index).firstStyle
+    while at != NO_ENTRY {
+      let record = self.styles.get(u32.toUsize(at))
+      if record.state == state {
+        let key = propertyKey(record.property)
+        let mut replaced = false
+        let mut i: usize = 0
+        while i < out.length() {
+          if propertyKey(out.get(i)) == key {
+            out.set(i, record.property)
+            replaced = true
+            break
+          }
+          i = i + 1
+        }
+        if !replaced {
+          run out.append(record.property)
+        }
+      }
+      at = record.next
+    }
+  }
+}
+
+fn propertyKey(property: Property) -> u32 {
+  return keyOf(property)
+}
+
+/// What a handler answers: a message or not, and whether the event goes on to the handlers of
+/// the nodes above.
+pub union Reply<M> {
+  /// Sends `message`; the event bubbles on.
+  Emit { pub message: M },
+  /// Sends `message`; nodes above do not see the event.
+  EmitAndStop { pub message: M },
+  /// Sends nothing; nodes above do not see the event.
+  Stop,
+  /// Sends nothing; the event bubbles on.
+  Pass,
+}
+
+/// A reply and the depth of the node whose handler gave it.
+pub struct Answer<M> {
+  pub depth: u32,
+  pub reply: Reply<M>,
+}
+
+/// The layout box of an anchored node, as the tree laid it out last.
+pub struct AnchorRect {
+  pub key: u64,
+  pub rect: Rect<f32>,
+  /// Whether the node was pressed (a primary button press on it or inside it that has not
+  /// ended): a drag in progress.
+  pub pressed: bool,
+  pub hovered: bool,
+  pub focused: bool,
+}
+
+impl Copy for AnchorRect {}
+
+/// The key of the overlay layer's host box under the root (see [`Ui.overlay`]).
+pub const OVERLAY_KEY: u64 = 0x0F7EA11A7E570001
+
+fn overlayIdentity() -> Identity {
+  return Identity { keyed: true, value: OVERLAY_KEY }
+}
+
+/// The builder a view writes into. See the module documentation.
+pub struct Ui<M> {
+  /// Allocation for views, as [`Heap.alloc`].
+  pub heap: Heap,
+  pub arena: Arena,
+  pub previous: Arena,
+  lookup: HashMap<Word, u32>,
+  claimed: List<bool>,
+  current: u32,
+  hasPendingKey: bool,
+  pendingKey: u64,
+  dispatching: bool,
+  path: List<Identity>,
+  depth: u32,
+  ordinals: List<u32>,
+  event: Event,
+  answers: List<Answer<M>>,
+  /// Entries the last render copied with `lazy` instead of running the body.
+  pub reused: u32,
+  /// The layout boxes of anchored nodes, filled by the runtime before each pass.
+  pub anchors: List<AnchorRect>,
+  pub viewportBounds: Rect<f32>,
+  /// The overlay host entry of this render, or `NO_ENTRY`.
+  overlayHost: u32,
+  /// How many times `overlay` ran this pass.
+  overlays: u32,
+  /// A dispatch pass for an event in an overlay, outside that overlay's body: every node's
+  /// body runs (to find the `overlay` call), and no handler does.
+  searching: bool,
+  /// View identities and the last virtual ranges requested by the backend.
+  pub virtualLists: List<VirtualList>,
+  /// Backend containers whose virtual view was removed.
+  pub removedVirtualPorts: List<u32>,
+}
+
+/// The listener flag that records of `kind` need.
+pub fn listenerFlag(kind: EventKind) -> u32 {
+  return match kind {
+    EventKind.PointerDown => LISTEN_POINTER_DOWN
+    EventKind.PointerUp => LISTEN_POINTER_UP
+    EventKind.Click => LISTEN_CLICK
+    EventKind.PointerMove => LISTEN_POINTER_MOVE
+    EventKind.PointerEnter => LISTEN_POINTER_ENTER
+    EventKind.PointerLeave => LISTEN_POINTER_LEAVE
+    EventKind.Wheel => LISTEN_WHEEL
+    EventKind.KeyDown => LISTEN_KEY_DOWN
+    EventKind.KeyUp => LISTEN_KEY_UP
+    EventKind.Focus => LISTEN_FOCUS
+    EventKind.Blur => LISTEN_BLUR
+    EventKind.Input => LISTEN_INPUT
+    EventKind.Layout => LISTEN_LAYOUT
+    EventKind.Scroll => LISTEN_SCROLL
+  }
+}
+
+/// Whether records of `kind` go to the handlers of the target's ancestors too. The tree queues
+/// enter, leave, focus, blur and scroll records only for a target that listens itself, so
+/// those reach the target's handlers only.
+pub fn bubbles(kind: EventKind) -> bool {
+  return match kind {
+    EventKind.PointerEnter => false
+    EventKind.PointerLeave => false
+    EventKind.Focus => false
+    EventKind.Blur => false
+    EventKind.Layout => false
+    EventKind.Scroll => false
+    _ => true
+  }
+}
+
+fn mix(value: u64) -> u64 {
+  let mut z = u64.wrappingAdd(value, 0x9E3779B97F4A7C15)
+  z = u64.wrappingMultiply(u64.bitXor(z, u64.shiftRight(z, 30)), 0xBF58476D1CE4E5B9)
+  z = u64.wrappingMultiply(u64.bitXor(z, u64.shiftRight(z, 27)), 0x94D049BB133111EB)
+  return u64.bitXor(z, u64.shiftRight(z, 31))
+}
+
+/// The lookup key of the child `identity` of entry `parent`.
+fn slotKey(parent: u32, identity: Identity) -> u64 {
+  let tag: u64 = if identity.keyed {
+    1
+  } else {
+    2
+  }
+  return mix(u64.bitXor(mix(u32.toU64(parent) * 4 + tag), identity.value))
+}
+
+/// A 64-bit key for text, for `ui.key` and `ui.each` (FNV-1a).
+pub fn textKey(value: string) -> u64 {
+  let bytes = String.utf8Bytes(value)
+  let mut hash: u64 = 0xCBF29CE484222325
+  let mut i: usize = 0
+  while i < bytes.length {
+    hash = u64.wrappingMultiply(u64.bitXor(hash, u8.toU64(bytes[i])), 0x100000001B3)
+    i = i + 1
+  }
+  return hash
+}
+
+impl<M> Ui<M> {
+  pub fn make() -> Ui<M> {
+    return Ui<M> {
+      heap: Heap.make(),
+      arena: Arena.make(),
+      previous: Arena.make(),
+      lookup: HashMap<Word, u32>.make(Hash.seed(0x5EED)),
+      claimed: List<bool>.make(),
+      current: 0,
+      hasPendingKey: false,
+      pendingKey: 0,
+      dispatching: false,
+      path: List<Identity>.make(),
+      depth: 0,
+      ordinals: List<u32>.make(),
+      event: Event.make(EventKind.Click, 0, List<u32>.make()),
+      answers: List<Answer<M>>.make(),
+      reused: 0,
+      anchors: List<AnchorRect>.make(),
+      viewportBounds: Rect<f32>.new(0.0, 0.0, 0.0, 0.0),
+      overlayHost: NO_ENTRY,
+      overlays: 0,
+      searching: false,
+      virtualLists: List<VirtualList>.make(),
+      removedVirtualPorts: List<u32>.make(),
+    }
+  }
+
+  /// Runs allocating work for the view (see [`Heap.alloc`]).
+  pub fn alloc<A>(self: &mut Self, work: once Effect<A ! OutOfMemoryError ? &mut Allocator>) -> A {
+    return self.heap.alloc(move work)
+  }
+
+  /// Whether this pass is a dispatch pass rather than a render.
+  pub fn isDispatching(self: &Self) -> bool {
+    return self.dispatching
+  }
+
+  // Passes, driven by the runtime.
+
+  /// Starts a render: the last render becomes `previous`, and the root entry is open.
+  pub effect fn beginRender(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let lists = self.virtualLists.asMutSlice()
+    let mut v: usize = 0
+    while v < lists.length {
+      lists[v].seen = false
+      v = v + 1
+    }
+    run self.previous.copyFrom(&self.arena)
+    self.arena.clear()
+    self.lookup.clear()
+    self.claimed.clear()
+    let count = self.previous.length()
+    let mut i: u32 = 1
+    while i < count {
+      let entry = self.previous.entry(i)
+      drop run self.lookup.insert(Hash.word(slotKey(entry.parent, entry.identity)), i)
+      i = i + 1
+    }
+    run self.claimed.appendRepeated(false, u32.toUsize(count))
+    let mut root = Entry.make(NodeKind.Box, NO_ENTRY, Identity { keyed: false, value: 0 })
+    root.id = ROOT_ID
+    if count > 0 {
+      root.old = 0
+    }
+    run self.arena.entries.append(root)
+    self.current = 0
+    self.hasPendingKey = false
+    self.dispatching = false
+    self.reused = 0
+    self.overlayHost = NO_ENTRY
+    self.overlays = 0
+    self.searching = false
+  }
+
+  /// Ends a render: the overlay layer, if any, moves after the root's other children so it is
+  /// drawn (and hit) above them.
+  pub fn endRender(self: &mut Self) -> () {
+    let mut v = self.virtualLists.length()
+    while v > 0 {
+      v = v - 1
+      if !self.virtualLists.asSlice()[v].seen {
+        let port = self.virtualLists.asSlice()[v].port
+        self.heap.alloc(self.removedVirtualPorts.append(self.previous.entry(port).id))
+        drop self.virtualLists.remove(v)
+      }
+    }
+    let host = self.overlayHost
+    if host == NO_ENTRY {
+      return ()
+    }
+    let mut root = self.arena.entry(0)
+    if root.lastChild == host {
+      return ()
+    }
+
+    // Unlink the host.
+    let after = self.arena.entry(host).next
+    if root.firstChild == host {
+      root.firstChild = after
+    } else {
+      let mut at = root.firstChild
+      while at != NO_ENTRY {
+        let mut entry = self.arena.entry(at)
+        if entry.next == host {
+          entry.next = after
+          self.arena.setEntry(at, entry)
+          break
+        }
+        at = entry.next
+      }
+    }
+
+    // Append it, and number the children again.
+    let mut last = self.arena.entry(root.lastChild)
+    last.next = host
+    self.arena.setEntry(root.lastChild, last)
+    let mut moved = self.arena.entry(host)
+    moved.next = NO_ENTRY
+    self.arena.setEntry(host, moved)
+    root.lastChild = host
+    self.arena.setEntry(0, root)
+    let mut position: u32 = 0
+    let mut at = root.firstChild
+    while at != NO_ENTRY {
+      let mut entry = self.arena.entry(at)
+      entry.position = position
+      self.arena.setEntry(at, entry)
+      position = position + 1
+      at = entry.next
+    }
+  }
+
+  /// Starts a dispatch pass for `event`, whose path the runtime resolved to `path` (the
+  /// identities below the root, outermost first).
+  pub effect fn beginDispatch(self: &mut Self, event: Event, path: &[Identity]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.event = move event
+    self.path.clear()
+    run self.path.appendSlice(path)
+    self.depth = 0
+    self.ordinals.clear()
+    run self.ordinals.append(0)
+    self.answers.clear()
+    self.hasPendingKey = false
+    self.dispatching = true
+    self.overlays = 0
+    self.searching = self.path.length() > 0 && self.path.get(0).same(&overlayIdentity())
+  }
+
+  /// Ends a dispatch pass and moves the messages its handlers sent, in bubbling order, into
+  /// `out`.
+  pub effect fn endDispatch(self: &mut Self, out: &mut List<M>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.dispatching = false
+    self.searching = false
+    let mut depth = usize.toU32(self.path.length())
+    let mut stopped = false
+    while !stopped {
+      // Handlers of the same node answer in the order they were declared.
+      let mut i: usize = 0
+      while i < self.answers.length() && !stopped {
+        if self.answers.asSlice()[i].depth == depth {
+          let answer = self.answers.remove(i)
+          match move answer.reply {
+            Reply<M>.Emit { message } => {
+              run out.append(move message)
+            }
+            Reply<M>.EmitAndStop { message } => {
+              run out.append(move message)
+              stopped = true
+            }
+            Reply<M>.Stop => {
+              stopped = true
+            }
+            Reply<M>.Pass => {}
+          }
+        } else {
+          i = i + 1
+        }
+      }
+      if depth == 0 {
+        break
+      }
+      depth = depth - 1
+    }
+    self.answers.clear()
+  }
+
+  // Nodes.
+
+  /// Uses `value` as the key of the next node this view opens, so the node keeps its identity
+  /// (and its tree state: focus, scroll, hover) when siblings come and go or move.
+  pub fn key(self: &mut Self, value: u64) -> () {
+    self.hasPendingKey = true
+    self.pendingKey = value
+  }
+
+  /// The identity of the next child of the open node.
+  fn nextIdentity(self: &mut Self) -> Identity {
+    if self.hasPendingKey {
+      self.hasPendingKey = false
+      return Identity { keyed: true, value: self.pendingKey }
+    }
+    if self.dispatching {
+      let at = u32.toUsize(self.depth)
+      let ordinal = self.ordinals.get(at)
+      self.ordinals.set(at, ordinal + 1)
+      return Identity { keyed: false, value: u32.toU64(ordinal) }
+    }
+    let mut parent = self.arena.entry(self.current)
+    let ordinal = parent.unkeyed
+    parent.unkeyed = ordinal + 1
+    self.arena.setEntry(self.current, parent)
+    return Identity { keyed: false, value: u32.toU64(ordinal) }
+  }
+
+  /// The entry of the last render that matches child `identity` of `parent`, unclaimed.
+  fn matchOld(self: &mut Self, parent: u32, identity: Identity, kind: NodeKind) -> u32 {
+    let oldParent = self.arena.entry(parent).old
+    if oldParent == NO_ENTRY {
+      return NO_ENTRY
+    }
+    let mut found = NO_ENTRY
+    if let Option<u32>.Some { value } = self.lookup.get(Hash.word(slotKey(oldParent, identity))) {
+      let entry = self.previous.entry(value)
+      if entry.parent == oldParent && entry.identity.same(&identity) {
+        found = value
+      }
+    }
+    if found == NO_ENTRY {
+      // A lookup collision: look through the old parent's children.
+      let mut at = self.previous.entry(oldParent).firstChild
+      while at != NO_ENTRY {
+        let entry = self.previous.entry(at)
+        if entry.identity.same(&identity) {
+          found = at
+          break
+        }
+        at = entry.next
+      }
+    }
+    if found == NO_ENTRY || self.claimed.get(u32.toUsize(found)) {
+      return NO_ENTRY
+    }
+    if self.previous.entry(found).kind != kind {
+      return NO_ENTRY
+    }
+    self.claimed.set(u32.toUsize(found), true)
+    return found
+  }
+
+  /// Opens a child of `kind` under the open node; returns it.
+  fn open(self: &mut Self, kind: NodeKind, identity: Identity) -> u32 {
+    let parent = self.current
+    let index = self.arena.length()
+    let mut entry = Entry.make(kind, parent, identity)
+    entry.old = self.matchOld(parent, identity, kind)
+    let mut up = self.arena.entry(parent)
+    entry.position = up.childCount
+    up.childCount = up.childCount + 1
+    if up.lastChild == NO_ENTRY {
+      up.firstChild = index
+    } else {
+      let mut last = self.arena.entry(up.lastChild)
+      last.next = index
+      self.arena.setEntry(up.lastChild, last)
+    }
+    up.lastChild = index
+    self.arena.setEntry(parent, up)
+    self.heap.alloc(self.arena.entries.append(entry))
+    return index
+  }
+
+  /// A node of `kind`. `body` sets its style, attributes and handlers and adds its children.
+  pub fn node(self: &mut Self, kind: NodeKind, body: fn(&mut Ui<M>) -> ()) -> () {
+    if self.searching {
+      self.hasPendingKey = false
+      body(&mut self)
+      self.hasPendingKey = false
+      return ()
+    }
+    let identity = self.nextIdentity()
+    if self.dispatching {
+      let at = u32.toUsize(self.depth)
+      if at < self.path.length() && self.path.get(at).same(&identity) {
+        self.depth = self.depth + 1
+        if self.ordinals.length() <= u32.toUsize(self.depth) {
+          self.heap.alloc(self.ordinals.append(0))
+        }
+        self.ordinals.set(u32.toUsize(self.depth), 0)
+        body(&mut self)
+        self.hasPendingKey = false
+        self.depth = self.depth - 1
+      }
+      return ()
+    }
+    let index = self.open(kind, identity)
+    let parent = self.current
+    self.current = index
+    body(&mut self)
+    self.hasPendingKey = false
+    self.current = parent
+  }
+
+  /// Mounts the visible items of a variable-height vertical list in the current column.
+  ///
+  /// # Details
+  ///
+  /// The current column must have a bounded height. This method owns its scrolling and
+  /// children. Do not add other children, gaps, or vertical padding to that column.
+  /// Item keys must be unique and stable. `listKey` must be unique in the view.
+  /// A focused item remains mounted outside the visible range until focus leaves it.
+  /// The tree measures heights after layout. Width changes and `options.revision` changes
+  /// discard measurements. Unmounted items retain no widget state; keep data in the model.
+  /// Inspection and native accessibility expose mounted items only.
+  /// Use `runtime.frame` in custom hosts to settle measurements before presentation.
+  pub fn virtualItems(
+    self: &mut Self,
+    listKey: u64,
+    count: usize,
+    options: VirtualOptions,
+    key: fn(usize) -> u64,
+    body: fn(&mut Ui<M>, usize) -> (),
+  ) -> () {
+    let mut v: usize = 0
+    while v < self.virtualLists.length() && self.virtualLists.asSlice()[v].key != listKey {
+      v = v + 1
+    }
+    if v == self.virtualLists.length() {
+      if self.dispatching || self.searching {
+        return ()
+      }
+      self.heap.alloc(self.virtualLists.append(VirtualList.make(listKey, options)))
+    }
+    if !self.dispatching && !self.searching {
+      let list = &mut self.virtualLists.asMutSlice()[v]
+      if list.count != count || list.options.revision != options.revision {
+        if list.pinned != usize.MAX {
+          let mut candidate: usize = 0
+          while candidate < count && key(candidate) != list.pinnedKey {
+            candidate = candidate + 1
+          }
+          list.pinned = if candidate < count {
+            candidate
+          } else {
+            usize.MAX
+          }
+        }
+      }
+      list.count = count
+      if list.first > count {
+        list.first = count
+      }
+      if list.end > count {
+        list.end = count
+      }
+      list.options = options
+      list.port = self.current
+      list.seen = true
+      list.rows.clear()
+    }
+    self.style(
+      &[
+        Property.OverflowY { value: Overflow.Auto },
+        Property.OverflowX { value: Overflow.Hidden },
+        Property.MinHeight { value: Length.px(0.0) },
+      ],
+    )
+    let first = self.virtualLists.asSlice()[v].first
+    let end = self.virtualLists.asSlice()[v].end
+    let pinned = self.virtualLists.asSlice()[v].pinned
+    let mut i = if pinned < first {
+      pinned
+    } else {
+      first
+    }
+    while i < end || (pinned < count && i == pinned) {
+      self.key(key(i))
+      self.column(
+        |ui| {
+          ui.style(&[Property.FlexShrink { value: 0.0 }])
+          if !ui.dispatching && !ui.searching {
+            ui.heap.alloc(
+              ui.virtualLists.asMutSlice()[v].rows.append(
+                VirtualRow { index: i, entry: ui.current },
+              ),
+            )
+          }
+          body(&mut ui, i)
+        },
+      )
+      let cursor = i + 1
+      if i < first {
+        i = first
+      } else if cursor == end && pinned >= end && pinned < count {
+        i = pinned
+      } else {
+        i = cursor
+      }
+    }
+  }
+
+  /// A leaf node of `kind` with no body.
+  fn leaf(self: &mut Self, kind: NodeKind) -> u32 {
+    if self.searching {
+      self.hasPendingKey = false
+      return NO_ENTRY
+    }
+    let identity = self.nextIdentity()
+    if self.dispatching {
+      return NO_ENTRY
+    }
+    return self.open(kind, identity)
+  }
+
+  /// A box (`display: block`).
+  pub fn box(self: &mut Self, body: fn(&mut Ui<M>) -> ()) -> () {
+    self.node(NodeKind.Box, body)
+  }
+
+  /// A flex row.
+  pub fn row(self: &mut Self, body: fn(&mut Ui<M>) -> ()) -> () {
+    self.node(
+      NodeKind.Box,
+      |ui| {
+        ui.style(
+          &[
+            Property.Display { value: Display.Flex },
+            Property.FlexDirection { value: FlexDirection.Row },
+          ],
+        )
+        body(&mut ui)
+      },
+    )
+  }
+
+  /// A flex column.
+  pub fn column(self: &mut Self, body: fn(&mut Ui<M>) -> ()) -> () {
+    self.node(
+      NodeKind.Box,
+      |ui| {
+        ui.style(
+          &[
+            Property.Display { value: Display.Flex },
+            Property.FlexDirection { value: FlexDirection.Column },
+          ],
+        )
+        body(&mut ui)
+      },
+    )
+  }
+
+  /// A text node: a run of text styled by its parent.
+  pub fn text(self: &mut Self, value: string) -> () {
+    let index = self.leaf(NodeKind.Text)
+    if index != NO_ENTRY {
+      let span = self.store(String.utf8Bytes(value))
+      let mut entry = self.arena.entry(index)
+      entry.text = span
+      self.arena.setEntry(index, entry)
+    }
+  }
+
+  /// A text node showing `value` in decimal.
+  pub fn number(self: &mut Self, value: i64) -> () {
+    let index = self.leaf(NodeKind.Text)
+    if index != NO_ENTRY {
+      let start = usize.toU32(self.arena.bytes.length())
+      let mut magnitude: u64 = if value < 0 {
+        i64.toU64(0 - (value + 1)) + 1
+      } else {
+        i64.toU64(value)
+      }
+      let mut digits: [u8; 20] = [0; 20]
+      let mut count: usize = 0
+      while true {
+        digits[count] = u64.toU8(magnitude % 10) + 48
+        count = count + 1
+        magnitude = magnitude / 10
+        if magnitude == 0 {
+          break
+        }
+      }
+      if value < 0 {
+        self.heap.alloc(self.arena.bytes.append(45))
+      }
+      while count > 0 {
+        count = count - 1
+        self.heap.alloc(self.arena.bytes.append(digits[count]))
+      }
+      let mut entry = self.arena.entry(index)
+      entry.text = Span { start: start, length: usize.toU32(self.arena.bytes.length()) - start }
+      self.arena.setEntry(index, entry)
+    }
+  }
+
+  /// A text node showing `value` with `places` digits after the point (at most 6), rounded.
+  pub fn decimal(self: &mut Self, value: f64, places: u32) -> () {
+    let index = self.leaf(NodeKind.Text)
+    if index == NO_ENTRY {
+      return ()
+    }
+    let start = usize.toU32(self.arena.bytes.length())
+    let digits = if places > 6 {
+      6
+    } else {
+      places
+    }
+    let mut scale: f64 = 1.0
+    let mut p: u32 = 0
+    while p < digits {
+      scale = scale * 10.0
+      p = p + 1
+    }
+    let negative = value < 0.0
+    let magnitude = if negative {
+      0.0 - value
+    } else {
+      value
+    }
+    let scaled = f64.toU64(f64.floor(magnitude * scale + 0.5))
+    if negative && scaled != 0 {
+      self.heap.alloc(self.arena.bytes.append(45))
+    }
+    let units = scaled / f64.toU64(scale)
+    self.appendDigits(units, 1)
+    if digits > 0 {
+      self.heap.alloc(self.arena.bytes.append(46))
+      self.appendDigits(scaled % f64.toU64(scale), digits)
+    }
+    let mut entry = self.arena.entry(index)
+    entry.text = Span { start: start, length: usize.toU32(self.arena.bytes.length()) - start }
+    self.arena.setEntry(index, entry)
+  }
+
+  /// Appends `value` in decimal to the text pool, padded with zeros to `width` digits.
+  fn appendDigits(self: &mut Self, value: u64, width: u32) -> () {
+    let mut digits: [u8; 20] = [0; 20]
+    let mut count: usize = 0
+    let mut rest = value
+    while true {
+      digits[count] = u64.toU8(rest % 10) + 48
+      count = count + 1
+      rest = rest / 10
+      if rest == 0 {
+        break
+      }
+    }
+    while count < u32.toUsize(width) && count < 20 {
+      digits[count] = 48
+      count = count + 1
+    }
+    while count > 0 {
+      count = count - 1
+      self.heap.alloc(self.arena.bytes.append(digits[count]))
+    }
+  }
+
+  /// Sets the open node’s Grid template, including grid-item placement.
+  pub fn gridTemplate(self: &mut Self, value: &Grid) -> () {
+    if self.dispatching || self.searching {
+      return ()
+    }
+    let index = usize.toU32(self.arena.grids.length())
+    let copy = self.heap.alloc(value.copy())
+    self.heap.alloc(self.arena.grids.append(move copy))
+    let mut entry = self.arena.entry(self.current)
+    entry.grid = index
+    self.arena.setEntry(self.current, entry)
+  }
+
+  /// A Grid container; the template owns tracks, names, repeats and areas.
+  pub fn grid(self: &mut Self, value: &Grid, body: fn(&mut Ui<M>) -> ()) -> () {
+    self.box(
+      |ui| {
+        ui.style(&[Property.Display { value: Display.Grid }])
+        ui.gridTemplate(value)
+        body(&mut ui)
+      },
+    )
+  }
+
+  /// Delivers the measured viewport-relative border box after it changes. Does not bubble.
+  /// Keep the callback idempotent; changing layout from it can schedule another frame.
+  pub fn onLayout(self: &mut Self, handler: fn(Rect<f32>) -> M) -> () {
+    self.on(EventKind.Layout, |event| Reply<M>.Emit { message: handler(event.bounds) })
+  }
+
+  /// Sets the image or icon source on the open node.
+  pub fn source(self: &mut Self, resource: u32) -> () {
+    if self.dispatching || self.searching {
+      return ()
+    }
+    let mut entry = self.arena.entry(self.current)
+    entry.source = resource
+    self.arena.setEntry(self.current, entry)
+  }
+
+  /// An image node showing a registered resource at its natural size.
+  pub fn image(self: &mut Self, resource: u32) -> () {
+    self.imageWith(resource, |ui| {})
+  }
+
+  /// An image with its own sizing, fit, accessibility label and input handlers.
+  pub fn imageWith(self: &mut Self, resource: u32, body: fn(&mut Ui<M>) -> ()) -> () {
+    self.node(
+      NodeKind.Image,
+      |ui| {
+        ui.source(resource)
+        ui.accessRole(Role.Image)
+        body(&mut ui)
+      },
+    )
+  }
+
+  /// An SVG mask icon tinted with the inherited text color.
+  pub fn icon(self: &mut Self, resource: u32) -> () {
+    self.iconWith(resource, |ui| {})
+  }
+
+  /// An icon with its own dimensions and attributes.
+  pub fn iconWith(self: &mut Self, resource: u32, body: fn(&mut Ui<M>) -> ()) -> () {
+    self.node(
+      NodeKind.Icon,
+      |ui| {
+        ui.source(resource)
+        body(&mut ui)
+      },
+    )
+  }
+
+  /// An input node with value `value`. The view controls the value.
+  pub fn input(self: &mut Self, value: string, body: fn(&mut Ui<M>) -> ()) -> () {
+    self.node(
+      NodeKind.Input,
+      |ui| {
+        ui.setText(value)
+        body(&mut ui)
+      },
+    )
+  }
+
+  /// A canvas node drawing `commands`.
+  pub fn canvas(self: &mut Self, commands: &[CanvasCommand], body: fn(&mut Ui<M>) -> ()) -> () {
+    self.node(
+      NodeKind.Canvas,
+      |ui| {
+        if !ui.dispatching {
+          let start = usize.toU32(ui.arena.canvas.length())
+          ui.heap.alloc(ui.arena.canvas.appendSlice(commands))
+          let mut entry = ui.arena.entry(ui.current)
+          entry.hasCanvas = true
+          entry.canvas = Span { start: start, length: usize.toU32(commands.length) }
+          ui.arena.setEntry(ui.current, entry)
+        }
+        body(&mut ui)
+      },
+    )
+  }
+
+  /// A button: a focusable box with role button and a text label, sending `onPress` when
+  /// clicked or pressed with Enter or Space.
+  pub fn button(self: &mut Self, label: string, onPress: fn() -> M) -> () {
+    self.pressable(
+      onPress,
+      |ui| {
+        ui.text(label)
+      },
+    )
+  }
+
+  /// A focusable box with role button that sends `onPress` when clicked or pressed with Enter
+  /// or Space; `body` styles it and adds its content.
+  pub fn pressable(self: &mut Self, onPress: fn() -> M, body: fn(&mut Ui<M>) -> ()) -> () {
+    self.node(
+      NodeKind.Box,
+      |ui| {
+        ui.accessRole(Role.Button)
+        ui.tabIndex(0)
+        ui.cursor(Cursor.Pointer)
+        ui.onClick(onPress)
+        body(&mut ui)
+      },
+    )
+  }
+
+  /// One child per item of `items`, keyed by `key`: the first node `body` opens for an item
+  /// takes the item's key.
+  pub fn each<T>(
+    self: &mut Self,
+    items: &[T],
+    key: fn(&T) -> u64,
+    body: fn(&mut Ui<M>, &T) -> (),
+  ) -> () {
+    let mut i: usize = 0
+    while i < items.length {
+      self.key(key(&items[i]))
+      body(&mut self, &items[i])
+      self.hasPendingKey = false
+      i = i + 1
+    }
+  }
+
+  /// As [`each`], with the item's index.
+  pub fn enumerate<T>(
+    self: &mut Self,
+    items: &[T],
+    key: fn(&T) -> u64,
+    body: fn(&mut Ui<M>, usize, &T) -> (),
+  ) -> () {
+    let mut i: usize = 0
+    while i < items.length {
+      self.key(key(&items[i]))
+      body(&mut self, i, &items[i])
+      self.hasPendingKey = false
+      i = i + 1
+    }
+  }
+
+  /// Reuses what `body` made in the last render when `hash` (a hash of everything `body`
+  /// reads) is the same as then, as Elm's `Html.lazy`: the region is copied and the diff skips
+  /// it. Each `lazy` call is told apart from the others under the same node by its order.
+  /// `body` should only open nodes; style and attribute calls outside a node of its own are
+  /// not kept when the region is reused.
+  pub fn lazy(self: &mut Self, hash: u64, body: fn(&mut Ui<M>) -> ()) -> () {
+    if self.dispatching {
+      body(&mut self)
+      return ()
+    }
+    let parent = self.current
+    let mut up = self.arena.entry(parent)
+    let ordinal = up.lazies
+    up.lazies = ordinal + 1
+    self.arena.setEntry(parent, up)
+    let oldParent = up.old
+    if oldParent != NO_ENTRY {
+      let records = self.previous.lazies.asSlice()
+      let mut i: usize = 0
+      while i < records.length {
+        let record = records[i]
+        if record.parent == oldParent && record.ordinal == ordinal && record.hash == hash
+          && self.unclaimedRange(record.entryStart, record.entryEnd) {
+          let mut containsVirtual = false
+          let mut v: usize = 0
+          while v < self.virtualLists.length() {
+            let list = &self.virtualLists.asSlice()[v]
+            if !list.seen
+              && (list.port == oldParent
+                || (list.port >= record.entryStart && list.port < record.entryEnd)) {
+              containsVirtual = true
+            }
+            v = v + 1
+          }
+          if !containsVirtual {
+            self.copyLazy(record, parent)
+            return ()
+          }
+        }
+        i = i + 1
+      }
+    }
+    let entryStart = self.arena.length()
+    let styleStart = usize.toU32(self.arena.styles.length())
+    let byteStart = usize.toU32(self.arena.bytes.length())
+    let canvasStart = usize.toU32(self.arena.canvas.length())
+    let overlaysBefore = self.overlays
+    body(&mut self)
+    if self.overlays != overlaysBefore {
+      // An overlay's nodes live outside the region, so it cannot be copied.
+      return ()
+    }
+    let record = LazyRecord {
+      parent: parent,
+      ordinal: ordinal,
+      hash: hash,
+      entryStart: entryStart,
+      entryEnd: self.arena.length(),
+      styleStart: styleStart,
+      styleEnd: usize.toU32(self.arena.styles.length()),
+      byteStart: byteStart,
+      byteEnd: usize.toU32(self.arena.bytes.length()),
+      canvasStart: canvasStart,
+      canvasEnd: usize.toU32(self.arena.canvas.length()),
+    }
+    self.heap.alloc(self.arena.lazies.append(record))
+  }
+
+  fn unclaimedRange(self: &Self, start: u32, end: u32) -> bool {
+    let mut i = start
+    while i < end {
+      if self.claimed.get(u32.toUsize(i)) {
+        return false
+      }
+      i = i + 1
+    }
+    return true
+  }
+
+  /// Copies lazy region `record` of the last render under `parent`.
+  fn copyLazy(self: &mut Self, record: LazyRecord, parent: u32) -> () {
+    let entryStart = self.arena.length()
+    let styleStart = usize.toU32(self.arena.styles.length())
+    let byteStart = usize.toU32(self.arena.bytes.length())
+    let canvasStart = usize.toU32(self.arena.canvas.length())
+    let entryShift = u32.wrappingSubtract(entryStart, record.entryStart)
+    let styleShift = u32.wrappingSubtract(styleStart, record.styleStart)
+    let byteShift = u32.wrappingSubtract(byteStart, record.byteStart)
+    let canvasShift = u32.wrappingSubtract(canvasStart, record.canvasStart)
+    self.reused = self.reused + (record.entryEnd - record.entryStart)
+    let inside = |index: u32| index != NO_ENTRY && index >= record.entryStart
+      && index < record.entryEnd
+    let mut i = record.entryStart
+    while i < record.entryEnd {
+      self.claimed.set(u32.toUsize(i), true)
+      let mut entry = self.previous.entry(i)
+      entry.old = i
+      entry.copied = true
+      if entry.firstChild != NO_ENTRY {
+        entry.firstChild = u32.wrappingAdd(entry.firstChild, entryShift)
+        entry.lastChild = u32.wrappingAdd(entry.lastChild, entryShift)
+      }
+      if entry.firstStyle != NO_ENTRY {
+        entry.firstStyle = u32.wrappingAdd(entry.firstStyle, styleShift)
+        entry.lastStyle = u32.wrappingAdd(entry.lastStyle, styleShift)
+      }
+      entry.text = shifted(entry.text, byteShift)
+      entry.label = shifted(entry.label, byteShift)
+      entry.testId = shifted(entry.testId, byteShift)
+      entry.placeholder = shifted(entry.placeholder, byteShift)
+      entry.canvas = shifted(entry.canvas, canvasShift)
+      if entry.grid != NO_ENTRY {
+        let grid = self.heap.alloc(self.previous.grids.asSlice()[u32.toUsize(entry.grid)].copy())
+        entry.grid = usize.toU32(self.arena.grids.length())
+        self.heap.alloc(self.arena.grids.append(move grid))
+      }
+      if inside(entry.parent) {
+        entry.parent = u32.wrappingAdd(entry.parent, entryShift)
+        if entry.next != NO_ENTRY {
+          entry.next = u32.wrappingAdd(entry.next, entryShift)
+        }
+        self.heap.alloc(self.arena.entries.append(entry))
+      } else {
+        // A top-level node of the region: link it under the new parent.
+        entry.parent = parent
+        entry.next = NO_ENTRY
+        let index = self.arena.length()
+        let mut up = self.arena.entry(parent)
+        entry.position = up.childCount
+        up.childCount = up.childCount + 1
+        if !entry.identity.keyed {
+          entry.identity = Identity { keyed: false, value: u32.toU64(up.unkeyed) }
+          up.unkeyed = up.unkeyed + 1
+        }
+        if up.lastChild == NO_ENTRY {
+          up.firstChild = index
+        } else {
+          let mut last = self.arena.entry(up.lastChild)
+          last.next = index
+          self.arena.setEntry(up.lastChild, last)
+        }
+        up.lastChild = index
+        self.arena.setEntry(parent, up)
+        self.heap.alloc(self.arena.entries.append(entry))
+      }
+      i = i + 1
+    }
+    let mut s = record.styleStart
+    while s < record.styleEnd {
+      let mut style = self.previous.styles.get(u32.toUsize(s))
+      if inside(style.entry) {
+        style.entry = u32.wrappingAdd(style.entry, entryShift)
+        if style.next != NO_ENTRY {
+          style.next = u32.wrappingAdd(style.next, styleShift)
+        }
+        self.heap.alloc(self.arena.styles.append(style))
+      } else {
+        // A style of the parent made by the body: dropped (see `lazy`), but its slot stays so
+        // the shifts hold.
+        style.entry = NO_ENTRY
+        style.next = NO_ENTRY
+        self.heap.alloc(self.arena.styles.append(style))
+      }
+      s = s + 1
+    }
+    self.heap.alloc(
+      self.arena.bytes.appendSlice(
+        Slice.view(
+          self.previous.bytes.asSlice(),
+          u32.toUsize(record.byteStart),
+          u32.toUsize(record.byteEnd - record.byteStart),
+        ),
+      ),
+    )
+    self.heap.alloc(
+      self.arena.canvas.appendSlice(
+        Slice.view(
+          self.previous.canvas.asSlice(),
+          u32.toUsize(record.canvasStart),
+          u32.toUsize(record.canvasEnd - record.canvasStart),
+        ),
+      ),
+    )
+
+    // Lazy regions nested in this one move with it.
+    let nested = self.previous.lazies.length()
+    let mut n: usize = 0
+    while n < nested {
+      let inner = self.previous.lazies.get(n)
+      if inside(inner.parent) {
+        let moved = LazyRecord {
+          parent: u32.wrappingAdd(inner.parent, entryShift),
+          ordinal: inner.ordinal,
+          hash: inner.hash,
+          entryStart: u32.wrappingAdd(inner.entryStart, entryShift),
+          entryEnd: u32.wrappingAdd(inner.entryEnd, entryShift),
+          styleStart: u32.wrappingAdd(inner.styleStart, styleShift),
+          styleEnd: u32.wrappingAdd(inner.styleEnd, styleShift),
+          byteStart: u32.wrappingAdd(inner.byteStart, byteShift),
+          byteEnd: u32.wrappingAdd(inner.byteEnd, byteShift),
+          canvasStart: u32.wrappingAdd(inner.canvasStart, canvasShift),
+          canvasEnd: u32.wrappingAdd(inner.canvasEnd, canvasShift),
+        }
+        self.heap.alloc(self.arena.lazies.append(moved))
+      }
+      n = n + 1
+    }
+    let copied = LazyRecord {
+      parent: parent,
+      ordinal: record.ordinal,
+      hash: record.hash,
+      entryStart: entryStart,
+      entryEnd: self.arena.length(),
+      styleStart: styleStart,
+      styleEnd: usize.toU32(self.arena.styles.length()),
+      byteStart: byteStart,
+      byteEnd: usize.toU32(self.arena.bytes.length()),
+      canvasStart: canvasStart,
+      canvasEnd: usize.toU32(self.arena.canvas.length()),
+    }
+    self.heap.alloc(self.arena.lazies.append(copied))
+  }
+
+  fn store(self: &mut Self, bytes: &[u8]) -> Span {
+    let start = usize.toU32(self.arena.bytes.length())
+    self.heap.alloc(self.arena.bytes.appendSlice(bytes))
+    return Span { start: start, length: usize.toU32(bytes.length) }
+  }
+
+  /// Sets the value of the open text or input node.
+  pub fn setText(self: &mut Self, value: string) -> () {
+    if self.dispatching {
+      return ()
+    }
+    let span = self.store(String.utf8Bytes(value))
+    let mut entry = self.arena.entry(self.current)
+    entry.text = span
+    self.arena.setEntry(self.current, entry)
+  }
+
+  // Style.
+
+  /// Adds `properties` to the open node's `state` look; later ones replace earlier ones.
+  pub fn styleFor(self: &mut Self, state: StyleState, properties: &[Property]) -> () {
+    if self.dispatching {
+      return ()
+    }
+    let mut i: usize = 0
+    while i < properties.length {
+      let at = usize.toU32(self.arena.styles.length())
+      let record = StyleRecord {
+        entry: self.current,
+        state: state,
+        property: properties[i],
+        next: NO_ENTRY,
+      }
+      self.heap.alloc(self.arena.styles.append(record))
+      let mut entry = self.arena.entry(self.current)
+      if entry.lastStyle == NO_ENTRY {
+        entry.firstStyle = at
+      } else {
+        let mut last = self.arena.styles.get(u32.toUsize(entry.lastStyle))
+        last.next = at
+        self.arena.styles.set(u32.toUsize(entry.lastStyle), last)
+      }
+      entry.lastStyle = at
+      self.arena.setEntry(self.current, entry)
+      i = i + 1
+    }
+  }
+
+  /// Adds `properties` to the open node's base style.
+  pub fn style(self: &mut Self, properties: &[Property]) -> () {
+    self.styleFor(StyleState.Base, properties)
+  }
+
+  /// The look while hovered.
+  pub fn hover(self: &mut Self, properties: &[Property]) -> () {
+    self.styleFor(StyleState.Hover, properties)
+  }
+
+  /// The look while pressed.
+  pub fn active(self: &mut Self, properties: &[Property]) -> () {
+    self.styleFor(StyleState.Active, properties)
+  }
+
+  /// The look while focused.
+  pub fn focused(self: &mut Self, properties: &[Property]) -> () {
+    self.styleFor(StyleState.Focus, properties)
+  }
+
+  /// The look while focused from the keyboard (focus rings).
+  pub fn focusVisible(self: &mut Self, properties: &[Property]) -> () {
+    self.styleFor(StyleState.FocusVisible, properties)
+  }
+
+  /// Padding on all four sides, in CSS pixels.
+  pub fn padding(self: &mut Self, value: f32) -> () {
+    let length = Length.px(value)
+    self.style(
+      &[
+        Property.Padding { side: Side.Top, value: length },
+        Property.Padding { side: Side.Right, value: length },
+        Property.Padding { side: Side.Bottom, value: length },
+        Property.Padding { side: Side.Left, value: length },
+      ],
+    )
+  }
+
+  /// The gap between rows and columns of a flex container.
+  pub fn gap(self: &mut Self, value: f32) -> () {
+    self.style(
+      &[
+        Property.RowGap { value: Length.px(value) },
+        Property.ColumnGap { value: Length.px(value) },
+      ],
+    )
+  }
+
+  pub fn background(self: &mut Self, color: Rgba<f32>) -> () {
+    self.style(&[Property.BackgroundColor { color: color }])
+  }
+
+  /// The text color.
+  pub fn color(self: &mut Self, color: Rgba<f32>) -> () {
+    self.style(&[Property.Color { color: color }])
+  }
+
+  pub fn fontSize(self: &mut Self, value: f32) -> () {
+    self.style(&[Property.FontSize { value: value }])
+  }
+
+  pub fn width(self: &mut Self, value: Length) -> () {
+    self.style(&[Property.Width { value: value }])
+  }
+
+  pub fn height(self: &mut Self, value: Length) -> () {
+    self.style(&[Property.Height { value: value }])
+  }
+
+  /// `flex-grow`.
+  pub fn grow(self: &mut Self, value: f32) -> () {
+    self.style(&[Property.FlexGrow { value: value }])
+  }
+
+  // Attributes.
+
+  fn edit(self: &mut Self) -> Option<Entry> {
+    if self.dispatching {
+      return Option<Entry>.None
+    }
+    return Option<Entry>.Some { value: self.arena.entry(self.current) }
+  }
+
+  pub fn accessRole(self: &mut Self, value: Role) -> () {
+    if let Option<Entry>.Some { value: entry } = self.edit() {
+      let mut changed = entry
+      changed.accessRole = value
+      self.arena.setEntry(self.current, changed)
+    }
+  }
+
+  /// The accessible name.
+  pub fn label(self: &mut Self, value: string) -> () {
+    if !self.dispatching {
+      let span = self.store(String.utf8Bytes(value))
+      let mut entry = self.arena.entry(self.current)
+      entry.label = span
+      self.arena.setEntry(self.current, entry)
+    }
+  }
+
+  /// The numeric accessibility range of the open control. Omitting it in the next view clears it.
+  pub fn valueRange(self: &mut Self, min: f32, max: f32, value: f32) -> () {
+    if !self.dispatching {
+      let mut entry = self.arena.entry(self.current)
+      entry.hasValueRange = true
+      entry.valueMin = min
+      entry.valueMax = max
+      entry.valueNow = value
+      self.arena.setEntry(self.current, entry)
+    }
+  }
+
+  /// A stable name for tests and inspectors.
+  pub fn testId(self: &mut Self, value: string) -> () {
+    if !self.dispatching {
+      let span = self.store(String.utf8Bytes(value))
+      let mut entry = self.arena.entry(self.current)
+      entry.testId = span
+      self.arena.setEntry(self.current, entry)
+    }
+  }
+
+  pub fn tabIndex(self: &mut Self, value: i32) -> () {
+    if let Option<Entry>.Some { value: entry } = self.edit() {
+      let mut changed = entry
+      changed.hasTabIndex = true
+      changed.tabIndex = value
+      self.arena.setEntry(self.current, changed)
+    }
+  }
+
+  pub fn cursor(self: &mut Self, value: Cursor) -> () {
+    if let Option<Entry>.Some { value: entry } = self.edit() {
+      let mut changed = entry
+      changed.hasCursor = true
+      changed.cursor = value
+      self.arena.setEntry(self.current, changed)
+    }
+  }
+
+  pub fn disabled(self: &mut Self, value: bool) -> () {
+    if let Option<Entry>.Some { value: entry } = self.edit() {
+      let mut changed = entry
+      changed.disabled = value
+      self.arena.setEntry(self.current, changed)
+    }
+  }
+
+  pub fn focusTrap(self: &mut Self, value: bool) -> () {
+    if let Option<Entry>.Some { value: entry } = self.edit() {
+      let mut changed = entry
+      changed.focusTrap = value
+      self.arena.setEntry(self.current, changed)
+    }
+  }
+
+  /// Whether a checkbox, radio button or switch is checked (`aria-checked`).
+  pub fn checked(self: &mut Self, value: bool) -> () {
+    if let Option<Entry>.Some { value: entry } = self.edit() {
+      let mut changed = entry
+      changed.checked = value
+      self.arena.setEntry(self.current, changed)
+    }
+  }
+
+  /// Whether a tab, option or list item is the selected one (`aria-selected`).
+  pub fn selected(self: &mut Self, value: bool) -> () {
+    if let Option<Entry>.Some { value: entry } = self.edit() {
+      let mut changed = entry
+      changed.selected = value
+      self.arena.setEntry(self.current, changed)
+    }
+  }
+
+  /// Whether what this node controls is open (`aria-expanded`).
+  pub fn expanded(self: &mut Self, value: bool) -> () {
+    if let Option<Entry>.Some { value: entry } = self.edit() {
+      let mut changed = entry
+      changed.expanded = value
+      self.arena.setEntry(self.current, changed)
+    }
+  }
+
+  /// The text an empty input shows.
+  pub fn placeholder(self: &mut Self, value: string) -> () {
+    if !self.dispatching {
+      let span = self.store(String.utf8Bytes(value))
+      let mut entry = self.arena.entry(self.current)
+      entry.placeholder = span
+      self.arena.setEntry(self.current, entry)
+    }
+  }
+
+  /// Makes the open input take several lines.
+  pub fn multiline(self: &mut Self, value: bool) -> () {
+    if let Option<Entry>.Some { value: entry } = self.edit() {
+      let mut changed = entry
+      changed.multiline = value
+      self.arena.setEntry(self.current, changed)
+    }
+  }
+
+  /// Makes the open input selectable but not editable.
+  pub fn readOnly(self: &mut Self, value: bool) -> () {
+    if let Option<Entry>.Some { value: entry } = self.edit() {
+      let mut changed = entry
+      changed.readOnly = value
+      self.arena.setEntry(self.current, changed)
+    }
+  }
+
+  // Focus, anchors and overlays.
+
+  /// Moves focus to the open node when this render asks for it and the last one did not (or
+  /// the node is new): a dialog focusing its first field when it opens, a menu its highlighted
+  /// item as the arrow keys move. Asking again in the next renders does nothing more, so a
+  /// view can ask for as long as the condition holds. The last node asking wins.
+  pub fn takeFocus(self: &mut Self) -> () {
+    if let Option<Entry>.Some { value: entry } = self.edit() {
+      let mut changed = entry
+      changed.wantsFocus = true
+      self.arena.setEntry(self.current, changed)
+    }
+  }
+
+  /// Scrolls the open node into view when this render asks and the last one did not (or the
+  /// node is new), as [`takeFocus`] does for focus: the highlighted row of a list that the
+  /// arrow keys move.
+  pub fn reveal(self: &mut Self) -> () {
+    if let Option<Entry>.Some { value: entry } = self.edit() {
+      let mut changed = entry
+      changed.wantsReveal = true
+      self.arena.setEntry(self.current, changed)
+    }
+  }
+
+  /// Names the open node `key` for [`anchorRect`]: the runtime reads its layout box from the
+  /// tree before each render and dispatch. Keys should be unique in the view.
+  pub fn anchor(self: &mut Self, key: u64) -> () {
+    if let Option<Entry>.Some { value: entry } = self.edit() {
+      let mut changed = entry
+      changed.hasAnchor = true
+      changed.anchor = key
+      self.arena.setEntry(self.current, changed)
+    }
+  }
+
+  /// Attaches this popup to the node named by `anchor(key)` in the same view.
+  /// The tree updates placement after scrolling and layout. The anchor key must exist.
+  pub fn anchored(self: &mut Self, key: u64, options: AnchorOptions) -> () {
+    if !self.dispatching && !self.searching {
+      let mut entry = self.arena.entry(self.current)
+      entry.hasPlacement = true
+      entry.placementTarget = key
+      entry.placementOptions = options
+      self.arena.setEntry(self.current, entry)
+    }
+  }
+
+  /// The border box, in CSS pixels of the viewport, of the node anchored as `key` in the last
+  /// render, as the tree last laid it out; none before it was laid out. A popup places itself
+  /// next to it, and a slider maps a pointer position to a value with it.
+  /// The current window content bounds, in logical pixels, for collision-aware overlays.
+  pub fn viewport(self: &Self) -> Rect<f32> {
+    return self.viewportBounds
+  }
+
+  pub fn anchorRect(self: &Self, key: u64) -> Option<Rect<f32>> {
+    let anchors = self.anchors.asSlice()
+    let mut i: usize = 0
+    while i < anchors.length {
+      if anchors[i].key == key {
+        return Option<Rect<f32>>.Some { value: anchors[i].rect }
+      }
+      i = i + 1
+    }
+    return Option<Rect<f32>>.None
+  }
+
+  /// Whether the node anchored as `key` is pressed: a press on it or inside it is in progress.
+  pub fn anchorPressed(self: &Self, key: u64) -> bool {
+    let anchors = self.anchors.asSlice()
+    let mut i: usize = 0
+    while i < anchors.length {
+      if anchors[i].key == key {
+        return anchors[i].pressed
+      }
+      i = i + 1
+    }
+    return false
+  }
+
+  /// Adds the nodes `body` opens to the overlay layer instead of the open node: a box under
+  /// the root, after everything else, so they are drawn and hit above the rest of the view
+  /// (menus, popovers, tooltips, dialogs). `key` names this overlay among the others (unique in
+  /// the view, as the anchor key of the popup's button usually is): its nodes go in a box of
+  /// their own, keyed `key`, at the viewport's top left with no size. Place them with
+  /// `position: absolute` and `inset` (next to an [`anchorRect`]) or `position: fixed`.
+  ///
+  /// Events in an overlay bubble to the root, not to the node that opened it. To find the
+  /// handlers of an event in an overlay, the dispatch pass runs the whole view, because the
+  /// `overlay` call can be anywhere in it; handlers outside the overlay do not run. `lazy`
+  /// does not reuse a region that opened an overlay.
+  pub fn overlay(self: &mut Self, key: u64, body: fn(&mut Ui<M>) -> ()) -> () {
+    self.overlays = self.overlays + 1
+    let pending = self.hasPendingKey
+    self.hasPendingKey = false
+    let identity = Identity { keyed: true, value: key }
+    if self.dispatching {
+      if !self.searching {
+        // The event is not in an overlay, or is in this one's parent region: nothing here.
+        self.hasPendingKey = pending
+        return ()
+      }
+      if self.path.length() < 2 || !self.path.get(1).same(&identity) {
+        // Another overlay: one nested in this one may hold the event.
+        body(&mut self)
+        self.hasPendingKey = pending
+        return ()
+      }
+      let depth = self.depth
+      let mut saved = List<u32>.make()
+      self.heap.alloc(saved.appendSlice(self.ordinals.asSlice()))
+      while self.ordinals.length() < 3 {
+        self.heap.alloc(self.ordinals.append(0))
+      }
+      self.depth = 2
+      self.ordinals.set(2, 0)
+      self.searching = false
+      body(&mut self)
+      self.searching = true
+      self.ordinals.clear()
+      self.heap.alloc(self.ordinals.appendSlice(saved.asSlice()))
+      self.depth = depth
+      self.hasPendingKey = pending
+      return ()
+    }
+    let parent = self.current
+    if self.overlayHost == NO_ENTRY {
+      self.current = 0
+      let host = self.open(NodeKind.Box, overlayIdentity())
+      self.current = host
+      self.zeroBox()
+      self.testId("overlay")
+      self.overlayHost = host
+    }
+    self.current = self.overlayHost
+    let wrapper = self.open(NodeKind.Box, identity)
+    self.current = wrapper
+    self.zeroBox()
+    body(&mut self)
+    self.hasPendingKey = pending
+    self.current = parent
+  }
+
+  /// Makes the open node a positioned box with no size at its containing block's top left.
+  fn zeroBox(self: &mut Self) -> () {
+    self.style(
+      &[
+        Property.Position { value: Position.Absolute },
+        Property.Inset { side: Side.Top, value: Length.px(0.0) },
+        Property.Inset { side: Side.Left, value: Length.px(0.0) },
+        Property.Width { value: Length.px(0.0) },
+        Property.Height { value: Length.px(0.0) },
+      ],
+    )
+  }
+
+  // Handlers.
+
+  /// Handles records of `kind` at the open node: `handler` runs during dispatch when the record
+  /// targets this node or, for bubbling kinds, a node below it.
+  pub fn on(self: &mut Self, kind: EventKind, handler: fn(&Event) -> Reply<M>) -> () {
+    if !self.dispatching {
+      let mut entry = self.arena.entry(self.current)
+      entry.listeners = u32.bitOr(entry.listeners, listenerFlag(kind))
+      self.arena.setEntry(self.current, entry)
+      return ()
+    }
+    if self.searching || self.event.kind != kind {
+      return ()
+    }
+    if !bubbles(kind) && u32.toUsize(self.depth) != self.path.length() {
+      return ()
+    }
+    let reply = handler(&self.event)
+    let answer = Answer<M> { depth: self.depth, reply: move reply }
+    self.heap.alloc(self.answers.append(move answer))
+  }
+
+  /// Sends `handler()` when the open node is clicked (or pressed with Enter or Space when it is
+  /// a focused button).
+  pub fn onClick(self: &mut Self, handler: fn() -> M) -> () {
+    self.on(EventKind.Click, |event| Reply<M>.Emit { message: handler() })
+  }
+
+  pub fn onPointerDown(self: &mut Self, handler: fn(&Event) -> Reply<M>) -> () {
+    self.on(EventKind.PointerDown, handler)
+  }
+
+  pub fn onKeyDown(self: &mut Self, handler: fn(&Event) -> Reply<M>) -> () {
+    self.on(EventKind.KeyDown, handler)
+  }
+
+  pub fn onFocus(self: &mut Self, handler: fn() -> M) -> () {
+    self.on(EventKind.Focus, |event| Reply<M>.Emit { message: handler() })
+  }
+
+  pub fn onBlur(self: &mut Self, handler: fn() -> M) -> () {
+    self.on(EventKind.Blur, |event| Reply<M>.Emit { message: handler() })
+  }
+
+  /// Sends `handler(value)` when the open input's value changes; `value` is the input's new
+  /// value, a copy the message can keep.
+  pub fn onInput(self: &mut Self, handler: fn(String) -> M) -> () {
+    if !self.dispatching {
+      self.on(EventKind.Input, |event| Reply<M>.Pass)
+      return ()
+    }
+    if self.searching || self.event.kind != EventKind.Input {
+      return ()
+    }
+    let value = self.heap.alloc(String.copy(String.view(&self.event.value)))
+    let message = handler(move value)
+    let answer = Answer<M> { depth: self.depth, reply: Reply<M>.Emit { message: move message } }
+    self.heap.alloc(self.answers.append(move answer))
+  }
+
+  /// Sends `handler()` when Enter goes down with no modifier in the open node or below it (an
+  /// input's submit), and stops the key there.
+  pub fn onEnter(self: &mut Self, handler: fn() -> M) -> () {
+    self.on(
+      EventKind.KeyDown,
+      |event| if String.view(&event.key) == "Enter" && event.modifiers == 0 {
+        Reply<M>.EmitAndStop { message: handler() }
+      } else {
+        Reply<M>.Pass
+      },
+    )
+  }
+}

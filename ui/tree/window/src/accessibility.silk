@@ -1,0 +1,297 @@
+//! Publishes the actual UI hierarchy, labels, state and measured bounds to the OS.
+import window.accessibility as native
+import window.types { WindowId }
+import ui_tree.lib { UiTree, Input, Event, EventKind, NONE, NodeInfo }
+import ui_tree.inspect
+import ui_tree.edit
+import ui_tree.mutation { Role, NodeKind, LISTEN_CLICK, NOT_FOCUSABLE }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.u8
+import silk.num.u32
+import silk.text.string { String }
+
+fn scope(tree: &UiTree<'_>) -> u32 {
+  let mut at = tree.focused
+  while at != NONE {
+    if tree.node(at).focusTrap {
+      return at
+    }
+    at = tree.node(at).parent
+  }
+  return tree.root
+}
+
+fn within(tree: &UiTree<'_>, slot: u32, root: u32) -> bool {
+  let mut at = slot
+  while at != NONE {
+    if at == root {
+      return true
+    }
+    at = tree.node(at).parent
+  }
+  return false
+}
+
+fn disabled(tree: &UiTree<'_>, slot: u32) -> bool {
+  let mut at = slot
+  while at != NONE {
+    if tree.node(at).disabled {
+      return true
+    }
+    at = tree.node(at).parent
+  }
+  return false
+}
+
+/// One node of an accessibility snapshot, as the OS sees it.
+pub struct AxNode {
+  pub id: u32,
+  pub parent: u32,
+  pub accessRole: u32,
+  pub flags: u32,
+  pub x: f64,
+  pub y: f64,
+  pub width: f64,
+  pub height: f64,
+  pub label: String,
+  pub value: String,
+  pub hasRange: bool,
+  pub min: f64,
+  pub max: f64,
+  pub now: f64,
+}
+
+/// An action the OS asked for: 1 press, 2 focus, 3 replace text (`text`), 4 increment, 5
+/// decrement.
+pub struct AxAction {
+  pub kind: u32,
+  pub target: u32,
+  pub text: String,
+}
+
+impl AxAction {
+  pub fn none() -> AxAction {
+    return AxAction { kind: 0, target: 0, text: String.make() }
+  }
+}
+
+/// Whether this platform has an accessibility tree to publish.
+pub fn supported() -> bool {
+  return native.supported()
+}
+
+/// Publishes the tree's accessibility snapshot to the OS for `window`, on the thread that
+/// runs the platform.
+pub effect fn sync(tree: &UiTree<'_>, window: WindowId) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !native.supported() {
+    return ()
+  }
+  let mut nodes = List<AxNode>.make()
+  run snapshot(tree, &mut nodes)
+  publish(window, nodes.asSlice())
+}
+
+/// Hands `nodes` to the OS for `window`.
+pub fn publish(window: WindowId, nodes: &[AxNode]) -> () {
+  if !native.supported() {
+    return ()
+  }
+  native.begin(window)
+  let mut i: usize = 0
+  while i < nodes.length {
+    let n = &nodes[i]
+    native.node(
+      window,
+      n.id,
+      n.parent,
+      n.accessRole,
+      n.flags,
+      n.x,
+      n.y,
+      n.width,
+      n.height,
+      String.view(&n.label),
+      String.view(&n.value),
+    )
+    if n.hasRange {
+      native.range(window, n.id, n.min, n.max, n.now)
+    }
+    i = i + 1
+  }
+  native.end(window)
+}
+
+/// The tree's accessibility snapshot, in the order the OS reads it, appended to `out`. Its
+/// strings use the selected allocator.
+pub effect fn snapshot(tree: &UiTree<'_>, out: &mut List<AxNode>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut stack = List<u32>.make()
+  let mut children = List<u32>.make()
+  let root = scope(tree)
+  if root != NONE {
+    run stack.append(root)
+  }
+  while stack.length() > 0 {
+    let slot = stack.pop().unwrapOr(NONE)
+    let node = tree.node(slot)
+    if !node.live || !node.computed.text.visible {
+      continue
+    }
+    run tree.childSlots(slot, &mut children)
+    let mut child = children.length()
+    while child > 0 {
+      child = child - 1
+      run stack.append(children.get(child))
+    }
+    if let Option<NodeInfo>.Some { value: geometry } = run inspect.info(tree, node.id) {
+      let bounds = geometry.bounds
+      if !geometry.laidOut {
+        continue
+      }
+      let mut accessRole = node.accessRole
+      if accessRole == Role.None && node.kind == NodeKind.Text {
+        accessRole = Role.Paragraph
+      }
+      if accessRole == Role.None && node.kind == NodeKind.Input {
+        accessRole = Role.TextBox
+      }
+      let mut flags: u32 = 0
+      if disabled(tree, slot) {
+        flags = flags | 1
+      }
+      if tree.focused == slot {
+        flags = flags | 2
+      }
+      if node.checked {
+        flags = flags | 4
+      }
+      if node.selected {
+        flags = flags | 8
+      }
+      if node.expanded {
+        flags = flags | 16
+      }
+      if node.edit.readOnly {
+        flags = flags | 32
+      }
+      if (node.listeners & LISTEN_CLICK) != 0 {
+        flags = flags | 64
+      }
+      let label = run String.copy(String.view(&node.label))
+      let value = run String.copy(String.view(&node.text))
+      run out.append(
+        AxNode {
+          id: node.id,
+          parent: if slot == root {
+            0
+          } else {
+            geometry.parent
+          },
+          accessRole: u8.toU32(Role.value(accessRole)),
+          flags: flags,
+          x: f32.toF64(bounds.xMin),
+          y: f32.toF64(bounds.yMin),
+          width: f32.toF64(bounds.width()),
+          height: f32.toF64(bounds.height()),
+          label: move label,
+          value: move value,
+          hasRange: node.hasValueRange,
+          min: f32.toF64(node.valueMin),
+          max: f32.toF64(node.valueMax),
+          now: f32.toF64(node.valueNow),
+        },
+      )
+    }
+  }
+}
+
+/// Moves the actions the OS asked for on `window` into `out`, on the thread that runs the
+/// platform.
+pub effect fn nativeActions(window: WindowId, out: &mut List<AxAction>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  while true {
+    let action = native.poll(window)
+    if action.kind == 0 {
+      return ()
+    }
+    let text = if action.kind == 3 {
+      run native.actionText(window)
+    } else {
+      String.make()
+    }
+    run out.append(AxAction { kind: action.kind, target: action.target, text: move text })
+  }
+}
+
+/// Answers the actions the OS asked for on `window`.
+pub effect fn poll(tree: &mut UiTree<'_>, window: WindowId) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut actions = List<AxAction>.make()
+  run nativeActions(window, &mut actions)
+  run apply(&mut tree, &mut actions)
+}
+
+/// Answers `actions`, which it empties.
+pub effect fn apply(tree: &mut UiTree<'_>, actions: &mut List<AxAction>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let list = actions.asMutSlice()
+  let mut index: usize = 0
+  while index < list.length {
+    let action = Intrinsic.replace(list[index], AxAction.none())
+    index = index + 1
+    let slot = tree.slotOf(action.target)
+    if slot == NONE || !within(&tree.*, slot, scope(&tree.*)) || disabled(&tree.*, slot)
+      || !tree.node(slot).computed.text.visible {
+      continue
+    }
+    if let Option<NodeInfo>.Some { value } = run inspect.info(&tree.*, action.target) {
+      if !value.laidOut {
+        continue
+      }
+    } else {
+      continue
+    }
+    if action.kind == 1 {
+      let mut path = List<u32>.make()
+      run tree.pathTo(slot, &mut path)
+      run tree.queueEvent(Event.make(EventKind.Click, action.target, move path))
+    } else if action.kind == 2 {
+      if tree.node(slot).tabIndex != NOT_FOCUSABLE {
+        run tree.focusSlot(slot)
+      }
+    } else if action.kind == 3 {
+      if tree.node(slot).kind != NodeKind.Input || tree.node(slot).edit.readOnly {
+        continue
+      }
+      run tree.focusSlot(slot)
+      run edit.selectAll(&mut tree, slot)
+      let text = run String.copy(String.view(&action.text))
+      run tree.dispatch(Input.TextInput { text: move text })
+    } else if action.kind == 4 || action.kind == 5 {
+      run tree.focusSlot(slot)
+      run tree.dispatch(
+        Input.KeyDown {
+          key: run String.copy(
+            if action.kind == 4 {
+              "ArrowUp"
+            } else {
+              "ArrowDown"
+            },
+          ),
+          code: String.make(),
+          modifiers: 0,
+          repeat: false,
+        },
+      )
+    }
+  }
+}

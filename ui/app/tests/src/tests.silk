@@ -1,0 +1,529 @@
+//! ui-app tests: the counter and todo examples, and two small apps for list moves and
+//! bubbling, driven through the real tree with synthetic input. Run from the repository root.
+import virtual_lists
+import images
+import layout_capabilities
+import ui_app_examples.counter { Counter, Message as CounterMessage }
+import ui_app_examples.todo { Todo, Message as TodoMessage, Command as TodoCommand, Store }
+import ui_app_examples.look { SANS }
+import ui_app.app { App, Context, NoCommand, Perform }
+import ui_app.tasks { Tasks }
+import ui_app.runtime { Runtime, tick, drain }
+import ui_app.harness { click, press, locate }
+import ui_app.seq as seq
+import ui_app.ui { Ui, Reply }
+import ui_fixtures.fixtures as fixtures
+import ui_tree.lib {
+  UiTree,
+  TreeError,
+  Batch,
+  FrameInput,
+  NodeInfo,
+  MOD_CONTROL,
+  Property,
+  EventKind
+}
+import font_collection.lib { FontCollection }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.concurrency.fiber { Cancelled, Fiber }
+import silk.concurrency.local_scheduler { LocalScheduler, StalledError }
+import silk.concurrency.scheduler { Scheduler, TaskIdExhaustedError }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+import silk.num.u64
+import silk.num.i32
+
+fn viewport() -> FrameInput {
+  return FrameInput { width: 360.0, height: 360.0, scale: 1.0, time: 0.0 }
+}
+
+effect fn fonts(tree: &mut UiTree<'_>) -> ()
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut batch = Batch.make()
+  run batch.fontFamily(SANS, "Noto Sans, sans-serif")
+  run tree.apply(run batch.take())
+}
+
+/// The tree id of the first node whose test id, label or text is `value`.
+effect fn idOf(tree: &mut UiTree<'_>, value: string) -> u32
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  return match run locate(&mut tree, viewport(), value) {
+    Option<NodeInfo>.Some { value: node } => node.id
+    Option<NodeInfo>.None => 0
+  }
+}
+
+// The counter: clicks, minimal mutations, key bindings, timers.
+
+effect fn counterBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  run fonts(&mut tree)
+  let mut app = Runtime<Counter, CounterMessage, NoCommand>.make(Counter.make())
+  run app.start(&mut tree, 0.0)
+  run Testing.expect(app.stats.mutations > 10, "the first render creates the whole view")
+
+  run Testing.expect(run click(&mut app, &mut tree, viewport(), "+"), "the + button is there")
+  run Testing.expect(app.model.count == 1, "clicking + increments")
+  run Testing.expect(app.stats.mutations == 1, "only the number's text changes")
+  drop run click(&mut app, &mut tree, viewport(), "+")
+  drop run click(&mut app, &mut tree, viewport(), "-")
+  run Testing.expect(app.model.count == 1, "+ + - leaves 1")
+  run Testing.expect((run idOf(&mut tree, "1")) != 0, "the tree shows the count")
+
+  // Key bindings reach the model wherever focus is.
+  run press(&mut app, &mut tree, viewport(), "ArrowUp", 0)
+  run Testing.expect(app.model.count == 2, "ArrowUp increments")
+  run press(&mut app, &mut tree, viewport(), "r", MOD_CONTROL)
+  run Testing.expect(app.model.count == 0, "Ctrl+R resets")
+  run press(&mut app, &mut tree, viewport(), "r", 0)
+  run Testing.expect(app.model.count == 0, "R without Ctrl is not the binding")
+
+  // A message that changes nothing renders nothing.
+  app.send(CounterMessage.Reset)
+  run drain(&mut app, &mut tree)
+  run Testing.expect(app.stats.mutations == 0, "an unchanged view sends no mutations")
+
+  // The timer subscription starts with Auto and stops with Stop.
+  run Testing.expect(app.nextDeadline().isNone(), "no timer before Auto")
+  drop run click(&mut app, &mut tree, viewport(), "Auto")
+  run Testing.expect(app.model.running, "Auto starts the timer")
+  run Testing.expect((run idOf(&mut tree, "Counting up every second")) != 0, "the note shows")
+  run tick(&mut app, &mut tree, 0.5, false)
+  run Testing.expect(app.model.ticks == 0, "not due at 0.5 s")
+  run tick(&mut app, &mut tree, 1.0, false)
+  run Testing.expect(app.model.ticks == 1 && app.model.count == 1, "one tick at 1 s")
+  run tick(&mut app, &mut tree, 3.5, false)
+  run Testing.expect(app.model.ticks == 2, "a late tick fires once")
+  drop run click(&mut app, &mut tree, viewport(), "Stop")
+  run Testing.expect(app.nextDeadline().isNone(), "Stop removes the timer")
+  run Testing.expect((run idOf(&mut tree, "Counting up every second")) == 0, "the note is gone")
+  run tick(&mut app, &mut tree, 10.0, false)
+  run Testing.expect(app.model.ticks == 2, "no tick after Stop")
+}
+
+test effect fn counterClicksKeysAndTimers() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run counterBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// The todo list: keyed deletes, toggles through labels, filters, commands, lazy reuse.
+
+struct MemoryStore {
+  calls: u64,
+  last: u64,
+}
+
+impl Store for MemoryStore {
+  effect fn save(self: &mut Self, count: u64) -> u64 {
+    self.calls = self.calls + 1
+    self.last = count
+    return count
+  }
+}
+
+effect fn todoBody(store: &mut MemoryStore) -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  run fonts(&mut tree)
+  let mut app = Runtime<Todo, TodoMessage, TodoCommand>.make(run Todo.make())
+  run app.start(&mut tree, 0.0)
+  let milk = run idOf(&mut tree, "Buy milk")
+  let dog = run idOf(&mut tree, "Walk the dog")
+  run Testing.expect(milk != 0 && dog != 0, "the items show")
+
+  // Delete the first item: the others keep their nodes, and Save runs.
+  drop run click(&mut app, &mut tree, viewport(), "Delete") |> Effect.provideMut<Store>(&mut store)
+  run Testing.expect(app.model.items.length() == 2, "Delete removes an item")
+  run Testing.expect((run idOf(&mut tree, "Buy milk")) == 0, "the deleted item is gone")
+  run Testing.expect((run idOf(&mut tree, "Walk the dog")) == dog, "the others keep their nodes")
+  run Testing.expect(store.calls == 1 && store.last == 2, "Save ran with the new count")
+  run Testing.expect(app.model.saved == 2 && !app.model.saving, "Saved came back")
+
+  // Toggle through the checkbox's label.
+  drop run click(&mut app, &mut tree, viewport(), "Walk the dog")
+    |> Effect.provideMut<Store>(&mut store)
+  run Testing.expect(app.model.items.asSlice()[1].done, "the checkbox toggles its item")
+  run Testing.expect((run idOf(&mut tree, "Clear done")) != 0, "Clear done shows")
+
+  // Filters hide and show items; the footer's counts did not change, so it is reused.
+  drop run click(&mut app, &mut tree, viewport(), "Active") |> Effect.provideMut<Store>(&mut store)
+  run Testing.expect((run idOf(&mut tree, "Walk the dog")) == 0, "Active hides done items")
+  run Testing.expect(app.stats.reused > 0, "the footer is copied, not rebuilt")
+  drop run click(&mut app, &mut tree, viewport(), "All") |> Effect.provideMut<Store>(&mut store)
+  let back = run idOf(&mut tree, "Walk the dog")
+  run Testing.expect(back != 0 && back != dog, "All shows it again, as a new node")
+
+  // Ctrl+N adds; Clear done removes the done ones.
+  run press(&mut app, &mut tree, viewport(), "n", MOD_CONTROL)
+    |> Effect.provideMut<Store>(&mut store)
+  run Testing.expect(app.model.items.length() == 3, "Ctrl+N adds an item")
+  run Testing.expect((run idOf(&mut tree, "Task 4")) != 0, "the new item shows")
+  drop run click(&mut app, &mut tree, viewport(), "Clear done")
+    |> Effect.provideMut<Store>(&mut store)
+  run Testing.expect(app.model.items.length() == 1, "Clear done removes the done items")
+  run Testing.expect(store.last == 1, "and saves")
+  run Testing.expect(seq.count(app.model.items.asSlice(), |item| item.done) == 0, "none done")
+}
+
+test effect fn todoKeyedListCommandsAndLazy() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut store = MemoryStore { calls: 0, last: 0 }
+  run todoBody(&mut store) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Keyed moves: rotating and reversing a list moves the fewest nodes, and keeps focus.
+
+struct Rows {
+  order: List<u64>,
+}
+
+union RowsMessage {
+  Rotate,
+  Reverse,
+  Remove { id: u64 },
+}
+
+impl App<RowsMessage, NoCommand> for Rows {
+  fn view(self: &Self, ui: &mut Ui<RowsMessage>) -> () {
+    ui.style(&[Property.FontFamily { family: SANS }])
+    ui.each(
+      self.order.asSlice(),
+      |id| id.*,
+      |ui, id| {
+        ui.box(
+          |ui| {
+            ui.tabIndex(0)
+            ui.number(u64.toI64(id.*))
+          },
+        )
+      },
+    )
+  }
+
+  fn update(self: &mut Self, message: RowsMessage, cx: &mut Context<NoCommand>) -> () {
+    match move message {
+      RowsMessage.Rotate => {
+        let last = self.order.pop()
+        if let Option<u64>.Some { value } = last {
+          cx.alloc(self.order.insertSlice(0, &[value]))
+        }
+      }
+      RowsMessage.Reverse => {
+        let items = self.order.asMutSlice()
+        let mut i: usize = 0
+        while i < items.length / 2 {
+          let swap = items[i]
+          items[i] = items[items.length - 1 - i]
+          items[items.length - 1 - i] = swap
+          i = i + 1
+        }
+      }
+      RowsMessage.Remove { id } => {
+        let mut i: usize = 0
+        while i < self.order.length() {
+          if self.order.get(i) == id {
+            drop self.order.remove(i)
+          } else {
+            i = i + 1
+          }
+        }
+      }
+    }
+  }
+}
+
+effect fn rowsBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  run fonts(&mut tree)
+  let mut order = List<u64>.make()
+  let initial: [u64; 5] = [1, 2, 3, 4, 5]
+  run order.appendSlice(&initial)
+  let mut app = Runtime<Rows, RowsMessage, NoCommand>.make(Rows { order: move order })
+  run app.start(&mut tree, 0.0)
+  let five = run idOf(&mut tree, "5")
+
+  // Focus row 5 with the keyboard, then move it to the front.
+  let mut i = 0
+  while i < 5 {
+    run press(&mut app, &mut tree, viewport(), "Tab", 0)
+    i = i + 1
+  }
+  run Testing.expect(tree.focused == tree.node(tree.slotOf(five)).parent, "row 5 has focus")
+  app.send(RowsMessage.Rotate)
+  run drain(&mut app, &mut tree)
+  run Testing.expect(app.stats.mutations == 1, "rotating moves one node")
+  run Testing.expect((run idOf(&mut tree, "5")) == five, "the moved row keeps its node")
+  run Testing.expect(tree.focused == tree.node(tree.slotOf(five)).parent, "and its focus")
+
+  app.send(RowsMessage.Reverse)
+  run drain(&mut app, &mut tree)
+  run Testing.expect(app.stats.mutations == 4, "reversing five rows moves four")
+  app.send(RowsMessage.Remove { id: 3 })
+  run drain(&mut app, &mut tree)
+  run Testing.expect(app.stats.mutations == 1, "removing a row is one destroy")
+  run Testing.expect((run idOf(&mut tree, "3")) == 0, "row 3 is gone")
+}
+
+test effect fn keyedRowsMoveTheFewestNodes() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run rowsBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Bubbling: handlers answer from the target up, and a stop ends it.
+
+struct Nest {
+  log: List<u32>,
+  stop: bool,
+}
+
+union NestMessage {
+  Outer,
+  Middle,
+  Inner,
+  ToggleStop,
+}
+
+impl App<NestMessage, NoCommand> for Nest {
+  fn view(self: &Self, ui: &mut Ui<NestMessage>) -> () {
+    ui.style(&[Property.FontFamily { family: SANS }])
+    ui.box(
+      |ui| {
+        ui.onClick(|| NestMessage.Outer)
+        ui.box(
+          |ui| {
+            ui.text("sibling")
+          },
+        )
+        ui.box(
+          |ui| {
+            ui.onClick(|| NestMessage.Middle)
+            ui.box(
+              |ui| {
+                if self.stop {
+                  ui.on(
+                    EventKind.Click,
+                    |event| Reply<NestMessage>.EmitAndStop { message: NestMessage.Inner },
+                  )
+                } else {
+                  ui.onClick(|| NestMessage.Inner)
+                }
+                ui.text("target")
+              },
+            )
+          },
+        )
+      },
+    )
+    ui.button("toggle", || NestMessage.ToggleStop)
+  }
+
+  fn update(self: &mut Self, message: NestMessage, cx: &mut Context<NoCommand>) -> () {
+    let code: u32 = match move message {
+      NestMessage.Outer => 1
+      NestMessage.Middle => 2
+      NestMessage.Inner => 3
+      NestMessage.ToggleStop => {
+        self.stop = !self.stop
+        0
+      }
+    }
+    if code != 0 {
+      cx.alloc(self.log.append(code))
+    }
+  }
+}
+
+effect fn nestBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  run fonts(&mut tree)
+  let mut app = Runtime<Nest, NestMessage, NoCommand>.make(
+    Nest { log: List<u32>.make(), stop: false },
+  )
+  run app.start(&mut tree, 0.0)
+  drop run click(&mut app, &mut tree, viewport(), "target")
+  let log = app.model.log.asSlice()
+  run Testing.expect(
+    log.length == 3 && log[0] == 3 && log[1] == 2 && log[2] == 1,
+    "inner, middle, outer",
+  )
+  drop run click(&mut app, &mut tree, viewport(), "sibling")
+  run Testing.expect(
+    app.model.log.length() == 4 && app.model.log.get(3) == 1,
+    "a sibling bubbles to outer only",
+  )
+  drop run click(&mut app, &mut tree, viewport(), "toggle")
+  app.model.log.clear()
+  drop run click(&mut app, &mut tree, viewport(), "target")
+  run Testing.expect(
+    app.model.log.length() == 1 && app.model.log.get(0) == 3,
+    "a stop ends the bubbling",
+  )
+}
+
+test effect fn handlersBubbleFromTheTargetUp() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run nestBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// The loop helpers.
+
+effect fn seqBody() -> ()
+  ! AssertionError<'static> | OutOfMemoryError
+  ? &mut Allocator {
+  let numbers: [i32; 5] = [1, 2, 3, 4, 5]
+  let mut sum = 0
+  seq.forEach(
+    &numbers,
+    |n| {
+      sum = sum + n.*
+    },
+  )
+  run Testing.expect(sum == 15, "forEach visits every item")
+  let mut weighted: usize = 0
+  seq.enumerate(
+    &numbers,
+    |i, n| {
+      weighted = weighted + i * i32.toUsize(n.*)
+    },
+  )
+  run Testing.expect(weighted == 40, "enumerate passes the index")
+  let doubled = run seq.map(&numbers, |n| n.* * 2)
+  run Testing.expect(doubled.length() == 5 && doubled.get(4) == 10, "map transforms")
+  let even = run seq.filter(&numbers, |n| n.* % 2 == 0)
+  run Testing.expect(even.length() == 2 && even.get(1) == 4, "filter keeps matches")
+  run Testing.expect(seq.count(&numbers, |n| n.* > 2) == 3, "count counts matches")
+}
+
+test effect fn loopHelpers() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run seqBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Commands on fibers: a slow command does not hold up a fast one, and messages come back as
+// their commands finish.
+
+struct Waits {
+  started: u64,
+  finished: u64,
+  done: List<u64>,
+}
+
+union WaitsMessage {
+  Start { id: u64, nanoseconds: u64 },
+  Done { id: u64 },
+}
+
+struct Wait {
+  id: u64,
+  nanoseconds: u64,
+}
+
+impl Perform<WaitsMessage, never ? &mut Scheduler | &mut MonotonicClock> for Wait {
+  effect fn perform(self: Self) -> WaitsMessage
+    ? &mut Scheduler | &mut MonotonicClock {
+    run Effect.sleep(self.nanoseconds)
+    return WaitsMessage.Done { id: self.id }
+  }
+}
+
+impl App<WaitsMessage, Wait> for Waits {
+  fn view(self: &Self, ui: &mut Ui<WaitsMessage>) -> () {
+    ui.style(&[Property.FontFamily { family: SANS }])
+    ui.number(u64.toI64(self.finished))
+  }
+
+  fn update(self: &mut Self, message: WaitsMessage, cx: &mut Context<Wait>) -> () {
+    match move message {
+      WaitsMessage.Start { id, nanoseconds } => {
+        self.started = self.started + 1
+        cx.command(Wait { id: id, nanoseconds: nanoseconds })
+      }
+      WaitsMessage.Done { id } => {
+        self.finished = self.finished + 1
+        cx.alloc(self.done.append(id))
+      }
+    }
+  }
+}
+
+effect fn tasksBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError | TaskIdExhaustedError | Cancelled
+  ? &mut Scheduler | &mut MonotonicClock | &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  run fonts(&mut tree)
+  let mut app = Runtime<Waits, WaitsMessage, Wait>.make(
+    Waits { started: 0, finished: 0, done: List<u64>.make() },
+  )
+  app.deferCommands()
+  run app.start(&mut tree, 0.0)
+  app.send(WaitsMessage.Start { id: 1, nanoseconds: 40000000 })
+  app.send(WaitsMessage.Start { id: 2, nanoseconds: 1000000 })
+  run drain(&mut app, &mut tree)
+  run Testing.expect(app.model.started == 2 && app.deferred() == 2, "the commands wait")
+  run Testing.expect(app.model.done.length() == 0, "nothing ran during drain")
+  let mut tasks = Tasks<WaitsMessage, never>.make()
+  run Testing.expect((run tasks.launch(&mut app)) == 2, "both commands start")
+  run Testing.expect(app.deferred() == 0 && tasks.length() == 2, "and run on fibers")
+  let mut frames: u64 = 0
+  while tasks.length() != 0 && frames < 100000000 {
+    run Fiber.yieldNow()
+    if (run tasks.collect(&mut app)) != 0 {
+      run drain(&mut app, &mut tree)
+    }
+    frames = frames + 1
+  }
+  run Testing.expect(app.model.done.length() == 2, "both messages came back")
+  run Testing.expect(
+    app.model.done.get(0) == 2 && app.model.done.get(1) == 1,
+    "the fast command's message comes first",
+  )
+  run Testing.expect(frames > 1, "the loop kept running while the commands waited")
+  run Testing.expect((run idOf(&mut tree, "2")) != 0, "the view shows both")
+}
+
+effect fn tasksRoot() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError | TaskIdExhaustedError | Cancelled
+  ? &mut Scheduler | &mut MonotonicClock {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run tasksBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn commandsOnFibers() -> ()
+  ! AssertionError<'static>
+    | TreeError
+    | OutOfMemoryError
+    | TaskIdExhaustedError
+    | Cancelled
+    | StalledError {
+  let mut clock = OsMonotonicClock.make()
+  let mut scheduler = LocalScheduler.make()
+  run scheduler.execute<
+    (),
+    AssertionError<'static> | TreeError | OutOfMemoryError | TaskIdExhaustedError | Cancelled
+  >(tasksRoot())
+    |> Effect.provideMut<MonotonicClock>(&mut clock)
+}

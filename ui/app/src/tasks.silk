@@ -1,0 +1,88 @@
+//! [`Tasks`]: commands that run on fibers, so a slow command (a sleep, a fetch) does not hold
+//! up input and frames.
+//!
+//! A runtime normally performs each command as soon as `update` returns it. After
+//! `runtime.deferCommands()` the runtime keeps the commands instead, and the host loop moves
+//! them onto fibers with `launch` and picks up their messages with `collect`:
+//!
+//! ```silk
+//! runtime.deferCommands()
+//! while running {
+//!   run pump(&mut runtime, &mut tree) // input; new commands wait in the runtime
+//!   run tasks.launch(&mut runtime)    // each waiting command starts on its own fiber
+//!   run Fiber.yieldNow()              // the fibers run
+//!   if (run tasks.collect(&mut runtime)) != 0 {
+//!     run drain(&mut runtime, &mut tree) // their messages update the model
+//!   }
+//! }
+//! ```
+//!
+//! The loop runs inside a scheduler (`LocalScheduler.execute`). A fiber can only use the
+//! Scheduler and the clock, so a command that runs here owns what it needs: its row is
+//! `&mut Scheduler | &mut MonotonicClock`. A command that borrows a service from the host has to
+//! run synchronously, through a runtime that does not defer.
+//!
+//! Messages come back in the order their commands finish, not the order they started.
+import app { App, Perform }
+import runtime { Runtime }
+import silk.collections.list { List }
+import silk.concurrency.fiber { Cancelled, Fiber }
+import silk.concurrency.scheduler { Scheduler, TaskIdExhaustedError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.monotonic_clock { MonotonicClock }
+
+/// The commands running on fibers, with message type `M` and error type `E`.
+pub struct Tasks<M, E> {
+  running: List<Fiber<M, E>>,
+}
+
+impl<M: 'static, E: 'static> Tasks<M, E> {
+  pub fn make() -> Tasks<M, E> {
+    return Tasks<M, E> { running: List<Fiber<M, E>>.make() }
+  }
+
+  /// How many commands are still running (or finished and not collected yet).
+  pub fn length(self: &Self) -> usize {
+    return self.running.length()
+  }
+
+  /// Starts each command the runtime is holding on its own fiber. Returns how many started.
+  pub effect fn launch<
+    A: App<M, C>,
+    C: Perform<M, E ? &mut Scheduler | &mut MonotonicClock> + 'static
+  >(self: &mut Self, runtime: &mut Runtime<A, M, C>) -> usize
+    ! OutOfMemoryError | TaskIdExhaustedError
+    ? &mut Scheduler | &mut Allocator {
+    let mut started: usize = 0
+    while runtime.deferred() != 0 {
+      let command = runtime.takeDeferred()
+      let fiber = run Fiber<M, E>.forkChild(command.perform())
+      run self.running.append(move fiber)
+      started = started + 1
+    }
+    return started
+  }
+
+  /// Queues the messages of the commands that have finished on the runtime (`drain` handles
+  /// them), without waiting for the others. Returns how many it queued. A command's error, or
+  /// its cancellation, comes back as this effect's error.
+  pub effect fn collect<A: App<M, C>, C>(self: &mut Self, runtime: &mut Runtime<A, M, C>) -> usize
+    ! E | Cancelled
+    ? &mut Scheduler {
+    let mut collected: usize = 0
+    let mut i: usize = 0
+    while i < self.running.length() {
+      if self.running.asSlice()[i].isFinished() {
+        let fiber = self.running.remove(i)
+
+        // A finished fiber's join does not park.
+        let message = run fiber.join()
+        runtime.send(move message)
+        collected = collected + 1
+      } else {
+        i = i + 1
+      }
+    }
+    return collected
+  }
+}

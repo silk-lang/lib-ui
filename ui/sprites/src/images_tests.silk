@@ -1,0 +1,187 @@
+//! ImageStore: decoded once, uploaded once, uploaded again only after eviction.
+import images { ImageStore, ImageId }
+import uploads { Upload }
+import atlas.atlas { Atlas, AtlasOptions, AtlasTile, AtlasError }
+import codec.image { Image, ImageError }
+import codec.png { PngError }
+import codec.png
+import codec.jpeg { JpegError }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.num.u32
+
+// 3 x 2 RGBA: red ramps with x, green with y, the last column at half alpha.
+fn gradientPng() -> &'static [u8] {
+  return b"\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52\x00\x00\x00\x03\x00\x00\x00\x02\x08\x06\x00\x00\x00\x9d\x74\x66\x1a\x00\x00\x00\x1e\x49\x44\x41\x54\x78\x9c\x63\x60\x60\x30\xfa\x9f\x02\xc4\x27\x18\x8c\x1a\x18\x18\x4e\x00\x39\x40\x7c\xe2\x84\x51\x03\x00\x78\x2e\x0a\xd9\xf0\xcb\x90\x6a\x00\x00\x00\x00\x49\x45\x4e\x44\xae\x42\x60\x82"
+}
+
+/// Whether `upload` holds exactly `expected`, tile-sized rows of four bytes per pixel.
+fn uploadHolds(bytes: &[u8], upload: Upload, expected: &[u8]) -> bool {
+  let width = upload.tile.bounds.xMax - upload.tile.bounds.xMin
+  let height = upload.tile.bounds.yMax - upload.tile.bounds.yMin
+  if upload.bytesPerRow != width * 4 || u32.toUsize(width * height * 4) != expected.length {
+    return false
+  }
+  if upload.offset + expected.length > bytes.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < expected.length {
+    if bytes[upload.offset + i] != expected[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+effect fn solid(side: u32, value: u8) -> Image
+  ! ImageError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut image = run Image.make(side, side)
+  let data = image.dataMut()
+  let mut i: usize = 0
+  while i < data.length {
+    data[i] = value
+    i = i + 1
+  }
+  drop data
+  return move image
+}
+
+fn tileOf(found: Option<AtlasTile>) -> AtlasTile {
+  return match &found {
+    Option<AtlasTile>.Some { value } => value
+    _ => Intrinsic.trap("no tile")
+  }
+}
+
+test effect fn decodedImageIsUploadedOnce() -> ()
+  ! AssertionError<'static> | PngError | JpegError | ImageError | AtlasError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut atlas = Atlas.make(AtlasOptions.default())
+  let mut store = ImageStore.make()
+  let id = run store.decode(gradientPng()) |> Effect.provideMut<Allocator>(&mut allocator)
+  let expected = run png.decode(gradientPng()) |> Effect.provideMut<Allocator>(&mut allocator)
+  drop atlas.beginFrame()
+  let tile = tileOf(run store.tile(&mut atlas, id) |> Effect.provideMut<Allocator>(&mut allocator))
+  run Testing.expect(tile.bounds.xMax - tile.bounds.xMin == 3, "tile width is the image's")
+  run Testing.expect(tile.bounds.yMax - tile.bounds.yMin == 2, "tile height is the image's")
+  run Testing.expect(store.uploads().length == 1, "one upload")
+  run Testing.expect(
+    uploadHolds(store.uploadBytes(), store.uploads()[0], expected.data()),
+    "the upload holds the decoded premultiplied samples",
+  )
+  store.clearUploads()
+  let mut frame: usize = 0
+  while frame < 5 {
+    drop atlas.beginFrame()
+    let again = tileOf(
+      run store.tile(&mut atlas, id) |> Effect.provideMut<Allocator>(&mut allocator),
+    )
+    run Testing.expect(
+      again.id.index == tile.id.index && again.id.generation == tile.id.generation,
+      "same tile",
+    )
+    frame = frame + 1
+  }
+  run Testing.expect(
+    store.uploads().length == 0 && store.uploadCount() == 1,
+    "never uploaded again",
+  )
+}
+
+test effect fn evictedImageIsUploadedAgainWithoutDecoding() -> ()
+  ! AssertionError<'static> | ImageError | AtlasError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+
+  // Room for one 8 x 8 image only.
+  let mut atlas = Atlas.make(
+    AtlasOptions { textureSize: 8, maxTextureSize: 8, maxTextures: 1, padding: 0 },
+  )
+  let mut store = ImageStore.make()
+  let firstImage = run solid(8, 40) |> Effect.provideMut<Allocator>(&mut allocator)
+  let first = run store.insert(move firstImage) |> Effect.provideMut<Allocator>(&mut allocator)
+  let secondImage = run solid(8, 90) |> Effect.provideMut<Allocator>(&mut allocator)
+  let second = run store.insert(move secondImage) |> Effect.provideMut<Allocator>(&mut allocator)
+  drop atlas.beginFrame()
+  drop run store.tile(&mut atlas, first) |> Effect.provideMut<Allocator>(&mut allocator)
+  drop atlas.beginFrame()
+  drop run store.tile(&mut atlas, second) |> Effect.provideMut<Allocator>(&mut allocator)
+  drop atlas.beginFrame()
+  store.clearUploads()
+  let back = tileOf(
+    run store.tile(&mut atlas, first) |> Effect.provideMut<Allocator>(&mut allocator),
+  )
+  run Testing.expect(store.uploadCount() == 3, "the evicted image is queued again")
+  run Testing.expect(store.uploads().length == 1, "one upload this frame")
+  run Testing.expect(store.uploads()[0].tile.id.index == back.id.index, "for the new tile")
+  run Testing.expect(
+    store.uploadBytes()[0] == 40 && store.uploadBytes()[255] == 40,
+    "with the kept samples",
+  )
+
+  // Both in one frame cannot fit: the image drawn this frame is never evicted.
+  let refused = run Effect.result(store.tile(&mut atlas, second))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let full = match &refused {
+    Result<Option<AtlasTile>, AtlasError | OutOfMemoryError>.Failure { error } => true
+    _ => false
+  }
+  run Testing.expect(full, "a second image in the same frame does not fit")
+}
+
+test effect fn removedImagesGoStale() -> ()
+  ! AssertionError<'static> | ImageError | AtlasError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut atlas = Atlas.make(AtlasOptions.default())
+  let mut store = ImageStore.make()
+  let idImage = run solid(4, 7) |> Effect.provideMut<Allocator>(&mut allocator)
+  let id = run store.insert(move idImage) |> Effect.provideMut<Allocator>(&mut allocator)
+  drop atlas.beginFrame()
+  let tile = tileOf(run store.tile(&mut atlas, id) |> Effect.provideMut<Allocator>(&mut allocator))
+  run Testing.expect(
+    run store.remove(&mut atlas, id) |> Effect.provideMut<Allocator>(&mut allocator),
+    "removed",
+  )
+  run Testing.expect(store.length() == 0, "no live image")
+  run Testing.expect(atlas.get(tile.id).isNone(), "its tile is freed")
+  let after = run store.tile(&mut atlas, id) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(after.isNone(), "a stale id has no tile")
+  run Testing.expect(store.image(id).isNone(), "nor samples")
+  let reusedImage = run solid(2, 9) |> Effect.provideMut<Allocator>(&mut allocator)
+  let reused = run store.insert(move reusedImage) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    reused.index == id.index && reused.generation != id.generation,
+    "the slot is reused under a new generation",
+  )
+  run Testing.expect(
+    store.image(id).isNone() && store.image(reused).isSome(),
+    "the old id stays stale",
+  )
+}
+
+test effect fn oversizedImageIsRefused() -> ()
+  ! AssertionError<'static> | ImageError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut atlas = Atlas.make(
+    AtlasOptions { textureSize: 8, maxTextureSize: 8, maxTextures: 1, padding: 0 },
+  )
+  let mut store = ImageStore.make()
+  let idImage = run solid(9, 1) |> Effect.provideMut<Allocator>(&mut allocator)
+  let id = run store.insert(move idImage) |> Effect.provideMut<Allocator>(&mut allocator)
+  drop atlas.beginFrame()
+  let result = run Effect.result(store.tile(&mut atlas, id))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let tooLarge = match &result {
+    Result<Option<AtlasTile>, AtlasError | OutOfMemoryError>.Failure { error } => match &error {
+      AtlasError.TooLarge { width, height } => true
+      _ => false
+    }
+    _ => false
+  }
+  run Testing.expect(tooLarge, "larger than the atlas's largest texture")
+}

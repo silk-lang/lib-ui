@@ -1,0 +1,78 @@
+//! Shared canvas cache checks remain independent of the editor model.
+import ui_tree.lib { UiTree, TreeError, Batch, CpuSnapshot }
+import ui_tree.canvas_text { TextCache, TextRequest, TextViewport, setup, croppedText }
+import ui_tree.canvas_view { TextBindings, Refinement }
+import ui_fixtures.fixtures as fixtures
+import atlas.atlas { AtlasError }
+import vector.geometry_error { GeometryError }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.geometry.rect { Rect }
+
+effect fn body() -> ()
+  ! TreeError | AtlasError | GeometryError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut destination = run UiTree.make(&fonts)
+  let mut scratch = run UiTree.make(&fonts)
+  run setup(&mut scratch)
+  let mut batch = Batch.make()
+  run batch.fontFamily(1, "Inter")
+  run scratch.apply(run batch.take())
+  let mut snapshot = CpuSnapshot.make()
+  let mut cache = TextCache.make()
+  cache.rasterFrame = 1
+  let request = TextRequest {
+    id: 1,
+    key: 1,
+    value: "A long canvas label",
+    size: 30.0,
+    weight: 400,
+    family: 1,
+    fill: 0xff000000,
+    x: 0.0,
+    y: 0.0,
+    width: 3000.0,
+    height: 80.0,
+  }
+  let view = TextViewport { x: 0.0, y: 0.0, width: 400.0, height: 300.0, zoom: 4.0 }
+  let tile = run cache.raster(request, view, &mut destination, &mut scratch, &mut snapshot, 1.0)
+  run Testing.expect(croppedText(tile), "large text uses a viewport crop")
+  let mut bindings = TextBindings.make()
+  run bindings.append(Rect<f32>.new(0.0, 0.0, 3000.0, 80.0), tile.cache, &cache)
+  run Testing.expect(
+    !bindings.needsRaster(&cache, view, 1.0, &destination, true),
+    "current covered crop needs no new raster",
+  )
+  let pan = TextViewport { x: 1.0, y: 0.0, width: 400.0, height: 300.0, zoom: 4.0 }
+  run Testing.expect(
+    !bindings.needsRaster(&cache, pan, 1.0, &destination, true),
+    "crop overscan is reused for small pans",
+  )
+  let distant = TextViewport { x: 1500.0, y: 0.0, width: 400.0, height: 300.0, zoom: 4.0 }
+  run Testing.expect(
+    bindings.needsRaster(&cache, distant, 1.0, &destination, false),
+    "newly exposed text refreshes even while quality is deferred",
+  )
+  drop destination.atlas.free(tile.tile.id)
+  run Testing.expect(
+    bindings.needsRaster(&cache, view, 1.0, &destination, false),
+    "atlas eviction invalidates previously checked coverage",
+  )
+  let mut refinement = Refinement.make()
+  run Testing.expect(refinement.defer(true, 1.0, 0.15), "motion starts the refinement delay")
+  refinement.pending = true
+  run Testing.expect(
+    !refinement.due(1.1) && refinement.due(1.2),
+    "idle refinement becomes due without another input event",
+  )
+  refinement.pending = false
+  run Testing.expect(refinement.nextDeadline().isNone(), "completed refinement stops host wakeups")
+}
+
+test effect fn sharedCoverageAndRefinement() -> ()
+  ! TreeError | AtlasError | GeometryError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run body() |> Effect.provideMut<Allocator>(&mut allocator)
+}

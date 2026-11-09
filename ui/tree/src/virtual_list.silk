@@ -1,0 +1,513 @@
+//! Tree-owned variable-height virtualization for native and foreign-language clients.
+//! Only the visible range and an overscan region need UI nodes. Measured heights
+//! replace estimates, while the tree preserves the first visible item.
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.num.usize
+
+/// Configuration for a vertical list with measured item heights.
+pub struct VirtualOptions {
+  /// Estimated height of each unmeasured item, in CSS pixels. Must be finite and positive.
+  pub estimatedHeight: f32,
+  /// Extra content mounted above and below the viewport, in CSS pixels. Must be finite and nonnegative.
+  pub overscan: f32,
+  /// Space after each item, in CSS pixels. Must be finite and nonnegative.
+  pub gap: f32,
+  /// Change this value when item order or size-affecting content changes.
+  pub revision: u64,
+}
+
+impl Copy for VirtualOptions {}
+
+/// One mounted client node and its logical item index.
+pub struct VirtualItem {
+  /// Logical item index.
+  pub index: usize,
+  /// Client node ID of a direct child box of the virtual scroll container.
+  pub id: u32,
+}
+
+impl Copy for VirtualItem {}
+
+/// Retained geometry for one virtual list. Managed by `UiTree`; clients configure it with mutations.
+pub struct VirtualList {
+  /// Current list configuration.
+  pub options: VirtualOptions,
+  /// Estimated or measured item heights, including gaps.
+  pub heights: List<f32>,
+  sums: List<f64>,
+  /// Mounted client items in logical order.
+  pub rows: List<VirtualItem>,
+  /// Private layout-node IDs for omitted content and inter-item gaps.
+  pub spacers: List<usize>,
+  /// Last applied heights of the private layout nodes.
+  pub spacerHeights: List<f32>,
+  /// Client node ID of the scroll container.
+  pub port: u32,
+  /// First item in the mounted viewport range.
+  pub first: usize,
+  /// Exclusive end of the mounted viewport range.
+  pub end: usize,
+  /// Current vertical offset in CSS pixels.
+  pub scroll: f32,
+  /// Last measured width of the scroll container.
+  pub width: f32,
+  /// Last measured height of the scroll container.
+  pub height: f32,
+  /// Whether the tree must restore the scroll anchor.
+  pub correction: bool,
+}
+
+impl VirtualList {
+  /// Creates empty controller geometry. Use tree mutations to attach a controller.
+  pub fn make(options: VirtualOptions) -> VirtualList {
+    return VirtualList {
+      options: options,
+      heights: List<f32>.make(),
+      sums: List<f64>.make(),
+      rows: List<VirtualItem>.make(),
+      spacers: List<usize>.make(),
+      spacerHeights: List<f32>.make(),
+      port: 0,
+      first: 0,
+      end: 0,
+      scroll: 0.0,
+      width: 0.0,
+      height: 800.0,
+      correction: false,
+    }
+  }
+
+  /// Replaces all measurements with estimates for `count` items.
+  pub effect fn reset(self: &mut Self, count: usize, options: VirtualOptions) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.options = options
+    self.heights.clear()
+    self.sums.clear()
+    let estimate = f32.max(1.0, options.estimatedHeight) + f32.max(0.0, options.gap)
+    run self.heights.appendRepeated(estimate, count)
+    run self.sums.append(0.0)
+    let mut i: usize = 1
+    while i <= count {
+      let low = i - usize.bitAnd(i, i - 1)
+      run self.sums.append(usize.toF64(low) * f32.toF64(estimate))
+      i = i + 1
+    }
+    drop self.range(true)
+  }
+
+  /// Returns the estimated or measured position before item `end`.
+  /// `end` must not exceed the item count.
+  pub fn prefix(self: &Self, end: usize) -> f32 {
+    let mut i = end
+    let mut total = 0.0
+    while i > 0 {
+      total = total + self.sums.get(i)
+      i = usize.bitAnd(i, i - 1)
+    }
+    return f64.toF32(total)
+  }
+
+  /// Returns the item at `position`, or the item count at the end.
+  pub fn locate(self: &Self, position: f32) -> usize {
+    let mut bit: usize = 1
+    while bit <= self.heights.length() / 2 {
+      bit = bit * 2
+    }
+    let mut at: usize = 0
+    let mut sum = 0.0
+    while bit > 0 {
+      let next = at + bit
+      if next <= self.heights.length() && sum + self.sums.get(next) <= f32.toF64(position) {
+        at = next
+        sum = sum + self.sums.get(next)
+      }
+      bit = bit / 2
+    }
+    return at
+  }
+
+  /// Updates one measured height and returns whether it changed.
+  /// `index` must be less than the item count.
+  pub fn measure(self: &mut Self, index: usize, height: f32) -> bool {
+    let value = f32.max(1.0, height)
+    let delta = value - self.heights.get(index)
+    if f32.abs(delta) < 0.25 {
+      return false
+    }
+    self.heights.set(index, value)
+    let mut i = index + 1
+    while i < self.sums.length() {
+      let sum = self.sums.get(i) + f32.toF64(delta)
+      self.sums.set(i, sum)
+      i = i + (i - usize.bitAnd(i, i - 1))
+    }
+    return true
+  }
+
+  /// Updates the mounted range, retaining overscan until its inner margin is crossed.
+  pub fn range(self: &mut Self, force: bool) -> bool {
+    let overscan = f32.max(0.0, self.options.overscan)
+    let margin = overscan * 0.25
+    if !force && (self.first == 0 || self.prefix(self.first) <= self.scroll - margin)
+      && (self.end == self.heights.length()
+        || self.prefix(self.end) >= self.scroll + self.height + margin) {
+      return false
+    }
+    let first = self.locate(f32.max(0.0, self.scroll - overscan))
+    let candidate = self.locate(self.scroll + self.height + overscan) + 1
+    let end = if candidate < self.heights.length() {
+      candidate
+    } else {
+      self.heights.length()
+    }
+    let changed = first != self.first || end != self.end
+    self.first = first
+    self.end = end
+    return changed
+  }
+}
+
+/// A requested mounted range. Indices in `[first, end)` and `pinned` must remain mounted.
+/// A pinned item outside the range retains focus. `usize.MAX` means no pinned item.
+pub struct VirtualRange {
+  /// Logical number of items.
+  pub count: usize,
+  /// First requested item index.
+  pub first: usize,
+  /// Exclusive end of the requested range.
+  pub end: usize,
+  /// Focused item index, or `usize.MAX`.
+  pub pinned: usize,
+  /// Focused item's wrapper node ID, or `NONE`.
+  pub pinnedId: u32,
+}
+
+impl Copy for VirtualRange {}
+
+import tree { UiTree, TreeError }
+import node { NONE }
+import mutation { NodeKind }
+import inspect { info, NodeInfo }
+import interact
+import layout.lib { NodeId, Style, Dimension }
+import silk.core.option { Option }
+import silk.core.effect { Effect }
+
+fn find(tree: &UiTree<'_>, id: u32) -> usize {
+  let mut i: usize = 0
+  while i < tree.virtualLists.length() {
+    if tree.virtualLists.asSlice()[i].port == id {
+      return i
+    }
+    i = i + 1
+  }
+  return usize.MAX
+}
+
+/// Returns a plain-data request for a configured container, or `None`.
+pub fn request(tree: &UiTree<'_>, id: u32) -> Option<VirtualRange> {
+  let index = find(tree, id)
+  if index == usize.MAX {
+    return Option<VirtualRange>.None
+  }
+  let list = &tree.virtualLists.asSlice()[index]
+  let mut pinnedId = NONE
+  let mut pinned = usize.MAX
+  let mut r: usize = 0
+  while r < list.rows.length() {
+    let row = list.rows.get(r)
+    let mut focused = tree.focused
+    while focused != NONE {
+      if tree.node(focused).id == row.id {
+        pinned = row.index
+        pinnedId = row.id
+        break
+      }
+      focused = tree.node(focused).parent
+    }
+    r = r + 1
+  }
+  return Option<VirtualRange>.some(
+    VirtualRange {
+      count: list.heights.length(),
+      first: list.first,
+      end: list.end,
+      pinned: pinned,
+      pinnedId: pinnedId,
+    },
+  )
+}
+
+/// Installs or updates a controller. Called by `Mutation.SetVirtualList`.
+pub effect fn configure(
+  tree: &mut UiTree<'_>,
+  mutation: usize,
+  id: u32,
+  count: usize,
+  options: VirtualOptions,
+) -> ()
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let slot = tree.slotOf(id)
+  if slot == NONE {
+    fail TreeError.UnknownNode { index: mutation, id: id }
+  }
+  if tree.node(slot).kind != NodeKind.Box {
+    fail TreeError.WrongKind { index: mutation, id: id }
+  }
+  if !f32.isFinite(options.estimatedHeight) || options.estimatedHeight <= 0.0
+    || !f32.isFinite(options.overscan)
+    || options.overscan < 0.0
+    || !f32.isFinite(options.gap)
+    || options.gap < 0.0
+    || count == usize.MAX
+    || !f32.isFinite((f32.max(1.0, options.estimatedHeight) + options.gap) * usize.toF32(count)) {
+    fail TreeError.BadVirtualList { index: mutation, id: id }
+  }
+  let mut at = find(&tree, id)
+  if at == usize.MAX {
+    at = tree.virtualLists.length()
+    let mut list = VirtualList.make(options)
+    list.port = id
+    run tree.virtualLists.append(move list)
+  }
+  let list = &mut tree.virtualLists.asMutSlice()[at]
+  if list.heights.length() != count || list.options.revision != options.revision
+    || list.options.estimatedHeight != options.estimatedHeight
+    || list.options.gap != options.gap {
+    let old = list.locate(list.scroll)
+    let offset = list.scroll - list.prefix(old)
+    let anchor = if old < count {
+      old
+    } else {
+      count
+    }
+    run list.reset(count, options)
+    list.scroll = list.prefix(anchor) + offset
+    list.correction = true
+  }
+  let overscanChanged = list.options.overscan != options.overscan
+  list.options = options
+  drop list.range(overscanChanged)
+}
+
+/// Binds sorted direct children to indices. Invalid bindings leave the previous bindings intact.
+pub effect fn bind(tree: &mut UiTree<'_>, mutation: usize, id: u32, items: List<VirtualItem>) -> ()
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let at = find(&tree, id)
+  if at == usize.MAX {
+    fail TreeError.BadVirtualList { index: mutation, id: id }
+  }
+  let mut children = List<u32>.make()
+  run tree.childSlots(tree.slotOf(id), &mut children)
+  let values = items.asSlice()
+  if children.length() != values.length {
+    fail TreeError.BadVirtualList { index: mutation, id: id }
+  }
+  let count = tree.virtualLists.asSlice()[at].heights.length()
+  let mut i: usize = 0
+  while i < values.length {
+    let item = values[i]
+    let slot = tree.slotOf(item.id)
+    if slot == NONE || tree.node(slot).kind != NodeKind.Box || children.get(i) != slot
+      || item.index >= count
+      || (i > 0 && values[i - 1].index >= item.index) {
+      fail TreeError.BadVirtualList { index: mutation, id: id }
+    }
+    i = i + 1
+  }
+  let list = &mut tree.virtualLists.asMutSlice()[at]
+  list.rows = move items
+}
+
+effect fn layoutError<E>(error: E) -> never
+  ! TreeError {
+  drop error
+  fail TreeError.Layout
+}
+
+/// Removes a controller and private layout nodes without destroying client items.
+pub effect fn clear(tree: &mut UiTree<'_>, id: u32) -> ()
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let at = find(&tree, id)
+  if at == usize.MAX {
+    return ()
+  }
+  let removed = tree.virtualLists.remove(at)
+  let mut i: usize = 0
+  while i < removed.spacers.length() {
+    let node = NodeId { index: removed.spacers.get(i) }
+    if tree.layout.contains(node) {
+      run Effect.catchAll(tree.layout.destroy(node), layoutError)
+    }
+    i = i + 1
+  }
+}
+
+/// Updates private spacers and pending scroll corrections before layout.
+pub effect fn prepare(tree: &mut UiTree<'_>) -> ()
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut v: usize = 0
+  while v < tree.virtualLists.length() {
+    let portId = tree.virtualLists.asSlice()[v].port
+    let port = tree.slotOf(portId)
+    if port == NONE {
+      run clear(&mut tree, portId)
+      continue
+    }
+    let css = tree.node(port).css
+    let mut rowCss = List<usize>.make()
+    let mut r: usize = 0
+    while r < tree.virtualLists.asSlice()[v].rows.length() {
+      let row = tree.virtualLists.asSlice()[v].rows.get(r)
+      let slot = tree.slotOf(row.id)
+      if slot == NONE || tree.node(slot).parent != port
+        || row.index >= tree.virtualLists.asSlice()[v].heights.length() {
+        drop tree.virtualLists.asMutSlice()[v].rows.remove(r)
+      } else {
+        run rowCss.append(tree.node(slot).css)
+        r = r + 1
+      }
+    }
+    let list = &mut tree.virtualLists.asMutSlice()[v]
+    while list.spacers.length() > list.rows.length() + 1 {
+      let at = list.spacers.length() - 1
+      let node = NodeId { index: list.spacers.get(at) }
+      run Effect.catchAll(tree.layout.destroy(node), layoutError)
+      list.spacers.truncate(at)
+      list.spacerHeights.truncate(at)
+    }
+    while list.spacers.length() < list.rows.length() + 1 {
+      let node = run tree.layout.create(Style.make())
+      run list.spacers.append(node.index)
+      run list.spacerHeights.append(-1.0)
+      while tree.slotOfCss.length() <= node.index {
+        run tree.slotOfCss.append(NONE)
+      }
+      tree.slotOfCss.set(node.index, NONE)
+    }
+    let mut i: usize = 0
+    let mut cursor: usize = 0
+    while i < list.spacers.length() {
+      let last = i == list.rows.length()
+      let end = if last {
+        list.heights.length()
+      } else {
+        list.rows.get(i).index
+      }
+      let gap: f32 = if i > 0 {
+        list.options.gap
+      } else {
+        0.0
+      }
+      let height = f32.max(0.0, list.prefix(end) - list.prefix(cursor) + gap)
+      let spacer = NodeId { index: list.spacers.get(i) }
+      if list.spacerHeights.get(i) != height {
+        let mut style = Style.make()
+        style.height = Dimension.px(height)
+        style.flexShrink = 0.0
+        run Effect.catchAll(tree.layout.setStyle(spacer, move style), layoutError)
+        list.spacerHeights.set(i, height)
+      }
+      let before = if last {
+        Option<NodeId>.None
+      } else {
+        Option<NodeId>.some(NodeId { index: rowCss.get(i) })
+      }
+      let expected = match before {
+        Option<NodeId>.Some { value } => value.index
+        Option<NodeId>.None => usize.MAX
+      }
+      let current = &tree.layout.nodes.asSlice()[spacer.index]
+      if current.parent != css || current.nextSibling != expected {
+        run Effect.catchAll(
+          tree.layout.insertBefore(NodeId { index: css }, spacer, before),
+          layoutError,
+        )
+      }
+      if !last {
+        cursor = list.rows.get(i).index + 1
+      }
+      i = i + 1
+    }
+    let correction = list.correction
+    let scroll = list.scroll
+    list.correction = false
+    if correction {
+      run interact.scrollTo(&mut tree, port, 0.0, scroll)
+    }
+    v = v + 1
+  }
+}
+
+/// Measures bound rows, maintains focus retention, and computes requested ranges after layout.
+/// Returns whether spacer geometry or scroll anchoring requires another layout pass.
+pub effect fn settle(tree: &mut UiTree<'_>) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut changed = false
+  let mut v: usize = 0
+  while v < tree.virtualLists.length() {
+    let id = tree.virtualLists.asSlice()[v].port
+    if let Option<NodeInfo>.Some { value: port } = run info(&tree, id) {
+      if port.laidOut {
+        let mut measured = List<f32>.make()
+        let mut r: usize = 0
+        while r < tree.virtualLists.asSlice()[v].rows.length() {
+          let row = tree.virtualLists.asSlice()[v].rows.get(r)
+          let height: f32 = match run info(&tree, row.id) {
+            Option<NodeInfo>.Some { value } => if value.laidOut {
+              value.bounds.height()
+            } else {
+              -1.0
+            }
+            Option<NodeInfo>.None => -1.0
+          }
+          run measured.append(height)
+          r = r + 1
+        }
+        let list = &mut tree.virtualLists.asMutSlice()[v]
+        list.scroll = port.scrollY
+        list.height = port.bounds.height()
+        let anchor = list.locate(list.scroll)
+        let before = list.prefix(anchor)
+        let mut resized = false
+        if list.width != 0.0 && f32.abs(list.width - port.bounds.width()) > 0.5 {
+          let count = list.heights.length()
+          let options = list.options
+          run list.reset(count, options)
+          resized = true
+        }
+        list.width = port.bounds.width()
+        let mut i: usize = 0
+        while i < measured.length() {
+          let row = list.rows.get(i)
+          if measured.get(i) >= 0.0 && row.index < list.heights.length() {
+            let height = measured.get(i) + list.options.gap
+            if list.measure(row.index, height) {
+              resized = true
+            }
+          }
+          i = i + 1
+        }
+        if resized {
+          let shift = list.prefix(anchor) - before
+          list.scroll = f32.max(0.0, list.scroll + shift)
+          list.correction = f32.abs(shift) > 0.01
+          changed = true
+        }
+        drop list.range(false)
+      }
+    }
+    v = v + 1
+  }
+  return changed
+}

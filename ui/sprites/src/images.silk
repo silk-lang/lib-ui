@@ -1,0 +1,180 @@
+//! Decoded images, uploaded into polychrome atlas tiles once.
+//!
+//! [`ImageStore.decode`] turns PNG or JPEG bytes into premultiplied sRGB samples once
+//! (`codec.decode.decodeSrgb`: ICC profiles and PNG gamma converted, EXIF orientation applied);
+//! [`ImageStore.insert`] takes samples made elsewhere. [`ImageStore.tile`] allocates the image's
+//! tile and queues its pixels the first time it is drawn, then only touches it. The store keeps
+//! the decoded samples, so an image whose tile the atlas evicted is uploaded again without
+//! decoding it again; [`ImageStore.remove`] frees both.
+import uploads { Upload, Uploads }
+import atlas.atlas { Atlas, AtlasTile, AtlasError, Kind }
+import codec.image { Image, ImageError }
+import codec.png { PngError }
+import codec.jpeg { JpegError }
+import codec.decode
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+
+/// An image in an [`ImageStore`]. It goes stale when the image is removed.
+pub struct ImageId {
+  pub index: u32,
+  pub generation: u32,
+}
+
+impl Copy for ImageId {}
+
+struct Slot {
+  image: Option<Image>,
+  tile: Option<AtlasTile>,
+  generation: u32,
+}
+
+pub struct ImageStore {
+  slots: List<Slot>,
+  free: List<u32>,
+  pending: Uploads,
+  uploaded: u64,
+}
+
+impl ImageStore {
+  pub fn make() -> ImageStore {
+    return ImageStore {
+      slots: List<Slot>.make(),
+      free: List<u32>.make(),
+      pending: Uploads.make(),
+      uploaded: 0,
+    }
+  }
+
+  /// Decodes a PNG or JPEG file and keeps its display-ready samples.
+  pub effect fn decode(self: &mut Self, data: &[u8]) -> ImageId
+    ! PngError | JpegError | ImageError | OutOfMemoryError
+    ? &mut Allocator {
+    let image = run decode.decodeSrgb(data)
+    return run self.insert(move image)
+  }
+
+  /// Keeps premultiplied sRGB samples drawn or decoded elsewhere.
+  pub effect fn insert(self: &mut Self, image: Image) -> ImageId
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if let Option<u32>.Some { value: index } = self.free.pop() {
+      let slots = self.slots.asMutSlice()
+      let slot = &mut slots[u32.toUsize(index)]
+      slot.image = Option<Image>.some(move image)
+      slot.tile = Option<AtlasTile>.None
+      return ImageId { index: index, generation: slot.generation }
+    }
+    let index = u64.toU32(usize.toU64(self.slots.length()))
+    run self.slots.append(
+      Slot { image: Option<Image>.some(move image), tile: Option<AtlasTile>.None, generation: 0 },
+    )
+    return ImageId { index: index, generation: 0 }
+  }
+
+  fn live(self: &Self, id: ImageId) -> bool {
+    let index = u32.toUsize(id.index)
+    if index >= self.slots.length() {
+      return false
+    }
+    let slot = &self.slots.asSlice()[index]
+    return slot.generation == id.generation && slot.image.isSome()
+  }
+
+  /// The decoded samples of `id`, or None for a stale id.
+  pub fn image(self: &Self, id: ImageId) -> Option<&Image> {
+    if !self.live(id) {
+      return Option<&Image>.None
+    }
+    return match &self.slots.asSlice()[u32.toUsize(id.index)].image {
+      Option<Image>.Some { value } => Option<&Image>.some(&value)
+      _ => Option<&Image>.None
+    }
+  }
+
+  /// The number of live images.
+  pub fn length(self: &Self) -> usize {
+    return self.slots.length() - self.free.length()
+  }
+
+  /// How many times an image's pixels were queued for upload, since the store was made.
+  pub fn uploadCount(self: &Self) -> u64 {
+    return self.uploaded
+  }
+
+  /// The tile of `id` in `atlas`, or None for a stale id. The first call, and the first after
+  /// the atlas evicted the tile, allocates a tile of the image's size and queues its pixels in
+  /// [`ImageStore.uploads`]; other calls touch the tile so the atlas keeps it.
+  ///
+  /// Fails with `AtlasError.TooLarge` for an image larger than the atlas's largest texture,
+  /// and `AtlasError.Full` when there is no room after evicting what earlier frames used.
+  pub effect fn tile(self: &mut Self, atlas: &mut Atlas, id: ImageId) -> Option<AtlasTile>
+    ! AtlasError | OutOfMemoryError
+    ? &mut Allocator {
+    if !self.live(id) {
+      return Option<AtlasTile>.None
+    }
+    let index = u32.toUsize(id.index)
+    if let Option<AtlasTile>.Some { value } = &self.slots.asSlice()[index].tile {
+      if atlas.touch(value.id) {
+        return Option<AtlasTile>.some(value)
+      }
+    }
+    let slots = self.slots.asMutSlice()
+    let slot = &mut slots[index]
+    let tile = match &slot.image {
+      Option<Image>.Some { value } => {
+        let made = run atlas.allocate(Kind.Polychrome, value.width(), value.height())
+        run self.pending.push(made, value.data(), value.width() * 4)
+        made
+      }
+      _ => {
+        return Option<AtlasTile>.None
+      }
+    }
+    slot.tile = Option<AtlasTile>.some(tile)
+    self.uploaded = self.uploaded + 1
+    return Option<AtlasTile>.some(tile)
+  }
+
+  /// Drops the samples of `id` and frees its tile. Returns false for a stale id.
+  pub effect fn remove(self: &mut Self, atlas: &mut Atlas, id: ImageId) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.live(id) {
+      return false
+    }
+    let slots = self.slots.asMutSlice()
+    let slot = &mut slots[u32.toUsize(id.index)]
+    if let Option<AtlasTile>.Some { value } = &slot.tile {
+      drop atlas.free(value.id)
+    }
+    slot.image = Option<Image>.None
+    slot.tile = Option<AtlasTile>.None
+    slot.generation = slot.generation + 1
+    drop slots
+    run self.free.append(id.index)
+    return true
+  }
+
+  /// Tiles allocated since the last [`ImageStore.clearUploads`], in allocation order, four bytes
+  /// per pixel (premultiplied RGBA).
+  pub fn uploads(self: &Self) -> &[Upload] {
+    return self.pending.list()
+  }
+
+  /// The pixel bytes [`Upload.offset`] points into.
+  pub fn uploadBytes(self: &Self) -> &[u8] {
+    return self.pending.bytes()
+  }
+
+  /// Forgets the queued uploads once the renderer has copied them.
+  pub fn clearUploads(self: &mut Self) -> () {
+    self.pending.clear()
+  }
+}
