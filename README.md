@@ -2,6 +2,71 @@
 
 Standalone retained UI, application framework, components, native/browser hosts, and inspection tools for Silk.
 
+## Run a demo locally
+
+Run commands from the **lib-ui repository root**, including when using a Git worktree.
+The demo launcher builds the selected executable and opens its window; no workspace-wide
+build or sibling repository checkout is needed.
+
+With the Silk launcher (`silk`) installed, first install the compiler selected by `silk.toml`:
+
+```sh
+silk use
+```
+
+`silk update self` updates the launcher, not the compiler selected by this workspace.
+If you see “workspace silk-version … is not installed”, run `silk use` in this checkout.
+
+On **Apple Silicon macOS 26+**, use Node.js 22+, LLVM 22 and the Xcode/macOS SDK.
+For Homebrew LLVM 22 at its usual path, run these in the same terminal:
+
+```sh
+export SILK_CLANG=/opt/homebrew/opt/llvm/bin/clang
+export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+"$SILK_CLANG" --version # must report clang 22, not Apple clang
+node modules/app/demo/scripts/demo
+```
+
+Change `SILK_CLANG` if LLVM 22 is installed elsewhere. `SDKROOT` matters for CPU-only tools
+and test executables too: without it, Silk dev.63 can use system-library stubs missing
+`tanf`, `cosf`, `sinf` and `hypotf`, causing `ld64.lld: undefined symbol` errors.
+
+On **Linux**, install LLVM 22 and the X11, xkbcommon, Wayland and wayland-protocols
+development packages, set `SILK_CLANG` to the absolute LLVM 22 clang path, then run the
+same demo command from a graphical desktop. On **Windows**, use an x64 Visual Studio
+2026 developer PowerShell with its C++ tools and Windows SDK, PowerShell 7, Node.js 22+
+and LLVM 22; set `$env:SILK_CLANG` to the LLVM clang executable before launching.
+
+| Demo | Interactive command |
+| --- | --- |
+| Todo application | `node modules/app/demo/scripts/demo` |
+| Components gallery | `node modules/components/demo/scripts/demo` |
+| Retained tree editor | `node modules/tree/demo/scripts/demo --editor` |
+| Small window/counter | `node modules/tree/window/demo/run` |
+| Todo with inspector/devtools | `node modules/inspect/devtools/scripts/devtools todo` |
+
+Close the window to return to the terminal. The first build fetches pinned dependencies
+and prepares native libraries through Silk's manifest hooks.
+
+For the small counter in Chrome/Edge with WebGPU and JSPI (137+), run
+`node modules/tree/window/scripts/browser serve` and open the URL printed by the server.
+Keep the server running; Ctrl+C stops it. Serving does not require Playwright.
+
+`silk build` builds all 31 packages, including CLI tools and test executables; it does
+**not** launch a demo. Commands containing `check`/`test` are automated verification.
+`scripts/setup-ci.mjs` is hosted-CI provisioning, not local shell setup.
+For Notes, Studio, Scroll Lab, Showcase or Graphics Demo, use the
+[nonstd application quickstart](https://github.com/silk-lang/nonstd#run-an-application-locally).
+
+### Remaining compiler warnings
+
+Silk dev.63 can report `MOD0007` for required interface imports used through method calls
+([silk#2819](https://github.com/silk-lang/silk/issues/2819)). It also reports module imports
+that deliberately include browser C/wasm exports. These imports must remain: deleting
+`Platform`, `libm` or `generated_webgpu_exports` to follow the warning can break method
+lookup or browser linkage. These diagnostics are separate from the macOS linker errors
+above; no warning suppression is enabled.
+
 ## Provenance and toolchains
 
 Extracted without removing UI packages, fixtures, goldens, demos, inspector tools, or browser surfaces from `silk-lang/nonstd` commit `7d6c3693a9ad1fec24127985626ab4224f9f1995`. Packages live under `modules/`; public package names and import namespaces are unchanged. Applications such as Notes, Studio, Scroll Lab, Showcase, and Graphics Demo remain in their application repository; they are consumers, not dependencies of this repository.
@@ -48,6 +113,7 @@ UI-to-UI dependencies stay local. External dependencies use canonical `https://g
 From this repository root, with the toolchain on `PATH`:
 
 ```sh
+silk check --manifest-path modules/tree/window/silk.toml # serial first Git fetch
 silk check --workspace
 silk build --manifest-path modules/inspect/cli/silk.toml
 node scripts/check.mjs
