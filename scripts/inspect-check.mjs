@@ -6,7 +6,7 @@ import { withDisplay, start, stop } from './native-run.mjs';
 import { program, inspectorCLI, expect, json, picture, png, work } from './inspector.mjs';
 
 export async function inspect() {
-  const binary = build('ui/tree/demo');
+  const binary = build('modules/tree/demo');
   const cli = inspectorCLI();
   await withDisplay('x11', async env => {
     const app = await program('inbox', binary, [], env, cli);
@@ -81,9 +81,9 @@ class McpClient {
 }
 
 export async function mcp() {
-  const binary = build('ui/tree/demo');
+  const binary = build('modules/tree/demo');
   const cli = inspectorCLI();
-  const server = build('ui/inspect/mcp');
+  const server = build('modules/inspect/mcp');
   await withDisplay('x11', async env => {
     const app = await program('mcp-inbox', binary, [], env, cli);
     const client = new McpClient(server, { ...env, SILK_UI_INSPECT: app.socket });

@@ -14,7 +14,7 @@ export function repositoryRoot(name) {
   if (!/^lib-[a-z]+$/.test(name)) throw new Error(`Invalid dependency repository: ${name}`);
   const url = `https://github.com/silk-lang/${name}.git`;
   const revisions = new Set();
-  for (const manifest of manifests(resolve(root, 'ui'))) {
+  for (const manifest of manifests(resolve(root, 'modules'))) {
     for (const line of readFileSync(manifest, 'utf8').split('\n')) {
       if (!line.includes(`git = "${url}"`)) continue;
       const revision = line.match(/\brev\s*=\s*"([0-9a-f]{40})"/)?.[1];
@@ -24,6 +24,6 @@ export function repositoryRoot(name) {
   }
   if (revisions.size !== 1) throw new Error(`Expected one ${name} revision, found ${[...revisions]}`);
   const checkout = resolve(process.env.SILK_HOME || resolve(homedir(), '.silk'), 'git', [...revisions][0]);
-  if (!existsSync(resolve(checkout, 'silk.toml'))) throw new Error(`Missing fetched ${name}: ${checkout}; run silk check --manifest-path ${resolve(root, 'ui/tree/window/silk.toml')}`);
+  if (!existsSync(resolve(checkout, 'silk.toml'))) throw new Error(`Missing fetched ${name}: ${checkout}; run silk check --manifest-path ${resolve(root, 'modules/tree/window/silk.toml')}`);
   return checkout;
 }

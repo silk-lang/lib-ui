@@ -30,4 +30,4 @@ export async function program(name, binary, args, env, cli) {
   catch (error) { await stop(child); throw error; }
   return { child, socket, command, close: () => stop(child) };
 }
-export function inspectorCLI() { return build('ui/inspect/cli'); }
+export function inspectorCLI() { return build('modules/inspect/cli'); }

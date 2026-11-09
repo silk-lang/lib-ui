@@ -4,7 +4,7 @@ Standalone retained UI, application framework, components, native/browser hosts,
 
 ## Provenance and toolchains
 
-Extracted without removing UI packages, fixtures, goldens, demos, inspector tools, or browser surfaces from `silk-lang/nonstd` commit `7d6c3693a9ad1fec24127985626ab4224f9f1995`. The original `ui/...` package paths are preserved. Applications such as Notes, Studio, Scroll Lab, Showcase, and Graphics Demo remain in their application repository; they are consumers, not dependencies of this repository.
+Extracted without removing UI packages, fixtures, goldens, demos, inspector tools, or browser surfaces from `silk-lang/nonstd` commit `7d6c3693a9ad1fec24127985626ab4224f9f1995`. Packages live under `modules/`; public package names and import namespaces are unchanged. Applications such as Notes, Studio, Scroll Lab, Showcase, and Graphics Demo remain in their application repository; they are consumers, not dependencies of this repository.
 
 Use Silk **0.1.0-dev.63+657e3c900f65**, LLVM **22.1.8**, and Node **22+**. `toolchains.lock.json` pins downloadable toolchains and their checksums. Silk performs compilation, package resolution, native archive preparation, and package generation directly. Node orchestrates processes, HTTP/browser fixtures, and inspection protocols; Windows native preparation uses PowerShell from the pinned `lib-native` payload. No normal build, test, or run command invokes Python.
 
@@ -30,14 +30,14 @@ All 31 original UI workspace packages remain members of `silk.toml`:
 
 | Role | Package paths |
 | --- | --- |
-| Consumable text and assets | `ui/text`, `ui/sprites`, `ui/assets` |
-| Retained tree and platform hosting | `ui/tree`, `ui/tree/window` |
-| Application framework and components | `ui/app`, `ui/app/window`, `ui/components` |
-| Inspection APIs | `ui/inspect`, `ui/inspect/server`, `ui/inspect/devtools` |
-| Reusable demo/fixture libraries | `ui/app/examples`, `ui/components/gallery`, `ui/tree/fixtures` |
-| Developer applications (not library APIs) | `ui/app/demo`, `ui/components/demo`, `ui/tree/demo`, `ui/tree/window/demo`, `ui/inspect/devtools/app` |
-| Developer protocol and comparison executables | `ui/inspect/cli`, `ui/inspect/mcp`, `ui/text/tools/cli`, `ui/tree/browser` |
-| Tests and golden runners (not library APIs) | `ui/app/tests`, `ui/app/window/tests`, `ui/components/tests`, `ui/inspect/tests`, `ui/inspect/server/tests`, `ui/inspect/devtools/tests`, `ui/tree/tests`, `ui/tree/window/tests` |
+| Consumable text and assets | `modules/text`, `modules/sprites`, `modules/assets` |
+| Retained tree and platform hosting | `modules/tree`, `modules/tree/window` |
+| Application framework and components | `modules/app`, `modules/app/window`, `modules/components` |
+| Inspection APIs | `modules/inspect`, `modules/inspect/server`, `modules/inspect/devtools` |
+| Reusable demo/fixture libraries | `modules/app/examples`, `modules/components/gallery`, `modules/tree/fixtures` |
+| Developer applications (not library APIs) | `modules/app/demo`, `modules/components/demo`, `modules/tree/demo`, `modules/tree/window/demo`, `modules/inspect/devtools/app` |
+| Developer protocol and comparison executables | `modules/inspect/cli`, `modules/inspect/mcp`, `modules/text/tools/cli`, `modules/tree/browser` |
+| Tests and golden runners (not library APIs) | `modules/app/tests`, `modules/app/window/tests`, `modules/components/tests`, `modules/inspect/tests`, `modules/inspect/server/tests`, `modules/inspect/devtools/tests`, `modules/tree/tests`, `modules/tree/window/tests` |
 
 The manifests explicitly export consumable modules. Test-only packages declare their test module as the library entrypoint rather than inventing a runnable application. CLI executables and demos are developer tools, not dependencies of the API packages. Shared scenes, CPU/GPU rendering, vector graphics, codecs, and atlases remain in `lib-graphics`; native windows and WebGPU in `lib-native`; layout/styles in `lib-css`; parsing/shaping/rasterization in `lib-fonts`; SVG parsing/rendering in `lib-svg`. None are copied into this repository.
 
@@ -49,7 +49,7 @@ From this repository root, with the toolchain on `PATH`:
 
 ```sh
 silk check --workspace
-silk build --manifest-path ui/inspect/cli/silk.toml
+silk build --manifest-path modules/inspect/cli/silk.toml
 node scripts/check.mjs
 node scripts/check-native.mjs
 node scripts/check-browser.mjs
@@ -60,17 +60,17 @@ node scripts/check-browser.mjs
 Individual entrypoints remain available:
 
 ```sh
-node ui/app/demo/scripts/demo
-node ui/components/demo/scripts/demo check --release
-node ui/tree/demo/scripts/demo --editor
-node ui/tree/demo/scripts/demo inspect
-node ui/tree/demo/scripts/demo mcp
-node ui/tree/window/demo/run --check
-node ui/inspect/devtools/scripts/devtools todo
-node ui/inspect/devtools/scripts/devtools check
-node ui/inspect/devtools/scripts/devtools --connect 1
-node ui/tree/window/scripts/browser serve
-node ui/tree/window/scripts/browser test ui/tree/window/demo -- --size 400,250 --click 90,35
+node modules/app/demo/scripts/demo
+node modules/components/demo/scripts/demo check --release
+node modules/tree/demo/scripts/demo --editor
+node modules/tree/demo/scripts/demo inspect
+node modules/tree/demo/scripts/demo mcp
+node modules/tree/window/demo/run --check
+node modules/inspect/devtools/scripts/devtools todo
+node modules/inspect/devtools/scripts/devtools check
+node modules/inspect/devtools/scripts/devtools --connect 1
+node modules/tree/window/scripts/browser serve
+node modules/tree/window/scripts/browser test modules/tree/window/demo -- --size 400,250 --click 90,35
 ```
 
 The devtools check drives the owned todo demo: live element discovery, selection/highlighting, style declarations, box model, input/event logging, changed tree content, and screenshots of both windows. Notes-specific persistence and its devtools acceptance remain application-repository checks. To launch devtools alongside another already-built debug application, use `devtools external --app-binary PATH [--app-arg ARG ...]`; to connect to an existing process, use `--connect ADDRESS`.
@@ -81,12 +81,12 @@ No sibling checkout is needed. `scripts/dependency-root.mjs` resolves external p
 
 These paths are supported payloads for applications using the published Git revision:
 
-- `ui/tree/window/browser/app-host.js`, `index.html`, `serve.mjs`, and `test.mjs`.
-- `node <lib-ui>/ui/tree/window/browser/serve.mjs APP.wasm [PORT]` serves an externally compiled module.
-- `node <lib-ui>/ui/tree/window/browser/test.mjs --wasm APP.wasm [--size W,H] [--scale N] [--click X,Y] [--type TEXT] [--stored KEY] [--screenshot FILE]` exercises its render check, real input, and optional localStorage/reload behavior. On Linux provide a display, for example with `xvfb-run -a`.
-- The page imports `/ui/tree/window/browser/app-host.js`; its imports retain `/native/platform/window/browser/window-host.js` and `/native/gpu/webgpu/browser/host.ts`. The server maps those URL prefixes to the manifest-pinned native checkout, not a source-tree directory. Custom servers must provide the same mappings.
-- Browser application roots must import their own WebGPU export module, using the template `native/gpu/webgpu/browser/generated_webgpu_exports.silk` from that same native revision and direct `webgpu`/`webgpu_sys` aliases. `node scripts/generate-browser-exports.mjs` refreshes the two owned roots; `--check` checks freshness. Wasm builds on POSIX use an 8 MiB stack through the Node clang wrapper; Windows retains the compiler's default stack.
+- `modules/tree/window/browser/app-host.js`, `index.html`, `serve.mjs`, and `test.mjs`.
+- `node <lib-ui>/modules/tree/window/browser/serve.mjs APP.wasm [PORT]` serves an externally compiled module.
+- `node <lib-ui>/modules/tree/window/browser/test.mjs --wasm APP.wasm [--size W,H] [--scale N] [--click X,Y] [--type TEXT] [--stored KEY] [--screenshot FILE]` exercises its render check, real input, and optional localStorage/reload behavior. On Linux provide a display, for example with `xvfb-run -a`.
+- The page imports `/ui/tree/window/browser/app-host.js`; its imports retain `/native/platform/window/browser/window-host.js` and `/native/gpu/webgpu/browser/host.ts`. The server maps `/ui/tree/window/browser/` to this repository's `modules/tree/window/browser/`, and the two `/native/` prefixes to `modules/platform/window/browser/` and `modules/gpu/webgpu/browser/` in the manifest-pinned native checkout. Custom servers must provide the same distinct URL namespaces; `/modules/` is not a browser URL prefix.
+- Browser application roots must import their own WebGPU export module, using the template `modules/gpu/webgpu/browser/generated_webgpu_exports.silk` from that same native revision and direct `webgpu`/`webgpu_sys` aliases. `node scripts/generate-browser-exports.mjs` refreshes the two owned roots; `--check` checks freshness. Wasm builds on POSIX use an 8 MiB stack through the Node clang wrapper; Windows retains the compiler's default stack.
 
-UI fixture assets are owned under `ui/assets/assets` and embedded in `src/generated_assets.silk`. `node ui/assets/scripts/embed-assets [--check]` refreshes/checks them without Python. The historical procedural photo authoring script is optional, self-contained, and uses Pillow only when deliberately regenerating committed photos; it is not a build dependency. Additional text-comparison fonts are owned under `ui/text/tests/fonts`; all Noto, Amiri, M+ and Roboto Flex OFL notices accompany their unchanged subset files. Unit tests and golden runners use repository-root working directories. Fonts/icons/photos needed by normal UI fixtures are embedded and do not depend on the working directory.
+UI fixture assets are owned under `modules/assets/assets` and embedded in `src/generated_assets.silk`. `node modules/assets/scripts/embed-assets [--check]` refreshes/checks them without Python. The historical procedural photo authoring script is optional, self-contained, and uses Pillow only when deliberately regenerating committed photos; it is not a build dependency. Additional text-comparison fonts are owned under `modules/text/tests/fonts`; all Noto, Amiri, M+ and Roboto Flex OFL notices accompany their unchanged subset files. Unit tests and golden runners use repository-root working directories. Fonts/icons/photos needed by normal UI fixtures are embedded and do not depend on the working directory.
 
-See [the UI guide](ui/README.md), [the framework](ui/app/README.md), [components](ui/components/README.md), and [inspection tools](ui/inspect/README.md).
+See [the UI guide](modules/README.md), [the framework](modules/app/README.md), [components](modules/components/README.md), and [inspection tools](modules/inspect/README.md).
