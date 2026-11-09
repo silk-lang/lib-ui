@@ -51,6 +51,9 @@ and prepares native libraries through Silk's manifest hooks.
 For the small counter in Chrome/Edge with WebGPU and JSPI (137+), run
 `node modules/tree/window/scripts/browser serve` and open the URL printed by the server.
 Keep the server running; Ctrl+C stops it. Serving does not require Playwright.
+The browser builder finds LLVM 22+ through `clang-22` on `PATH`, the standard macOS
+Homebrew LLVM locations, then `clang` on `PATH`. `SILK_CLANG` is an optional override;
+an invalid explicit override fails rather than silently choosing another compiler.
 
 `silk build` builds all 31 packages, including CLI tools and test executables; it does
 **not** launch a demo. Commands containing `check`/`test` are automated verification.
@@ -75,7 +78,7 @@ Use Silk **0.1.0-dev.63+657e3c900f65**, LLVM **22.1.8**, and Node **22+**. `tool
 
 For hosted CI, `node scripts/install-silk.mjs` installs the pinned compiler and adds its bin directory to `GITHUB_PATH` (locally it prints the directory to add to `PATH`). Then `node scripts/setup-ci.mjs` resolves the native dependency and provisions its pinned tools. `--linux-gpu` provisions lavapipe; `--browser` selects an existing Chromium and installs pinned Playwright JavaScript without downloading a browser. Local browser runners use `PLAYWRIGHT_MODULE`, `PLAYWRIGHT_CHROMIUM_EXECUTABLE`, and `CHROME_PATH` when supplied. Set `SILK` to override the Silk executable and `SILK_CLANG` for LLVM 22 clang.
 
-WebAssembly builds require `SILK_CLANG` (set by `setup-ci.mjs`). The generated stack wrapper binds that executable directly because Silk deliberately filters compiler subprocess environments; it does not fall back to a different `clang` on `PATH`.
+WebAssembly builds use an installed LLVM 22+ compiler, discovered as described above or selected with `SILK_CLANG`. The generated stack wrapper binds its absolute executable path because Silk filters compiler subprocess environments. No CI provisioning command is needed to serve a browser demo.
 
 Linux native compilation needs X11, xkbcommon, Wayland, and wayland-protocols development headers; window checks additionally need Xvfb, xauth, Weston, and Vulkan/lavapipe. Windows requires the x64 Visual Studio 2026 developer environment, Windows SDK and PowerShell 7. macOS requires Apple Silicon macOS 26+ and `SDKROOT` set to `xcrun --sdk macosx --show-sdk-path`. The checked-in CI exercises native package checks and rendering/inspection on Linux, macOS, and Windows, plus browser checks on Linux.
 
