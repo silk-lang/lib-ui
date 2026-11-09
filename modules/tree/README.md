@@ -1,47 +1,108 @@
 # ui-tree
 
-The retained UI tree: nodes a client creates and changes with plain-data mutations, laid out by
+The retained UI tree, like a small DOM: you make nodes, put them in each other, style them, feed
+input in and read events out, and ask for a frame to draw. It is laid out by
 [css-layout](https://github.com/silk-lang/lib-css/tree/main/modules/layout) with [ui-text](../text), and painted into a
 [ui_scene](https://github.com/silk-lang/lib-graphics/tree/main/modules/ui_scene) `Scene` that the CPU reference or
-[ui_renderer](https://github.com/silk-lang/lib-graphics/tree/main/modules/ui_renderer) draws. It has no closures and no callbacks: ids are
-integers the client chooses, and everything that crosses the boundary is a `Mutation` going in or
-an `Event` or a plain-data query result coming out, so a framework in Silk or a JavaScript host can drive it the same way.
+[ui_renderer](https://github.com/silk-lang/lib-graphics/tree/main/modules/ui_renderer) draws. It has no closures and no callbacks: what
+crosses the boundary is plain data, so Silk code can call it directly and a JavaScript or remote
+host can drive it through the mutation protocol.
 
-## Driving a tree
+## Using a tree
 
 ```silk
-let mut tree = run UiTree.make(&collection)       // borrows a font_collection FontCollection
+import ui_tree.lib { Tree, Viewport, Property, Length, Side, EventKind, Event, Input }
+
+let mut tree = run Tree.make(&fonts)               // borrows a font_collection FontCollection
+let sans = run tree.fontFamily("Inter, Noto Sans, sans-serif")
+let root = run tree.box(&[
+  Property.FontFamily { family: sans.raw() },
+  Property.Padding { side: Side.Top, value: Length.px(16.0) },
+])
+let save = run tree.box(&[])
+run tree.append(save, run tree.text("Save"))
+run tree.append(root, save)
+run tree.setRoot(root)
+run tree.listen(save, &[EventKind.Click])
+
+let frame = run tree.frame(Viewport { width: 800.0, height: 600.0, scale: 2.0 }, time)
+// draw frame.scene after copying frame.uploads, then: tree.clearUploads()
+
+run tree.dispatch(Input.press(20.0, 30.0))
+run tree.dispatch(Input.release(20.0, 30.0))
+let records = run tree.events()
+// records[i].target, records[i].path, and records[i].event:
+//   Event.Click { pointer, button, count } => ...
+```
+
+- **Nodes** come back as typed handles: `tree.box(style)`, `tree.span(style)` (an inline box),
+  `tree.text(value)`, `tree.input(style)`, `tree.image(source, style)`, `tree.icon(source, style)`
+  and `tree.canvas(style)` return `BoxNode`, `TextNode`, `InputNode`, `ImageNode`, `IconNode`
+  and `CanvasNode`. The kind is in the type, so appending to a text node or setting the text of
+  a box does not compile. Every handle has an `id()`, a `NodeId`, which is what events and
+  queries name nodes by; `BoxNode.of(id)` and the others turn an id back into a handle.
+- **Structure**: `setRoot`, `append`, `insertBefore`, `remove` (detach, can be appended again)
+  and `destroy` (free the subtree). A child already in the tree moves, as in the DOM.
+- **Style** is a list of typed `Property` values: `setStyle` for the base look, `setStyleFor`
+  with a `StyleState` for hover, active, focus and focus-visible, and `clearStyle`. Text
+  properties inherit; the rest do not.
+- **Content and attributes**: `setText`, `setSource`, `setCanvas`, `setGrid`, `setAttribute`
+  (role, label, test id, tab index, cursor, disabled, focus trap, checked, selected, expanded,
+  and for inputs multiline, read-only and placeholder), with `setLabel`, `setTestId` and
+  `setRole` for the common ones.
+- **Events**: `listen(node, &[EventKind.Click, ...])` says what a node wants records for,
+  `dispatch(input)` feeds a pointer, wheel, key or text `Input` in, and `events()` takes the
+  queued `EventRecord`s. A record has the `target`, the `path` from the root to it, and an
+  `Event` union whose variants carry only what that event has. `record.hits(node)` asks whether
+  the event reaches a listener on `node` while bubbling. See [Interaction](#interaction).
+- **Focus, selection and scrolling**: `focus`, `blur`, `focused()`, `select`, `selection`,
+  `caretRect`, `scrollTo`, `scrollIntoView`, `scrollOffset`.
+- **Resources**: `fontFamily(names)`, `defineImage(bytes)`, `defineDecodedImage(image)`,
+  `defineIcon(bytes)` and `release(resource)`.
+- **Frames**: `frame(viewport, time)` returns a `Frame` with the `scene`, the atlas `uploads`,
+  the `cursor`, the `ime` area, `wakeAt` (the next caret blink) and `again` (the tree wants
+  another frame right away). `needsFrame()` tells an on-demand host whether to ask.
+- **Queries** answer with `Option` when there may be nothing: `root()`, `parent`, `children`,
+  `kind`, `hitTest`, `bounds`, `fragments`, `find`, `view` (a `NodeView` snapshot for inspectors
+  and tests) and `describe` (the text snapshot goldens compare).
+- **Errors**: calls fail with a `TreeError` (`StaleNode`, `WrongKind`, `Cycle`,
+  `UnknownResource`, `BadResource`, `BadVirtualList`, `Layout`, `View`), and
+  `error.message()` says it in a sentence: `node #12 does not exist (it was destroyed, or never
+  created)`. An id is not handed out again after its node is destroyed, so an old handle fails
+  and never names a newer node.
+
+## The mutation protocol
+
+A JavaScript or remote host drives the same tree with plain data. It chooses its own node, font
+family and resource numbers, sends `Mutation` values, and gets the same event records back.
+
+```silk
 let mut batch = Batch.make()
 run batch.fontFamily(1, "Inter, Noto Sans, sans-serif")
 run batch.create(1, NodeKind.Box)
-run batch.style(1, &[Property.Padding { side: Side.Top, value: Length.Px { value: 16.0 } }])
+run batch.style(1, &[Property.Padding { side: Side.Top, value: Length.px(16.0) }])
 run batch.root(1)
 run batch.text(1, 2, "Hello")                     // create, set text, append to 1
 run tree.apply(run batch.take())
-run tree.frame(FrameInput { width: 800.0, height: 600.0, scale: 2.0, time: 0.0 })
-// tree.scene() is the frame; tree.pendingUploads() the atlas tiles it rasterized.
 ```
 
-- **Mutations** (`mutation.silk`): `Create`, `InsertBefore`, `Remove`, `Destroy`, `SetStyle`
-  (per `StyleState`: base, hover, active, focus, focus-visible), `ClearStyle`, `SetText`,
-  `SetAttribute` (role, label, test id, tab index, cursor, disabled, focus trap, the states
-  checked, selected and expanded, and for inputs multiline, read-only and placeholder),
-  `SetSelection`,
-  `SetListeners` (a `LISTEN_*` bit set), `SetRoot`, `Focus`, `Blur`, `ScrollTo`,
-  `ScrollIntoView`, `SetSource`, `SetCanvas`, and the resource definitions `DefineFontFamily`,
-  `DefineImage` (PNG or JPEG bytes) and `DefineIcon` (SVG bytes). `apply` stops at the first
-  mutation that fails and returns a `TreeError` naming its index; the ones before it stay
-  applied. Destroyed ids can be used again.
-- **Node kinds**: box, text, image, icon (an SVG tinted with the text color, sized to the font
-  size unless styled), input (an editable text field, see [Text editing](#text-editing)) and
-  canvas (fill and stroke path commands in the node's content box).
-- **Styles** are typed `Property` values. Text properties (family, size, weight, style, line
-  height, color, alignment, white space, direction, decoration) inherit; the rest do not. Hover,
-  active and focus variants apply over the base style while the node is in that state.
-- **Events** (`node.Event`) carry the kind, the target id, the full root to target id path and a
-  payload (pointer position, modifiers, button, click count, wheel delta, key and code, and for
-  input records the value, the DOM `inputType` and the selection).
-  `takeEvents` drains them. See [Interaction](#interaction).
+- `apply` stops at the first mutation that fails with a `ProtocolError` holding its `index` and
+  the `TreeError`; the mutations before it stay applied.
+- `Mutation` (`mutation.silk`) has one variant for each thing a direct call does: `Create`,
+  `InsertBefore`, `Remove`, `Destroy`, `SetStyle`, `ClearStyle`, `SetText`, `SetAttribute`,
+  `SetSelection`, `SetListeners`, `SetRoot`, `Focus`, `Blur`, `ScrollTo`, `ScrollIntoView`,
+  `SetSource`, `SetCanvas`, `SetGrid`, the virtual list and anchor mutations, and the resource
+  definitions.
+- Direct calls and protocol ids can share one tree: `NodeId.of(7)` names the client's node 7,
+  and a node made with `tree.box` takes a number that is not in use.
+
+## Moving from the old API
+
+`ui_tree.lib` is the API above. The engine underneath is `ui_tree.engine` (`UiTree`), and the
+old front door is `ui_tree.legacy`, which the packages of this repository import until each is
+ported. `tree.engine()` reaches the engine from a `Tree` for those packages. The sections below
+still describe some features in the engine's terms (`Mutation` names, `takeEvents`, `LISTEN_*`
+flags); each has the direct call listed above.
 
 ## Virtual scrolling
 
