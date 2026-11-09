@@ -63,8 +63,9 @@ let records = run tree.events()
   the `cursor`, the `ime` area, `wakeAt` (the next caret blink) and `again` (the tree wants
   another frame right away). `needsFrame()` tells an on-demand host whether to ask.
 - **Queries** answer with `Option` when there may be nothing: `root()`, `parent`, `children`,
-  `kind`, `hitTest`, `bounds`, `fragments`, `find`, `view` (a `NodeView` snapshot for inspectors
-  and tests) and `describe` (the text snapshot goldens compare).
+  `kind`, `path`, `hitTest`, `pick` (what an element picker selects), `bounds`, `fragments`,
+  `find`, `view` (a `NodeView`: a read-only look at one node's attributes, state, styles and
+  computed style, for inspectors and tests) and `describe` (the text snapshot goldens compare).
 - **Errors**: calls fail with a `TreeError` (`StaleNode`, `WrongKind`, `Cycle`,
   `UnknownResource`, `BadResource`, `BadVirtualList`, `Layout`, `View`), and
   `error.message()` says it in a sentence: `node #12 does not exist (it was destroyed, or never

@@ -29,7 +29,7 @@ import id {
   FontFamily,
   Resource
 }
-import event { Input, EventRecord, Selection, HostRequest, listenFlags }
+import event { Input, EventRecord, Selection, HostRequest, listenFlags, listenFlag }
 import mutation {
   Mutation,
   NodeKind,
@@ -41,7 +41,7 @@ import mutation {
   Cursor,
   CanvasCommand
 }
-import node { NONE, FrameInput, FrameStats, Event as RawEvent, EventKind, Pending }
+import node { NONE, Node as RawNode, FrameInput, FrameStats, Event as RawEvent, EventKind, Pending }
 import edit { HostRequest as RawHostRequest, Keymap, ImeArea }
 import grid { Grid }
 import style { Computed }
@@ -129,42 +129,172 @@ pub struct NodeState {
 
 impl Copy for NodeState {}
 
-/// A snapshot of one node, for inspectors and tests: what it is, what the client set on it
-/// and what the tree made of that.
-pub struct NodeView {
-  pub id: NodeId,
-  pub kind: NodeKind,
-  pub parent: Option<NodeId>,
-  pub accessRole: Role,
-  /// The accessible name set with `Attribute.Label`.
-  pub label: String,
-  pub testId: String,
-  /// The value of a text or input node.
-  pub text: String,
-  pub tabIndex: i32,
-  pub cursor: Cursor,
-  pub disabled: bool,
-  pub checked: bool,
-  pub selected: bool,
-  pub expanded: bool,
-  pub state: NodeState,
-  /// The union of the border boxes of the node's fragments, when layout gave it any.
-  pub bounds: Option<Rect<f32>>,
-  /// The style the client set for each state.
-  pub base: List<Property>,
-  pub hover: List<Property>,
-  pub active: List<Property>,
-  pub focus: List<Property>,
-  pub focusVisible: List<Property>,
-  /// The resolved style.
-  pub computed: Computed,
-  listeners: u32,
+/// The numeric accessibility state of a slider or other range control.
+pub struct ValueRange {
+  pub min: f32,
+  pub max: f32,
+  pub value: f32,
 }
 
-impl NodeView {
+impl Copy for ValueRange {}
+
+/// A read-only look at one node, for inspectors and tests: what it is, what the client set on
+/// it and what the tree made of that. It borrows the tree and copies nothing.
+pub struct NodeView<'t, 'a> {
+  core: &'t UiTree<'a>,
+  slot: u32,
+}
+
+impl<'t, 'a> NodeView<'t, 'a> {
+  fn node(self: &Self) -> &'t RawNode {
+    return self.core.node(self.slot)
+  }
+
+  pub fn id(self: &Self) -> NodeId {
+    return NodeId.of(self.node().id)
+  }
+
+  pub fn kind(self: &Self) -> NodeKind {
+    return self.node().kind
+  }
+
+  pub fn parent(self: &Self) -> Option<NodeId> {
+    let parent = self.node().parent
+    if parent == NONE {
+      return Option<NodeId>.None
+    }
+    return Option<NodeId>.Some { value: NodeId.of(self.core.node(parent).id) }
+  }
+
+  /// The children, in order.
+  pub effect fn children(self: &Self) -> List<NodeId>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut slots = List<u32>.make()
+    run self.core.childSlots(self.slot, &mut slots)
+    let mut out = List<NodeId>.make()
+    let mut i: usize = 0
+    while i < slots.length() {
+      run out.append(NodeId.of(self.core.node(slots.get(i)).id))
+      i = i + 1
+    }
+    return move out
+  }
+
+  pub fn accessRole(self: &Self) -> Role {
+    return self.node().accessRole
+  }
+
+  /// The accessible name set with `Attribute.Label`.
+  pub fn label(self: &Self) -> string<'t> {
+    return String.view(&self.node().label)
+  }
+
+  pub fn testId(self: &Self) -> string<'t> {
+    return String.view(&self.node().testId)
+  }
+
+  /// The value of a text or input node.
+  pub fn text(self: &Self) -> string<'t> {
+    return String.view(&self.node().text)
+  }
+
+  pub fn tabIndex(self: &Self) -> i32 {
+    return self.node().tabIndex
+  }
+
+  pub fn cursor(self: &Self) -> Cursor {
+    return self.node().cursor
+  }
+
+  pub fn disabled(self: &Self) -> bool {
+    return self.node().disabled
+  }
+
+  pub fn focusTrap(self: &Self) -> bool {
+    return self.node().focusTrap
+  }
+
+  pub fn checked(self: &Self) -> bool {
+    return self.node().checked
+  }
+
+  pub fn selected(self: &Self) -> bool {
+    return self.node().selected
+  }
+
+  pub fn expanded(self: &Self) -> bool {
+    return self.node().expanded
+  }
+
+  /// The numeric range set with `Attribute.ValueRange`.
+  pub fn valueRange(self: &Self) -> Option<ValueRange> {
+    let n = self.node()
+    if !n.hasValueRange {
+      return Option<ValueRange>.None
+    }
+    return Option<ValueRange>.Some {
+      value: ValueRange { min: n.valueMin, max: n.valueMax, value: n.valueNow },
+    }
+  }
+
+  pub fn state(self: &Self) -> NodeState {
+    let n = self.node()
+    let focused = self.core.focused == self.slot
+    return NodeState {
+      hovered: n.hovered,
+      pressed: n.pressed,
+      focused: focused,
+      focusVisible: focused && self.core.focusVisible,
+      scrollX: n.scrollX,
+      scrollY: n.scrollY,
+    }
+  }
+
   /// Whether the node listens for events of `kind`.
   pub fn listens(self: &Self, kind: EventKind) -> bool {
-    return (self.listeners & listenFlags(&[kind])) != 0
+    return (self.node().listeners & listenFlag(kind)) != 0
+  }
+
+  /// The style the client set for `state`.
+  pub fn style(self: &Self, state: StyleState) -> &'t [Property] {
+    let n = self.node()
+    return match state {
+      StyleState.Base => n.base.asSlice()
+      StyleState.Hover => n.hover.asSlice()
+      StyleState.Active => n.active.asSlice()
+      StyleState.Focus => n.focus.asSlice()
+      StyleState.FocusVisible => n.focusVisible.asSlice()
+    }
+  }
+
+  /// The resolved style.
+  pub fn computed(self: &Self) -> &'t Computed {
+    return &self.node().computed
+  }
+
+  /// The union of the border boxes of the node's fragments in CSS pixels of the viewport,
+  /// when layout gave it any.
+  pub effect fn bounds(self: &Self) -> Option<Rect<f32>>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match run inspect.info(self.core, self.node().id) {
+      Option.Some { value } => if value.laidOut {
+        Option<Rect<f32>>.Some { value: value.bounds }
+      } else {
+        Option<Rect<f32>>.None
+      }
+      Option.None => Option<Rect<f32>>.None
+    }
+  }
+
+  /// The layout fragments, in order: one per line for inline boxes and text.
+  pub effect fn fragments(self: &Self) -> List<FragmentInfo>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut out = List<FragmentInfo>.make()
+    run inspect.fragmentsOf(self.core, self.slot, &mut out)
+    return move out
   }
 }
 
@@ -985,50 +1115,49 @@ impl<'a> Tree<'a> {
     return run liftIds(&raw)
   }
 
-  /// A snapshot of `node` for inspectors and tests, when it exists.
-  pub effect fn view<N: Node>(self: &Self, node: N) -> Option<NodeView>
+  /// A read-only look at `node` for inspectors and tests, when it exists.
+  pub fn view<'t, N: Node>(self: &'t Self, node: N) -> Option<NodeView<'t, 'a>> {
+    let slot = self.core.slotOf(node.id().raw())
+    if slot == NONE {
+      return Option<NodeView<'t, 'a>>.None
+    }
+    return Option<NodeView<'t, 'a>>.Some { value: NodeView { core: &self.core, slot: slot } }
+  }
+
+  /// The ids from the root down to `node`. Empty when it does not exist.
+  pub effect fn path<N: Node>(self: &Self, node: N) -> List<NodeId>
     ! OutOfMemoryError
     ? &mut Allocator {
-    let id = node.id()
-    let slot = self.core.slotOf(id.raw())
-    if slot == NONE {
-      return Option<NodeView>.None
+    let mut raw = List<u32>.make()
+    let slot = self.core.slotOf(node.id().raw())
+    if slot != NONE {
+      run self.core.pathTo(slot, &mut raw)
     }
-    let n = self.core.node(slot)
-    let focused = self.core.focused == slot
-    return Option<NodeView>.Some {
-      value: NodeView {
-        id: id,
-        kind: n.kind,
-        parent: self.parent(id),
-        accessRole: n.accessRole,
-        label: run String.copy(String.view(&n.label)),
-        testId: run String.copy(String.view(&n.testId)),
-        text: run String.copy(String.view(&n.text)),
-        tabIndex: n.tabIndex,
-        cursor: n.cursor,
-        disabled: n.disabled,
-        checked: n.checked,
-        selected: n.selected,
-        expanded: n.expanded,
-        state: NodeState {
-          hovered: n.hovered,
-          pressed: n.pressed,
-          focused: focused,
-          focusVisible: focused && self.core.focusVisible,
-          scrollX: n.scrollX,
-          scrollY: n.scrollY,
-        },
-        bounds: run self.bounds(id),
-        base: run copyProperties(n.base.asSlice()),
-        hover: run copyProperties(n.hover.asSlice()),
-        active: run copyProperties(n.active.asSlice()),
-        focus: run copyProperties(n.focus.asSlice()),
-        focusVisible: run copyProperties(n.focusVisible.asSlice()),
-        computed: n.computed,
-        listeners: n.listeners,
-      },
+    return run liftIds(&raw)
+  }
+
+  /// The topmost, deepest node painted at (`x`, `y`): what an inspector's element picker
+  /// selects. Unlike `hitTest` it finds text nodes and nodes with `pointer-events: none`.
+  pub fn pick(self: &Self, x: f32, y: f32) -> Option<NodeId> {
+    let id = inspect.pick(&self.core, x, y)
+    if id == NONE {
+      return Option<NodeId>.None
     }
+    return Option<NodeId>.Some { value: NodeId.of(id) }
+  }
+
+  /// The viewport of the last frame.
+  pub fn viewport(self: &Self) -> Viewport {
+    return Viewport {
+      width: self.core.input.width,
+      height: self.core.input.height,
+      scale: self.core.input.scale,
+    }
+  }
+
+  /// The number of the last frame, counted from 1.
+  pub fn frameNumber(self: &Self) -> u64 {
+    return self.core.frameNumber
   }
 
   /// A text snapshot of the tree from the root down: one line per node, indented by depth,
