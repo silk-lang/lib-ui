@@ -10,7 +10,7 @@ Use Silk **0.1.0-dev.61+91f335268900**, LLVM **22.1.8**, and Node **22+**. `tool
 
 For hosted CI, `node scripts/install-silk.mjs` installs the pinned compiler and adds its bin directory to `GITHUB_PATH` (locally it prints the directory to add to `PATH`). Then `node scripts/setup-ci.mjs` resolves the native dependency and provisions its pinned tools. `--linux-gpu` provisions lavapipe; `--browser` selects an existing Chromium and installs pinned Playwright JavaScript without downloading a browser. Local browser runners use `PLAYWRIGHT_MODULE`, `PLAYWRIGHT_CHROMIUM_EXECUTABLE`, and `CHROME_PATH` when supplied. Set `SILK` to override the Silk executable and `SILK_CLANG` for LLVM 22 clang.
 
-The WebAssembly stack wrapper selects `SILK_REAL_CLANG`, then `SILK_CLANG`, then `clang` on `PATH`.
+WebAssembly builds require `SILK_CLANG` (set by `setup-ci.mjs`). The generated stack wrapper binds that executable directly because Silk deliberately filters compiler subprocess environments; it does not fall back to a different `clang` on `PATH`.
 
 Linux native compilation needs X11, xkbcommon, Wayland, and wayland-protocols development headers; window checks additionally need Xvfb, xauth, Weston, and Vulkan/lavapipe. Windows requires the x64 Visual Studio 2026 developer environment, Windows SDK and PowerShell 7. macOS requires Apple Silicon macOS 26+ and `SDKROOT` set to `xcrun --sdk macosx --show-sdk-path`. The checked-in CI exercises native package checks and rendering/inspection on Linux, macOS, and Windows, plus browser checks on Linux.
 
