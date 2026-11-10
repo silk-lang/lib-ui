@@ -14,7 +14,7 @@ import ui_app.tasks { Tasks }
 import ui_app.runtime { Runtime, tick, drain }
 import ui_app.harness { click, press, locate }
 import ui_app.seq as seq
-import ui_app.ui { Ui, Reply }
+import ui_app.ui { Ui, Reply, DefaultAction }
 import ui_fixtures.fixtures as fixtures
 import ui_tree.legacy {
   UiTree,
@@ -385,6 +385,93 @@ test effect fn handlersBubbleFromTheTargetUp() -> ()
   ! AssertionError<'static> | TreeError | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   run nestBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Default actions: a handler or the view can keep a press from taking focus.
+
+struct Keeps {
+  pressed: u32,
+}
+
+union KeepsMessage {
+  Pressed,
+}
+
+impl App<KeepsMessage, NoCommand> for Keeps {
+  fn view(self: &Self, ui: &mut Ui<KeepsMessage>) -> () {
+    ui.style(&[css.fontFamily(SANS)])
+    ui.input(
+      "",
+      |ui| {
+        ui.testId("field")
+      },
+    )
+    ui.box(
+      |ui| {
+        ui.tabIndex(0)
+        ui.onPointerDown(
+          |event| Reply<KeepsMessage>.Custom {
+            message: Option<KeepsMessage>.Some { value: KeepsMessage.Pressed },
+            stopPropagation: false,
+            preventDefault: true,
+          },
+        )
+        ui.text("handler keeps focus")
+      },
+    )
+    ui.box(
+      |ui| {
+        ui.tabIndex(0)
+        ui.prevent(&[DefaultAction.Focus])
+        ui.text("view keeps focus")
+      },
+    )
+    ui.box(
+      |ui| {
+        ui.tabIndex(0)
+        ui.onPointerDown(|event| Reply<KeepsMessage>.Emit { message: KeepsMessage.Pressed })
+        ui.text("takes focus")
+      },
+    )
+  }
+
+  fn update(self: &mut Self, message: KeepsMessage, cx: &mut Context<NoCommand>) -> () {
+    match move message {
+      KeepsMessage.Pressed => {
+        self.pressed = self.pressed + 1
+      }
+    }
+  }
+}
+
+effect fn keepsBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  run fonts(&mut tree)
+  let mut app = Runtime<Keeps, KeepsMessage, NoCommand>.make(Keeps { pressed: 0 })
+  run app.start(&mut tree, 0.0)
+  let field = run idOf(&mut tree, "field")
+  drop run click(&mut app, &mut tree, viewport(), "field")
+  run Testing.expect(tree.node(tree.focused).id == field, "a click focuses the field")
+
+  drop run click(&mut app, &mut tree, viewport(), "handler keeps focus")
+  run Testing.expect(app.model.pressed == 1, "the handler ran")
+  run Testing.expect(tree.node(tree.focused).id == field, "and its reply kept focus in the field")
+
+  drop run click(&mut app, &mut tree, viewport(), "view keeps focus")
+  run Testing.expect(tree.node(tree.focused).id == field, "a node the view marked keeps it too")
+
+  drop run click(&mut app, &mut tree, viewport(), "takes focus")
+  run Testing.expect(app.model.pressed == 2, "a plain handler runs")
+  run Testing.expect(tree.node(tree.focused).id != field, "and the press takes focus as usual")
+}
+
+test effect fn handlersAndViewsPreventDefaults() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run keepsBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
 // The loop helpers.

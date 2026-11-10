@@ -102,9 +102,18 @@ mode: it enters only the nodes on the event's path and calls the handlers there,
 order from the target up. `onInput(|text| ...)` hands the handler the input's new value as an owned `String`, and
 `onEnter(handler)` sends a message for Enter (an input's submit). `on(kind, handler)` takes a
 `fn(&Event) -> Reply<M>`, where `Reply`
-is `Emit`, `EmitAndStop`, `Stop` or `Pass`. Enter, leave, focus, blur and scroll go to the
+is `Emit`, `EmitAndStop`, `Stop`, `Pass`, `Prevent` or `Custom`. Enter, leave, focus, blur and scroll go to the
 target only. So a handler sees the model as it is when the event arrives, and nothing captured
 can go stale.
+
+Handlers run before the tree's default action, as in a browser, so they can prevent it.
+`Reply.Prevent` keeps a press from moving focus, a wheel from scrolling, or a key from doing
+what it does (Tab, Enter and Space clicks, editing, typed text). `Reply.Custom { message,
+stopPropagation, preventDefault }` spells out all three, as Elm's `custom`. When the view knows
+ahead of time, it declares it on the node instead: `ui.prevent(&[DefaultAction.Scroll])` for a
+canvas that pans itself, `ui.prevent(&[DefaultAction.Focus])` for a toolbar button that must
+not take focus from an editor. A host feeds input with `runtime.feed(&mut app, &mut tree,
+input)`, which is `tree.begin`, the handlers, then `tree.finish` with their verdict.
 
 The state attributes `checked`, `selected` and `expanded`, and for inputs `placeholder`,
 `multiline` and `readOnly`, describe a node to the tree (and so to inspectors and tests).

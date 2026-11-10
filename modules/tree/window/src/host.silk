@@ -4,7 +4,7 @@
 import ui_scene.scene { Scene }
 import ui_tree.inspect { findAll }
 import ui_tree.legacy { UiTree, TreeError, FrameInput, CpuSnapshot, Mutation }
-import lib { feed, windowCursor, HostState, serve, coalesce }
+import lib { toInput, windowCursor, HostState, serve, coalesce }
 import adapter { fastScrollOf }
 import render_thread { FastScroll, FastScrolled, RenderSettings }
 
@@ -144,6 +144,17 @@ pub interface WindowClient<S, E, ? R> {
   effect fn pump(self: &mut Self, state: &mut S, tree: &mut UiTree<'_>) -> ()
     ! E | TreeError | OutOfMemoryError
     ? R | &mut Allocator {}
+
+  /// Delivers the record of an input before the tree runs its default action (focus,
+  /// scrolling, what a key does), and returns whether a handler prevented that default. The
+  /// host calls it between `tree.begin` and `tree.finish`. A client with no say pumps and
+  /// prevents nothing.
+  effect fn decide(self: &mut Self, state: &mut S, tree: &mut UiTree<'_>) -> bool
+    ! E | TreeError | OutOfMemoryError
+    ? R | &mut Allocator {
+    run self.pump(&mut state, &mut tree)
+    return false
+  }
 
   /// Advances client timers and optional animation subscriptions.
   effect fn tick(
@@ -547,7 +558,17 @@ pub effect fn runWindow<H: WindowClient<S, E, R>, S, E, ? R>(
             break
           }
           _ => {
-            if !check && run feed(&mut tree, &value) {
+            let fed = if check {
+              Option<Input>.None
+            } else {
+              run toInput(&value)
+            }
+            if let Option<Input>.Some { value: input } = move fed {
+              // As a browser does: the handlers of the input see it first, and the default
+              // action runs unless one of them prevented it.
+              run tree.begin(&input)
+              let prevented = run content.decide(&mut state, &mut tree)
+              run tree.finish(move input, prevented)
               run serve(&mut platform, owner, &mut tree, &mut host)
               run inspector.observe(&tree)
               run content.pump(&mut state, &mut tree)

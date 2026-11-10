@@ -45,6 +45,8 @@ import ui_tree.mutation {
   LISTEN_LAYOUT
 }
 import ui_tree.node { Event, EventKind }
+pub import ui_tree.event { DefaultAction }
+import ui_tree.event { preventFlags }
 import silk.collections.hash { Hash, Word }
 import silk.collections.hash_map { HashMap }
 import silk.collections.list { List }
@@ -135,6 +137,8 @@ pub struct Entry {
   pub cursor: Cursor,
   pub disabled: bool,
   pub focusTrap: bool,
+  /// `Attribute.Prevent` flags.
+  pub prevents: u32,
   /// `Attribute.Checked`, `Selected` and `Expanded`.
   pub checked: bool,
   pub selected: bool,
@@ -203,6 +207,7 @@ impl Entry {
       cursor: Cursor.Default,
       disabled: false,
       focusTrap: false,
+      prevents: 0,
       checked: false,
       selected: false,
       expanded: false,
@@ -374,6 +379,12 @@ pub union Reply<M> {
   Stop,
   /// Sends nothing; the event bubbles on.
   Pass,
+  /// Sends nothing and prevents the default action of the input (focus on a press, scrolling
+  /// on a wheel, what a key does), as `preventDefault`; the event bubbles on.
+  Prevent,
+  /// Everything spelled out, as Elm's `custom`: an optional message, whether nodes above see
+  /// the event, and whether the default action is prevented.
+  Custom { pub message: Option<M>, pub stopPropagation: bool, pub preventDefault: bool },
 }
 
 /// A reply and the depth of the node whose handler gave it.
@@ -419,6 +430,8 @@ pub struct Ui<M> {
   ordinals: List<u32>,
   event: Event,
   answers: List<Answer<M>>,
+  /// A handler of a dispatch pass asked for the default action to be prevented.
+  prevented: bool,
   /// Entries the last render copied with `lazy` instead of running the body.
   pub reused: u32,
   /// The layout boxes of anchored nodes, filled by the runtime before each pass.
@@ -518,6 +531,7 @@ impl<M> Ui<M> {
       ordinals: List<u32>.make(),
       event: Event.make(EventKind.Click, 0, List<u32>.make()),
       answers: List<Answer<M>>.make(),
+      prevented: false,
       reused: 0,
       anchors: List<AnchorRect>.make(),
       viewportBounds: Rect<f32>.new(0.0, 0.0, 0.0, 0.0),
@@ -681,6 +695,20 @@ impl<M> Ui<M> {
               stopped = true
             }
             Reply<M>.Pass => {}
+            Reply<M>.Prevent => {
+              self.prevented = true
+            }
+            Reply<M>.Custom { message, stopPropagation, preventDefault } => {
+              if let Option<M>.Some { value } = move message {
+                run out.append(move value)
+              }
+              if preventDefault {
+                self.prevented = true
+              }
+              if stopPropagation {
+                stopped = true
+              }
+            }
           }
         } else {
           i = i + 1
@@ -1638,6 +1666,25 @@ impl<M> Ui<M> {
     if let Option<Entry>.Some { value: entry } = self.edit() {
       let mut changed = entry
       changed.disabled = value
+      self.arena.setEntry(self.current, changed)
+    }
+  }
+
+  /// Whether a handler asked for the default action to be prevented since the last call.
+  pub fn takePrevented(self: &mut Self) -> bool {
+    let value = self.prevented
+    self.prevented = false
+    return value
+  }
+
+  /// Turns default actions off for input aimed at the open node or anything inside it: the
+  /// declarative `preventDefault`, for what the view knows ahead of time. A canvas that pans
+  /// itself prevents `Scroll`; a toolbar button that must not take focus from an editor
+  /// prevents `Focus`. The handlers still run.
+  pub fn prevent(self: &mut Self, actions: &[DefaultAction]) -> () {
+    if let Option<Entry>.Some { value: entry } = self.edit() {
+      let mut changed = entry
+      changed.prevents = preventFlags(actions)
       self.arena.setEntry(self.current, changed)
     }
   }
