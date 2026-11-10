@@ -1,0 +1,555 @@
+import silk.cli.task { TaskError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.encoding.base64 { Base64, Base64Error }
+import silk.io.writer { Writer, WriterError }
+import silk.io.writer_native { StdoutWriter, StderrWriter }
+import silk.json.output { JsonOptions }
+import silk.json.scanner { JsonError }
+import silk.json.value { Json, JsonEntry, JsonNumber, Value }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f64
+import silk.num.u8
+import silk.num.usize
+import silk.system.child_process { ChildProcess, ProcessError }
+import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.text.format { Format }
+import silk.text.string { InvalidUtf8, String }
+import task_browser_cdp { Browser, open, page, send, evaluate, close, findChrome, parse, stringify }
+import task_browser_text_process { executeText }
+import task_support { rootPath, require }
+
+// CLI parsing belongs to the root task. Empty executable options consult their environment
+// variables; a supplied executable/cases path is resolved relative to the invoking directory.
+pub struct TextOptions<'a> {
+  pub cli: string<'a>,
+  pub chrome: string<'a>,
+  pub tolerance: f64,
+  pub blockTolerance: f64,
+  pub only: string<'a>,
+  pub cases: string<'a>,
+  pub verbose: bool,
+}
+
+pub fn textDefaults<'a>() -> TextOptions<'a> {
+  return TextOptions { cli: "", chrome: "", tolerance: 0.1, blockTolerance: 0.5,
+    only: "", cases: "", verbose: false }
+}
+
+pub effect fn runText(options: &TextOptions<'_>) -> ()
+  ! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+  ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  let cliText = run configured(options.cli, "UI_TEXT_CLI")
+  run require(String.view(&cliText) != "", "Pass --cli PATH (or UI_TEXT_CLI) to the built ui-text-cli")
+  let cwdBytes = run HostInput.workingDirectory()
+  let cwd = run Path.fromBytes(Bytes.asSlice(&cwdBytes))
+  let cli = if String.startsWith(String.view(&cliText), "/") { run Path.make(String.view(&cliText)) }
+    else { run Path.resolve(&cwd, String.view(&cliText)) }
+  let root = run rootPath(".")
+  let casesPath = if options.cases == "" { run rootPath("modules/text/tests/chrome/cases.json") }
+    else if String.startsWith(options.cases, "/") { run Path.make(options.cases) }
+    else { run Path.resolve(&cwd, options.cases) }
+  let casesBytes = run FileSystem.readFile(&casesPath)
+  let cases = run parse(Bytes.asSlice(&casesBytes))
+  let runtimePath = run rootPath("modules/text/tests/chrome/observe.js")
+  let runtimeBytes = run FileSystem.readFile(&runtimePath)
+  let runtime = run utf8(Bytes.asSlice(&runtimeBytes))
+  let executable = run findChrome(options.chrome)
+  let mut browser = run open(String.view(&executable), true,
+    &["--disable-background-networking", "--disable-component-update", "--disable-extensions",
+      "--force-device-scale-factor=1", "--font-render-hinting=none"])
+  let completed = run Effect.result(compareCases(&mut browser, &cli, &root, &cases, runtime, options))
+  run close(&mut browser)
+  let summary = match move completed {
+    Result<Value, TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError>.Success { value } => move value
+    Result<Value, TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError>.Failure { error } => { fail move error }
+  }
+  run printJson(&summary, false, 2)
+  let failures = run array(run field(&summary, "failures"))
+  run require(failures.length == 0, "Chrome text comparison failed")
+}
+
+effect fn compareCases(browser: &mut Browser, cli: &Path, root: &Path, cases: &Value,
+  runtime: string, options: &TextOptions<'_>) -> Value
+  ! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+  ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  let empty = object()
+  let version = run send(&mut browser, "Browser.getVersion", &empty, "")
+  let session = run page(&mut browser)
+  let mut failures = List<Value>.make()
+  let mut caseCount: usize = 0
+  let mut fragmentCount: usize = 0
+  let mut maxInline: f64 = 0.0
+  let mut maxBlock: f64 = 0.0
+  let tests = run array(cases)
+  let mut testIndex: usize = 0
+  while testIndex < tests.length {
+    let test = &tests[testIndex]
+    testIndex = testIndex + 1
+    let name = run text(run field(test, "name"))
+    if options.only != "" && options.only != name { continue }
+    caseCount = caseCount + 1
+    let protocol = run encodeProtocol(test)
+    let native = run executeText(cli, root, Bytes.asSlice(&protocol))
+    if native.status != 0 {
+      let mut stderr = StderrWriter.make()
+      run Writer.writeAll(Bytes.asSlice(&native.errors)) |> Effect.provideMut<Writer>(&mut stderr)
+      let mut message = run String.copy("ui-text-cli failed on ")
+      run String.append(&mut message, name)
+      fail TaskError { message: move message, status: 1 }
+    }
+    let result = run parse(Bytes.asSlice(&native.output))
+    let fragmentsValue = run field(&result, "texts")
+    let fragments = run array(fragmentsValue)
+    let fonts = run loadFonts(test, root)
+    let testJson = run stringify(test)
+    let fontJson = run stringify(&fonts)
+    let fragmentJson = run stringify(fragmentsValue)
+    let mut expression = run String.copy("(")
+    run String.append(&mut expression, runtime)
+    run String.append(&mut expression, ")(")
+    run String.append(&mut expression, String.view(&testJson))
+    run String.append(&mut expression, ",")
+    run String.append(&mut expression, String.view(&fontJson))
+    run String.append(&mut expression, ",")
+    run String.append(&mut expression, String.view(&fragmentJson))
+    run String.append(&mut expression, if options.verbose { ",true)" } else { ",false)" })
+    let observedValue = run evaluate(&mut browser, String.view(&expression), String.view(&session))
+    let observed = run array(&observedValue)
+    run require(observed.length == fragments.length, "Chrome returned the wrong number of text fragments")
+    let mut caseFailures = List<Value>.make()
+    let mut index: usize = 0
+    while index < fragments.length {
+      let fragment = &fragments[index]
+      let measured = &observed[index]
+      index = index + 1
+      let measuredText = run text(run field(measured, "text"))
+      // Match JavaScript /^\s*$/ exactly, including ECMAScript's Unicode whitespace set.
+      if whitespace(measuredText) { continue }
+      let missing = match Json.field(measured, "missing") {
+        Option<&Value>.Some { value } => match &value.* { Value.Bool { value: flag } => flag _ => false }
+        Option<&Value>.None => false
+      }
+      if missing {
+        let mut failure = object()
+        run put(&mut failure, "text", run Json.copy(run field(measured, "text")))
+        run put(&mut failure, "native", run Json.copy(fragment))
+        run put(&mut failure, "chrome", Value.Null)
+        run List<Value>.append(&mut caseFailures, move failure)
+        continue
+      }
+      fragmentCount = fragmentCount + 1
+      let dx = f64.abs((run number(run field(fragment, "x"))) - (run number(run field(measured, "x"))))
+      let dw = f64.abs((run number(run field(fragment, "width"))) - (run number(run field(measured, "width"))))
+      let dy = f64.abs((run number(run field(fragment, "y"))) - (run number(run field(measured, "y"))))
+      let dh = f64.abs((run number(run field(fragment, "height"))) - (run number(run field(measured, "height"))))
+      maxInline = f64.max(maxInline, f64.max(dx, dw))
+      maxBlock = f64.max(maxBlock, f64.max(dy, dh))
+      if dx > options.tolerance || dw > options.tolerance || dy > options.blockTolerance || dh > options.blockTolerance {
+        let mut failure = object()
+        run put(&mut failure, "text", run Json.copy(run field(measured, "text")))
+        run put(&mut failure, "native", run project(fragment, &["x", "y", "width", "height", "face", "level"]))
+        let mut chrome = run project(measured, &["x", "y", "width", "height"])
+        let rects = match Json.field(measured, "list") {
+          Option<&Value>.Some { value } => value
+          Option<&Value>.None => run field(measured, "rects")
+        }
+        run put(&mut chrome, "rects", run Json.copy(rects))
+        run put(&mut failure, "chrome", move chrome)
+        run List<Value>.append(&mut caseFailures, move failure)
+      }
+    }
+    let count = List<Value>.length(&caseFailures)
+    let mut stderr = StderrWriter.make()
+    if count == 0 {
+      run Format.format("{}: ok\n", &.(name)) |> Effect.provideMut<Writer>(&mut stderr)
+    } else {
+      run Format.format("{}: FAIL ({})\n", &.(name, count)) |> Effect.provideMut<Writer>(&mut stderr)
+      let caseFailureValue = Value.Array { values: move caseFailures }
+      if options.verbose { run printJson(&caseFailureValue, true, 1) }
+      let mut record = object()
+      run put(&mut record, "name", run Json.copy(run field(test, "name")))
+      run put(&mut record, "failures", move caseFailureValue)
+      run List<Value>.append(&mut failures, move record)
+    }
+  }
+  let mut summary = object()
+  run put(&mut summary, "browser", run Json.copy(run field(&version, "product")))
+  run put(&mut summary, "tolerance", floating(options.tolerance))
+  run put(&mut summary, "blockTolerance", floating(options.blockTolerance))
+  run put(&mut summary, "cases", integer(caseCount))
+  run put(&mut summary, "fragments", integer(fragmentCount))
+  run put(&mut summary, "maxInlineDelta", floating(maxInline))
+  run put(&mut summary, "maxBlockDelta", floating(maxBlock))
+  run put(&mut summary, "failures", Value.Array { values: move failures })
+  return move summary
+}
+
+effect fn encodeProtocol(test: &Value) -> Bytes
+  ! TaskError | OutOfMemoryError | WriterError ? &mut Allocator {
+  let mut output = Bytes.make()
+  let fonts = run array(run field(test, "fonts"))
+  let mut index: usize = 0
+  while index < fonts.length {
+    run append(&mut output, "font ")
+    run append(&mut output, run text(run field(&fonts[index], "path")))
+    run append(&mut output, "\n")
+    index = index + 1
+  }
+  match Json.field(test, "fallbacks") {
+    Option<&Value>.Some { value } => match &value.* {
+      Value.Null => {}
+      _ => {
+        let families = run array(value)
+        index = 0
+        while index < families.length {
+          run append(&mut output, "fallback ")
+          run append(&mut output, run text(&families[index]))
+          run append(&mut output, "\n")
+          index = index + 1
+        }
+      }
+    }
+    Option<&Value>.None => {}
+  }
+  let styles = run array(run field(test, "styles"))
+  index = 0
+  while index < styles.length {
+    let style = &styles[index]
+    run append(&mut output, "style ")
+    run hundredths(&mut output, run field(style, "size"))
+    run append(&mut output, " ")
+    run appendScalar(&mut output, style, "weight", "400")
+    run append(&mut output, " ")
+    run appendScalar(&mut output, style, "style", "normal")
+    run append(&mut output, " ")
+    let families = run array(run field(style, "families"))
+    let mut familyIndex: usize = 0
+    while familyIndex < families.length {
+      if familyIndex != 0 { run append(&mut output, "|") }
+      run append(&mut output, run text(&families[familyIndex]))
+      familyIndex = familyIndex + 1
+    }
+    run append(&mut output, "\n")
+    index = index + 1
+  }
+  let block = run field(test, "block")
+  run append(&mut output, "block ")
+  run hundredths(&mut output, run field(block, "width"))
+  run append(&mut output, " ")
+  run appendScalar(&mut output, block, "direction", "ltr")
+  run append(&mut output, " ")
+  run appendScalar(&mut output, block, "align", "start")
+  run append(&mut output, " ")
+  match Json.field(block, "lineHeight") {
+    Option<&Value>.Some { value } => run hundredths(&mut output, value)
+    Option<&Value>.None => run append(&mut output, "normal")
+  }
+  run append(&mut output, " ")
+  run appendScalar(&mut output, block, "whiteSpace", "collapse")
+  run append(&mut output, " ")
+  run appendScalar(&mut output, block, "style", "0")
+  run append(&mut output, "\n")
+  run contentProtocol(&mut output, run field(test, "content"), block)
+  run append(&mut output, "close\n")
+  return move output
+}
+
+effect fn contentProtocol(output: &mut Bytes, content: &Value, block: &Value) -> ()
+  ! TaskError | OutOfMemoryError | WriterError ? &mut Allocator {
+  let children = run array(content)
+  let mut index: usize = 0
+  while index < children.length {
+    let child = &children[index]
+    match &child.* {
+      Value.String { text: value } => {
+        run append(&mut output, "text ")
+        let bytes = String.utf8Bytes(String.view(&value))
+        let digits = b"0123456789abcdef"
+        let mut at: usize = 0
+        let mut start: usize = 0
+        while at < bytes.length {
+          let byte = bytes[at]
+          if byte <= 32 || byte >= 127 || byte == 37 {
+            run Bytes.append(&mut output, Slice.view<u8>(bytes, start, at - start))
+            run Bytes.append(&mut output, &[37, digits[u8.toUsize(byte / 16)], digits[u8.toUsize(byte % 16)]])
+            start = at + 1
+          }
+          at = at + 1
+        }
+        run Bytes.append(&mut output, Slice.view<u8>(bytes, start, bytes.length - start))
+        run append(&mut output, "\n")
+      }
+      _ => {
+        run append(&mut output, "open ")
+        match Json.field(child, "style") {
+          Option<&Value>.Some { value } => {
+            match &value.* {
+              Value.Null => run appendScalar(&mut output, block, "style", "0")
+              _ => run scalar(&mut output, value)
+            }
+          }
+          Option<&Value>.None => run appendScalar(&mut output, block, "style", "0")
+        }
+        let bidi = Option<string>.unwrapOr(Json.asString(Json.field(child, "bidi")), "")
+        if bidi != "" {
+          run append(&mut output, " ")
+          run append(&mut output, bidi)
+          run append(&mut output, " ")
+          run appendScalar(&mut output, child, "direction", "ltr")
+        }
+        run append(&mut output, "\n")
+        run contentProtocol(&mut output, run field(child, "content"), block)
+        run append(&mut output, "close\n")
+      }
+    }
+    index = index + 1
+  }
+}
+
+effect fn loadFonts(test: &Value, root: &Path) -> Value
+  ! TaskError | FileError | OutOfMemoryError ? &mut Allocator | &mut FileSystem {
+  let fonts = run array(run field(test, "fonts"))
+  let mut loaded = List<Value>.make()
+  let mut index: usize = 0
+  while index < fonts.length {
+    let font = &fonts[index]
+    let path = run Path.resolve(root, run text(run field(font, "path")))
+    let bytes = run FileSystem.readFile(&path)
+    let mut encoded = Bytes.make()
+    let length = match Base64.encodedLength(Bytes.length(&bytes)) {
+      Result<usize, Base64Error>.Success { value } => value
+      Result<usize, Base64Error>.Failure { .. } => {
+        fail TaskError { message: run String.copy("font is too large for base64"), status: 1 }
+      }
+    }
+    run Bytes.reserveExact(&mut encoded, length)
+    let mut at: usize = 0
+    while at < length {
+      let _appended = Bytes.appendWithinCapacity(&mut encoded, 0)
+      at = at + 1
+    }
+    match Base64.encodeInto(Bytes.asMutSlice(&mut encoded), Bytes.asSlice(&bytes)) {
+      Result<usize, Base64Error>.Success { .. } => {}
+      Result<usize, Base64Error>.Failure { .. } => {
+        fail TaskError { message: run String.copy("font base64 encoding failed"), status: 1 }
+      }
+    }
+    let data = match String.fromBytes(move encoded) {
+      Result<String, InvalidUtf8>.Success { value } => move value
+      Result<String, InvalidUtf8>.Failure { .. } => {
+        fail TaskError { message: run String.copy("base64 output is not UTF-8"), status: 1 }
+      }
+    }
+    let mut copy = run Json.copy(font)
+    run put(&mut copy, "data", Value.String { text: move data })
+    run List<Value>.append(&mut loaded, move copy)
+    index = index + 1
+  }
+  return Value.Array { values: move loaded }
+}
+
+effect fn configured(explicit: string, environment: string) -> String
+  ! TaskError | HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
+  if explicit != "" { return run String.copy(explicit) }
+  let found = run HostInput.variableNamed(environment)
+  return match move found {
+    Option<Bytes>.Some { value } => run String.copy(run utf8(Bytes.asSlice(&value)))
+    Option<Bytes>.None => String.make()
+  }
+}
+
+fn object() -> Value { return Value.Object { entries: List<JsonEntry>.make() } }
+fn floating(value: f64) -> Value { return Value.Number { value: JsonNumber.Float { value: value } } }
+fn integer(value: usize) -> Value { return Value.Number { value: JsonNumber.Unsigned { value: usize.toU64(value) } } }
+
+effect fn put(target: &mut Value, key: string, value: Value) -> ()
+  ! TaskError | OutOfMemoryError ? &mut Allocator {
+  match &mut target.* {
+    Value.Object { entries } => {
+      let items = List<JsonEntry>.asMutSlice(&mut entries)
+      let mut index: usize = 0
+      while index < items.length {
+        if String.view(&items[index].key) == key {
+          items[index].value = move value
+          return ()
+        }
+        index = index + 1
+      }
+      run List<JsonEntry>.append(&mut entries, JsonEntry { key: run String.copy(key), value: move value })
+    }
+    _ => { fail TaskError { message: run String.copy("expected JSON object"), status: 1 } }
+  }
+}
+
+effect fn field<'a>(value: &'a Value, key: string) -> &'a Value
+  ! TaskError | OutOfMemoryError ? &mut Allocator {
+  return match Json.field(value, key) {
+    Option<&Value>.Some { value: found } => found
+    Option<&Value>.None => {
+      let mut message = run String.copy("missing JSON field: ")
+      run String.append(&mut message, key)
+      fail TaskError { message: move message, status: 1 }
+    }
+  }
+}
+
+effect fn array(value: &Value) -> &[Value]
+  ! TaskError | OutOfMemoryError ? &mut Allocator {
+  return match &value.* {
+    Value.Array { values } => List<Value>.asSlice(&values)
+    _ => { fail TaskError { message: run String.copy("expected JSON array"), status: 1 } }
+  }
+}
+
+effect fn text(value: &Value) -> string
+  ! TaskError | OutOfMemoryError ? &mut Allocator {
+  return match &value.* {
+    Value.String { text: content } => String.view(&content)
+    _ => { fail TaskError { message: run String.copy("expected JSON string"), status: 1 } }
+  }
+}
+
+effect fn number(value: &Value) -> f64
+  ! TaskError | OutOfMemoryError ? &mut Allocator {
+  return match Json.asF64(Option<&Value>.some(value)) {
+    Option<f64>.Some { value: number } => number
+    Option<f64>.None => { fail TaskError { message: run String.copy("expected finite JSON number"), status: 1 } }
+  }
+}
+
+effect fn utf8(bytes: &[u8]) -> string
+  ! TaskError | OutOfMemoryError ? &mut Allocator {
+  return match String.fromUtf8(bytes) {
+    Result<string, InvalidUtf8>.Success { value } => value
+    Result<string, InvalidUtf8>.Failure { .. } => { fail TaskError { message: run String.copy("expected UTF-8 text"), status: 1 } }
+  }
+}
+
+effect fn append(output: &mut Bytes, value: string) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  run Bytes.append(&mut output, String.utf8Bytes(value))
+}
+
+effect fn hundredths(output: &mut Bytes, value: &Value) -> ()
+  ! TaskError | OutOfMemoryError ? &mut Allocator {
+  // Math.round rounds half ties toward +infinity, unlike ties-to-even round().
+  let rounded = f64.floor((run number(value)) * 100.0 + 0.5)
+  let integer = match f64.checkedToI64(rounded) {
+    Option<i64>.Some { value: integral } => integral
+    Option<i64>.None => { fail TaskError { message: run String.copy("text measurement is out of range"), status: 1 } }
+  }
+  let mut buffer: [u8; 20] = [0; 20]
+  let length = Format.writeI64Display(integer, &mut buffer, 0)
+  run Bytes.append(&mut output, Slice.view<u8>(&buffer, 0, length))
+}
+
+effect fn scalar(output: &mut Bytes, value: &Value) -> ()
+  ! TaskError | OutOfMemoryError | WriterError ? &mut Allocator {
+  match &value.* {
+    Value.String { text } => run append(&mut output, String.view(&text))
+    Value.Number { .. } => {
+      let numeric = run number(value)
+      if numeric == f64.floor(numeric) {
+        match f64.checkedToI64(numeric) {
+          Option<i64>.Some { value: integral } => {
+            let mut bytes: [u8; 20] = [0; 20]
+            let length = Format.writeI64Display(integral, &mut bytes, 0)
+            run Bytes.append(&mut output, Slice.view<u8>(&bytes, 0, length))
+            return ()
+          }
+          Option<i64>.None => {}
+        }
+      }
+      let rendered = run stringify(value)
+      run append(&mut output, String.view(&rendered))
+    }
+    _ => {
+      let rendered = run stringify(value)
+      run append(&mut output, String.view(&rendered))
+    }
+  }
+}
+
+effect fn appendScalar(output: &mut Bytes, value: &Value, key: string, fallback: string) -> ()
+  ! TaskError | OutOfMemoryError | WriterError ? &mut Allocator {
+  match Json.field(value, key) {
+    Option<&Value>.Some { value: found } => match &found.* {
+      Value.Null => run append(&mut output, fallback)
+      _ => run scalar(&mut output, found)
+    }
+    Option<&Value>.None => run append(&mut output, fallback)
+  }
+}
+
+effect fn project(value: &Value, keys: &[string]) -> Value
+  ! TaskError | OutOfMemoryError ? &mut Allocator {
+  let mut output = object()
+  let mut index: usize = 0
+  while index < keys.length {
+    match Json.field(value, keys[index]) {
+      Option<&Value>.Some { value: found } => run put(&mut output, keys[index], run Json.copy(found))
+      Option<&Value>.None => {}
+    }
+    index = index + 1
+  }
+  return move output
+}
+
+effect fn printJson(value: &Value, errors: bool, indentation: usize) -> ()
+  ! TaskError | OutOfMemoryError | WriterError ? &mut Allocator {
+  let options = JsonOptions.indented(indentation)
+  let mut out = StdoutWriter.make()
+  let mut err = StderrWriter.make()
+  let completed = if errors {
+    run Effect.result(Json.serialize(value, &options)) |> Effect.provideMut<Writer>(&mut err)
+  } else {
+    run Effect.result(Json.serialize(value, &options)) |> Effect.provideMut<Writer>(&mut out)
+  }
+  match move completed {
+    Result<(), JsonError | WriterError>.Success { .. } => {}
+    Result<(), JsonError | WriterError>.Failure { error } => match move error {
+      WriterError writer => { fail move writer }
+      JsonError invalid => {
+        drop invalid
+        fail TaskError { message: run String.copy("could not serialize text comparison result"), status: 1 }
+      }
+    }
+  }
+  if errors { run Writer.writeAll(b"\n") |> Effect.provideMut<Writer>(&mut err) }
+  else { run Writer.writeAll(b"\n") |> Effect.provideMut<Writer>(&mut out) }
+}
+
+fn whitespace(value: string) -> bool {
+  let bytes = String.utf8Bytes(value)
+  let mut at: usize = 0
+  while at < bytes.length {
+    let byte = bytes[at]
+    if (byte >= 9 && byte <= 13) || byte == 32 {
+      at = at + 1
+      continue
+    }
+    if at + 1 < bytes.length && byte == 194 && bytes[at + 1] == 160 {
+      at = at + 2
+      continue
+    }
+    if at + 2 >= bytes.length { return false }
+    let second = bytes[at + 1]
+    let third = bytes[at + 2]
+    if (byte == 225 && second == 154 && third == 128)
+      || (byte == 226 && second == 128 && ((third >= 128 && third <= 138) || third == 168 || third == 169 || third == 175))
+      || (byte == 226 && second == 129 && third == 159)
+      || (byte == 227 && second == 128 && third == 128)
+      || (byte == 239 && second == 187 && third == 191) {
+      at = at + 3
+      continue
+    }
+    return false
+  }
+  return true
+}

@@ -1,0 +1,605 @@
+// Host-side assertions and input orchestration are Silk; only the browser runtime remains JavaScript.
+import silk.cli.task { TaskError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.encoding.base64 { Base64 }
+import silk.io.writer { WriterError }
+import silk.json.value { Json, JsonEntry, JsonNumber, Value }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f64
+import silk.num.i64
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.system.child_process { ChildProcess, ProcessError }
+import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
+import silk.system.system_clock { Instant, SystemClock }
+import silk.text.string { String }
+import task_browser_cdp { Browser, close, evaluate, findChrome, openWithEnvironment, page, send, stringify }
+import task_browser_server { Server, inputPath, report, sleep, start, stop }
+import task_native_display { Display, inheritedDisplay, openDisplay, closeDisplay }
+import task_support { require }
+
+const HOST_OS: string = Intrinsic.targetOperatingSystem()
+
+pub struct WindowOptions<'a> {
+  pub width: u32,
+  pub height: u32,
+  pub scale: f64,
+  pub click: bool,
+  pub clickX: f64,
+  pub clickY: f64,
+  pub typed: string<'a>,
+  pub screenshot: string<'a>,
+  pub stored: string<'a>,
+  pub chromium: string<'a>,
+}
+impl<'a> WindowOptions<'a> {
+  pub fn defaults() -> WindowOptions<'a> {
+    return WindowOptions { width: 800, height: 600, scale: 1.0, click: false, clickX: 0.0, clickY: 0.0,
+      typed: "", screenshot: "", stored: "", chromium: "" }
+  }
+}
+
+fn object() -> Value { return Value.Object { entries: List<JsonEntry>.make() } }
+fn number(value: f64) -> Value { return Value.Number { value: JsonNumber.Float { value: value } } }
+fn integer(value: usize) -> Value { return Value.Number { value: JsonNumber.Unsigned { value: usize.toU64(value) } } }
+effect fn text(value: string) -> Value ! OutOfMemoryError ? &mut Allocator { return Value.String { text: run String.copy(value) } }
+effect fn put(target: &mut Value, key: string, value: Value) -> () ! OutOfMemoryError ? &mut Allocator {
+  match &mut target.* {
+    Value.Object { entries } => run List.append(&mut entries, JsonEntry { key: run String.copy(key), value: move value })
+    _ => Intrinsic.trap("browser task expected a JSON object")
+  }
+}
+effect fn member<'a>(value: &'a Value, key: string) -> &'a Value ! TaskError | OutOfMemoryError ? &mut Allocator {
+  return match Json.field(value, key) {
+    Option.Some { value: found } => found
+    Option.None => { fail TaskError { message: run String.copy("missing browser result field"), status: 1 } }
+  }
+}
+effect fn items<'a>(value: &'a Value) -> &'a [Value] ! TaskError | OutOfMemoryError ? &mut Allocator {
+  return match &value.* {
+    Value.Array { values } => List.asSlice(&values)
+    _ => { fail TaskError { message: run String.copy("expected browser result array"), status: 1 } }
+  }
+}
+effect fn unsigned(value: &Value) -> usize ! TaskError | OutOfMemoryError ? &mut Allocator {
+  return match Json.asU64(Option<&Value>.some(value)) {
+    Option.Some { value: number } => u64.toUsize(number)
+    Option.None => { fail TaskError { message: run String.copy("expected unsigned browser result"), status: 1 } }
+  }
+}
+fn isNull(value: &Value) -> bool { return match &value.* { Value.Null => true _ => false } }
+fn isTrue(value: &Value) -> bool { return match &value.* { Value.Bool { value: flag } => flag _ => false } }
+fn nonemptyError(value: &Value) -> bool {
+  return match Json.asString(Json.field(value, "error")) { Option.Some { value: error } => error != "" Option.None => false }
+}
+effect fn now() -> Instant {
+  let mut clock = OsMonotonicClock.make()
+  return run MonotonicClock.now() |> Effect.provideMut<MonotonicClock>(&mut clock)
+}
+effect fn expired(start: &Instant, milliseconds: i64) -> bool {
+  let current = run now()
+  let elapsed = (SystemClock.seconds(&current) - SystemClock.seconds(start)) * 1000000000
+    + SystemClock.nanoseconds(&current) - SystemClock.nanoseconds(start)
+  return elapsed >= milliseconds * 1000000
+}
+effect fn command(browser: &mut Browser, session: string, method: string, parameters: Value) -> Value
+  ! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+  ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  return run send(&mut browser, method, &parameters, session)
+}
+effect fn navigate(browser: &mut Browser, session: string, url: string) -> ()
+  ! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+  ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  let mut parameters = object()
+  run put(&mut parameters, "url", run text(url))
+  let response = run command(&mut browser, session, "Page.navigate", move parameters)
+  match Json.asString(Json.field(&response, "errorText")) {
+    Option.Some { value } => run require(value == "", value)
+    Option.None => {}
+  }
+  let expected = Json.field(&response, "loaderId") |> Json.asString |> Option<string>.unwrapOr("")
+  if expected != "" {
+    let started = run now()
+    while true {
+      let tree = run command(&mut browser, session, "Page.getFrameTree", object())
+      let current = Json.field(&tree, "frameTree") |> Json.fieldAt("frame") |> Json.fieldAt("loaderId")
+        |> Json.asString |> Option<string>.unwrapOr("")
+      if current == expected {
+        let ready = run evaluate(&mut browser, "document.readyState", session)
+        if (Json.asString(Option<&Value>.some(&ready)) |> Option<string>.unwrapOr("")) == "complete" { break }
+      }
+      run require(!run expired(&started, 30000), "browser navigation did not load within 30 seconds")
+      run sleep(20)
+    }
+  }
+}
+effect fn errors(browser: &Browser, pageOnly: bool) -> bool ! TaskError | OutOfMemoryError | WriterError ? &mut Allocator {
+  let values = List.asSlice(&browser.errors)
+  let mut index: usize = 0
+  let mut failed = false
+  while index < values.length {
+    let message = run stringify(&values[index])
+    run report("[Chromium error] {message}\n", &.{ message: String.view(&message) })
+    let method = match Json.asString(Json.field(&values[index], "method")) { Option.Some { value } => value Option.None => "" }
+    if !pageOnly || method == "Runtime.exceptionThrown" { failed = true }
+    index = index + 1
+  }
+  return failed
+}
+effect fn browserDisplay() -> Display
+  ! TaskError | FileError | HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator | &mut FileSystem {
+  static if Intrinsic.targetOperatingSystem() == "linux" {
+    let display = run HostInput.variableNamed("DISPLAY")
+    match &display {
+      Option.Some { value } => { if Bytes.length(&value) > 0 { return inheritedDisplay() } }
+      Option.None => {}
+    }
+  }
+  return run openDisplay("x11")
+}
+
+effect fn launch(display: &Display, explicit: string) -> Browser
+  ! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+  ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  let executable = run findChrome(explicit)
+  let mut flags = List<string>.make()
+  let common = ["--enable-unsafe-webgpu", "--use-angle=swiftshader", "--enable-features=Vulkan", "--disable-vulkan-surface", "--enable-unsafe-swiftshader",
+    "--no-sandbox", "--disable-dev-shm-usage", "--disable-background-timer-throttling", "--disable-renderer-backgrounding", "--hide-scrollbars", "--mute-audio"]
+  let mut index: usize = 0
+  while index < common.length {
+    run List.append(&mut flags, common[index])
+    index = index + 1
+  }
+  static if Intrinsic.targetOperatingSystem() == "linux" { run List.append(&mut flags, "--use-vulkan=swiftshader") }
+  let mut browser = run openWithEnvironment(String.view(&executable), HOST_OS != "linux", List.asSlice(&flags), List.asSlice(&display.environment))
+  let version = run command(&mut browser, "", "Browser.getVersion", object())
+  let product = match Json.asString(Json.field(&version, "product")) { Option.Some { value } => value Option.None => "Chromium" }
+  run report("{product} ({platform})\n", &.{ product: product, platform: HOST_OS })
+  return move browser
+}
+
+pub effect fn treeTest(wasm: string) -> ()
+  ! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+  ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  let display = run browserDisplay()
+  let outcome = run Effect.result(treeWithDisplay(wasm, &display))
+  let cleanup = run Effect.result(closeDisplay(move display))
+  match move outcome { Result.Success { .. } => {} Result.Failure { error } => { fail move error } }
+  match move cleanup { Result.Success { .. } => {} Result.Failure { error } => { fail move error } }
+}
+effect fn treeWithDisplay(wasm: string, display: &Display) -> ()
+  ! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+  ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  let mut server = run start(wasm, true)
+  let outcome = run Effect.result(treeWithServer(&server, display))
+  let cleanup = run Effect.result(stop(&mut server))
+  match move outcome { Result.Success { .. } => {} Result.Failure { error } => { fail move error } }
+  match move cleanup { Result.Success { .. } => {} Result.Failure { error } => { fail move error } }
+}
+effect fn treeWithServer(server: &Server, display: &Display) -> ()
+  ! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+  ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  let mut browser = run launch(display, "")
+  let outcome = run Effect.result(trees(&mut browser, String.view(&server.origin)))
+  let cleanup = run Effect.result(close(&mut browser))
+  match move outcome { Result.Success { .. } => {} Result.Failure { error } => { fail move error } }
+  match move cleanup { Result.Success { .. } => {} Result.Failure { error } => { fail move error } }
+}
+effect fn trees(browser: &mut Browser, origin: string) -> ()
+  ! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+  ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  let session = run page(&mut browser)
+  run navigate(&mut browser, String.view(&session), origin)
+  let started = run now()
+  while !isTrue(&(run evaluate(&mut browser, "window.ready", String.view(&session)))) {
+    run require(!run expired(&started, 30000), "tree browser runtime did not become ready")
+    run sleep(20)
+  }
+  browser.timeoutMs = 1200000
+  let results = run evaluate(&mut browser, "window.runTrees([0,1,2,3,4,5,6,7],120000)", String.view(&session))
+  run require(!run errors(&browser, true), "tree browser reported page errors")
+  let samples = run items(&results)
+  run require(samples.length == 8, "tree browser did not return both formats for all four fixtures")
+  let names = ["card-list", "form", "inbox", "editor"]
+  let mut failed = false
+  let mut index: usize = 0
+  while index < samples.length {
+    let sample = &samples[index]
+    let fixture = run unsigned(run member(sample, "index"))
+    run require(fixture == index, "tree browser fixture order differs")
+    let width = run unsigned(run member(sample, "width"))
+    let height = run unsigned(run member(sample, "height"))
+    let cpu = run items(run member(sample, "cpu"))
+    let gpu = run items(run member(sample, "gpu"))
+    run require(width > 0 && height > 0 && cpu.length == gpu.length && cpu.length == width * height * 4, "tree fixture pixel sizes differ")
+    let mut maximum: usize = 0
+    let mut over: usize = 0
+    let mut sum: usize = 0
+    let mut worst: usize = 0
+    let mut channel: usize = 0
+    while channel < cpu.length {
+      let a = run unsigned(&cpu[channel])
+      let b = run unsigned(&gpu[channel])
+      let delta = if a > b { a - b } else { b - a }
+      if delta > maximum {
+        maximum = delta
+        worst = channel
+      }
+      if delta > 8 { over = over + 1 }
+      sum = sum + delta
+      channel = channel + 1
+    }
+    let mean = usize.toF64(sum) / usize.toF64(cpu.length)
+    let passed = maximum <= 96 && usize.toF64(over) / usize.toF64(cpu.length) <= 0.002 && mean <= 0.25
+    if !passed { failed = true }
+    let pixel = worst / 4
+    run report("{status} {name} ({target}, {width}x{height}): max delta {maximum} at {x},{y}, {over} of {channels} channels over 8, mean {mean:.4}\n", &.{
+      status: if passed { "PASS" } else { "FAIL" }, name: names[fixture % 4], target: if fixture < 4 { "rgba8" } else { "bgra8" },
+      width: width, height: height, maximum: maximum, x: pixel % width, y: pixel / width, over: over, channels: cpu.length, mean: mean,
+    })
+    index = index + 1
+  }
+  run require(!failed, "tree browser pixel comparison failed")
+}
+
+pub effect fn windowTest(wasm: string, options: WindowOptions<'_>) -> ()
+  ! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+  ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  run require(options.width > 0 && options.height > 0 && f64.isFinite(options.scale) && options.scale > 0.0, "invalid browser viewport or scale")
+  let display = run browserDisplay()
+  let outcome = run Effect.result(windowWithDisplay(wasm, &options, &display))
+  let cleanup = run Effect.result(closeDisplay(move display))
+  match move outcome { Result.Success { .. } => {} Result.Failure { error } => { fail move error } }
+  match move cleanup { Result.Success { .. } => {} Result.Failure { error } => { fail move error } }
+}
+effect fn windowWithDisplay(wasm: string, options: &WindowOptions<'_>, display: &Display) -> ()
+  ! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+  ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  let mut server = run start(wasm, false)
+  let outcome = run Effect.result(windowWithServer(&server, options, display))
+  let cleanup = run Effect.result(stop(&mut server))
+  match move outcome { Result.Success { .. } => {} Result.Failure { error } => { fail move error } }
+  match move cleanup { Result.Success { .. } => {} Result.Failure { error } => { fail move error } }
+}
+effect fn windowWithServer(server: &Server, options: &WindowOptions<'_>, display: &Display) -> ()
+  ! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+  ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  let mut browser = run launch(display, options.chromium)
+  let outcome = run Effect.result(window(&mut browser, String.view(&server.origin), options))
+  let cleanup = run Effect.result(close(&mut browser))
+  match move outcome { Result.Success { .. } => {} Result.Failure { error } => { fail move error } }
+  match move cleanup { Result.Success { .. } => {} Result.Failure { error } => { fail move error } }
+}
+effect fn viewport(browser: &mut Browser, session: string, options: &WindowOptions<'_>) -> ()
+  ! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+  ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  let mut parameters = object()
+  run put(&mut parameters, "width", integer(u32.toUsize(options.width)))
+  run put(&mut parameters, "height", integer(u32.toUsize(options.height)))
+  run put(&mut parameters, "deviceScaleFactor", number(options.scale))
+  run put(&mut parameters, "mobile", Value.Bool { value: false })
+  drop run command(&mut browser, session, "Emulation.setDeviceMetricsOverride", move parameters)
+}
+effect fn readyCanvas(browser: &mut Browser, session: string) -> ()
+  ! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+  ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  let started = run now()
+  while true {
+    let width = run evaluate(&mut browser, "document.querySelector('canvas')?.width", session)
+    match Json.asF64(Option<&Value>.some(&width)) { Option.Some { value } => { if value > 0.0 { return () } } Option.None => {} }
+    let state = run evaluate(&mut browser, "window.appResult", session)
+    if !isNull(&state) { return () }
+    run require(!run expired(&started, 120000), "window canvas did not become ready within 120 seconds")
+    run sleep(20)
+  }
+}
+effect fn window(browser: &mut Browser, origin: string, options: &WindowOptions<'_>) -> ()
+  ! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+  ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  let check = run page(&mut browser)
+  run viewport(&mut browser, String.view(&check), options)
+  List.clear(&mut browser.errors)
+  let mut checkUrl = run String.copy(origin)
+  run String.append(&mut checkUrl, "/?check")
+  run navigate(&mut browser, String.view(&check), String.view(&checkUrl))
+  let started = run now()
+  let mut result = run evaluate(&mut browser, "window.appResult", String.view(&check))
+  while isNull(&result) {
+    run require(!run expired(&started, 300000), "window rendering check did not finish within 300 seconds")
+    run sleep(20)
+    result = run evaluate(&mut browser, "window.appResult", String.view(&check))
+  }
+  let zero = match Json.asI32(Json.field(&result, "status")) { Option.Some { value } => value == 0 Option.None => false }
+  let checkErrors = run errors(&browser, false)
+  let mut failed = !zero || checkErrors
+  let description = run stringify(&result)
+  run report("{status} check: {result}\n", &.{ status: if failed { "FAIL" } else { "PASS" }, result: String.view(&description) })
+  // Closing this target prevents its late errors from contaminating the input watch.
+  let target = run command(&mut browser, String.view(&check), "Target.getTargetInfo", object())
+  let targetId = match Json.asString(Json.field(run member(&target, "targetInfo"), "targetId")) {
+    Option.Some { value } => value
+    Option.None => { fail TaskError { message: run String.copy("missing check page target id"), status: 1 } }
+  }
+  let mut closing = object()
+  run put(&mut closing, "targetId", run text(targetId))
+  drop run command(&mut browser, "", "Target.closeTarget", move closing)
+
+  let session = run page(&mut browser)
+  let sessionId = String.view(&session)
+  run viewport(&mut browser, sessionId, options)
+  List.clear(&mut browser.errors)
+  run navigate(&mut browser, sessionId, origin)
+  run readyCanvas(&mut browser, sessionId)
+  run sleep(1500)
+  let width = u32.toF64(options.width)
+  let height = u32.toF64(options.height)
+  let points = [[width * 0.3, height * 0.3], [width * 0.6, height * 0.5], [width * 0.5, height * 0.7]]
+  let mut x = 0.0
+  let mut y = 0.0
+  let mut index: usize = 0
+  while index < points.length {
+    let oldX = x
+    let oldY = y
+    let mut step: usize = 1
+    while step <= 4 {
+      x = oldX + (points[index][0] - oldX) * usize.toF64(step) / 4.0
+      y = oldY + (points[index][1] - oldY) * usize.toF64(step) / 4.0
+      run mouse(&mut browser, sessionId, "mouseMoved", x, y, false)
+      step = step + 1
+    }
+    run sleep(80)
+    index = index + 1
+  }
+  if options.click {
+    run mouse(&mut browser, sessionId, "mouseMoved", options.clickX, options.clickY, false)
+    run mouse(&mut browser, sessionId, "mousePressed", options.clickX, options.clickY, true)
+    run mouse(&mut browser, sessionId, "mouseReleased", options.clickX, options.clickY, true)
+    run sleep(300)
+  }
+  if options.typed != "" {
+    run typeText(&mut browser, sessionId, options.typed)
+    run sleep(300)
+  }
+  run mouse(&mut browser, sessionId, "mouseMoved", width * 0.5, height * 0.5, false)
+  run mouse(&mut browser, sessionId, "mouseWheel", width * 0.5, height * 0.5, false)
+  run sleep(800)
+  let state = run evaluate(&mut browser, "window.appResult", sessionId)
+  let inputErrors = run errors(&browser, false)
+  let inputFailed = nonemptyError(&state) || inputErrors
+  if nonemptyError(&state) {
+    let message = run stringify(&state)
+    run report("{error}\n", &.{ error: String.view(&message) })
+  }
+  run report("{status} input: pointer, click, keys and wheel with no errors\n", &.{ status: if inputFailed { "FAIL" } else { "PASS" } })
+  failed = failed || inputFailed
+  if options.screenshot != "" { run screenshot(&mut browser, sessionId, options.screenshot) }
+  if options.stored != "" {
+    let mut key = run String.copy("silk-app:")
+    run String.append(&mut key, options.stored)
+    let kept = run stored(&mut browser, sessionId, origin, String.view(&key), options.typed)
+    run report("{status} stored: {count} characters under {key}\n", &.{ status: if kept > 0 { "PASS" } else { "FAIL" }, count: kept, key: String.view(&key) })
+    failed = failed || kept == 0
+    List.clear(&mut browser.errors)
+    run reload(&mut browser, sessionId)
+    run readyCanvas(&mut browser, sessionId)
+    run sleep(1500)
+    let reloaded = run evaluate(&mut browser, "window.appResult", sessionId)
+    let reloadErrors = run errors(&browser, false)
+    let reloadFailed = nonemptyError(&reloaded) || reloadErrors
+    if nonemptyError(&reloaded) {
+      let message = run stringify(&reloaded)
+      run report("{error}\n", &.{ error: String.view(&message) })
+    }
+    run report("{status} reload: the app started from what it kept\n", &.{ status: if reloadFailed { "FAIL" } else { "PASS" } })
+    failed = failed || reloadFailed
+  }
+  run require(!failed, "window browser check failed")
+}
+
+effect fn loader(browser: &mut Browser, session: string) -> String
+  ! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+  ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  let response = run command(&mut browser, session, "Page.getFrameTree", object())
+  let tree = run member(&response, "frameTree")
+  let frame = run member(tree, "frame")
+  return match Json.asString(Json.field(frame, "loaderId")) {
+    Option.Some { value } => run String.copy(value)
+    Option.None => { fail TaskError { message: run String.copy("missing page loader id"), status: 1 } }
+  }
+}
+effect fn reload(browser: &mut Browser, session: string) -> ()
+  ! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+  ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  let previous = run loader(&mut browser, session)
+  drop run command(&mut browser, session, "Page.reload", object())
+  let started = run now()
+  while true {
+    let current = run loader(&mut browser, session)
+    if String.view(&current) != String.view(&previous) { return () }
+    run require(!run expired(&started, 120000), "window reload did not commit within 120 seconds")
+    run sleep(20)
+  }
+}
+
+effect fn mouse(browser: &mut Browser, session: string, kind: string, x: f64, y: f64, button: bool) -> ()
+  ! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+  ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  let mut parameters = object()
+  run put(&mut parameters, "type", run text(kind))
+  run put(&mut parameters, "x", number(x))
+  run put(&mut parameters, "y", number(y))
+  if button {
+    run put(&mut parameters, "button", run text("left"))
+    run put(&mut parameters, "buttons", integer(if kind == "mousePressed" { 1 } else { 0 }))
+    run put(&mut parameters, "clickCount", integer(1))
+  }
+  if kind == "mouseWheel" {
+    run put(&mut parameters, "deltaX", integer(0))
+    run put(&mut parameters, "deltaY", integer(400))
+  }
+  drop run command(&mut browser, session, "Input.dispatchMouseEvent", move parameters)
+}
+
+// US keyboard layout: keydown/text/keyup for mapped keys, Input.insertText for all others.
+effect fn typeText(browser: &mut Browser, session: string, typed: string) -> ()
+  ! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+  ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  let bytes = String.utf8Bytes(typed)
+  let mut offset: usize = 0
+  while offset < bytes.length {
+    let first = bytes[offset]
+    let size: usize = if first < 128 { 1 } else if first < 224 { 2 } else if first < 240 { 3 } else { 4 }
+    let character = String.slice(typed, offset, size)
+    let mut code = String.make()
+    let mut virtualKey: usize = 0
+    if (first >= 65 && first <= 90) || (first >= 97 && first <= 122) {
+      let upper = if first >= 97 { first - 32 } else { first }
+      code = run String.copy("Key")
+      run String.append(&mut code, unsafe String.fromUtf8Unchecked(&[upper]))
+      virtualKey = u8.toUsize(upper)
+    } else if first >= 48 && first <= 57 {
+      code = run String.copy("Digit")
+      run String.append(&mut code, character)
+      virtualKey = u8.toUsize(first)
+    } else {
+      let unshifted = b" `-=[]\\;',./"
+      let shifted = b" ~_+{}|:\"<>?"
+      let names = ["Space", "Backquote", "Minus", "Equal", "BracketLeft", "BracketRight", "Backslash", "Semicolon", "Quote", "Comma", "Period", "Slash"]
+      let keys: [usize; 12] = [32, 192, 189, 187, 219, 221, 220, 186, 222, 188, 190, 191]
+      let mut index: usize = 0
+      while index < unshifted.length {
+        if first == unshifted[index] || first == shifted[index] {
+          code = run String.copy(names[index])
+          virtualKey = keys[index]
+          break
+        }
+        index = index + 1
+      }
+      let symbols = b")!@#$%^&*("
+      index = 0
+      while index < symbols.length {
+        if first == symbols[index] {
+          code = run String.copy("Digit")
+          let digit = usize.toU8(index) + 48
+          run String.append(&mut code, unsafe String.fromUtf8Unchecked(&[digit]))
+          virtualKey = index + 48
+          break
+        }
+        index = index + 1
+      }
+      if first == 9 {
+        code = run String.copy("Tab")
+        virtualKey = 9
+      }
+      if first == 10 || first == 13 {
+        code = run String.copy("Enter")
+        virtualKey = 13
+      }
+    }
+    if virtualKey == 0 {
+      run sleep(30)
+      let mut parameters = object()
+      run put(&mut parameters, "text", run text(character))
+      drop run command(&mut browser, session, "Input.insertText", move parameters)
+    } else {
+      let mut key: string = character
+      let mut entered: string = character
+      if virtualKey == 13 { key = "Enter" entered = "\r" }
+      else if virtualKey == 9 { key = "Tab" entered = "" }
+      let mut down = object()
+      run put(&mut down, "type", run text(if entered == "" { "rawKeyDown" } else { "keyDown" }))
+      run put(&mut down, "key", run text(key))
+      run put(&mut down, "code", run text(String.view(&code)))
+      run put(&mut down, "windowsVirtualKeyCode", integer(virtualKey))
+      run put(&mut down, "text", run text(entered))
+      run put(&mut down, "unmodifiedText", run text(entered))
+      drop run command(&mut browser, session, "Input.dispatchKeyEvent", move down)
+      run sleep(30)
+      let mut up = object()
+      run put(&mut up, "type", run text("keyUp"))
+      run put(&mut up, "key", run text(key))
+      run put(&mut up, "code", run text(String.view(&code)))
+      run put(&mut up, "windowsVirtualKeyCode", integer(virtualKey))
+      drop run command(&mut browser, session, "Input.dispatchKeyEvent", move up)
+    }
+    offset = offset + size
+  }
+}
+
+effect fn screenshot(browser: &mut Browser, session: string, filename: string) -> ()
+  ! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+  ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  let mut parameters = object()
+  run put(&mut parameters, "format", run text(if String.endsWith(filename, ".jpg") || String.endsWith(filename, ".jpeg") { "jpeg" } else { "png" }))
+  run put(&mut parameters, "fromSurface", Value.Bool { value: true })
+  run put(&mut parameters, "captureBeyondViewport", Value.Bool { value: false })
+  let response = run command(&mut browser, session, "Page.captureScreenshot", move parameters)
+  let encoded = match Json.asString(Json.field(&response, "data")) {
+    Option.Some { value } => String.utf8Bytes(value)
+    Option.None => { fail TaskError { message: run String.copy("missing screenshot bytes"), status: 1 } }
+  }
+  let length = match Base64.decodedLength(encoded) {
+    Result.Success { value } => value
+    Result.Failure { .. } => { fail TaskError { message: run String.copy("invalid screenshot base64"), status: 1 } }
+  }
+  let mut output = List<u8>.make()
+  run List.appendRepeated(&mut output, 0, length)
+  match Base64.decodeInto(List.asMutSlice(&mut output), encoded) {
+    Result.Success { .. } => {}
+    Result.Failure { .. } => { fail TaskError { message: run String.copy("invalid screenshot base64"), status: 1 } }
+  }
+  let path = run inputPath(filename)
+  match move (run Path.parent(&path)) {
+    Option.Some { value } => run FileSystem.createDirectoriesRecursively(&value)
+    Option.None => {}
+  }
+  run FileSystem.writeFile(&path, List.asSlice(&output))
+}
+
+effect fn stored(browser: &mut Browser, session: string, origin: string, key: string, typed: string) -> usize
+  ! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+  ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  drop run command(&mut browser, session, "DOMStorage.enable", object())
+  let mut storageId = object()
+  run put(&mut storageId, "securityOrigin", run text(origin))
+  run put(&mut storageId, "isLocalStorage", Value.Bool { value: true })
+  let mut parameters = object()
+  run put(&mut parameters, "storageId", move storageId)
+  let started = run now()
+  while true {
+    let response = run send(&mut browser, "DOMStorage.getDOMStorageItems", &parameters, session)
+    let entries = run items(run member(&response, "entries"))
+    let mut index: usize = 0
+    while index < entries.length {
+      let pair = run items(&entries[index])
+      run require(pair.length == 2, "invalid browser localStorage entry")
+      let found = match Json.asString(Option<&Value>.some(&pair[0])) { Option.Some { value } => value Option.None => "" }
+      let value = match Json.asString(Option<&Value>.some(&pair[1])) { Option.Some { value } => value Option.None => "" }
+      if found == key && value != "" && (typed == "" || String.contains(value, typed)) { return utf16Length(value) }
+      index = index + 1
+    }
+    if run expired(&started, 10000) { return 0 }
+    run sleep(100)
+  }
+}
+fn utf16Length(text: string) -> usize {
+  let bytes = String.utf8Bytes(text)
+  let mut length: usize = 0
+  let mut index: usize = 0
+  while index < bytes.length {
+    let value = bytes[index]
+    if value < 128 || value >= 192 { length = length + 1 }
+    if value >= 240 { length = length + 1 }
+    index = index + 1
+  }
+  return length
+}

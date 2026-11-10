@@ -1,0 +1,263 @@
+static if Intrinsic.targetOperatingSystem() == "darwin" || Intrinsic.targetOperatingSystem() == "linux" {
+import silk.cli.task { Task, TaskError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Drop }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.text.string { String }
+import silk.num.isize
+import silk.num.u8
+import silk.num.i32
+import silk.num.usize
+import task_support { rootPath, pathText, text, environment, require }
+import task_native_process { start, finish, poll, pause, milliseconds, noSignalFlag }
+import task_native_display { decimal }
+
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  extern "C" struct Address { length: u8, family: u8, port: u16, address: u32, zero: [u8; 8] }
+} else {
+  extern "C" struct Address { family: u16, port: u16, address: u32, zero: [u8; 8] }
+}
+extern "C" struct SockAddrStorage { words: [u64; 16] }
+unsafe extern "C" fn socket(domain: i32, kind: i32, protocol: i32) -> i32
+@foreign(noCapture: .("address"))
+unsafe extern "C" fn bind(fd: i32, address: ?[*]const u8, length: u32) -> i32
+unsafe extern "C" fn listen(fd: i32, backlog: i32) -> i32
+@foreign(noCapture: ("address", "length"))
+unsafe extern "C" fn accept(fd: i32, address: *mut SockAddrStorage, length: *mut u32) -> i32
+unsafe extern "C" fn close(fd: i32) -> i32
+@foreign(noCapture: .("value"))
+unsafe extern "C" fn setsockopt(fd: i32, level: i32, name: i32, value: ?[*]const u8, length: u32) -> i32
+@foreign(noCapture: .("buffer"))
+unsafe extern "C" fn recv(fd: i32, buffer: ?[*]mut u8, length: usize, flags: i32) -> isize
+@foreign(noCapture: .("buffer"))
+unsafe extern "C" fn send(fd: i32, buffer: ?[*]const u8, length: usize, flags: i32) -> isize
+struct Socket { fd: i32 }
+impl Drop for Socket { fn drop(self: &mut Self) -> () { let _closed = unsafe close(self.fd) } }
+
+fn sendAll(fd: i32, bytes: &[u8]) -> bool {
+  let mut offset: usize = 0
+  while offset < bytes.length {
+    let part = Slice.view(bytes, offset, bytes.length - offset)
+    let count = unsafe send(fd, Pointer.fromSlice(part), part.length, noSignalFlag())
+    if count <= 0 { return false }
+    offset = offset + isize.toUsize(count)
+  }
+  return true
+}
+fn hex(byte: u8) -> i32 {
+  if byte >= 48 && byte <= 57 { return u8.toI32(byte - 48) }
+  if byte >= 65 && byte <= 70 { return u8.toI32(byte - 65) + 10 }
+  if byte >= 97 && byte <= 102 { return u8.toI32(byte - 97) + 10 }
+  return -1
+}
+
+fn dotSegment(bytes: &[u8]) -> usize {
+  let mut at: usize = 0
+  let mut dots: usize = 0
+  while at < bytes.length {
+    if bytes[at] == 46 { at = at + 1 }
+    else if at + 2 < bytes.length && bytes[at] == 37 && bytes[at + 1] == 50 && (bytes[at + 2] == 69 || bytes[at + 2] == 101) { at = at + 3 }
+    else { return 0 }
+    dots = dots + 1
+  }
+  return if dots <= 2 { dots } else { 0 }
+}
+
+effect fn decoded(target: string) -> String ! TaskError | OutOfMemoryError ? &mut Allocator {
+  let raw = String.utf8Bytes(target)
+  let mut start: usize = 0
+  if String.startsWith(target, "http://") { start = 7 }
+  else if String.startsWith(target, "https://") { start = 8 }
+  else if String.startsWith(target, "//") { start = 2 }
+  if start != 0 {
+    while start < raw.length && raw[start] != 47 && raw[start] != 92 && raw[start] != 63 && raw[start] != 35 { start = start + 1 }
+  }
+  let mut end = start
+  while end < raw.length && raw[end] != 63 && raw[end] != 35 { end = end + 1 }
+  let mut parts = List<&[u8]>.make()
+  let mut at = start
+  while at < end {
+    while at < end && (raw[at] == 47 || raw[at] == 92) { at = at + 1 }
+    let from = at
+    while at < end && raw[at] != 47 && raw[at] != 92 { at = at + 1 }
+    let part = Slice.view(raw, from, at - from)
+    let dots = dotSegment(part)
+    if dots == 2 { let _removed = parts.pop() }
+    else if dots != 1 && part.length != 0 { run parts.append(part) }
+  }
+  let mut bytes = Bytes.make()
+  run Bytes.append(&mut bytes, b"/")
+  let segments = parts.asSlice()
+  let mut segment: usize = 0
+  while segment < segments.length {
+    if segment != 0 { run Bytes.append(&mut bytes, b"/") }
+    let source = segments[segment]
+    at = 0
+    while at < source.length {
+      if source[at] == 37 {
+        run require(at + 2 < source.length, "Invalid percent escape")
+        let high = hex(source[at + 1])
+        let low = hex(source[at + 2])
+        run require(high >= 0 && low >= 0, "Invalid percent escape")
+        let one = [i32.toU8(high * 16 + low)]
+        run Bytes.append(&mut bytes, &one)
+        at = at + 3
+      } else {
+        let one = [source[at]]
+        run Bytes.append(&mut bytes, &one)
+        at = at + 1
+      }
+    }
+    segment = segment + 1
+  }
+  return run text(Bytes.asSlice(&bytes))
+}
+
+effect fn response(fd: i32, target: string, head: bool) -> ()
+! TaskError | FileError | HostInputError | OutOfMemoryError
+? &mut HostInput | &mut Allocator | &mut FileSystem {
+  let photos = run rootPath("modules/assets/assets/photos")
+  let path = run decoded(target)
+  let mut relative = run String.copy(".")
+  run String.append(&mut relative, String.view(&path))
+  let file = run Path.resolve(&photos, String.view(&relative))
+  let mut prefix = run String.copy(pathText(&photos))
+  run String.append(&mut prefix, "/")
+  if !String.startsWith(pathText(&file), String.view(&prefix)) {
+    let _sent = sendAll(fd, b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+    return ()
+  }
+  let loaded = run Effect.result(FileSystem.readFile(&file))
+  let bytes = match move loaded {
+    Result<Bytes, FileError | OutOfMemoryError>.Success {value} => move value
+    Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => {
+      match move error {
+        FileError failure => {
+          if failure.reason.code == FileSystem.notFound().code {
+            let _sent = sendAll(fd, b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            return ()
+          }
+          fail move failure
+        }
+        OutOfMemoryError failure => { fail move failure }
+      }
+    }
+  }
+  let length = run decimal(Bytes.length(&bytes))
+  let mut headers = run String.copy("HTTP/1.1 200 OK\r\nContent-Type: ")
+  run String.append(&mut headers, if String.endsWith(pathText(&file), ".png") { "image/png" } else { "image/jpeg" })
+  run String.append(&mut headers, "\r\nContent-Length: ")
+  run String.append(&mut headers, String.view(&length))
+  run String.append(&mut headers, "\r\nConnection: close\r\n\r\n")
+  if sendAll(fd, String.utf8Bytes(String.view(&headers))) && !head { let _sent = sendAll(fd, Bytes.asSlice(&bytes)) }
+}
+
+fn loopbackAddress() -> Address {
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    return Address {length: 16, family: 2, port: 5998, address: 16777343, zero: [0; 8]}
+  } else {
+    return Address {family: 2, port: 5998, address: 16777343, zero: [0; 8]}
+  }
+}
+
+pub effect fn httpFixture() -> ()
+! TaskError | FileError | HostInputError | OutOfMemoryError
+? &mut HostInput | &mut Allocator | &mut FileSystem {
+  let server = Socket {fd: unsafe socket(2, 1, 0)}
+  run require(server.fd >= 0, "Cannot create HTTP fixture socket")
+  let enabled: i32 = 1
+  let enabledBytes = unsafe Pointer.bytes<i32>(Pointer.fromRef(&enabled))
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    let _reuse = unsafe setsockopt(server.fd, 65535, 4, enabledBytes, 4)
+  } else {
+    let _reuse = unsafe setsockopt(server.fd, 1, 2, enabledBytes, 4)
+  }
+  let address = loopbackAddress()
+  let addressBytes = unsafe Pointer.bytes<Address>(Pointer.fromRef(&address))
+  run require(unsafe bind(server.fd, addressBytes, 16) == 0, "Cannot bind HTTP fixture 127.0.0.1:28183")
+  run require(unsafe listen(server.fd, 128) == 0, "Cannot listen on HTTP fixture socket")
+  let marker = run rootPath(".cache/ui-http-ready")
+  run FileSystem.writeFileWithParents(&marker, b"ready")
+  while true {
+    let mut peer = SockAddrStorage {words: [0; 16]}
+    let mut peerLength: u32 = 128
+    let client = Socket {fd: unsafe accept(server.fd, Pointer.fromMutRef(&mut peer), Pointer.fromMutRef(&mut peerLength))}
+    run require(client.fd >= 0, "HTTP fixture accept failed")
+    static if Intrinsic.targetOperatingSystem() == "darwin" { let _configured = unsafe setsockopt(client.fd, 65535, 4130, enabledBytes, 4) }
+    let mut request = Bytes.make()
+    let mut buffer: [u8; 4096] = [0; 4096]
+    let mut complete = false
+    while Bytes.length(&request) < 65536 {
+      let count = unsafe recv(client.fd, Pointer.fromMutSlice(&mut buffer), 4096, 0)
+      if count <= 0 { break }
+      run Bytes.append(&mut request, Slice.view(&buffer, 0, isize.toUsize(count)))
+      let bytes = Bytes.asSlice(&request)
+      let mut at: usize = 0
+      while at + 3 < bytes.length {
+        if bytes[at] == 13 && bytes[at + 1] == 10 && bytes[at + 2] == 13 && bytes[at + 3] == 10 {
+          complete = true
+          break
+        }
+        at = at + 1
+      }
+      if complete { break }
+    }
+    if !complete { continue }
+    let bytes = Bytes.asSlice(&request)
+    let mut first: usize = 0
+    while first < bytes.length && bytes[first] != 32 { first = first + 1 }
+    let mut end = first + 1
+    while end < bytes.length && bytes[end] != 32 { end = end + 1 }
+    if first >= bytes.length || end >= bytes.length { continue }
+    let target = run text(Slice.view(bytes, first + 1, end - first - 1))
+    let head = first == 4 && bytes[0] == 72 && bytes[1] == 69 && bytes[2] == 65 && bytes[3] == 68
+    let result = run Effect.result(response(client.fd, String.view(&target), head))
+    if let Result<(), TaskError | FileError | HostInputError | OutOfMemoryError>.Failure {error: _error} = move result {
+      let _sent = sendAll(client.fd, b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+    }
+  }
+}
+
+pub effect fn httpCheck(compiler: string, clang: string) -> ()
+! TaskError | FileError | HostInputError | OutOfMemoryError
+? &mut HostInput | &mut Allocator | &mut FileSystem {
+  let marker = run rootPath(".cache/ui-http-ready")
+  if run FileSystem.exists(&marker) { run FileSystem.removeFile(&marker) }
+  let executable = match move run HostInput.argument(0) {
+    Option<Bytes>.Some {value} => run text(Bytes.asSlice(&value))
+    Option<Bytes>.None => run Task.abort("Missing task executable path")
+  }
+  let mut fixture = run start(String.view(&executable), &["http-fixture"], &[], false, false, false)
+  let deadline = milliseconds() + 10000
+  while !run FileSystem.exists(&marker) {
+    if run poll(&mut fixture) { run Task.abort("HTTP fixture exited before listening") }
+    if milliseconds() >= deadline { run Task.abort("Timed out starting HTTP fixture") }
+    pause()
+  }
+  run FileSystem.removeFile(&marker)
+  let selected = if compiler == "" { run environment("SILK_COMPILER") } else { run String.copy(compiler) }
+  run require(String.view(&selected) != "", "SILK_COMPILER is not set")
+  let manifest = run rootPath("modules/app/window/tests/silk.toml")
+  let mut arguments = List<string>.make()
+  run arguments.append("test")
+  run arguments.append("--manifest-path")
+  run arguments.append(pathText(&manifest))
+  run arguments.append("--root")
+  run arguments.append("src/http.silk")
+  if clang != "" {
+    run arguments.append("--clang")
+    run arguments.append(clang)
+  }
+  let mut child = run start(String.view(&selected), arguments.asSlice(), &[], false, false, false)
+  let outcome = run finish(&mut child, 1200000)
+  if outcome.code != 0 { fail TaskError {message: run String.copy("HTTP image tests failed"), status: outcome.code} }
+}
+}

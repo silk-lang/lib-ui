@@ -17,10 +17,10 @@ in seconds relative to host startup. `frame`, `scene`, and `draw` support custom
 composition. The host publishes accessibility geometry after client layout settles.
 
 The [direct-tree counter](demo/src/main.silk) is a complete example with no app or
-component framework dependency. From the repository root, with Node 22+:
+component framework dependency. From the repository root:
 
-    node modules/tree/window/demo/run
-    node modules/tree/window/demo/run --check
+    silk task native demo modules/tree/window/demo
+    silk task native demo modules/tree/window/demo -- --check
 
 The check dispatches a click and Tab through the real input path, verifies the
 updated text, and compares GPU output with the CPU reference. `--debug` builds a
@@ -34,18 +34,22 @@ The same host runs in a browser tab: a wasm32 build of the program draws on a ca
 `navigator.gpu`, with modules/platform/window's browser backend for input and the input method.
 From the repository root:
 
-    node modules/tree/window/scripts/browser serve                       # the owned counter
-    node modules/tree/window/scripts/browser serve /path/to/app/package
-    node modules/tree/window/scripts/browser test modules/tree/window/demo -- --size 400,250 --click 90,35
-    node modules/tree/window/browser/serve.mjs /path/to/compiled-app.wasm
-    node modules/tree/window/browser/test.mjs --wasm /path/to/compiled-app.wasm --stored notes
+    silk task browser serve                       # the owned counter
+    silk task browser serve --package /path/to/app/package
+    silk task browser test --package modules/tree/window/demo --size 400,250 --click 90,35
+    silk task browser build --package /path/to/app/package
+    silk task browser test --package /path/to/app/package --stored notes
 
-`serve` builds the package for `wasm32-unknown-unknown` (release unless `--debug`) and prints
-the page's address, by default http://127.0.0.1:8050/. It needs WebGPU and WebAssembly JSPI:
-Chrome or Edge 137 or later. The server reads the module on each request, so after
-`scripts/browser build` a reload shows the new build. Add `?check` to the address for the
-rendering check of `--check`. `test` runs that check and then real input in the installed
-Chromium (see [browser/test.mjs](browser/test.mjs) for its options).
+`silk task browser serve` builds the package for `wasm32-unknown-unknown` (release unless `--debug`) and prints
+the page's address, by default http://127.0.0.1:8050/ (`--port` changes it). It needs WebGPU and
+WebAssembly JSPI: Chrome or Edge 137 or later. The server reads the module on each request, so after
+`silk task browser build` a reload shows the new build. Add `?check` to the address for the
+rendering check of `--check`. `test` runs that check and then real input in installed
+Chromium. Its options are `--click X,Y`, `--type TEXT`, `--size WIDTH,HEIGHT`, `--scale N`,
+`--screenshot FILE`, and `--stored KEY`; `CHROMIUM_EXECUTABLE` selects a browser.
+The host automation is Silk, while browser runtime modules remain JavaScript. Managed browser
+tests require Darwin or Linux until [Silk #3034](https://github.com/silk-lang/silk/issues/3034)
+adds the Windows subprocess capability; building and serving do not have that limitation.
 
 How it differs from a native window:
 
@@ -62,9 +66,9 @@ How it differs from a native window:
   `browser.stored(key)` reads it back on the next visit (both do nothing natively). The page
   puts `silk-app:` before each key, and gives the app no storage in check mode, so a check
   always starts from nothing.
-- **An 8 MiB stack.** The compiler links wasm with a 1 MiB stack, which deep layouts overflow
-  (the trap reads "memory access out of bounds"), so `scripts/browser` links through a clang
-  wrapper that asks for 8 MiB on POSIX; Windows retains the compiler's default.
+- **An 8 MiB stack.** Browser tasks set the compiler's declarative `stackSize` profile input to
+  `8MiB` on every platform. No clang or shell wrapper is generated. The compiler's default 1 MiB
+  stack is too small for deep layouts, which otherwise trap with "memory access out of bounds".
 - **`main` takes no arguments.** Read `browser.checkRequested()` for `?check`, and print with
   `console.StderrWriter`: standard error natively, the browser console in the page.
 - **Two modules in the program's own package.** A dependency exports no wasm symbols, so the
@@ -79,7 +83,7 @@ imports, and call `runApp({ wasm, container })`.
 
 The server resolves native payloads from `$SILK_HOME/git/<revision>`, as declared in the UI
 manifests. No sibling source checkout is required. See the root README for stable virtual URL
-prefixes and the public payload contract. `node scripts/generate-browser-exports.mjs`
+prefixes and the public payload contract. `silk task generate-browser-exports`
 refreshes the two owned export modules; `--check` compares them with the pinned template.
 
 ## Background images

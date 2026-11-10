@@ -1,0 +1,254 @@
+import silk.cli.task { Task, TaskError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.io.writer { WriterError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.box { Box }
+import silk.platform.windows.path { WindowsPath }
+import silk.system.child_process { ChildProcess, ProcessError }
+import silk.system.filesystem { DirectoryEntry, FileError, FileSystem, Path }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.text.string { InvalidUtf8, String }
+import silk.toml.scanner { TomlError }
+import silk.toml.value { Toml, TomlChild, Value }
+import silk.num.u8
+import silk.num.usize
+
+const HOST_OS: string = Intrinsic.targetOperatingSystem()
+const HOST_ARCH: string = Intrinsic.targetArchitecture()
+
+pub fn pathText(path: &Path) -> string {
+  return Path.view(path) |> Option<string>.unwrapOr("")
+}
+
+pub effect fn require(condition: bool, message: string) -> ()
+  ! TaskError | OutOfMemoryError ? &mut Allocator {
+  if !condition { run Task.abort(message) }
+}
+
+// Absolute paths name themselves; relative ones resolve from the project root.
+pub effect fn rootPath(value: string) -> Path
+  ! TaskError | FileError | HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
+  if String.startsWith(value, "/") { return run Path.make(value) }
+  let root = run Task.root()
+  return run Path.resolve(&root, value)
+}
+
+pub effect fn readToml(path: &Path) -> Value
+  ! TaskError | FileError | OutOfMemoryError ? &mut Allocator | &mut FileSystem {
+  let bytes = run FileSystem.readFile(path)
+  return match move run Effect.result(Toml.parse(Bytes.asSlice(&bytes))) {
+    Result<Value, TomlError | OutOfMemoryError>.Success { value } => move value
+    Result<Value, TomlError | OutOfMemoryError>.Failure { error } => match move error {
+      OutOfMemoryError failure => { fail move failure }
+      TomlError failure => {
+        drop failure
+        run Task.abort("Invalid TOML manifest")
+      }
+    }
+  }
+}
+
+pub effect fn text(bytes: &[u8]) -> String ! TaskError | OutOfMemoryError ? &mut Allocator {
+  return match String.fromUtf8(bytes) {
+    Result<string, InvalidUtf8>.Success { value } => run String.copy(value)
+    Result<string, InvalidUtf8>.Failure { .. } => run Task.abort("Expected UTF-8 text")
+  }
+}
+
+pub effect fn environment(name: string) -> String
+  ! TaskError | HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
+  return match move run HostInput.variableNamed(name) {
+    Option<Bytes>.Some { value } => run text(Bytes.asSlice(&value))
+    Option<Bytes>.None => run String.copy("")
+  }
+}
+
+pub effect fn hostPath(value: string) -> Path
+  ! FileError | OutOfMemoryError ? &mut Allocator {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    return run WindowsPath.fromNative(value)
+  } else { return run Path.make(value) }
+}
+
+// Match every dependency declaration, including target/profile-specific tables.
+effect fn revisions(value: &Value, url: string, revision: &mut String) -> ()
+  ! TaskError | OutOfMemoryError ? &mut Allocator {
+  let git = Toml.field(value, "git") |> Toml.asString |> Option<string>.unwrapOr("")
+  if git == url {
+    let pin = Toml.field(value, "rev") |> Toml.asString |> Option<string>.unwrapOr("")
+    let bytes = String.utf8Bytes(pin)
+    run require(bytes.length == 40, "Dependency must have an exact 40-character Git revision")
+    let mut at: usize = 0
+    while at < bytes.length {
+      let ch = bytes[at]
+      run require((ch >= 48 && ch <= 57) || (ch >= 97 && ch <= 102), "Invalid Git revision")
+      at = at + 1
+    }
+    run require(String.view(&revision) == "" || String.view(&revision) == pin, "Conflicting dependency Git revisions")
+    if String.view(&revision) == "" { revision.* = run String.copy(pin) }
+  }
+  match &value.* {
+    Value.Table { entries, kind: _ } => {
+      let boxed = Box<List<TomlChild>>.get(&entries)
+      let children = List<TomlChild>.asSlice(&boxed[0])
+      let mut at: usize = 0
+      while at < children.length {
+        match &children[at] {
+          TomlChild.Member { entry } => run revisions(&entry.value, url, &mut revision)
+          _ => {}
+        }
+        at = at + 1
+      }
+    }
+    Value.Array { values, tables: _ } => {
+      let boxed = Box<List<TomlChild>>.get(&values)
+      let children = List<TomlChild>.asSlice(&boxed[0])
+      let mut at: usize = 0
+      while at < children.length {
+        match &children[at] {
+          TomlChild.Item { value: child } => run revisions(&child, url, &mut revision)
+          _ => {}
+        }
+        at = at + 1
+      }
+    }
+    _ => {}
+  }
+}
+
+effect fn scanManifests(directory: &Path, url: string, revision: &mut String) -> ()
+  ! TaskError | FileError | OutOfMemoryError ? &mut Allocator | &mut FileSystem {
+  let entries = run FileSystem.listDirectory(directory)
+  let items = List<DirectoryEntry>.asSlice(&entries)
+  let mut at: usize = 0
+  while at < items.length {
+    let item = &items[at]
+    let name = Path.name(&item.path) |> Option<string>.unwrapOr("")
+    if item.kind.code == 1 && name != "build" && name != ".cache" && name != ".git" {
+      run scanManifests(&item.path, url, &mut revision)
+    } else if item.kind.code == 0 && name == "silk.toml" {
+      let document = run readToml(&item.path)
+      run revisions(&document, url, &mut revision)
+    }
+    at = at + 1
+  }
+}
+
+pub effect fn repositoryRoot(name: string) -> Path
+  ! TaskError | FileError | HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator | &mut FileSystem {
+  run require(String.startsWith(name, "lib-"), "Expected a lib-prefixed dependency")
+  let mut url = run String.copy("https://github.com/silk-lang/")
+  run String.append(&mut url, name)
+  run String.append(&mut url, ".git")
+  let modules = run rootPath("modules")
+  let mut revision = String.make()
+  run scanManifests(&modules, String.view(&url), &mut revision)
+  run require(String.view(&revision) != "", "No pinned revision for dependency")
+  let mut home = run environment("SILK_HOME")
+  if String.view(&home) == "" {
+    home = run environment(if HOST_OS == "windows" { "USERPROFILE" } else { "HOME" })
+    run require(String.view(&home) != "", "HOME or SILK_HOME must be set")
+    run String.append(&mut home, "/.silk")
+  }
+  let base = run hostPath(String.view(&home))
+  let git = run Path.join(&base, "git")
+  let checkout = run Path.join(&git, String.view(&revision))
+  let manifest = run Path.join(&checkout, "silk.toml")
+  run require(run FileSystem.exists(&manifest), "Missing pinned dependency; run silk check --manifest-path modules/tree/window/silk.toml")
+  return move checkout
+}
+
+pub effect fn build(packagePath: string, release: bool, wasm: bool) -> String
+  ! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+  ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  let root = run Task.root()
+  let written = if String.startsWith(packagePath, "/") { run Path.make(packagePath) }
+    else { run Path.resolve(&root, packagePath) }
+  let manifest = if String.endsWith(packagePath, ".toml") {
+    run Path.fromBytes(Path.rawBytes(&written))
+  } else { run Path.join(&written, "silk.toml") }
+  let package = match move run Path.parent(&manifest) {
+    Option<Path>.Some { value } => move value
+    Option<Path>.None => run Task.abort("Package manifest has no parent")
+  }
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    if !wasm {
+      run Task.silk(&["check", "--manifest-path", pathText(&manifest)])
+      run nativeTask(&["prepare-windows"])
+    }
+  }
+  if wasm {
+    let profile = if release {
+      "{\"target\":\"wasm32-unknown-unknown\",\"optimization\":\"speed\",\"debug\":false,\"stackSize\":\"8MiB\"}"
+    } else {
+      "{\"target\":\"wasm32-unknown-unknown\",\"optimization\":\"none\",\"debug\":true,\"stackSize\":\"8MiB\"}"
+    }
+    run Task.silk(&["build", "--manifest-path", pathText(&manifest), "--profile-input", profile])
+  } else if release {
+    run Task.silk(&["build", "--manifest-path", pathText(&manifest), "--release"])
+  } else {
+    run Task.silk(&["build", "--manifest-path", pathText(&manifest)])
+  }
+  let document = run readToml(&manifest)
+  let name = Toml.field(&document, "package") |> Toml.fieldAt("name") |> Toml.asString |> Option<string>.unwrapOr("")
+  run require(name != "", "Package manifest has no name")
+  let mut workspace = run Path.fromBytes(Path.rawBytes(&package))
+  let mut ancestor = run Path.fromBytes(Path.rawBytes(&package))
+  while true {
+    let candidate = run Path.join(&ancestor, "silk.toml")
+    if run FileSystem.exists(&candidate) {
+      let parentManifest = run readToml(&candidate)
+      if Toml.field(&parentManifest, "workspace").isSome() {
+        workspace = run Path.fromBytes(Path.rawBytes(&ancestor))
+        break
+      }
+    }
+    match move run Path.parent(&ancestor) {
+      Option<Path>.Some { value } => { ancestor = move value }
+      Option<Path>.None => { break }
+    }
+  }
+  let base = run Path.join(&workspace, "build/llvm")
+  let target = if wasm { "wasm32-unknown-unknown" }
+    else if HOST_OS == "darwin" {
+      if HOST_ARCH == "aarch64" { "aarch64-apple-darwin" } else { "x86_64-apple-darwin" }
+    } else if HOST_OS == "windows" { "x86_64-pc-windows-msvc" }
+    else { if HOST_ARCH == "aarch64" { "aarch64-unknown-linux-gnu" } else { "x86_64-unknown-linux-gnu" } }
+  let targetRoot = run Path.join(&base, target)
+  let profileRoot = run Path.join(&targetRoot, if release { "release" } else { "debug" })
+  let mut filename = run String.copy(name)
+  static if Intrinsic.targetOperatingSystem() == "windows" { if !wasm { run String.append(&mut filename, ".exe") } }
+  let binary = run Path.join(&profileRoot, String.view(&filename))
+  run require(run FileSystem.exists(&binary), "Compiler output was not found at the expected target/profile path")
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    if !wasm { run nativeTask(&["prepare-windows", "--runtime-directory", pathText(&profileRoot)]) }
+  }
+  return run String.copy(pathText(&binary))
+}
+
+pub effect fn nativeTask(arguments: &[string]) -> ()
+  ! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+  ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  let native = run repositoryRoot("lib-native")
+  let manifest = run Path.join(&native, "silk.toml")
+  let mut words = List<string>.make()
+  run List<string>.appendSlice(&mut words, &["task", "--manifest-path", pathText(&manifest)])
+  run List<string>.appendSlice(&mut words, arguments)
+  run Task.silk(List<string>.asSlice(&words))
+}
+
+pub effect fn setupCi(browser: bool, linuxGpu: bool) -> ()
+  ! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+  ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  run Task.silk(&["check", "--manifest-path", "modules/tree/window/silk.toml"])
+  let mut words = List<string>.make()
+  run List<string>.append(&mut words, "setup-ci")
+  if browser { run List<string>.append(&mut words, "--browser") }
+  if linuxGpu { run List<string>.append(&mut words, "--linux-gpu") }
+  run nativeTask(List<string>.asSlice(&words))
+}

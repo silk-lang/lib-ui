@@ -169,7 +169,7 @@ tree, viewport, "Add")` finds a node by test id, label or text and clicks its ce
 name ("the Save button"), `typeText` types into the focused input, and `clickAt`, `drag`,
 `hover`, `moveTo` and `wheel` drive the pointer; `snapshot` returns the `describe` text. The tests
 check counts and stats with these, and `modules/app/tests` renders golden scenes (`describe` text and
-PNG) for the counter and the todo list. `modules/app/demo/scripts/demo check` runs the todo list in a
+PNG) for the counter and the todo list. `silk task native demo modules/app/demo -- check` runs the todo list in a
 real window on X11 and Wayland, clicks Add and compares a frame.
 
 ## Limits

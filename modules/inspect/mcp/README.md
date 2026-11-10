@@ -93,7 +93,7 @@ accepted and ignored. Calls are answered one at a time, in order.
 
 ```sh
 silk test --manifest-path modules/inspect/server/tests/silk.toml --root src/tests.silk
-node modules/tree/demo/scripts/demo mcp     # an MCP client drives the demo in a window
+silk task native mcp       # an MCP client drives the demo in a window
 ```
 
 - `mcpToolsDriveTheTree`: the bridge over the inbox fixture, with `Protocol.handle` in place of
