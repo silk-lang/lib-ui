@@ -24,6 +24,7 @@ import ui_tree.mutation {
   LISTEN_KEY_DOWN
 }
 import ui_tree.node { Event, EventKind, FrameInput }
+import ui_tree.input { Input }
 import ui_tree.virtual_list { VirtualItem, VirtualRange }
 import ui_tree.inspect { NodeInfo, info }
 import ui_tree.engine { UiTree, TreeError }
@@ -77,6 +78,7 @@ pub struct Runtime<A, M, C> {
   head: usize,
   batch: List<Mutation>,
   records: List<Event>,
+  prevented: bool,
   path: List<Identity>,
   timers: List<Timer>,
   animating: bool,
@@ -111,6 +113,7 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
       head: 0,
       batch: List<Mutation>.make(),
       records: List<Event>.make(),
+      prevented: false,
       path: List<Identity>.make(),
       timers: List<Timer>.make(),
       animating: false,
@@ -414,6 +417,14 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
     }
   }
 
+  /// Whether a handler prevented a default action since the last call. A host that feeds
+  /// input in two steps (`tree.begin`, `pump`, `tree.finish`) hands this to `finish`.
+  pub fn takePrevented(self: &mut Self) -> bool {
+    let value = self.prevented
+    self.prevented = false
+    return value
+  }
+
   /// Dispatches `record` through the view: the messages its handlers send join the queue.
   /// A record whose path names a node that is gone (a later record of a batch whose earlier
   /// ones changed the view) is dropped.
@@ -444,6 +455,9 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
     App<M, C>.view(&self.model, &mut self.ui)
     let before = self.queue.length()
     run self.ui.endDispatch(&mut self.queue)
+    if self.ui.takePrevented() {
+      self.prevented = true
+    }
     self.stats.dispatches = self.stats.dispatches + 1
     if isKey && self.keyBindings && self.queue.length() == before {
       // No handler in the view took the key: try the key bindings.
@@ -503,6 +517,25 @@ pub effect fn drain<A: App<M, C>, M, C: Perform<M, E, R>, E, ? R>(
   runtime.queue.clear()
   runtime.head = 0
   run runtime.render(&mut tree)
+}
+
+/// Feeds one input to the tree the way a browser does: the handlers of the input's own record
+/// run first, and the tree's default action (focus, scrolling, what a key does) runs only if
+/// none of them prevented it with `Reply.Prevent`. Hosts call this in place of
+/// `tree.dispatch` followed by `pump`. Returns whether any record was handled.
+pub effect fn feed<A: App<M, C>, M, C: Perform<M, E, R>, E, ? R>(
+  runtime: &mut Runtime<A, M, C>,
+  tree: &mut UiTree<'_>,
+  input: Input,
+) -> bool
+  ! E | TreeError | OutOfMemoryError
+  ? R | &mut Allocator {
+  run tree.begin(&input)
+  let first = run pump(&mut runtime, &mut tree)
+  let prevented = runtime.takePrevented()
+  run tree.finish(move input, prevented)
+  let second = run pump(&mut runtime, &mut tree)
+  return first || second
 }
 
 /// Takes the tree's event records and handles them one at a time: dispatch, update, render.

@@ -1068,9 +1068,29 @@ fn pathPrevents(tree: &UiTree<'_>, slot: u32, flag: u32) -> bool {
 
 /// The first half of a dispatch: where the pointer is, hover, and the record of the input
 /// itself. Nothing a client could prevent happens here.
+/// Remembers `slot` as the target of the input under way.
+fn remember(tree: &mut UiTree<'_>, slot: u32) -> () {
+  tree.pendingTarget = slot
+  tree.pendingTargetId = if slot == NONE {
+    NONE
+  } else {
+    tree.node(slot).id
+  }
+}
+
+/// The target `begin` remembered, or NONE when it is gone or out of the tree.
+fn remembered(tree: &UiTree<'_>) -> u32 {
+  if alive(tree, tree.pendingTarget, tree.pendingTargetId) && attached(tree, tree.pendingTarget) {
+    return tree.pendingTarget
+  }
+  return NONE
+}
+
 pub effect fn begin(tree: &mut UiTree<'_>, input: &Input) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
+  tree.pendingTarget = NONE
+  tree.pendingTargetId = NONE
   match &input.* {
     Input.PointerMove { x, y, modifiers } => {
       let hit = run moved(&mut tree, x, y, modifiers)
@@ -1098,6 +1118,7 @@ pub effect fn begin(tree: &mut UiTree<'_>, input: &Input) -> ()
           return ()
         }
       }
+      remember(&mut tree, hit)
       if hit == NONE || disabledAt(&tree.*, hit) {
         return ()
       }
@@ -1134,6 +1155,7 @@ pub effect fn begin(tree: &mut UiTree<'_>, input: &Input) -> ()
     Input.PointerCancel => {}
     Input.Wheel { x, y, deltaX, deltaY, modifiers } => {
       let hit = run moved(&mut tree, x, y, modifiers)
+      remember(&mut tree, hit)
       if hit != NONE && pathListens(&tree.*, hit, LISTEN_WHEEL) {
         let mut event = run record(&tree.*, EventKind.Wheel, hit)
         event.x = x
@@ -1146,12 +1168,14 @@ pub effect fn begin(tree: &mut UiTree<'_>, input: &Input) -> ()
     }
     Input.KeyDown { key, code, modifiers, repeat } => {
       let target = keyTarget(&tree.*)
+      remember(&mut tree, target)
       if target != NONE && pathListens(&tree.*, target, LISTEN_KEY_DOWN) {
         run keyRecord(&mut tree, EventKind.KeyDown, target, &key, &code, modifiers, repeat)
       }
     }
     Input.KeyUp { key, code, modifiers } => {
       let target = keyTarget(&tree.*)
+      remember(&mut tree, target)
       if target != NONE && pathListens(&tree.*, target, LISTEN_KEY_UP) {
         run keyRecord(&mut tree, EventKind.KeyUp, target, &key, &code, modifiers, false)
       }
@@ -1184,11 +1208,16 @@ pub effect fn finish(tree: &mut UiTree<'_>, input: Input, prevented: bool) -> ()
       if button != BUTTON_PRIMARY || tree.thumbSlot != NONE {
         return ()
       }
-      let hit = hitSlot(&tree.*, x, y)
-      if hit == NONE {
+      if tree.pendingTarget == NONE {
+        // The press landed on nothing.
         if !prevented {
           run tree.focusSlot(NONE)
         }
+        return ()
+      }
+      let hit = remembered(&tree.*)
+      if hit == NONE {
+        // The pressed node went away while the press was handled: nothing takes focus.
         return ()
       }
       let keepFocus = prevented || pathPrevents(&tree.*, hit, PREVENT_FOCUS)
@@ -1242,7 +1271,10 @@ pub effect fn finish(tree: &mut UiTree<'_>, input: Input, prevented: bool) -> ()
       clearPress(&mut tree)
     }
     Input.Wheel { x, y, deltaX, deltaY, .. } => {
-      let hit = hitSlot(&tree.*, x, y)
+      let mut hit = remembered(&tree.*)
+      if hit == NONE {
+        hit = hitSlot(&tree.*, x, y)
+      }
       if hit == NONE || prevented || pathPrevents(&tree.*, hit, PREVENT_SCROLL) {
         return ()
       }
@@ -1259,14 +1291,18 @@ pub effect fn finish(tree: &mut UiTree<'_>, input: Input, prevented: bool) -> ()
         return ()
       }
       tree.suppressText = false
-      if target == tree.focused && tree.node(target).kind == NodeKind.Input
+
+      // Editing and keyboard clicks belong to the node the key went to. When a handler moved
+      // focus or removed that node, they do not fall on whatever has focus now.
+      let same = target == remembered(&tree.*)
+      if same && target == tree.focused && tree.node(target).kind == NodeKind.Input
         && run edit.keyDown(&mut tree, target, &key, modifiers) {
         return ()
       }
       let plain = u32.bitAnd(modifiers, MOD_CONTROL + MOD_ALT + MOD_META) == 0
       if plain && String.view(&key) == "Tab" {
         run moveFocus(&mut tree, u32.bitAnd(modifiers, MOD_SHIFT) == 0)
-      } else if plain && !repeat && String.view(&key) == "Enter" && target == tree.focused
+      } else if same && plain && !repeat && String.view(&key) == "Enter" && target == tree.focused
         && enterClicks(tree.node(target).accessRole) {
         run keyboardClick(&mut tree, target, modifiers)
       }
@@ -1277,7 +1313,7 @@ pub effect fn finish(tree: &mut UiTree<'_>, input: Input, prevented: bool) -> ()
         return ()
       }
       let plain = u32.bitAnd(modifiers, MOD_CONTROL + MOD_ALT + MOD_META) == 0
-      if plain && String.view(&key) == " " && target == tree.focused
+      if plain && String.view(&key) == " " && target == remembered(&tree.*) && target == tree.focused
         && spaceClicks(tree.node(target).accessRole) {
         run keyboardClick(&mut tree, target, modifiers)
       }
