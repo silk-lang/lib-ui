@@ -1,0 +1,144 @@
+//! Why a tree call failed.
+import engine { TreeError as RawError }
+import id { NodeId }
+import inspect { writeInt }
+import svg_css.cssom_error { CssomError }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.usize
+import silk.text.string { String }
+
+/// Why a call on a `Tree` failed. `TreeError.message` says it in words.
+pub union TreeError {
+  /// The node was destroyed, or never existed.
+  StaleNode { pub node: NodeId },
+  /// A protocol client created a node with an id already in use.
+  IdInUse { pub node: NodeId },
+  /// The call does not apply to the node's kind: children of a leaf, text of a box.
+  WrongKind { pub node: NodeId },
+  /// The call would put a node inside itself, or move the root.
+  Cycle { pub node: NodeId },
+  /// The resource is not defined.
+  UnknownResource { pub resource: u32 },
+  /// The resource's data did not decode.
+  BadResource { pub resource: u32 },
+  /// The virtual list's configuration or its item bindings are invalid.
+  BadVirtualList { pub node: NodeId },
+  /// Layout or text shaping failed.
+  Layout,
+  /// A scroll operation failed.
+  View { pub error: CssomError },
+}
+
+impl Copy for TreeError {}
+
+impl TreeError {
+  /// The error for the engine's `raw` error, without its batch index.
+  pub fn lift(raw: RawError) -> TreeError {
+    return match raw {
+      RawError.UnknownNode { id, .. } => TreeError.StaleNode { node: NodeId.of(id) }
+      RawError.IdInUse { id, .. } => TreeError.IdInUse { node: NodeId.of(id) }
+      RawError.WrongKind { id, .. } => TreeError.WrongKind { node: NodeId.of(id) }
+      RawError.BadMove { id, .. } => TreeError.Cycle { node: NodeId.of(id) }
+      RawError.UnknownResource { resource, .. } => TreeError.UnknownResource { resource: resource }
+      RawError.BadResource { resource, .. } => TreeError.BadResource { resource: resource }
+      RawError.Layout => TreeError.Layout
+      RawError.BadVirtualList { id, .. } => TreeError.BadVirtualList { node: NodeId.of(id) }
+      RawError.View { error } => TreeError.View { error: error }
+    }
+  }
+
+  /// The error in a sentence, such as `node #12 does not exist (it was destroyed, or never created)`.
+  pub effect fn message(self: Self) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut out = String.make()
+    match self {
+      TreeError.StaleNode { node } => {
+        run writeNode(&mut out, node)
+        run out.append(" does not exist (it was destroyed, or never created)")
+      }
+      TreeError.IdInUse { node } => {
+        run writeNode(&mut out, node)
+        run out.append(" already exists; a new node needs an id that is not in use")
+      }
+      TreeError.WrongKind { node } => {
+        run writeNode(&mut out, node)
+        run out.append(" is the wrong kind of node for this call")
+      }
+      TreeError.Cycle { node } => {
+        run writeNode(&mut out, node)
+        run out.append(" cannot move there: it would be inside itself, or it is the root")
+      }
+      TreeError.UnknownResource { resource } => {
+        run out.append("resource ")
+        run writeInt(&mut out, u32.toU64(resource))
+        run out.append(" is not defined")
+      }
+      TreeError.BadResource { resource } => {
+        run out.append("the data of resource ")
+        run writeInt(&mut out, u32.toU64(resource))
+        run out.append(" did not decode")
+      }
+      TreeError.BadVirtualList { node } => {
+        run out.append("the virtual list on ")
+        run writeNode(&mut out, node)
+        run out.append(" has an invalid configuration or item binding")
+      }
+      TreeError.Layout => {
+        run out.append("layout or text shaping failed")
+      }
+      TreeError.View { .. } => {
+        run out.append("a scroll operation failed")
+      }
+    }
+    return move out
+  }
+}
+
+effect fn writeNode(out: &mut String, node: NodeId) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.append("node #")
+  run writeInt(&mut out, u32.toU64(node.raw()))
+}
+
+/// Why a mutation batch stopped: mutation `index` failed with `error`. The mutations before
+/// it stay applied.
+pub struct ProtocolError {
+  pub index: usize,
+  pub error: TreeError,
+}
+
+impl Copy for ProtocolError {}
+
+impl ProtocolError {
+  pub fn lift(raw: RawError) -> ProtocolError {
+    let index = match raw {
+      RawError.UnknownNode { index, .. } => index
+      RawError.IdInUse { index, .. } => index
+      RawError.WrongKind { index, .. } => index
+      RawError.BadMove { index, .. } => index
+      RawError.UnknownResource { index, .. } => index
+      RawError.BadResource { index, .. } => index
+      RawError.BadVirtualList { index, .. } => index
+      RawError.Layout => 0
+      RawError.View { .. } => 0
+    }
+    return ProtocolError { index: index, error: TreeError.lift(raw) }
+  }
+
+  /// The error in a sentence, starting with which mutation failed.
+  pub effect fn message(self: Self) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut out = String.make()
+    run out.append("mutation ")
+    run writeInt(&mut out, usize.toU64(self.index))
+    run out.append(": ")
+    let detail = run self.error.message()
+    run out.append(String.view(&detail))
+    return move out
+  }
+}
