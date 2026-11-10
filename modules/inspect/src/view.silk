@@ -28,11 +28,14 @@ import ui_tree.mutation {
   DimensionKind,
   ObjectFit
 }
+import properties.computed { LineHeight as LayoutLineHeight }
 import silk.num.usize
 import ui_tree.engine { UiTree }
 import ui_tree.node { NONE }
+import properties.values
 import ui_tree.mutation {
   Property,
+  Declaration,
   Length,
   Side,
   Display,
@@ -69,7 +72,9 @@ import ui_tree.style { Computed, Fill }
 import layout.lib { Display as CssDisplay, DisplayInside, DisplayOutside }
 import ui_tree.inspect { kindName, roleName, writeInt, writeNumber }
 import overlay { BoxModel, boxModels }
+import silk.collections.bytes { Bytes }
 import silk.collections.list { List }
+import silk.core.result { Result }
 import silk.color.rgba { Rgba }
 import silk.geometry.corners { Corners }
 import silk.geometry.rect { Rect }
@@ -78,7 +83,7 @@ import silk.num.f32
 import silk.num.i32
 import silk.num.i64
 import silk.num.u32
-import silk.text.string { String }
+import silk.text.string { String, InvalidUtf8 }
 
 // Values.
 
@@ -838,15 +843,23 @@ pub effect fn computedProperties(c: &Computed, text: bool, out: &mut List<Proper
   run out.append(Property.AspectRatioAuto { value: c.layout.aspectRatioAuto })
   if !text {
     run boxProperties(c, &mut out)
-    run out.append(Property.ObjectFit { value: c.objectFit })
-    run out.append(Property.ObjectPosition { x: c.objectX, y: c.objectY })
+    run out.append(Property.ObjectFit { value: c.paint.objectFit })
+    run out.append(Property.ObjectPosition { x: lengthOf(c.paint.objectX), y: lengthOf(c.paint.objectY) })
   }
   let t = c.text
   run out.append(Property.FontFamily { family: t.family })
   run out.append(Property.FontSize { value: t.size })
   run out.append(Property.FontWeight { value: t.weight })
   run out.append(Property.FontStyle { value: t.style })
-  run out.append(Property.LineHeight { value: t.lineHeight })
+  run out.append(
+    Property.LineHeight {
+      value: match t.lineHeight {
+        LayoutLineHeight.Normal => LineHeight.Normal
+        LayoutLineHeight.Number { value } => LineHeight.Number { value: value }
+        LayoutLineHeight.Length { value } => LineHeight.Px { value: value }
+      },
+    },
+  )
   run out.append(Property.Color { color: t.color })
   run out.append(Property.TextAlign { value: t.align })
   run out.append(Property.WhiteSpace { value: t.whiteSpace })
@@ -878,10 +891,10 @@ effect fn boxProperties(c: &Computed, out: &mut List<Property>) -> ()
   run out.append(Property.Padding { side: Side.Right, value: lengthOf(c.layout.padding.right) })
   run out.append(Property.Padding { side: Side.Bottom, value: lengthOf(c.layout.padding.bottom) })
   run out.append(Property.Padding { side: Side.Left, value: lengthOf(c.layout.padding.left) })
-  run out.append(Property.BorderWidth { side: Side.Top, value: c.border.top })
-  run out.append(Property.BorderWidth { side: Side.Right, value: c.border.right })
-  run out.append(Property.BorderWidth { side: Side.Bottom, value: c.border.bottom })
-  run out.append(Property.BorderWidth { side: Side.Left, value: c.border.left })
+  run out.append(Property.BorderWidth { side: Side.Top, value: c.paint.border.top })
+  run out.append(Property.BorderWidth { side: Side.Right, value: c.paint.border.right })
+  run out.append(Property.BorderWidth { side: Side.Bottom, value: c.paint.border.bottom })
+  run out.append(Property.BorderWidth { side: Side.Left, value: c.paint.border.left })
   if c.layout.position != Position.Static {
     run out.append(Property.Inset { side: Side.Top, value: lengthOf(c.layout.inset.top) })
     run out.append(Property.Inset { side: Side.Right, value: lengthOf(c.layout.inset.right) })
@@ -904,7 +917,7 @@ effect fn boxProperties(c: &Computed, out: &mut List<Property>) -> ()
   run out.append(Property.OverflowX { value: c.layout.overflowX })
   run out.append(Property.OverflowY { value: c.layout.overflowY })
   run out.append(Property.AspectRatio { value: c.layout.aspectRatio })
-  match c.background {
+  match c.paint.background {
     Fill.None => {
       run out.append(
         Property.BackgroundColor { color: Rgba<f32> { r: 0.0, g: 0.0, b: 0.0, a: 0.0 } },
@@ -917,17 +930,17 @@ effect fn boxProperties(c: &Computed, out: &mut List<Property>) -> ()
       run out.append(Property.BackgroundGradient { angle: angle, from: from, to: to })
     }
   }
-  run out.append(Property.BorderColor { color: c.borderColor })
-  run out.append(Property.BorderStyle { value: c.borderStyle })
-  run out.append(Property.BorderRadius { value: c.radii })
-  if c.hasShadow {
-    run out.append(Property.BoxShadow { value: c.shadow })
+  run out.append(Property.BorderColor { color: c.paint.borderColor })
+  run out.append(Property.BorderStyle { value: c.paint.borderStyle })
+  run out.append(Property.BorderRadius { value: c.paint.radii })
+  if c.paint.hasShadow {
+    run out.append(Property.BoxShadow { value: c.paint.shadow })
   } else {
     run out.append(Property.NoBoxShadow)
   }
-  run out.append(Property.Opacity { value: c.opacity })
-  run out.append(Property.BackdropBlur { value: c.backdropBlur })
-  run out.append(Property.PointerEvents { value: c.pointerEvents })
+  run out.append(Property.Opacity { value: c.paint.opacity })
+  run out.append(Property.BackdropBlur { value: c.paint.backdropBlur })
+  run out.append(Property.PointerEvents { value: c.paint.pointerEvents })
 }
 
 /// The display keyword of a computed display.
@@ -984,24 +997,38 @@ fn gapOf(value: Dimension) -> Length {
   return lengthOf(value)
 }
 
-effect fn patch(out: &mut String, title: string, properties: &List<Property>) -> ()
+effect fn patch(out: &mut String, title: string, declarations: &List<Declaration>) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
-  if properties.length() == 0 {
+  if declarations.length() == 0 {
     return ()
   }
   run out.append("style ")
   run out.append(title)
   run out.append(" {\n")
-  let values = properties.asSlice()
+  let items = declarations.asSlice()
   let mut i: usize = 0
-  while i < values.length {
+  while i < items.length {
     run out.append("  ")
-    run writeProperty(&mut out, values[i])
+    run writeDeclaration(&mut out, &items[i])
     run out.append(";\n")
     i = i + 1
   }
   run out.append("}\n")
+}
+
+/// Writes `declaration` as CSS text without the semicolon, such as `padding-top: 6px`.
+pub effect fn writeDeclaration(out: &mut String, declaration: &Declaration) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = Bytes.make()
+  run values.writeDeclaration(&mut text, declaration)
+  match String.fromUtf8(text.asSlice()) {
+    Result<string, InvalidUtf8>.Success { value } => {
+      run out.append(value)
+    }
+    Result<string, InvalidUtf8>.Failure { error: _ } => {}
+  }
 }
 
 effect fn flag(out: &mut String, listeners: u32, bit: u32, name: string) -> ()
@@ -1242,7 +1269,16 @@ pub effect fn inspectNode(
   if options.computed {
     let mut computed = List<Property>.make()
     run computedProperties(&node.computed, node.kind == NodeKind.Text, &mut computed)
-    run patch(&mut out, "computed", &computed)
+    run out.append("style computed {\n")
+    let listed = computed.asSlice()
+    let mut i: usize = 0
+    while i < listed.length {
+      run out.append("  ")
+      run writeProperty(&mut out, listed[i])
+      run out.append(";\n")
+      i = i + 1
+    }
+    run out.append("}\n")
   }
 }
 

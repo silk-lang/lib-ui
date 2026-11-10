@@ -14,7 +14,8 @@ import mutation {
   Mutation,
   NodeKind,
   StyleState,
-  Property,
+  Declaration,
+  CssProperty,
   Attribute,
   Role,
   Cursor,
@@ -26,9 +27,11 @@ import mutation {
   LISTEN_FOCUS,
   LISTEN_BLUR,
   LISTEN_LAYOUT,
-  NOT_FOCUSABLE,
-  propertyKey
+  NOT_FOCUSABLE
 }
+import properties.catalog
+import properties.declare
+import properties.values
 import input { Input }
 import interact
 import layers
@@ -143,28 +146,75 @@ fn defaultDisplay(kind: NodeKind) -> Display {
   }
 }
 
-/// Sets `property` in `list`, replacing an earlier value of the same property.
-effect fn setProperty(list: &mut List<Property>, property: Property) -> ()
+/// Whether every longhand of `inner` is also a longhand of `outer`.
+fn covers(outer: CssProperty, inner: CssProperty) -> bool {
+  let innerCount = catalog.longhandCount(inner)
+  let outerCount = catalog.longhandCount(outer)
+  let mut i: usize = 0
+  while i < innerCount {
+    let wanted = catalog.longhandAt(inner, i)
+    let mut found = false
+    let mut j: usize = 0
+    while j < outerCount {
+      if catalog.longhandAt(outer, j) == wanted {
+        found = true
+        break
+      }
+      j = j + 1
+    }
+    if !found {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+/// Sets `declaration` in `list` the way CSSOM's `setProperty` does. A longhand replaces its
+/// earlier value in place. A shorthand removes what it covers and goes last, so a longhand set
+/// after a shorthand keeps overriding it and one set before it does not.
+effect fn setDeclaration(list: &mut List<Declaration>, declaration: &Declaration) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
-  let key = propertyKey(property)
-  let values = list.asMutSlice()
+  let copy = run values.cloneDeclaration(declaration)
+  let property = declaration.property
+  if catalog.longhandCount(property) > 1 {
+    let mut i = list.length()
+    while i > 0 {
+      i = i - 1
+      if covers(property, list.asSlice()[i].property) {
+        drop list.remove(i)
+      }
+    }
+    run list.append(move copy)
+    return ()
+  }
   let mut i: usize = 0
-  while i < values.length {
-    if propertyKey(values[i]) == key {
-      values[i] = property
+  while i < list.length() {
+    if list.asSlice()[i].property == property {
+      list.set(i, move copy)
       return ()
     }
     i = i + 1
   }
-  run list.append(property)
+  run list.append(move copy)
 }
 
-fn applyAll(computed: &mut Computed, list: &List<Property>) -> () {
-  let values = list.asSlice()
+fn applyAll(computed: &mut Computed, list: &List<Declaration>) -> () {
+  let items = list.asSlice()
+  // Font size first: `em` lengths in the same patch refer to it.
   let mut i: usize = 0
-  while i < values.length {
-    computed.apply(values[i])
+  while i < items.length {
+    if items[i].property == CssProperty.FontSize {
+      computed.apply(&items[i])
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < items.length {
+    if items[i].property != CssProperty.FontSize {
+      computed.apply(&items[i])
+    }
     i = i + 1
   }
 }
@@ -509,27 +559,27 @@ impl<'a> UiTree<'a> {
         let slot = run self.require(index, id)
         run self.destroy(index, slot)
       }
-      Mutation.SetStyle { id, state, properties } => {
+      Mutation.SetStyle { id, state, declarations } => {
         let slot = run self.require(index, id)
-        let values = properties.asSlice()
+        let values = declarations.asSlice()
         let node = self.nodeMut(slot)
         let mut i: usize = 0
         while i < values.length {
           match state {
             StyleState.Base => {
-              run setProperty(&mut node.base, values[i])
+              run setDeclaration(&mut node.base, &values[i])
             }
             StyleState.Hover => {
-              run setProperty(&mut node.hover, values[i])
+              run setDeclaration(&mut node.hover, &values[i])
             }
             StyleState.Active => {
-              run setProperty(&mut node.active, values[i])
+              run setDeclaration(&mut node.active, &values[i])
             }
             StyleState.Focus => {
-              run setProperty(&mut node.focus, values[i])
+              run setDeclaration(&mut node.focus, &values[i])
             }
             StyleState.FocusVisible => {
-              run setProperty(&mut node.focusVisible, values[i])
+              run setDeclaration(&mut node.focusVisible, &values[i])
             }
           }
           i = i + 1
@@ -798,11 +848,11 @@ impl<'a> UiTree<'a> {
       css: css,
       inner: inner,
       parent: NONE,
-      base: List<Property>.make(),
-      hover: List<Property>.make(),
-      active: List<Property>.make(),
-      focus: List<Property>.make(),
-      focusVisible: List<Property>.make(),
+      base: List<Declaration>.make(),
+      hover: List<Declaration>.make(),
+      active: List<Declaration>.make(),
+      focus: List<Declaration>.make(),
+      focusVisible: List<Declaration>.make(),
       computed: computed,
       fontKey: 0,
       paintHash: 0,
@@ -1381,17 +1431,17 @@ impl<'a> UiTree<'a> {
 
     // CSS pointer-events inherits, but an explicit descendant auto remains targetable.
     if parent != NONE {
-      computed.pointerEvents = self.node(parent).computed.pointerEvents
+      computed.paint.pointerEvents = self.node(parent).computed.paint.pointerEvents
     }
     computed.layout.display = display(defaultDisplay(node.kind))
     if node.kind == NodeKind.Input {
       // Inputs keep their spaces; one line scrolls sideways, several wrap and scroll down.
       if node.edit.multiline {
-        computed.apply(Property.WhiteSpace { value: WhiteSpace.PreWrap })
+        computed.apply(&declare.whiteSpace(WhiteSpace.PreWrap))
         computed.layout.overflowX = Overflow.Hidden
         computed.layout.overflowY = Overflow.Auto
       } else {
-        computed.apply(Property.WhiteSpace { value: WhiteSpace.Pre })
+        computed.apply(&declare.whiteSpace(WhiteSpace.Pre))
         computed.layout.overflowX = Overflow.Hidden
         computed.layout.overflowY = Overflow.Hidden
       }
