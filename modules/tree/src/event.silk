@@ -19,6 +19,7 @@ import input {
 }
 import edit { HostRequest as RawHostRequest }
 import silk.collections.list { List }
+import silk.core.option { Option }
 import silk.core.ownership { Copy }
 import silk.geometry.rect { Rect }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
@@ -583,5 +584,144 @@ pub fn listenFlag(kind: EventKind) -> u32 {
     EventKind.Input => 2048
     EventKind.Scroll => 4096
     EventKind.Layout => 8192
+  }
+}
+
+/// Something the tree does by itself in answer to input, which a client can turn off: see
+/// `Tree.prevent` for a node that always opts out and `Tree.begin` for a decision per event.
+pub enum DefaultAction {
+  /// A primary press moves focus and starts a text selection.
+  Focus,
+  /// A wheel scrolls.
+  Scroll,
+  /// A key moves focus (Tab), clicks (Enter, Space) or edits, and types its text.
+  Keys,
+}
+
+/// The `PREVENT_*` flags for `actions`.
+pub fn preventFlags(actions: &[DefaultAction]) -> u32 {
+  let mut flags: u32 = 0
+  let mut i: usize = 0
+  while i < actions.length {
+    let flag: u32 = match actions[i] {
+      DefaultAction.Focus => 1
+      DefaultAction.Scroll => 2
+      DefaultAction.Keys => 4
+    }
+    flags = flags | flag
+    i = i + 1
+  }
+  return flags
+}
+
+/// Where an event is on its way through the tree, as DOM `Event.eventPhase`.
+pub enum Phase {
+  /// On the way down from the root, before the target.
+  Capture,
+  /// At the target.
+  Target,
+  /// On the way back up to the root.
+  Bubble,
+}
+
+/// One stop of an event: a node on the path and the phase it is visited in.
+pub struct Step {
+  pub node: NodeId,
+  pub phase: Phase,
+}
+
+impl Copy for Step {}
+
+/// Whether events of `kind` bubble. Enter, leave, focus, blur, scroll and layout do not, as
+/// in the DOM: they are captured on the way down and then delivered to the target only.
+pub fn bubbles(kind: EventKind) -> bool {
+  return match kind {
+    EventKind.PointerEnter => false
+    EventKind.PointerLeave => false
+    EventKind.Focus => false
+    EventKind.Blur => false
+    EventKind.Scroll => false
+    EventKind.Layout => false
+    _ => true
+  }
+}
+
+/// Walks one event record through its path in DOM order: capture from the root down, the
+/// target, then bubbling back up. Every client that runs handlers uses it, so they all agree
+/// on the order and on what stopping and preventing mean.
+///
+/// ```silk
+/// let mut walk = Propagation.over(&record)
+/// let mut step = walk.next()
+/// while step.isSome() {
+///   // run the handlers registered for this node and phase; they may call
+///   // walk.stopPropagation() and walk.preventDefault()
+///   step = walk.next()
+/// }
+/// run tree.finish(move pending, walk.defaultPrevented())
+/// ```
+pub struct Propagation<'r> {
+  record: &'r EventRecord,
+  /// Steps handed out so far.
+  taken: usize,
+  bubbling: bool,
+  stopped: bool,
+  prevented: bool,
+}
+
+impl<'r> Propagation<'r> {
+  pub fn over(record: &'r EventRecord) -> Propagation<'r> {
+    return Propagation {
+      record: record,
+      taken: 0,
+      bubbling: bubbles(record.event.kind()),
+      stopped: false,
+      prevented: false,
+    }
+  }
+
+  /// The next stop, or `None` when the walk is over or a handler stopped it.
+  pub fn next(self: &mut Self) -> Option<Step> {
+    let path = self.record.path.asSlice()
+    let length = path.length
+    if self.stopped || length == 0 {
+      return Option<Step>.None
+    }
+    let at = self.taken
+    if at + 1 < length {
+      self.taken = at + 1
+      return Option<Step>.Some { value: Step { node: path[at], phase: Phase.Capture } }
+    }
+    if at + 1 == length {
+      self.taken = at + 1
+      return Option<Step>.Some { value: Step { node: path[at], phase: Phase.Target } }
+    }
+
+    // Past the target: step `length + k` is the ancestor `k + 1` levels above it.
+    let above = at - length + 1
+    if !self.bubbling || above >= length {
+      return Option<Step>.None
+    }
+    self.taken = at + 1
+    return Option<Step>.Some {
+      value: Step { node: path[length - 1 - above], phase: Phase.Bubble },
+    }
+  }
+
+  /// No further node is visited, as DOM `stopPropagation`. Handlers left on the current node
+  /// are the client's to run or skip.
+  pub fn stopPropagation(self: &mut Self) -> () {
+    self.stopped = true
+  }
+
+  /// Asks for the default action to be skipped, as DOM `preventDefault`. It does not stop the
+  /// walk.
+  pub fn preventDefault(self: &mut Self) -> () {
+    self.prevented = true
+  }
+
+  /// The verdict to hand to `Tree.finish`.
+  pub fn defaultPrevented(self: &Self) -> bool {
+    return self.prevented
   }
 }

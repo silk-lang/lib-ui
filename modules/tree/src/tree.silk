@@ -29,7 +29,18 @@ import id {
   FontFamily,
   Resource
 }
-import event { Input, EventRecord, Selection, HostRequest, listenFlags, listenFlag }
+import event {
+  Input,
+  EventRecord,
+  Selection,
+  HostRequest,
+  DefaultAction,
+  listenFlags,
+  listenFlag,
+  preventFlags
+}
+import input { Input as RawInput }
+import interact
 import mutation {
   Mutation,
   NodeKind,
@@ -137,6 +148,12 @@ pub struct ValueRange {
 }
 
 impl Copy for ValueRange {}
+
+/// An input whose default action has not run yet: what `Tree.begin` returns and
+/// `Tree.finish` takes.
+pub struct PendingInput {
+  input: RawInput,
+}
 
 /// A read-only look at one node, for inspectors and tests: what it is, what the client set on
 /// it and what the tree made of that. It borrows the tree and copies nothing.
@@ -619,6 +636,47 @@ impl<'a> Tree<'a> {
     run self.one(Mutation.SetListeners { id: node.id().raw(), flags: listenFlags(kinds) })
   }
 
+  /// Turns default actions off for input aimed at `node` or anything inside it, replacing
+  /// what it prevented before. It is the declarative `preventDefault`: a canvas that pans
+  /// itself prevents `Scroll`, a toolbar button that must not steal focus prevents `Focus`.
+  /// The event records still arrive. An empty list prevents nothing.
+  pub effect fn prevent<N: Node>(self: &mut Self, node: N, actions: &[DefaultAction]) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    run self.setAttribute(node.id(), Attribute.Prevent { actions: preventFlags(actions) })
+  }
+
+  /// While the primary button is down, sends pointer move and up records and the click to
+  /// `node` wherever the pointer goes, as DOM `setPointerCapture`. Call it from a pointer
+  /// down. The capture ends with the press, and nothing happens when no button is down.
+  ///
+  /// A press already captures implicitly: its moves and its release go to the pressed node.
+  /// Use this to hand a drag to another node, such as the track of a slider whose thumb was
+  /// pressed.
+  pub effect fn setPointerCapture<N: Node>(self: &mut Self, node: N) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    run self.one(Mutation.SetPointerCapture { id: node.id().raw() })
+  }
+
+  /// Ends the capture of the press, the implicit one included: until the button comes up,
+  /// pointer records go to the node under the pointer, as they do in a browser for a mouse.
+  pub effect fn releasePointerCapture(self: &mut Self) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    run self.one(Mutation.ReleasePointerCapture)
+  }
+
+  /// The node the press sends its pointer records to, if a button is down and the capture was
+  /// not released.
+  pub fn pointerCapture(self: &Self) -> Option<NodeId> {
+    let slot = interact.captureHolder(&self.core)
+    if slot == NONE {
+      return Option<NodeId>.None
+    }
+    return Option<NodeId>.Some { value: NodeId.of(self.core.node(slot).id) }
+  }
+
   // Focus, selection and scrolling.
 
   pub effect fn focus<N: Node>(self: &mut Self, node: N) -> ()
@@ -875,6 +933,36 @@ impl<'a> Tree<'a> {
     ! OutOfMemoryError
     ? &mut Allocator {
     run self.core.dispatch(input.lower())
+  }
+
+  /// The first half of `dispatch`, for a client that decides per event whether the default
+  /// action runs, as a handler calling `preventDefault` does. It hit tests, updates hover and
+  /// the active state, and queues the record of the input itself (pointer down, wheel, key
+  /// down and so on). Read it with `events`, run the handlers, then call `finish`.
+  ///
+  /// ```silk
+  /// let pending = run tree.begin(input)
+  /// let records = run tree.events()
+  /// let prevented = run handlers.run(&records)   // Propagation walks each record
+  /// run tree.finish(move pending, prevented)
+  /// ```
+  pub effect fn begin(self: &mut Self, input: Input) -> PendingInput
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let raw = input.lower()
+    run self.core.begin(&raw)
+    return PendingInput { input: move raw }
+  }
+
+  /// The second half of `dispatch`: runs the default action of the input (focus and
+  /// selection for a press, scrolling for a wheel, Tab, keyboard clicks and editing for a
+  /// key) unless `prevented`, and queues the records that follow from it, such as focus,
+  /// scroll, input and click. A click is no default action of the release and is not
+  /// prevented, as in the DOM.
+  pub effect fn finish(self: &mut Self, pending: PendingInput, prevented: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.core.finish(move pending.input, prevented)
   }
 
   /// Takes the queued event records, oldest first.

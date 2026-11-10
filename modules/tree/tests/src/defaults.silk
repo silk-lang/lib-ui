@@ -1,0 +1,357 @@
+//! Default actions a client can turn off, explicit pointer capture, and the propagation walk.
+import ui_tree.lib {
+  Tree,
+  TreeError,
+  Viewport,
+  NodeId,
+  Input,
+  EventKind,
+  DefaultAction,
+  Propagation,
+  Phase,
+  Property,
+  Length,
+  Overflow,
+  Attribute
+}
+import ui_fixtures.fixtures as fixtures
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+fn viewport() -> Viewport {
+  return Viewport { width: 400.0, height: 300.0, scale: 1.0 }
+}
+
+fn sized(width: f32, height: f32) -> [Property; 2] {
+  return [Property.Width { value: Length.px(width) }, Property.Height { value: Length.px(height) }]
+}
+
+fn focusIs(tree: &Tree<'_>, id: NodeId) -> bool {
+  return match tree.focused() {
+    Option.Some { value } => value.is(id)
+    Option.None => false
+  }
+}
+
+effect fn pressesCanKeepFocus() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run Tree.make(&fonts)
+  let root = run tree.box(&[])
+  let field = run tree.input(&sized(200.0, 30.0))
+  let tool = run tree.box(&sized(100.0, 40.0))
+  run tree.append(root, field)
+  run tree.append(root, tool)
+  run tree.setRoot(root)
+  run tree.setAttribute(tool, Attribute.TabIndex { value: 0 })
+  run tree.listen(tool, &[EventKind.PointerDown, EventKind.Click])
+  run tree.focus(field)
+  drop run tree.frame(viewport(), 0.0)
+
+  // Declared on the node: a toolbar button that never steals focus from the field.
+  run tree.prevent(tool, &[DefaultAction.Focus])
+  run tree.dispatch(Input.press(10.0, 50.0))
+  run tree.dispatch(Input.release(10.0, 50.0))
+  run Testing.expect(focusIs(&tree, field.id()), "the field keeps focus")
+  run Testing.expect((run tree.events()).length() == 2, "the press and the click still arrive")
+
+  // Decided per event: the client sees the press first and prevents its default.
+  run tree.prevent(tool, &[])
+  let pending = run tree.begin(Input.press(10.0, 50.0))
+  let seen = run tree.events()
+  run Testing.expect(seen.length() == 1, "begin queues the press")
+  run Testing.expect(focusIs(&tree, field.id()), "before any focus change")
+  run tree.finish(move pending, true)
+  run tree.dispatch(Input.release(10.0, 50.0))
+  run Testing.expect(focusIs(&tree, field.id()), "a prevented press takes no focus")
+  run Testing.expect((run tree.events()).length() == 1, "and still clicks")
+
+  // Left alone, the press moves focus as usual.
+  let allowed = run tree.begin(Input.press(10.0, 50.0))
+  run tree.finish(move allowed, false)
+  run tree.dispatch(Input.release(10.0, 50.0))
+  run Testing.expect(focusIs(&tree, tool.id()), "an unprevented press takes focus")
+}
+
+effect fn wheelsCanBePrevented() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run Tree.make(&fonts)
+  let root = run tree.box(&[])
+  let scroller = run tree.box(
+    &[
+      Property.Width { value: Length.px(200.0) },
+      Property.Height { value: Length.px(100.0) },
+      Property.OverflowY { value: Overflow.Scroll },
+    ],
+  )
+  let tall = run tree.box(&sized(100.0, 1000.0))
+  run tree.append(root, scroller)
+  run tree.append(scroller, tall)
+  run tree.setRoot(root)
+  run tree.listen(tall, &[EventKind.Wheel])
+  drop run tree.frame(viewport(), 0.0)
+
+  let pending = run tree.begin(Input.wheel(10.0, 10.0, 0.0, 40.0))
+  let seen = run tree.events()
+  run Testing.expect(seen.length() == 1, "the wheel record arrives before anything scrolls")
+  run tree.finish(move pending, true)
+  drop run tree.frame(viewport(), 16.0)
+  run Testing.expect(offsetY(&tree, scroller.id()) == 0.0, "a prevented wheel does not scroll")
+
+  run tree.prevent(tall, &[DefaultAction.Scroll])
+  run tree.dispatch(Input.wheel(10.0, 10.0, 0.0, 40.0))
+  drop run tree.frame(viewport(), 32.0)
+  run Testing.expect(offsetY(&tree, scroller.id()) == 0.0, "nor does one over a node that opts out")
+
+  run tree.prevent(tall, &[])
+  run tree.dispatch(Input.wheel(10.0, 10.0, 0.0, 40.0))
+  drop run tree.frame(viewport(), 48.0)
+  run Testing.expect(offsetY(&tree, scroller.id()) == 40.0, "left alone, the wheel scrolls")
+}
+
+fn offsetY(tree: &Tree<'_>, id: NodeId) -> f32 {
+  return match tree.scrollOffset(id) {
+    Option.Some { value } => value.y
+    Option.None => -1.0
+  }
+}
+
+effect fn keysCanBePrevented() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run Tree.make(&fonts)
+  let root = run tree.box(&[])
+  let field = run tree.input(&sized(200.0, 30.0))
+  let other = run tree.input(&sized(200.0, 30.0))
+  run tree.append(root, field)
+  run tree.append(root, other)
+  run tree.setRoot(root)
+  run tree.listen(field, &[EventKind.KeyDown])
+  run tree.focus(field)
+  drop run tree.frame(viewport(), 0.0)
+
+  // A prevented Tab stays, as a handler that keeps focus inside a widget wants.
+  let tab = run tree.begin(run Input.key("Tab"))
+  run Testing.expect((run tree.events()).length() == 1, "the key record arrives first")
+  run tree.finish(move tab, true)
+  run Testing.expect(focusIs(&tree, field.id()), "a prevented Tab does not move focus")
+
+  // A prevented key types nothing.
+  let letter = run tree.begin(run Input.key("a"))
+  run tree.finish(move letter, true)
+  run tree.dispatch(run Input.text("a"))
+  match tree.view(field) {
+    Option.Some { value } => run Testing.expect(value.text() == "", "its text is dropped")
+    Option.None => run Testing.expect(false, "the field has a view")
+  }
+
+  // The next key types again.
+  run tree.dispatch(run Input.key("b"))
+  run tree.dispatch(run Input.text("b"))
+  match tree.view(field) {
+    Option.Some { value } => run Testing.expect(value.text() == "b", "the next key types")
+    Option.None => run Testing.expect(false, "the field has a view")
+  }
+
+  run tree.dispatch(run Input.key("Tab"))
+  run Testing.expect(focusIs(&tree, other.id()), "an unprevented Tab moves focus")
+}
+
+effect fn capturesFollowThePress() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run Tree.make(&fonts)
+  let root = run tree.box(&[])
+  let thumb = run tree.box(&sized(100.0, 40.0))
+  let track = run tree.box(&sized(100.0, 40.0))
+  run tree.append(root, thumb)
+  run tree.append(root, track)
+  run tree.setRoot(root)
+  let all = [EventKind.PointerDown, EventKind.PointerMove, EventKind.PointerUp, EventKind.Click]
+  run tree.listen(thumb, &all)
+  run tree.listen(track, &all)
+  run tree.listen(root, &[EventKind.Click])
+  drop run tree.frame(viewport(), 0.0)
+
+  run tree.setPointerCapture(track)
+  run Testing.expect(tree.pointerCapture().isNone(), "no button is down, so nothing is captured")
+
+  // Implicit: the pressed node keeps the moves and the release.
+  run tree.dispatch(Input.press(10.0, 10.0))
+  run Testing.expect(captureIs(&tree, thumb.id()), "a press captures its target")
+  run tree.dispatch(Input.moveTo(10.0, 60.0))
+  run Testing.expect((run lastTarget(&mut tree)).is(thumb), "moves go to the pressed node")
+
+  // Explicit: handed to another node, which also gets the click.
+  run tree.setPointerCapture(track)
+  run Testing.expect(captureIs(&tree, track.id()), "the capture moved to the track")
+  run tree.dispatch(Input.moveTo(10.0, 10.0))
+  run Testing.expect((run lastTarget(&mut tree)).is(track), "moves over the thumb go to the track")
+  run tree.dispatch(Input.release(10.0, 10.0))
+  let records = run tree.events()
+  run Testing.expect(records.length() == 2, "the release and the click")
+  run Testing.expect(records.asSlice()[0].target.is(track), "the release goes to the track")
+  run Testing.expect(records.asSlice()[1].target.is(track), "and so does the click")
+  run Testing.expect(tree.pointerCapture().isNone(), "the capture ends with the press")
+
+  // Released: records go to whatever is under the pointer, as for a mouse in a browser.
+  run tree.dispatch(Input.press(10.0, 10.0))
+  run tree.releasePointerCapture()
+  run tree.dispatch(Input.moveTo(10.0, 60.0))
+  run Testing.expect((run lastTarget(&mut tree)).is(track), "after a release moves follow the pointer")
+  run tree.dispatch(Input.release(10.0, 60.0))
+  let after = run tree.events()
+  run Testing.expect(after.asSlice()[0].target.is(track), "and so does the button coming up")
+  run Testing.expect(after.asSlice()[1].target.is(root), "the click goes to the common ancestor")
+
+  // A capture can be taken while handling the press, before its default runs.
+  let pending = run tree.begin(Input.press(10.0, 10.0))
+  run tree.setPointerCapture(track)
+  run tree.finish(move pending, false)
+  run Testing.expect(captureIs(&tree, track.id()), "a capture taken between begin and finish holds")
+  run tree.dispatch(Input.release(10.0, 10.0))
+}
+
+fn captureIs(tree: &Tree<'_>, id: NodeId) -> bool {
+  return match tree.pointerCapture() {
+    Option.Some { value } => value.is(id)
+    Option.None => false
+  }
+}
+
+/// Takes the queued records and returns the target of the last one.
+effect fn lastTarget(tree: &mut Tree<'_>) -> NodeId
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let records = run tree.events()
+  if records.length() == 0 {
+    return NodeId.of(0)
+  }
+  return records.asSlice()[records.length() - 1].target
+}
+
+effect fn propagationWalksInDomOrder() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run Tree.make(&fonts)
+  let root = run tree.box(&[])
+  let panel = run tree.box(&[])
+  let button = run tree.box(&sized(100.0, 40.0))
+  run tree.append(root, panel)
+  run tree.append(panel, button)
+  run tree.setRoot(root)
+  run tree.setAttribute(button, Attribute.TabIndex { value: 0 })
+  run tree.listen(button, &[EventKind.PointerDown, EventKind.Focus])
+  drop run tree.frame(viewport(), 0.0)
+
+  let pending = run tree.begin(Input.press(10.0, 10.0))
+  let records = run tree.events()
+  let press = &records.asSlice()[0]
+
+  // Capture down, the target, then bubble up.
+  let mut walk = Propagation.over(press)
+  let mut order = String.make()
+  let mut step = walk.next()
+  while step.isSome() {
+    match step {
+      Option.Some { value } => {
+        run note(&mut order, value.phase, value.node, root.id(), panel.id())
+      }
+      Option.None => {}
+    }
+    step = walk.next()
+  }
+  run Testing.expect(
+    String.view(&order) == "c:root c:panel t:button b:panel b:root ",
+    "capture, target, bubble",
+  )
+
+  // Stopping ends the walk; preventing does not, and is the verdict for finish.
+  let mut stopped = Propagation.over(press)
+  drop stopped.next()
+  stopped.preventDefault()
+  run Testing.expect(stopped.next().isSome(), "preventing does not stop the walk")
+  stopped.stopPropagation()
+  run Testing.expect(stopped.next().isNone(), "stopping does")
+  run Testing.expect(stopped.defaultPrevented(), "the verdict is kept")
+  run tree.finish(move pending, stopped.defaultPrevented())
+  run Testing.expect(tree.focused().isNone(), "and prevents the focus of the press")
+  run tree.dispatch(Input.release(10.0, 10.0))
+
+  // Focus does not bubble: capture, then the target only.
+  run tree.focus(button)
+  let focus = run tree.events()
+  let mut quiet = Propagation.over(&focus.asSlice()[0])
+  let mut count: usize = 0
+  let mut last = Phase.Capture
+  let mut at = quiet.next()
+  while at.isSome() {
+    match at {
+      Option.Some { value } => {
+        last = value.phase
+      }
+      Option.None => {}
+    }
+    count = count + 1
+    at = quiet.next()
+  }
+  run Testing.expect(count == 3, "two captures and the target")
+  run Testing.expect(last == Phase.Target, "ending at the target")
+}
+
+effect fn note(out: &mut String, phase: Phase, node: NodeId, root: NodeId, panel: NodeId) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let letter = match phase {
+    Phase.Capture => "c:"
+    Phase.Target => "t:"
+    Phase.Bubble => "b:"
+  }
+  run out.append(letter)
+  if node.is(root) {
+    run out.append("root ")
+  } else if node.is(panel) {
+    run out.append("panel ")
+  } else {
+    run out.append("button ")
+  }
+}
+
+test effect fn pressDefaultsCanBePrevented() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run pressesCanKeepFocus() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn wheelDefaultsCanBePrevented() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run wheelsCanBePrevented() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn keyDefaultsCanBePrevented() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run keysCanBePrevented() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn pointerCaptureFollowsThePress() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run capturesFollowThePress() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn propagationVisitsCaptureTargetBubble() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run propagationWalksInDomOrder() |> Effect.provideMut<Allocator>(&mut allocator)
+}
