@@ -219,7 +219,13 @@ input against the last frame's layout, and the changes show at the next frame
 - **Pointer capture.** The node a primary press lands on gets the moves and the release until
   the button comes up, so drags keep their target. The click goes to the nearest common
   ancestor of the press and release targets, with the click count. Disabled nodes (and their
-  subtrees) get no down, up or click and no active state.
+  subtrees) get no down, up or click and no active state. `tree.setPointerCapture(node)`
+  hands the press to another node, as DOM `setPointerCapture`, and that node gets a
+  `GotPointerCapture` record. `LostPointerCapture` follows when it is released, handed on, or
+  the press ends (after the pointer up, before the click). `Input.PointerCancel` ends a press
+  without a click and queues `PointerCancel` for the node that was getting its records. All
+  three bubble. The implicit capture of a plain press reports nothing, as a mouse press in a
+  browser.
 - **Focus.** A press focuses the nearest focusable node at or above it, or blurs. Focusable
   means a tab index other than `NOT_FOCUSABLE` (the default for everything but inputs), laid
   out, visible and not disabled. Tab and Shift+Tab move through the tabbable nodes (tab index
