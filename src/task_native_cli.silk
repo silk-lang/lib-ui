@@ -1,0 +1,77 @@
+import silk.cli.command { Command, CommandLine, Opt }
+import silk.cli.task { Task, TaskError, TaskSet }
+import silk.collections.list { List }
+import silk.io.writer { WriterError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.child_process { ChildProcess, ProcessError }
+import silk.system.filesystem { FileError, FileSystem }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.text.string { String }
+static if Intrinsic.targetOperatingSystem() != "windows" {
+  import silk.num.usize
+  import task_native as Native
+}
+
+pub union Tasks {
+  Check { pub backend: String },
+  Inspect,
+  Mcp,
+  Demo { pub package: String, pub arguments: List<String>, pub release: bool },
+  Devtools { pub mode: String, pub connect: String, pub appBinary: String, pub appArgs: List<String>, pub buildOnly: bool },
+  HttpTest { pub compiler: String, pub clang: String },
+  HttpFixture,
+}
+impl CommandLine for Tasks {
+  static fn command() -> Command<Tasks> {
+    return Command<Tasks>.make("native-tasks", "Native demos and integration checks (macOS/Linux)")
+      |> Command.variant("Check", "Check windows, inspector, MCP and devtools")
+      |> Command.variant("Inspect", "Exercise the socket inspector")
+      |> Command.variant("Mcp", "Exercise the MCP protocol")
+      |> Command.variant("Demo", "Build and run a native demo; forward options after --")
+      |> Command.variant("Devtools", "Run todo/check/external inspector devtools")
+      |> Command.variant("HttpTest", "Run HTTP image tests with an owned fixture server")
+      |> Command.variant("HttpFixture", "Serve the loopback image fixture")
+      |> Command.option("backend", Opt.about("Window backend") |> Opt.default("all"))
+      |> Command.arg("package", Opt.about("Package directory") |> Opt.required)
+      |> Command.arg("arguments", Opt.about("Arguments forwarded to the demo"))
+      |> Command.arg("mode", Opt.about("Devtools mode") |> Opt.default("todo"))
+  }
+}
+impl TaskSet for Tasks {
+  effect fn perform(self: Tasks) -> ()
+    ! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+    ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+    static if Intrinsic.targetOperatingSystem() == "windows" {
+      drop self
+      run Task.abort("Windows managed subprocess support is unavailable: https://github.com/silk-lang/silk/issues/3034")
+    } else {
+      match move self {
+        Tasks.Check { backend } => run Native.checkNative(String.view(&backend))
+        Tasks.Inspect => run Native.inspect()
+        Tasks.Mcp => run Native.mcp()
+        Tasks.Demo { package, arguments, release } => {
+          let words = run views(&arguments)
+          run Native.demo(String.view(&package), List<string>.asSlice(&words), release)
+        }
+        Tasks.Devtools { mode, connect, appBinary, appArgs, buildOnly } => {
+          let words = run views(&appArgs)
+          run Native.devtools(String.view(&mode), String.view(&connect), String.view(&appBinary), List<string>.asSlice(&words), buildOnly)
+        }
+        Tasks.HttpTest { compiler, clang } => run Native.httpCheck(String.view(&compiler), String.view(&clang))
+        Tasks.HttpFixture => run Native.httpFixture()
+      }
+    }
+  }
+}
+static if Intrinsic.targetOperatingSystem() != "windows" {
+  effect fn views<'a>(owned: &'a List<String>) -> List<string<'a>> ! OutOfMemoryError ? &mut Allocator {
+    let mut result = List<string<'a>>.make()
+    let items = List<String>.asSlice(owned)
+    let mut at: usize = 0
+    while at < items.length {
+      run List<string<'a>>.append(&mut result, String.view(&items[at]))
+      at = at + 1
+    }
+    return move result
+  }
+}

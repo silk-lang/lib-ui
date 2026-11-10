@@ -26,10 +26,10 @@ The app to inspect must be a debug build started with `SILK_UI_INSPECT` set (see
 gallery (`modules/components/demo`) and inbox demo (`modules/tree/demo`) do.
 
 ```sh
-node modules/inspect/devtools/scripts/devtools todo             # the todo demo and devtools
-node modules/inspect/devtools/scripts/devtools external --app-binary /path/to/debug-app
+silk task native devtools todo             # the todo demo and devtools
+silk task native devtools external --app-binary /path/to/debug-app
 SILK_UI_INSPECT=1 ui-app-demo &                            # or any app, then:
-node modules/inspect/devtools/scripts/devtools --connect 1      # 1, tcp:<port> or a socket path
+silk task native devtools run --connect 1   # 1, tcp:<port> or a socket path
 ```
 
 `ui-devtools [--connect ADDRESS]` takes the address in the syntax of `SILK_UI_INSPECT` (default
@@ -74,7 +74,7 @@ Besides `hello`, `inspect`, `highlight` and `stats`, two commands came with the 
 silk test --manifest-path modules/inspect/devtools/tests/silk.toml --root src/tests.silk
 silk build --manifest-path modules/inspect/devtools/tests/silk.toml
 build/llvm/x86_64-unknown-linux-gnu/debug/ui-inspect-devtools-tests modules/inspect/devtools/tests/goldens [--update]
-node modules/inspect/devtools/scripts/devtools check
+silk task native devtools check
 ```
 
 - The devtools run headless against the todo example through `Protocol.handle`: the first

@@ -12,8 +12,8 @@ Packages:
 - `modules/components/gallery`: an app with every component, its state in one model.
 - `modules/components/tests`: one scripted test per component, a keyboard-only test, and describe and
   PNG goldens of the gallery.
-- `modules/components/demo`: the gallery in a native window (`scripts/demo`, and `scripts/demo
-  check` for CI).
+- `modules/components/demo`: the gallery in a native window (`silk task native demo modules/components/demo`,
+  with `-- check` for CI).
 
 ## Using them
 

@@ -284,9 +284,9 @@ For people and agents looking at a running UI (`inspect.silk`):
 silk test --manifest-path modules/tree/tests/silk.toml --root src/tests.silk
 silk build --manifest-path modules/tree/tests/silk.toml
 build/llvm/x86_64-unknown-linux-gnu/debug/ui-tree-tests modules/tree/tests/goldens [--update]
-node modules/tree/scripts/test-browser
+silk task browser check-tree
 silk test --manifest-path modules/tree/window/tests/silk.toml --root src/tests.silk
-node modules/tree/demo/scripts/demo [check]
+silk task native demo modules/tree/demo -- check
 ```
 
 - The unit tests cover replay (an unchanged frame replays the whole tree; changing one card's
@@ -314,7 +314,7 @@ node modules/tree/demo/scripts/demo [check]
   inbox with a toolbar, a scrolling list and a nested scroll box with their thumbs; an editor
   with a selection, a wrapping multiline input, a placeholder and a read-only input), each
   as a PNG (tolerance 2 per channel) and a `describe` text that must match exactly.
-- `scripts/test-browser` builds `browser/` for wasm32 and draws the trees with ui_renderer on
+- `silk task browser check-tree` builds `browser/` for wasm32 and draws the trees with ui_renderer on
   `navigator.gpu` in the installed Chromium, RGBA8 and BGRA8, against the CPU reference of the
   same frame, with examples/graphics-demo's limits (max 96, at most 0.2% of channels over 8, mean 0.25).
   The inbox receives a fractional `60.25px` wheel scroll before rendering, exercising retained
@@ -349,10 +349,10 @@ the wasm build draw the same bytes.
 
 ## Window demo
 
-`demo/` (`scripts/demo --editor` for the editor fixture, the place to try an input method)
+`demo/` (`silk task native demo modules/tree/demo -- --editor` for the editor fixture, the place to try an input method)
 is the inbox in a native window (modules/platform/window, ui_renderer on Dawn) and a tiny client:
 it reads the records and answers with mutations (New appends a row and scrolls it into view,
-Archive removes the focused row). `scripts/demo check` scripts a hover, a fractional wheel
+Archive removes the focused row). `silk task native demo modules/tree/demo -- check` scripts a hover, a fractional wheel
 scroll, and a Tab, then reads the surface back and compares it with the CPU reference,
 on X11 and Wayland under Xvfb and Weston with lavapipe.
 

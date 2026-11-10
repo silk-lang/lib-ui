@@ -1,0 +1,49 @@
+<!doctype html><title>Silk UI tree test</title><script type="module">
+import { WebGPUHost } from '/browser/host.ts';
+window.runTrees = async (indices, timeout) => {
+  const module = await WebAssembly.compileStreaming(fetch('/ui.wasm'));
+  const results = [];
+  for (const index of indices) {
+    const output = new Map();
+    const host = new WebGPUHost();
+    const imports = {
+      webgpu: host.imports,
+      host: { sample_output(kind, ptr, length) { output.set(kind, host.bytes(ptr, length).slice()); } },
+      math: { sin: Math.sin, cos: Math.cos, tan: Math.tan, hypot: Math.hypot, fmod: (x, y) => x % y },
+    };
+    const instance = await WebAssembly.instantiate(module, imports);
+    host.attach(instance);
+    const state = host.call('sample_start', index);
+    if (!state) throw new Error('sample_start(' + index + ') failed');
+    try {
+      await new Promise((resolve, reject) => {
+        let stopped = false, frame;
+        const deadline = setTimeout(() => finish(new Error('tree ' + index + ' timed out')), timeout);
+        const finish = error => {
+          if (stopped) return;
+          stopped = true; clearTimeout(deadline); cancelAnimationFrame(frame); host.onWake = undefined;
+          error ? reject(error) : resolve();
+        };
+        const poll = () => {
+          if (stopped) return;
+          try {
+            const status = host.call('sample_poll', state);
+            if (status === 1) finish();
+            else if (status < 0) finish(new Error('tree ' + index + ' failed: ' + new TextDecoder().decode(output.get(3) ?? new Uint8Array())));
+          } catch (error) { finish(error); }
+        };
+        const tick = () => { poll(); if (!stopped) frame = requestAnimationFrame(tick); };
+        host.onWake = poll;
+        tick();
+      });
+    } finally { host.call('sample_drop', state); }
+    await new Promise(resolve => setTimeout(resolve, 0));
+    host.assertClean();
+    const size = new DataView(output.get(0).buffer);
+    results.push({ index, width: size.getUint32(0, true), height: size.getUint32(4, true),
+      gpu: Array.from(output.get(1)), cpu: Array.from(output.get(2)) });
+  }
+  return results;
+};
+window.ready = true;
+</script>

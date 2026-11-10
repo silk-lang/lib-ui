@@ -97,5 +97,5 @@ let text = run snapshot(&mut tree, viewport)        // the describe snapshot
 ```
 
 Golden tests render a scene with `CpuSnapshot` and compare its PNG and `describe` text; see
-`app/tests/src/main.silk`. A window check (`node modules/app/demo/scripts/demo check`)
+`app/tests/src/main.silk`. A window check (`silk task native demo modules/app/demo -- check`)
 compares a real GPU frame against the CPU reference.

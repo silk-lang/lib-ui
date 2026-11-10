@@ -141,7 +141,7 @@ $ ui-inspect-cli screenshot inbox.png
 
 ```sh
 silk test --manifest-path modules/inspect/server/tests/silk.toml --root src/tests.silk
-node modules/tree/demo/scripts/demo inspect     # the CLI drives the demo in a window
+silk task native inspect      # the CLI drives the demo in a window
 ```
 
 - Every command through `Protocol.handle` over the inbox fixture: snapshot equals `describe`,
