@@ -17,9 +17,9 @@ export function manifest(packagePath) {
   return resolve(root, packagePath, packagePath.endsWith('.toml') ? '' : 'silk.toml');
 }
 export function prepareWindows(runtimeDirectory) {
-  const result = run('pwsh', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', resolve(repositoryRoot('lib-native'), 'scripts/prepare-windows.ps1'), '-Json',
-    ...(process.env.SILK_CLANG ? ['-Clang', process.env.SILK_CLANG] : []),
-    ...(runtimeDirectory ? ['-RuntimeDirectory', runtimeDirectory] : [])], { stdio: ['ignore', 'pipe', 'inherit'], encoding: 'utf8' });
+  const result = run(silk, ['task', '--manifest-path', resolve(repositoryRoot('lib-native'), 'silk.toml'), 'prepare-windows', '--json',
+    ...(process.env.SILK_CLANG ? ['--clang', process.env.SILK_CLANG] : []),
+    ...(runtimeDirectory ? ['--runtime-directory', resolve(runtimeDirectory)] : [])], { stdio: ['ignore', 'pipe', 'inherit'], encoding: 'utf8' });
   const prepared = JSON.parse(result.stdout);
   process.env.PATH = [resolve(prepared.dawn, 'bin'), prepared.dxc, resolve(prepared.glfw, 'lib-vc2022'), process.env.PATH].join(delimiter);
 }
