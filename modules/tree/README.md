@@ -11,13 +11,15 @@ host can drive it through the mutation protocol.
 ## Using a tree
 
 ```silk
-import ui_tree.lib { Tree, Viewport, Property, Length, Side, EventKind, Event, Input }
+import ui_tree.lib { Tree, Viewport, EventKind, Event, Input }
+import ui_tree.css
+import ui_tree.css { px }
 
 let mut tree = run Tree.make(&fonts)               // borrows a font_collection FontCollection
 let sans = run tree.fontFamily("Inter, Noto Sans, sans-serif")
 let root = run tree.box(&[
-  Property.FontFamily { family: sans.raw() },
-  Property.Padding { side: Side.Top, value: Length.px(16.0) },
+  css.fontFamily(sans.raw()),
+  css.paddingTop(px(16.0)),
 ])
 let save = run tree.box(&[])
 run tree.append(save, run tree.text("Save"))
@@ -43,7 +45,8 @@ let records = run tree.events()
   queries name nodes by; `BoxNode.of(id)` and the others turn an id back into a handle.
 - **Structure**: `setRoot`, `append`, `insertBefore`, `remove` (detach, can be appended again)
   and `destroy` (free the subtree). A child already in the tree moves, as in the DOM.
-- **Style** is a list of typed `Property` values: `setStyle` for the base look, `setStyleFor`
+- **Style** is a list of CSS declarations built with `ui_tree.css` (`css.width(px(120.0))`,
+  `css.display(Keyword.Flex)`), values as written: `setStyle` for the base look, `setStyleFor`
   with a `StyleState` for hover, active, focus and focus-visible, and `clearStyle`. Text
   properties inherit; the rest do not.
 - **Content and attributes**: `setText`, `setSource`, `setCanvas`, `setGrid`, `setAttribute`
@@ -81,7 +84,7 @@ family and resource numbers, sends `Mutation` values, and gets the same event re
 let mut batch = Batch.make()
 run batch.fontFamily(1, "Inter, Noto Sans, sans-serif")
 run batch.create(1, NodeKind.Box)
-run batch.style(1, &[Property.Padding { side: Side.Top, value: Length.px(16.0) }])
+run batch.style(1, &[css.paddingTop(px(16.0))])
 run batch.root(1)
 run batch.text(1, 2, "Hello")                     // create, set text, append to 1
 run tree.apply(run batch.take())

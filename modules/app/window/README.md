@@ -15,7 +15,7 @@ flags and the engine's Grid storage handles are managed by the UI layer.
 ```silk
 let columns = ui.alloc(Grid.columns(2))
 ui.grid(&columns, |ui| {
-  ui.width(Length.calc(-24.0, 100.0))
+  ui.width(ui.alloc(calc(-24.0, 100.0)))
   ui.gap(12.0)
   ui.box(|ui| { ui.text("First") })
   ui.box(|ui| { ui.text("Second") })
@@ -40,12 +40,12 @@ Give an image its own dimensions, semantics and interaction handlers:
 
 ```silk
 ui.imageWith(photo, |ui| {
-  ui.width(Length.px(320.0))
-  ui.height(Length.px(180.0))
+  ui.width(px(320.0))
+  ui.height(px(180.0))
   ui.label("Project cover")
   ui.style(&[
-    Property.ObjectFit { value: ObjectFit.Cover },
-    Property.ObjectPosition { x: Length.percent(50.0), y: Length.percent(25.0) },
+    css.objectFit(ObjectFit.Cover),
+    ui.alloc(css.objectPosition(percent(50.0), percent(25.0))),
   ])
   ui.onClick(|| Message.OpenCover)
 })
