@@ -8,6 +8,9 @@ import mutation {
   Role,
   Cursor,
   NOT_FOCUSABLE,
+  PREVENT_FOCUS,
+  PREVENT_SCROLL,
+  PREVENT_KEYS,
   LISTEN_POINTER_DOWN,
   LISTEN_POINTER_UP,
   LISTEN_CLICK,
@@ -466,7 +469,56 @@ fn clearPress(tree: &mut UiTree<'_>) -> () {
   tree.pressChain.clear()
   tree.capture = NONE
   tree.captureId = NONE
+  tree.captureMode = CAPTURE_IMPLICIT
+  tree.captureTo = NONE
+  tree.captureToId = NONE
   tree.thumbSlot = NONE
+}
+
+pub const CAPTURE_IMPLICIT: u32 = 0
+
+pub const CAPTURE_EXPLICIT: u32 = 1
+
+pub const CAPTURE_RELEASED: u32 = 2
+
+/// The node the press sends its pointer records to, or NONE for the node under the pointer.
+fn captureTarget(tree: &UiTree<'_>) -> u32 {
+  if captured(tree) == NONE || tree.captureMode == CAPTURE_RELEASED {
+    return NONE
+  }
+  if tree.captureMode == CAPTURE_EXPLICIT {
+    if alive(tree, tree.captureTo, tree.captureToId) && attached(tree, tree.captureTo) {
+      return tree.captureTo
+    }
+    return NONE
+  }
+  return tree.capture
+}
+
+/// `Mutation.SetPointerCapture`: `slot` takes the pointer records of the press under way.
+/// Returns false when no button is down.
+pub fn setCapture(tree: &mut UiTree<'_>, slot: u32) -> bool {
+  if captured(&tree.*) == NONE {
+    return false
+  }
+  tree.captureMode = CAPTURE_EXPLICIT
+  tree.captureTo = slot
+  tree.captureToId = tree.node(slot).id
+  return true
+}
+
+/// `Mutation.ReleasePointerCapture`.
+pub fn releaseCapture(tree: &mut UiTree<'_>) -> () {
+  if captured(&tree.*) != NONE {
+    tree.captureMode = CAPTURE_RELEASED
+    tree.captureTo = NONE
+    tree.captureToId = NONE
+  }
+}
+
+/// The node holding the capture of the press, or NONE.
+pub fn captureHolder(tree: &UiTree<'_>) -> u32 {
+  return captureTarget(tree)
 }
 
 /// The node holding the pointer capture, or NONE when it is gone.
@@ -998,17 +1050,35 @@ effect fn dragThumb(tree: &mut UiTree<'_>) -> ()
 pub effect fn dispatch(tree: &mut UiTree<'_>, input: Input) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
-  match move input {
+  run begin(&mut tree, &input)
+  run finish(&mut tree, move input, false)
+}
+
+/// Whether `slot` or a node above it prevents default action `flag` (`Attribute.Prevent`).
+fn pathPrevents(tree: &UiTree<'_>, slot: u32, flag: u32) -> bool {
+  let mut at = slot
+  while at != NONE {
+    if u32.bitAnd(tree.node(at).prevents, flag) != 0 {
+      return true
+    }
+    at = tree.node(at).parent
+  }
+  return false
+}
+
+/// The first half of a dispatch: where the pointer is, hover, and the record of the input
+/// itself. Nothing a client could prevent happens here.
+pub effect fn begin(tree: &mut UiTree<'_>, input: &Input) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match &input.* {
     Input.PointerMove { x, y, modifiers } => {
       let hit = run moved(&mut tree, x, y, modifiers)
       if tree.thumbSlot != NONE {
         run dragThumb(&mut tree)
         return ()
       }
-      let target = captured(&tree.*)
-      if target != NONE && target == tree.focused && tree.node(target).kind == NodeKind.Input {
-        run edit.pointerDrag(&mut tree, target, x, y)
-      }
+      let target = captureTarget(&tree.*)
       let to = if target != NONE {
         target
       } else {
@@ -1020,45 +1090,33 @@ pub effect fn dispatch(tree: &mut UiTree<'_>, input: Input) -> ()
     }
     Input.PointerDown { x, y, button, modifiers, clickCount } => {
       let hit = run moved(&mut tree, x, y, modifiers)
-      if hit == NONE {
-        if button == BUTTON_PRIMARY {
-          clearPress(&mut tree)
-          run tree.focusSlot(NONE)
-        }
-        return ()
-      }
-      let disabled = disabledAt(&tree.*, hit)
       if button == BUTTON_PRIMARY {
+        // A press that never saw its release ends here. A scrollbar thumb belongs to the
+        // tree, so a press on one is no pointer down for the client.
         clearPress(&mut tree)
-        if startThumb(&mut tree, hit, x, y) {
+        if hit != NONE && startThumb(&mut tree, hit, x, y) {
           return ()
         }
-        tree.focusVisible = false
-        if disabled {
-          run focusFrom(&mut tree, NONE)
-        } else {
-          run setPressed(&mut tree, hit)
-          tree.pressCount = clickCount
-          run focusFrom(&mut tree, hit)
-          if tree.focused == hit && tree.node(hit).kind == NodeKind.Input {
-            run edit.pointerDown(&mut tree, hit, x, y, clickCount, modifiers)
-          }
-        }
       }
-      if !disabled && pathListens(&tree.*, hit, LISTEN_POINTER_DOWN) {
+      if hit == NONE || disabledAt(&tree.*, hit) {
+        return ()
+      }
+      if button == BUTTON_PRIMARY {
+        // The active state and the capture start with the press, so a client handling the
+        // pointer down can already call `SetPointerCapture`.
+        run setPressed(&mut tree, hit)
+        tree.pressCount = clickCount
+      }
+      if pathListens(&tree.*, hit, LISTEN_POINTER_DOWN) {
         run pointerRecord(&mut tree, EventKind.PointerDown, hit, modifiers, button, clickCount)
       }
     }
     Input.PointerUp { x, y, button, modifiers } => {
       let hit = run moved(&mut tree, x, y, modifiers)
       if button == BUTTON_PRIMARY && tree.thumbSlot != NONE {
-        clearPress(&mut tree)
         return ()
       }
-      let holder = captured(&tree.*)
-      if button == BUTTON_PRIMARY && holder != NONE && tree.node(holder).kind == NodeKind.Input {
-        edit.pointerUp(&mut tree, holder)
-      }
+      let holder = captureTarget(&tree.*)
       let target = if button == BUTTON_PRIMARY && holder != NONE {
         holder
       } else {
@@ -1068,35 +1126,15 @@ pub effect fn dispatch(tree: &mut UiTree<'_>, input: Input) -> ()
         && pathListens(&tree.*, target, LISTEN_POINTER_UP) {
         run pointerRecord(&mut tree, EventKind.PointerUp, target, modifiers, button, 0)
       }
-      if button == BUTTON_PRIMARY {
-        if holder != NONE && hit != NONE {
-          let common = commonAncestor(&tree.*, holder, hit)
-          if common != NONE && !disabledAt(&tree.*, common)
-            && pathListens(&tree.*, common, LISTEN_CLICK) {
-            let count = tree.pressCount
-            run pointerRecord(&mut tree, EventKind.Click, common, modifiers, button, count)
-          }
-        }
-        clearPress(&mut tree)
-      }
     }
     Input.PointerLeave => {
       tree.pointerInside = false
       run updateHover(&mut tree, NONE, 0)
     }
-    Input.PointerCancel => {
-      let holder = captured(&tree.*)
-      if holder != NONE && tree.node(holder).kind == NodeKind.Input {
-        edit.pointerUp(&mut tree, holder)
-      }
-      clearPress(&mut tree)
-    }
+    Input.PointerCancel => {}
     Input.Wheel { x, y, deltaX, deltaY, modifiers } => {
       let hit = run moved(&mut tree, x, y, modifiers)
-      if hit == NONE {
-        return ()
-      }
-      if pathListens(&tree.*, hit, LISTEN_WHEEL) {
+      if hit != NONE && pathListens(&tree.*, hit, LISTEN_WHEEL) {
         let mut event = run record(&tree.*, EventKind.Wheel, hit)
         event.x = x
         event.y = y
@@ -1105,16 +1143,122 @@ pub effect fn dispatch(tree: &mut UiTree<'_>, input: Input) -> ()
         event.deltaY = deltaY
         run tree.queueEvent(move event)
       }
-      run scrollChain(&mut tree, hit, deltaX, deltaY)
     }
     Input.KeyDown { key, code, modifiers, repeat } => {
       let target = keyTarget(&tree.*)
-      if target == NONE {
-        return ()
-      }
-      if pathListens(&tree.*, target, LISTEN_KEY_DOWN) {
+      if target != NONE && pathListens(&tree.*, target, LISTEN_KEY_DOWN) {
         run keyRecord(&mut tree, EventKind.KeyDown, target, &key, &code, modifiers, repeat)
       }
+    }
+    Input.KeyUp { key, code, modifiers } => {
+      let target = keyTarget(&tree.*)
+      if target != NONE && pathListens(&tree.*, target, LISTEN_KEY_UP) {
+        run keyRecord(&mut tree, EventKind.KeyUp, target, &key, &code, modifiers, false)
+      }
+    }
+    Input.TextInput { .. } => {}
+    Input.ImePreedit { .. } => {}
+    Input.Paste { .. } => {}
+  }
+}
+
+/// The second half of a dispatch: the default action of `input` and the records that follow
+/// from it. With `prevented`, or under a node whose `Attribute.Prevent` names the action, the
+/// default is skipped: a press takes no focus and starts no selection, a wheel does not
+/// scroll, and a key does not move focus, click or edit. Hover, the active state, capture and
+/// the click of a press are not default actions and happen either way, as in the DOM.
+pub effect fn finish(tree: &mut UiTree<'_>, input: Input, prevented: bool) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match move input {
+    Input.PointerMove { x, y, .. } => {
+      if tree.thumbSlot != NONE {
+        return ()
+      }
+      let origin = captured(&tree.*)
+      if origin != NONE && origin == tree.focused && tree.node(origin).kind == NodeKind.Input {
+        run edit.pointerDrag(&mut tree, origin, x, y)
+      }
+    }
+    Input.PointerDown { x, y, button, modifiers, clickCount } => {
+      if button != BUTTON_PRIMARY || tree.thumbSlot != NONE {
+        return ()
+      }
+      let hit = hitSlot(&tree.*, x, y)
+      if hit == NONE {
+        if !prevented {
+          run tree.focusSlot(NONE)
+        }
+        return ()
+      }
+      let keepFocus = prevented || pathPrevents(&tree.*, hit, PREVENT_FOCUS)
+      tree.focusVisible = false
+      if disabledAt(&tree.*, hit) {
+        if !keepFocus {
+          run focusFrom(&mut tree, NONE)
+        }
+        return ()
+      }
+      if !keepFocus {
+        run focusFrom(&mut tree, hit)
+        if tree.focused == hit && tree.node(hit).kind == NodeKind.Input {
+          run edit.pointerDown(&mut tree, hit, x, y, clickCount, modifiers)
+        }
+      }
+    }
+    Input.PointerUp { x, y, button, modifiers } => {
+      if button != BUTTON_PRIMARY {
+        return ()
+      }
+      if tree.thumbSlot != NONE {
+        clearPress(&mut tree)
+        return ()
+      }
+      let origin = captured(&tree.*)
+      if origin != NONE && tree.node(origin).kind == NodeKind.Input {
+        edit.pointerUp(&mut tree, origin)
+      }
+      let hit = hitSlot(&tree.*, x, y)
+      let mut clicked = NONE
+      if tree.captureMode == CAPTURE_EXPLICIT {
+        // A captured press clicks its holder wherever the button comes up.
+        clicked = captureTarget(&tree.*)
+      } else if origin != NONE && hit != NONE {
+        clicked = commonAncestor(&tree.*, origin, hit)
+      }
+      if clicked != NONE && !disabledAt(&tree.*, clicked)
+        && pathListens(&tree.*, clicked, LISTEN_CLICK) {
+        let count = tree.pressCount
+        run pointerRecord(&mut tree, EventKind.Click, clicked, modifiers, button, count)
+      }
+      clearPress(&mut tree)
+    }
+    Input.PointerLeave => {}
+    Input.PointerCancel => {
+      let origin = captured(&tree.*)
+      if origin != NONE && tree.node(origin).kind == NodeKind.Input {
+        edit.pointerUp(&mut tree, origin)
+      }
+      clearPress(&mut tree)
+    }
+    Input.Wheel { x, y, deltaX, deltaY, .. } => {
+      let hit = hitSlot(&tree.*, x, y)
+      if hit == NONE || prevented || pathPrevents(&tree.*, hit, PREVENT_SCROLL) {
+        return ()
+      }
+      run scrollChain(&mut tree, hit, deltaX, deltaY)
+    }
+    Input.KeyDown { key, modifiers, repeat, .. } => {
+      let target = keyTarget(&tree.*)
+      if target == NONE {
+        tree.suppressText = false
+        return ()
+      }
+      if prevented || pathPrevents(&tree.*, target, PREVENT_KEYS) {
+        tree.suppressText = true
+        return ()
+      }
+      tree.suppressText = false
       if target == tree.focused && tree.node(target).kind == NodeKind.Input
         && run edit.keyDown(&mut tree, target, &key, modifiers) {
         return ()
@@ -1127,13 +1271,10 @@ pub effect fn dispatch(tree: &mut UiTree<'_>, input: Input) -> ()
         run keyboardClick(&mut tree, target, modifiers)
       }
     }
-    Input.KeyUp { key, code, modifiers } => {
+    Input.KeyUp { key, modifiers, .. } => {
       let target = keyTarget(&tree.*)
-      if target == NONE {
+      if target == NONE || prevented || pathPrevents(&tree.*, target, PREVENT_KEYS) {
         return ()
-      }
-      if pathListens(&tree.*, target, LISTEN_KEY_UP) {
-        run keyRecord(&mut tree, EventKind.KeyUp, target, &key, &code, modifiers, false)
       }
       let plain = u32.bitAnd(modifiers, MOD_CONTROL + MOD_ALT + MOD_META) == 0
       if plain && String.view(&key) == " " && target == tree.focused
@@ -1142,6 +1283,9 @@ pub effect fn dispatch(tree: &mut UiTree<'_>, input: Input) -> ()
       }
     }
     Input.TextInput { text } => {
+      if tree.suppressText {
+        return ()
+      }
       run edit.textInput(&mut tree, move text)
     }
     Input.ImePreedit { text, selectionStart, selectionEnd } => {

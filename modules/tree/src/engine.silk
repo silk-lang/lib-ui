@@ -249,6 +249,14 @@ pub struct UiTree<'a> {
   pub pressChain: List<u64>,
   pub capture: u32,
   pub captureId: u32,
+  /// Where the press sends its pointer records: `CAPTURE_IMPLICIT` (the pressed node),
+  /// `CAPTURE_EXPLICIT` (the node below, set with `SetPointerCapture`) or `CAPTURE_RELEASED`
+  /// (the node under the pointer).
+  pub captureMode: u32,
+  pub captureTo: u32,
+  pub captureToId: u32,
+  /// The last key down had its default prevented, so the text it types is dropped.
+  pub suppressText: bool,
   /// The click count of the press, for its click record.
   pub pressCount: u32,
   /// A scrollbar thumb being dragged: the container slot (NONE when none), the axis, and the
@@ -345,6 +353,10 @@ impl<'a> UiTree<'a> {
       pressChain: List<u64>.make(),
       capture: NONE,
       captureId: NONE,
+      captureMode: 0,
+      captureTo: NONE,
+      captureToId: NONE,
+      suppressText: false,
       pressCount: 0,
       thumbSlot: NONE,
       thumbVertical: true,
@@ -594,6 +606,9 @@ impl<'a> UiTree<'a> {
           Attribute.Disabled { value } => {
             node.disabled = value
           }
+          Attribute.Prevent { actions } => {
+            node.prevents = actions
+          }
           Attribute.FocusTrap { value } => {
             node.focusTrap = value
           }
@@ -654,6 +669,13 @@ impl<'a> UiTree<'a> {
       }
       Mutation.Blur => {
         run self.focusSlot(NONE)
+      }
+      Mutation.SetPointerCapture { id } => {
+        let slot = run self.require(index, id)
+        drop interact.setCapture(&mut self, slot)
+      }
+      Mutation.ReleasePointerCapture => {
+        interact.releaseCapture(&mut self)
       }
       Mutation.ScrollTo { id, x, y } => {
         let slot = run self.require(index, id)
@@ -822,6 +844,7 @@ impl<'a> UiTree<'a> {
       cursor: Cursor.Default,
       disabled: false,
       focusTrap: false,
+      prevents: 0,
       checked: false,
       selected: false,
       expanded: false,
@@ -1112,7 +1135,35 @@ impl<'a> UiTree<'a> {
       self.viewScrollState.interruptAll()
       self.viewScrollAnimations.clear()
     }
-    run interact.dispatch(&mut self, move input)
+    run interact.begin(&mut self, &input)
+    run interact.finish(&mut self, move input, false)
+  }
+
+  /// The first half of `dispatch`: hit testing, hover, and the record of the input itself
+  /// (pointer down, wheel, key down and so on), with no default action taken yet. Follow it
+  /// with `finish` for the same input.
+  pub effect fn begin(self: &mut Self, input: &Input) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let interruptsScroll = match &input.* {
+      Input.Wheel { .. } => true
+      Input.PointerDown { .. } => true
+      Input.KeyDown { .. } => true
+      _ => false
+    }
+    if interruptsScroll {
+      self.viewScrollState.interruptAll()
+      self.viewScrollAnimations.clear()
+    }
+    run interact.begin(&mut self, input)
+  }
+
+  /// The second half of `dispatch`: the default action of `input` (focus, scrolling, Tab,
+  /// keyboard clicks, editing) unless `prevented`, and the records that follow from it.
+  pub effect fn finish(self: &mut Self, input: Input, prevented: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run interact.finish(&mut self, move input, prevented)
   }
 
   /// The id of the node a pointer at (`x`, `y`) would target in the last frame, or NONE.
