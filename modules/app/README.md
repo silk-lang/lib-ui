@@ -181,6 +181,13 @@ check counts and stats with these, and `modules/app/tests` renders golden scenes
 PNG) for the counter and the todo list. `silk task native demo modules/app/demo -- check` runs the todo list in a
 real window on X11 and Wayland, clicks Add and compares a frame.
 
+## What depends on the tree
+
+Views, the diff and the element model (`ui`, `diff`, `equal`, `virtual_list`) import only
+`ui-protocol`: they produce mutations and read event records, and never touch a tree. Only
+`runtime` and `harness` hold a `ui-tree`, so another host that speaks the protocol needs its
+own runtime and nothing else.
+
 ## Limits
 
 - `runWindow` performs commands synchronously. For native workers, use deferred commands and
