@@ -1,0 +1,341 @@
+//! The tree's public protocol: plain-data [`Mutation`]s in, [`Event`] records out.
+//!
+//! Everything here is plain data. Nodes are named by integer ids the client chooses, styles are
+//! patches of (property, value) pairs, and resources (font families, images, icons) are defined
+//! once under client ids and then referenced by them. A later wire protocol is a serialization of
+//! these unions; a Silk client builds them directly.
+import options { AnchorOptions, VirtualOptions, VirtualItem }
+import codec.image { Image }
+pub import layout.lib {
+  UnicodeBidi,
+  WritingMode,
+  TextOrientation,
+  VerticalAlign,
+  VerticalAlignKind,
+  BaselineSource,
+  TextWrap,
+  WhiteSpaceCollapse,
+  TextJustify,
+  TextIndent,
+  TabSize,
+  BoxDecorationBreak,
+  MarginBreak,
+  BreakBetween,
+  BreakInside,
+  OverflowAlignment,
+  ScrollbarWidth,
+  ScrollbarGutter,
+  Float,
+  Clear,
+  Visibility,
+  Dimension,
+  DimensionKind,
+  TextAlign as LayoutTextAlign,
+  // The same keyword sets as css-layout's, so the protocol carries its types as they are.
+  FlexDirection,
+  FlexWrap,
+  Align,
+  Position,
+  Overflow,
+  BoxSizing,
+  TextAlign,
+  Direction
+}
+// Paint and text value types and the declaration model come from css-properties.
+pub import properties.computed {
+  ObjectFit,
+  BorderStyle,
+  FontStyle,
+  WhiteSpace,
+  DecorationLine,
+  BoxShadow,
+}
+pub import properties.values { Declaration, Value }
+pub import properties.keywords { Keyword }
+pub import properties.catalog { Property as CssProperty }
+import grid { Grid }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.color.rgba { Rgba }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.text.string { String }
+
+/// What a node is.
+pub enum NodeKind {
+  /// The `div` of the tree. Everything else styles a box.
+  Box,
+  /// A text leaf, laid out by the parent's inline formatting. Text takes its look from its
+  /// parent: wrap text in an inline box to style a span of it.
+  Text,
+  /// A decoded image, drawn over the content box ([`Mutation.SetSource`] names it).
+  Image,
+  /// An SVG icon drawn as a mask tinted with the text color. Its natural size is 1em square.
+  Icon,
+  /// An editable text field: one line, or several with the `Multiline` attribute. It owns
+  /// its caret, selection, undo history and input method composition, and queues `Input`
+  /// records when its value changes.
+  Input,
+  /// A box whose content the client paints with [`CanvasCommand`]s.
+  Canvas,
+}
+
+/// Which look a style patch sets: the base look, or a variant the tree switches to by itself.
+/// Variants apply over the base in this order: hover, active, focus, focus-visible.
+pub enum StyleState {
+  Base,
+  /// While the pointer is over the node or one of its descendants (CSS `:hover`).
+  Hover,
+  /// While the primary button went down on the node or a descendant and is not up yet
+  /// (CSS `:active`).
+  Active,
+  /// While the node has focus.
+  Focus,
+  /// While the node has focus that came from the keyboard, or from a `Focus` mutation after
+  /// keyboard use, as CSS `:focus-visible`. Inputs show it for any focus. Use it for focus rings.
+  FocusVisible,
+}
+
+/// Accessibility roles, published to clients, inspectors and supported native accessibility bridges.
+pub enum Role {
+  None,
+  Generic,
+  Button,
+  Link,
+  Checkbox,
+  Radio,
+  TextBox,
+  Heading,
+  Paragraph,
+  List,
+  ListItem,
+  Image,
+  Dialog,
+  Menu,
+  MenuItem,
+  Tab,
+  TabList,
+  TabPanel,
+  Toolbar,
+  Navigation,
+  Main,
+  Form,
+  Group,
+  Slider,
+  Switch,
+  ListBox,
+  Option,
+  Tooltip,
+}
+
+pub enum Cursor {
+  Default,
+  Pointer,
+  Text,
+  Move,
+  Grab,
+  Grabbing,
+  NotAllowed,
+  ResizeHorizontal,
+  ResizeVertical,
+  ResizeNorthWestSouthEast,
+  ResizeNorthEastSouthWest,
+  Crosshair,
+}
+
+/// A node attribute. Text attributes are cleared by setting them empty.
+pub union Attribute {
+  /// Numeric accessibility state for sliders and other range controls.
+  ValueRange { pub min: f32, pub max: f32, pub value: f32 },
+  ClearValueRange,
+  Role { pub value: Role },
+  /// The accessible name.
+  Label { pub value: String },
+  /// A stable name for tests and inspectors.
+  TestId { pub value: String },
+  /// Tab order as in HTML: negative is focusable (by pointer and `Focus`) but not tabbable, 0
+  /// is tree order, and positive values come first, lowest first. [`NOT_FOCUSABLE`], the
+  /// default for every kind but `Input`, takes the node out of focus again.
+  TabIndex { pub value: i32 },
+  Cursor { pub value: Cursor },
+  /// A disabled node and its subtree take no focus, no active state and no pointer down, up
+  /// or click records.
+  Disabled { pub value: bool },
+  /// While focus is inside this node, Tab and Shift+Tab cycle through its tabbable
+  /// descendants only, as a modal dialog wants.
+  FocusTrap { pub value: bool },
+  /// An input that takes several lines: Enter inserts a line break, text wraps
+  /// (`white-space: pre-wrap`) and the box scrolls vertically. Without it, an input is one
+  /// line (`white-space: pre`) that scrolls horizontally to keep the caret in view, and line
+  /// breaks typed or pasted into it become spaces.
+  Multiline { pub value: bool },
+  /// An input whose value the user can select and copy but not change.
+  ReadOnly { pub value: bool },
+  /// The text an empty input shows (CSS `placeholder`), in the placeholder color.
+  Placeholder { pub value: String },
+  /// The checked state of a checkbox, radio button or switch (`aria-checked`). For
+  /// assistive technology, inspectors and tests; the tree draws nothing for it.
+  Checked { pub value: bool },
+  /// Whether a tab, list item or option is the selected one (`aria-selected`).
+  Selected { pub value: bool },
+  /// Whether what a button or menu item controls is open (`aria-expanded`).
+  Expanded { pub value: bool },
+  /// The default actions (`PREVENT_*` flags) the tree skips for input aimed at this node or
+  /// its subtree, as a listener that always calls `preventDefault` does in the DOM. The
+  /// event records are still queued.
+  Prevent { pub actions: u32 },
+}
+
+/// Flags for [`Attribute.Prevent`].
+///
+/// A primary press does not move focus and does not start a text selection.
+pub const PREVENT_FOCUS: u32 = 1
+
+/// A wheel does not scroll.
+pub const PREVENT_SCROLL: u32 = 2
+
+/// A key does nothing by itself: no Tab navigation, no Enter or Space click, no editing, and
+/// no text typed by it.
+pub const PREVENT_KEYS: u32 = 4
+
+pub const PREVENT_ALL: u32 = 7
+
+/// The tab index of a node that is not focusable: the default for all kinds but `Input`
+/// (whose default is 0).
+pub const NOT_FOCUSABLE: i32 = -2147483648
+
+/// Listener flags for [`Mutation.SetListeners`]: which events the client wants records for.
+pub const LISTEN_POINTER_DOWN: u32 = 1
+
+pub const LISTEN_POINTER_UP: u32 = 2
+
+pub const LISTEN_CLICK: u32 = 4
+
+pub const LISTEN_POINTER_MOVE: u32 = 8
+
+pub const LISTEN_POINTER_ENTER: u32 = 16
+
+pub const LISTEN_POINTER_LEAVE: u32 = 32
+
+pub const LISTEN_WHEEL: u32 = 64
+
+pub const LISTEN_KEY_DOWN: u32 = 128
+
+pub const LISTEN_KEY_UP: u32 = 256
+
+pub const LISTEN_FOCUS: u32 = 512
+
+pub const LISTEN_BLUR: u32 = 1024
+
+pub const LISTEN_INPUT: u32 = 2048
+
+pub const LISTEN_SCROLL: u32 = 4096
+
+/// Every listener flag.
+pub const LISTEN_LAYOUT: u32 = 8192
+
+/// Every public event.
+pub const LISTEN_ALL: u32 = 16383
+
+/// One drawing command of a canvas node, in CSS pixels from the content box's top-left corner.
+/// Path commands build a path that the next `Fill` or `Stroke` draws and then clears.
+pub union CanvasCommand {
+  FillRect {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub radius: f32,
+    pub color: Rgba<f32>
+  },
+  MoveTo { pub x: f32, pub y: f32 },
+  LineTo { pub x: f32, pub y: f32 },
+  QuadTo { pub x1: f32, pub y1: f32, pub x: f32, pub y: f32 },
+  CubicTo { pub x1: f32, pub y1: f32, pub x2: f32, pub y2: f32, pub x: f32, pub y: f32 },
+  Close,
+  Fill { pub color: Rgba<f32> },
+  Stroke { pub color: Rgba<f32>, pub width: f32 },
+}
+
+impl Copy for CanvasCommand {}
+
+/// A change to the tree. Apply a batch with `UiTree.apply`.
+pub union Mutation {
+  /// Places a popup relative to target after layout. The tree owns its fixed position and viewport constraints.
+  /// The popup must be a box; its anchor must exist and must not depend on the popup.
+  SetAnchor { pub id: u32, pub target: u32, pub options: AnchorOptions },
+  /// Removes automatic placement and restores the node's ordinary styles.
+  ClearAnchor { pub id: u32 },
+  /// Configures tree-managed vertical virtualization on a bounded column box.
+  /// The tree owns spacer geometry, measurement, scroll anchoring and focus retention.
+  /// Clients mount the indices returned by `UiTree.virtualRange` and bind their nodes
+  /// with `SetVirtualItems`. Use finite positive estimated height and nonnegative gap/overscan.
+  SetVirtualList { pub id: u32, pub count: usize, pub options: VirtualOptions },
+  /// Binds every direct child box to its logical index, in strictly increasing order.
+  /// Children must have zero flex shrink. The tree creates private layout spacers;
+  /// do not supply spacers, unrelated children, container gaps or vertical padding.
+  SetVirtualItems { pub id: u32, pub items: List<VirtualItem> },
+  /// Removes the controller and its private spacers, leaving client nodes intact.
+  /// An absent controller is a no-op, including after the container is destroyed.
+  ClearVirtualList { pub id: u32 },
+  /// Makes a detached node `id` of `kind`. Ids are the client's: any `u32` not in use.
+  Create { pub id: u32, pub kind: NodeKind },
+  /// Inserts `child` into `parent` before `before`, or last without it. A child already in the
+  /// tree moves, as in the DOM.
+  InsertBefore { pub parent: u32, pub child: u32, pub before: Option<u32> },
+  /// Detaches `id` (and its subtree) from its parent. It can be inserted again.
+  Remove { pub id: u32 },
+  /// Detaches and frees `id` and its whole subtree; their ids can be used again.
+  Destroy { pub id: u32 },
+  /// Sets `properties` in the `state` look of `id`, each replacing the earlier value of its
+  /// property.
+  SetStyle { pub id: u32, pub state: StyleState, pub declarations: List<Declaration> },
+  /// Forgets every property set in the `state` look of `id`.
+  ClearStyle { pub id: u32, pub state: StyleState },
+  /// Sets the value of a text or input node. An input whose value changes puts its caret at
+  /// the end, ends any composition and forgets its undo history, as setting `value` in the DOM
+  /// does; setting the value it already has changes nothing, so a client can echo every
+  /// `Input` record back (a controlled input).
+  SetText { pub id: u32, pub value: String },
+  /// Selects the UTF-8 byte range from `anchor` to `focus` of an input's value (equal for a
+  /// caret). Offsets are clamped to the value and moved back to a character boundary.
+  SetSelection { pub id: u32, pub anchor: usize, pub focus: usize },
+  SetAttribute { pub id: u32, pub attribute: Attribute },
+  /// Sets the `LISTEN_*` flags of `id`.
+  SetListeners { pub id: u32, pub flags: u32 },
+  /// Makes `id` the root node, filling the viewport. The previous root is detached.
+  SetRoot { pub id: u32 },
+  Focus { pub id: u32 },
+  Blur,
+  /// While the primary button is down, sends pointer move and up records and the click to
+  /// `id` wherever the pointer is, as DOM `setPointerCapture`. It ends with the press. It does
+  /// nothing when no button is down.
+  SetPointerCapture { pub id: u32 },
+  /// Ends the capture of the press, the implicit one included: until the button comes up,
+  /// pointer records go to the node under the pointer.
+  ReleasePointerCapture,
+  /// Scrolls the scroll container `id` to offset (`x`, `y`) in CSS pixels, clamped to its
+  /// scroll range at the next frame.
+  ScrollTo { pub id: u32, pub x: f32, pub y: f32 },
+  /// At the next frame, scrolls the scroll containers around `id` the least that brings its
+  /// border box into view, as `scrollIntoView({ block: "nearest" })`.
+  ScrollIntoView { pub id: u32 },
+  /// Points an image or icon node at a resource defined with `DefineImage` or `DefineIcon`.
+  /// Replaces the node’s owned Grid template and item placement.
+  SetGrid { pub id: u32, pub value: Grid },
+  SetSource { pub id: u32, pub resource: u32 },
+  /// Replaces the drawing of a canvas node.
+  SetCanvas { pub id: u32, pub commands: List<CanvasCommand> },
+  /// Defines font family list `family` from CSS `font-family` text, such as
+  /// `"Inter, Noto Sans, sans-serif"`. Generic names map to the collection's generic families.
+  DefineFontFamily { pub family: u32, pub names: String },
+  /// Decodes a PNG or JPEG file as image resource `resource`.
+  DefineImage { pub resource: u32, pub data: Bytes },
+  /// Installs decoded, premultiplied sRGB samples without decoding on the UI thread.
+  DefineDecodedImage { pub resource: u32, pub image: Image },
+  /// Releases a resource. Nodes referencing it become empty until it is defined again.
+  ReleaseResource { pub resource: u32 },
+  /// Parses an SVG file as icon resource `resource`.
+  DefineIcon { pub resource: u32, pub data: Bytes },
+}
+
