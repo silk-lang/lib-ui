@@ -223,6 +223,95 @@ effect fn capturesFollowThePress() -> ()
   run tree.dispatch(Input.release(10.0, 10.0))
 }
 
+/// The kinds of the queued records, one letter each: g got, l lost, u up, c click, x cancel.
+effect fn kinds(tree: &mut Tree<'_>) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let records = run tree.events()
+  let list = records.asSlice()
+  let mut out = String.make()
+  let mut i: usize = 0
+  while i < list.length {
+    let letter = match list[i].event.kind() {
+      EventKind.GotPointerCapture => "g"
+      EventKind.LostPointerCapture => "l"
+      EventKind.PointerUp => "u"
+      EventKind.Click => "c"
+      EventKind.PointerCancel => "x"
+      _ => "?"
+    }
+    run out.append(letter)
+    i = i + 1
+  }
+  return move out
+}
+
+effect fn capturesAreReported() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run Tree.make(&fonts)
+  let root = run tree.box(&[])
+  let thumb = run tree.box(&sized(100.0, 40.0))
+  let track = run tree.box(&sized(100.0, 40.0))
+  run tree.append(root, thumb)
+  run tree.append(root, track)
+  run tree.setRoot(root)
+  let all = [
+    EventKind.PointerUp,
+    EventKind.Click,
+    EventKind.PointerCancel,
+    EventKind.GotPointerCapture,
+    EventKind.LostPointerCapture,
+  ]
+  run tree.listen(root, &all)
+  drop run tree.frame(viewport(), 0.0)
+
+  // The implicit capture of a press is silent, as a mouse press is in the DOM.
+  run tree.dispatch(Input.press(10.0, 10.0))
+  let quiet = run kinds(&mut tree)
+  run Testing.expect(String.view(&quiet) == "", "a plain press reports no capture")
+
+  // Taking it, handing it over and taking it again.
+  run tree.setPointerCapture(thumb)
+  run tree.setPointerCapture(thumb)
+  run tree.setPointerCapture(track)
+  let taken = run kinds(&mut tree)
+  run Testing.expect(String.view(&taken) == "glg", "got, then lost and got on the handover")
+
+  // The capture ends with the press: up, lost, then the click.
+  run tree.dispatch(Input.release(10.0, 10.0))
+  let ended = run kinds(&mut tree)
+  run Testing.expect(String.view(&ended) == "ulc", "up, lost, click")
+
+  // Releasing reports the loss once.
+  run tree.dispatch(Input.press(10.0, 10.0))
+  run tree.setPointerCapture(track)
+  run tree.releasePointerCapture()
+  run tree.releasePointerCapture()
+  run tree.dispatch(Input.release(10.0, 10.0))
+  let released = run kinds(&mut tree)
+  run Testing.expect(String.view(&released) == "gluc", "got, lost, then an ordinary release")
+
+  // A cancelled press: the cancel, the loss, and no click.
+  run tree.dispatch(Input.press(10.0, 10.0))
+  run tree.setPointerCapture(track)
+  drop run tree.events()
+  run tree.dispatch(Input.PointerCancel)
+  let cancelled = run tree.events()
+  run Testing.expect(cancelled.length() == 2, "the cancel and the lost capture")
+  run Testing.expect(cancelled.asSlice()[0].target.is(track), "the cancel goes to the holder")
+  run Testing.expect(
+    cancelled.asSlice()[0].event.kind() == EventKind.PointerCancel
+      && cancelled.asSlice()[1].event.kind() == EventKind.LostPointerCapture,
+    "cancel, then lost",
+  )
+  run Testing.expect(tree.pointerCapture().isNone(), "the capture is gone")
+  run tree.dispatch(Input.release(10.0, 10.0))
+  let nothing = run kinds(&mut tree)
+  run Testing.expect(String.view(&nothing) == "u", "the late release clicks nothing")
+}
+
 fn captureIs(tree: &Tree<'_>, id: NodeId) -> bool {
   return match tree.pointerCapture() {
     Option.Some { value } => value.is(id)
@@ -394,6 +483,12 @@ test effect fn pointerCaptureFollowsThePress() -> ()
   ! TreeError | OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run capturesFollowThePress() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn pointerCaptureIsReported() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run capturesAreReported() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
 test effect fn propagationVisitsCaptureTargetBubble() -> ()

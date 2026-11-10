@@ -20,7 +20,10 @@ import mutation {
   LISTEN_WHEEL,
   LISTEN_KEY_DOWN,
   LISTEN_KEY_UP,
-  LISTEN_SCROLL
+  LISTEN_SCROLL,
+  LISTEN_POINTER_CANCEL,
+  LISTEN_GOT_POINTER_CAPTURE,
+  LISTEN_LOST_POINTER_CAPTURE
 }
 import node { NONE, NO_INDEX, Event, EventKind }
 import edit
@@ -497,23 +500,56 @@ fn captureTarget(tree: &UiTree<'_>) -> u32 {
 
 /// `Mutation.SetPointerCapture`: `slot` takes the pointer records of the press under way.
 /// Returns false when no button is down.
-pub fn setCapture(tree: &mut UiTree<'_>, slot: u32) -> bool {
+pub effect fn setCapture(tree: &mut UiTree<'_>, slot: u32) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
   if captured(&tree.*) == NONE {
     return false
   }
+  let before = explicitHolder(&tree.*)
+  if before == slot {
+    return true
+  }
+  run captureRecord(&mut tree, EventKind.LostPointerCapture, LISTEN_LOST_POINTER_CAPTURE, before)
   tree.captureMode = CAPTURE_EXPLICIT
   tree.captureTo = slot
   tree.captureToId = tree.node(slot).id
+  run captureRecord(&mut tree, EventKind.GotPointerCapture, LISTEN_GOT_POINTER_CAPTURE, slot)
   return true
 }
 
 /// `Mutation.ReleasePointerCapture`.
-pub fn releaseCapture(tree: &mut UiTree<'_>) -> () {
+pub effect fn releaseCapture(tree: &mut UiTree<'_>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
   if captured(&tree.*) != NONE {
+    let before = explicitHolder(&tree.*)
     tree.captureMode = CAPTURE_RELEASED
     tree.captureTo = NONE
     tree.captureToId = NONE
+    run captureRecord(&mut tree, EventKind.LostPointerCapture, LISTEN_LOST_POINTER_CAPTURE, before)
   }
+}
+
+/// The node that took the capture with `SetPointerCapture` and still holds it, or NONE. The
+/// implicit capture of a press has no holder in this sense, as a mouse press has none in the
+/// DOM, so it gets no got and lost records.
+fn explicitHolder(tree: &UiTree<'_>) -> u32 {
+  if tree.captureMode != CAPTURE_EXPLICIT {
+    return NONE
+  }
+  return captureTarget(tree)
+}
+
+/// Queues a got or lost capture record for `slot` when it or a node on its path listens.
+effect fn captureRecord(tree: &mut UiTree<'_>, kind: EventKind, flag: u32, slot: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if slot == NONE || !pathListens(&tree.*, slot, flag) {
+    return ()
+  }
+  let event = run record(&tree.*, kind, slot)
+  run tree.queueEvent(move event)
 }
 
 /// The node holding the capture of the press, or NONE.
@@ -1152,7 +1188,17 @@ pub effect fn begin(tree: &mut UiTree<'_>, input: &Input) -> ()
       tree.pointerInside = false
       run updateHover(&mut tree, NONE, 0)
     }
-    Input.PointerCancel => {}
+    Input.PointerCancel => {
+      // The record goes where the press was sending its records.
+      let mut target = captureTarget(&tree.*)
+      if target == NONE {
+        target = captured(&tree.*)
+      }
+      if target != NONE && tree.thumbSlot == NONE
+        && pathListens(&tree.*, target, LISTEN_POINTER_CANCEL) {
+        run pointerRecord(&mut tree, EventKind.PointerCancel, target, 0, BUTTON_PRIMARY, 0)
+      }
+    }
     Input.Wheel { x, y, deltaX, deltaY, modifiers } => {
       let hit = run moved(&mut tree, x, y, modifiers)
       remember(&mut tree, hit)
@@ -1255,6 +1301,9 @@ pub effect fn finish(tree: &mut UiTree<'_>, input: Input, prevented: bool) -> ()
       } else if origin != NONE && hit != NONE {
         clicked = commonAncestor(&tree.*, origin, hit)
       }
+      // The capture ends with the press, before the click, as in the DOM.
+      let holder = explicitHolder(&tree.*)
+      run captureRecord(&mut tree, EventKind.LostPointerCapture, LISTEN_LOST_POINTER_CAPTURE, holder)
       if clicked != NONE && !disabledAt(&tree.*, clicked)
         && pathListens(&tree.*, clicked, LISTEN_CLICK) {
         let count = tree.pressCount
@@ -1268,6 +1317,8 @@ pub effect fn finish(tree: &mut UiTree<'_>, input: Input, prevented: bool) -> ()
       if origin != NONE && tree.node(origin).kind == NodeKind.Input {
         edit.pointerUp(&mut tree, origin)
       }
+      let holder = explicitHolder(&tree.*)
+      run captureRecord(&mut tree, EventKind.LostPointerCapture, LISTEN_LOST_POINTER_CAPTURE, holder)
       clearPress(&mut tree)
     }
     Input.Wheel { x, y, deltaX, deltaY, .. } => {

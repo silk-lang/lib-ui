@@ -123,6 +123,9 @@ pub fn eventName(kind: EventKind) -> string<'static> {
     EventKind.Blur => "blur"
     EventKind.Input => "input"
     EventKind.Layout => "layout"
+    EventKind.PointerCancel => "pointercancel"
+    EventKind.GotPointerCapture => "gotpointercapture"
+    EventKind.LostPointerCapture => "lostpointercapture"
     EventKind.Scroll => "scroll"
   }
 }
@@ -175,6 +178,8 @@ pub struct Protocol {
   surface: Scene,
   hasSurface: bool,
   inputs: List<Input>,
+  /// The first queued input went through `beginNext` and waits for `finishNext`.
+  began: bool,
   heldModifiers: u32,
   /// Set when a command dispatched input to the tree: the app must take the tree's event
   /// records and draw a frame before the next command runs.
@@ -196,6 +201,7 @@ impl Protocol {
       surface: Scene.make(),
       hasSurface: false,
       inputs: List<Input>.make(),
+      began: false,
       heldModifiers: 0,
       dispatched: false,
       repaint: false,
@@ -218,9 +224,41 @@ impl Protocol {
     if self.inputs.length() == 0 {
       return false
     }
+    if self.began {
+      run self.finishNext(&mut tree, false)
+      return true
+    }
     let input = self.inputs.remove(0)
     run tree.dispatch(move input)
     return true
+  }
+
+  /// The first half of dispatching one queued input, for a host whose application can
+  /// prevent default actions: targeting and the event records (`UiTree.begin`). Let the
+  /// application answer the records, then call `finishNext` with its verdict. Returns
+  /// false when no input waits.
+  pub effect fn beginNext(self: &mut Self, tree: &mut UiTree<'_>) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.began || self.inputs.length() == 0 {
+      return false
+    }
+    run tree.begin(&self.inputs.asSlice()[0])
+    self.began = true
+    return true
+  }
+
+  /// The second half: the default action of the input `beginNext` started, unless
+  /// `prevented`.
+  pub effect fn finishNext(self: &mut Self, tree: &mut UiTree<'_>, prevented: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.began {
+      return ()
+    }
+    self.began = false
+    let input = self.inputs.remove(0)
+    run tree.finish(move input, prevented)
   }
 
   /// Copies the complete composed application scene, including custom canvases, for

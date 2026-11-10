@@ -1,0 +1,743 @@
+//! What goes into a tree and what comes out of it: input from a host, and event records for
+//! the client. All of it is plain data.
+//!
+//! The names follow the DOM where the idea is the same: `key` and `code` are UI Events
+//! values, buttons are numbered as `MouseEvent.button`, wheel deltas are positive down and
+//! right, and input changes are named as `InputEvent.inputType`.
+import id { NodeId }
+import record { Event as RawEvent, EventKind }
+import input {
+  Input as RawInput,
+  MOD_SHIFT,
+  MOD_CONTROL,
+  MOD_ALT,
+  MOD_META,
+  BUTTON_PRIMARY,
+  BUTTON_AUXILIARY,
+  BUTTON_SECONDARY,
+  BUTTON_BACK
+}
+import request { HostRequest as RawHostRequest }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.geometry.rect { Rect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.string { String }
+
+/// The modifier keys held during an input or an event.
+pub struct Modifiers {
+  bits: u32,
+}
+
+impl Copy for Modifiers {}
+
+impl Modifiers {
+  pub fn none() -> Modifiers {
+    return Modifiers { bits: 0 }
+  }
+
+  /// The modifiers packed as `MOD_*` bits, as a window reports them.
+  pub fn fromBits(bits: u32) -> Modifiers {
+    return Modifiers { bits: bits & 15 }
+  }
+
+  pub fn toBits(self: Self) -> u32 {
+    return self.bits
+  }
+
+  pub fn shift(self: Self) -> bool {
+    return (self.bits & MOD_SHIFT) != 0
+  }
+
+  pub fn control(self: Self) -> bool {
+    return (self.bits & MOD_CONTROL) != 0
+  }
+
+  pub fn alt(self: Self) -> bool {
+    return (self.bits & MOD_ALT) != 0
+  }
+
+  /// Command on macOS, the Windows key elsewhere.
+  pub fn meta(self: Self) -> bool {
+    return (self.bits & MOD_META) != 0
+  }
+
+  /// Whether no modifier is held.
+  pub fn isEmpty(self: Self) -> bool {
+    return self.bits == 0
+  }
+
+  pub fn withShift(self: Self) -> Modifiers {
+    return Modifiers { bits: self.bits | MOD_SHIFT }
+  }
+
+  pub fn withControl(self: Self) -> Modifiers {
+    return Modifiers { bits: self.bits | MOD_CONTROL }
+  }
+
+  pub fn withAlt(self: Self) -> Modifiers {
+    return Modifiers { bits: self.bits | MOD_ALT }
+  }
+
+  pub fn withMeta(self: Self) -> Modifiers {
+    return Modifiers { bits: self.bits | MOD_META }
+  }
+}
+
+/// A pointer button, in the order of DOM `MouseEvent.button`.
+pub enum Button {
+  Primary,
+  Auxiliary,
+  Secondary,
+  Back,
+  Forward,
+}
+
+impl Button {
+  /// The button with DOM number `value`; numbers past 4 read as `Forward`.
+  pub fn fromNumber(value: u32) -> Button {
+    if value == BUTTON_PRIMARY {
+      return Button.Primary
+    }
+    if value == BUTTON_AUXILIARY {
+      return Button.Auxiliary
+    }
+    if value == BUTTON_SECONDARY {
+      return Button.Secondary
+    }
+    if value == BUTTON_BACK {
+      return Button.Back
+    }
+    return Button.Forward
+  }
+
+  pub fn toNumber(self: Self) -> u32 {
+    return match self {
+      Button.Primary => 0
+      Button.Auxiliary => 1
+      Button.Secondary => 2
+      Button.Back => 3
+      Button.Forward => 4
+    }
+  }
+}
+
+/// One input from a host. Positions and wheel deltas are CSS pixels of the viewport.
+pub union Input {
+  PointerMove { pub x: f32, pub y: f32, pub modifiers: Modifiers },
+  /// A button went down. `count` is 1 for a single click, 2 for a double click.
+  PointerDown {
+    pub x: f32,
+    pub y: f32,
+    pub button: Button,
+    pub modifiers: Modifiers,
+    pub count: u32
+  },
+  PointerUp { pub x: f32, pub y: f32, pub button: Button, pub modifiers: Modifiers },
+  /// The pointer left the window: nothing is hovered any more.
+  PointerLeave,
+  /// The press ended without a release the tree should act on: active states and pointer
+  /// capture end, and no click follows.
+  PointerCancel,
+  /// A wheel or trackpad scroll. Positive `deltaY` scrolls down.
+  Wheel { pub x: f32, pub y: f32, pub deltaX: f32, pub deltaY: f32, pub modifiers: Modifiers },
+  KeyDown { pub key: String, pub code: String, pub modifiers: Modifiers, pub repeat: bool },
+  KeyUp { pub key: String, pub code: String, pub modifiers: Modifiers },
+  /// Text typed or committed by the input method, for the focused input.
+  TextInput { pub text: String },
+  /// The input method's composition text. `selectionStart` and `selectionEnd` are UTF-8 byte
+  /// offsets into `text`. Empty text ends the composition without committing it.
+  ImePreedit { pub text: String, pub selectionStart: usize, pub selectionEnd: usize },
+  /// The clipboard text a host read to answer `HostRequest.ReadClipboard`.
+  Paste { pub target: NodeId, pub text: String },
+}
+
+impl Input {
+  /// A pointer move with no modifiers.
+  pub fn moveTo(x: f32, y: f32) -> Input {
+    return Input.PointerMove { x: x, y: y, modifiers: Modifiers.none() }
+  }
+
+  /// A single primary press with no modifiers.
+  pub fn press(x: f32, y: f32) -> Input {
+    return Input.PointerDown {
+      x: x,
+      y: y,
+      button: Button.Primary,
+      modifiers: Modifiers.none(),
+      count: 1,
+    }
+  }
+
+  /// The primary release that ends [`Input.press`].
+  pub fn release(x: f32, y: f32) -> Input {
+    return Input.PointerUp { x: x, y: y, button: Button.Primary, modifiers: Modifiers.none() }
+  }
+
+  /// A wheel scroll with no modifiers.
+  pub fn wheel(x: f32, y: f32, deltaX: f32, deltaY: f32) -> Input {
+    return Input.Wheel { x: x, y: y, deltaX: deltaX, deltaY: deltaY, modifiers: Modifiers.none() }
+  }
+
+  /// A key going down with no modifiers, its `code` the same as its `key`.
+  pub effect fn key(name: string) -> Input
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return Input.KeyDown {
+      key: run String.copy(name),
+      code: run String.copy(name),
+      modifiers: Modifiers.none(),
+      repeat: false,
+    }
+  }
+
+  /// Typed text for the focused input.
+  pub effect fn text(value: string) -> Input
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return Input.TextInput { text: run String.copy(value) }
+  }
+
+  /// The record the engine takes.
+  pub fn lower(self: Self) -> RawInput {
+    return match move self {
+      Input.PointerMove { x, y, modifiers } => RawInput.PointerMove {
+        x: x,
+        y: y,
+        modifiers: modifiers.toBits(),
+      }
+      Input.PointerDown { x, y, button, modifiers, count } => RawInput.PointerDown {
+        x: x,
+        y: y,
+        button: button.toNumber(),
+        modifiers: modifiers.toBits(),
+        clickCount: count,
+      }
+      Input.PointerUp { x, y, button, modifiers } => RawInput.PointerUp {
+        x: x,
+        y: y,
+        button: button.toNumber(),
+        modifiers: modifiers.toBits(),
+      }
+      Input.PointerLeave => RawInput.PointerLeave
+      Input.PointerCancel => RawInput.PointerCancel
+      Input.Wheel { x, y, deltaX, deltaY, modifiers } => RawInput.Wheel {
+        x: x,
+        y: y,
+        deltaX: deltaX,
+        deltaY: deltaY,
+        modifiers: modifiers.toBits(),
+      }
+      Input.KeyDown { key, code, modifiers, repeat } => RawInput.KeyDown {
+        key: move key,
+        code: move code,
+        modifiers: modifiers.toBits(),
+        repeat: repeat,
+      }
+      Input.KeyUp { key, code, modifiers } => RawInput.KeyUp {
+        key: move key,
+        code: move code,
+        modifiers: modifiers.toBits(),
+      }
+      Input.TextInput { text } => RawInput.TextInput { text: move text }
+      Input.ImePreedit { text, selectionStart, selectionEnd } => RawInput.ImePreedit {
+        text: move text,
+        selectionStart: selectionStart,
+        selectionEnd: selectionEnd,
+      }
+      Input.Paste { target, text } => RawInput.Paste { target: target.raw(), text: move text }
+    }
+  }
+}
+
+/// Where the pointer was and which modifiers were held.
+pub struct Pointer {
+  pub x: f32,
+  pub y: f32,
+  pub modifiers: Modifiers,
+}
+
+impl Copy for Pointer {}
+
+/// A key, by UI Events `key` (what it means on the layout) and `code` (the physical key).
+pub struct Key {
+  pub key: String,
+  pub code: String,
+  pub modifiers: Modifiers,
+}
+
+impl Key {
+  /// Whether this is key `name` with no modifier held.
+  pub fn is(self: &Self, name: string) -> bool {
+    return self.modifiers.isEmpty() && String.view(&self.key) == name
+  }
+
+  /// Whether this is key `name`, whatever modifiers are held.
+  pub fn named(self: &Self, name: string) -> bool {
+    return String.view(&self.key) == name
+  }
+}
+
+/// What changed an input's value, named as DOM `InputEvent.inputType`.
+pub enum InputType {
+  InsertText,
+  InsertLineBreak,
+  InsertFromPaste,
+  DeleteContentBackward,
+  DeleteContentForward,
+  DeleteWordBackward,
+  DeleteWordForward,
+  DeleteSoftLineBackward,
+  DeleteSoftLineForward,
+  DeleteByCut,
+  DeleteByComposition,
+  HistoryUndo,
+  HistoryRedo,
+}
+
+impl InputType {
+  /// The DOM name, such as `insertText`.
+  pub fn name(self: Self) -> string<'static> {
+    return match self {
+      InputType.InsertText => "insertText"
+      InputType.InsertLineBreak => "insertLineBreak"
+      InputType.InsertFromPaste => "insertFromPaste"
+      InputType.DeleteContentBackward => "deleteContentBackward"
+      InputType.DeleteContentForward => "deleteContentForward"
+      InputType.DeleteWordBackward => "deleteWordBackward"
+      InputType.DeleteWordForward => "deleteWordForward"
+      InputType.DeleteSoftLineBackward => "deleteSoftLineBackward"
+      InputType.DeleteSoftLineForward => "deleteSoftLineForward"
+      InputType.DeleteByCut => "deleteByCut"
+      InputType.DeleteByComposition => "deleteByComposition"
+      InputType.HistoryUndo => "historyUndo"
+      InputType.HistoryRedo => "historyRedo"
+    }
+  }
+
+  /// The type with DOM name `name`; an unknown name reads as `InsertText`.
+  pub fn fromName(name: string) -> InputType {
+    if name == "insertLineBreak" {
+      return InputType.InsertLineBreak
+    }
+    if name == "insertFromPaste" {
+      return InputType.InsertFromPaste
+    }
+    if name == "deleteContentBackward" {
+      return InputType.DeleteContentBackward
+    }
+    if name == "deleteContentForward" {
+      return InputType.DeleteContentForward
+    }
+    if name == "deleteWordBackward" {
+      return InputType.DeleteWordBackward
+    }
+    if name == "deleteWordForward" {
+      return InputType.DeleteWordForward
+    }
+    if name == "deleteSoftLineBackward" {
+      return InputType.DeleteSoftLineBackward
+    }
+    if name == "deleteSoftLineForward" {
+      return InputType.DeleteSoftLineForward
+    }
+    if name == "deleteByCut" {
+      return InputType.DeleteByCut
+    }
+    if name == "deleteByComposition" {
+      return InputType.DeleteByComposition
+    }
+    if name == "historyUndo" {
+      return InputType.HistoryUndo
+    }
+    if name == "historyRedo" {
+      return InputType.HistoryRedo
+    }
+    return InputType.InsertText
+  }
+}
+
+/// A selection in an input's value, as UTF-8 byte offsets: it runs from `anchor`, where it
+/// started, to `focus`, where the caret is. The two are equal for a caret.
+pub struct Selection {
+  pub anchor: usize,
+  pub focus: usize,
+}
+
+impl Copy for Selection {}
+
+impl Selection {
+  pub fn caret(at: usize) -> Selection {
+    return Selection { anchor: at, focus: at }
+  }
+
+  pub fn range(anchor: usize, focus: usize) -> Selection {
+    return Selection { anchor: anchor, focus: focus }
+  }
+
+  /// The lower offset, as DOM `selectionStart`.
+  pub fn start(self: Self) -> usize {
+    if self.anchor < self.focus {
+      return self.anchor
+    }
+    return self.focus
+  }
+
+  /// The higher offset, as DOM `selectionEnd`.
+  pub fn end(self: Self) -> usize {
+    if self.anchor < self.focus {
+      return self.focus
+    }
+    return self.anchor
+  }
+
+  pub fn isCaret(self: Self) -> bool {
+    return self.anchor == self.focus
+  }
+}
+
+/// An input's value after a change, what the change was, and the selection after it (its
+/// direction is not recorded: `anchor` is the lower offset).
+pub struct InputChange {
+  pub value: String,
+  pub inputType: InputType,
+  pub selection: Selection,
+}
+
+/// What happened. Each variant carries only what that event has.
+pub union Event {
+  /// A button went down. `count` is 1 for a single click, 2 for a double click.
+  PointerDown { pub pointer: Pointer, pub button: Button, pub count: u32 },
+  PointerUp { pub pointer: Pointer, pub button: Button },
+  /// `count` is 0 for a click made with the keyboard.
+  Click { pub pointer: Pointer, pub button: Button, pub count: u32 },
+  PointerMove { pub pointer: Pointer },
+  PointerEnter { pub pointer: Pointer },
+  PointerLeave { pub pointer: Pointer },
+  /// Deltas are CSS pixels, positive down and right.
+  Wheel { pub pointer: Pointer, pub deltaX: f32, pub deltaY: f32 },
+  KeyDown { pub key: Key, pub repeat: bool },
+  KeyUp { pub key: Key },
+  Focus,
+  Blur,
+  Input { pub change: InputChange },
+  /// The container's new scroll offset.
+  Scroll { pub x: f32, pub y: f32 },
+  /// The target's border box changed after layout, relative to the viewport. Does not bubble.
+  Layout { pub bounds: Rect<f32> },
+  /// The press ended without a release, as DOM `pointercancel`. No click follows.
+  PointerCancel { pub pointer: Pointer },
+  /// The target took the pointer capture of the press, as DOM `gotpointercapture`.
+  GotPointerCapture,
+  /// The target lost a capture it took, as DOM `lostpointercapture`: it was released, another
+  /// node took it, or the press ended.
+  LostPointerCapture,
+}
+
+impl Event {
+  pub fn kind(self: &Self) -> EventKind {
+    return match &self.* {
+      Event.PointerDown { .. } => EventKind.PointerDown
+      Event.PointerUp { .. } => EventKind.PointerUp
+      Event.Click { .. } => EventKind.Click
+      Event.PointerMove { .. } => EventKind.PointerMove
+      Event.PointerEnter { .. } => EventKind.PointerEnter
+      Event.PointerLeave { .. } => EventKind.PointerLeave
+      Event.Wheel { .. } => EventKind.Wheel
+      Event.KeyDown { .. } => EventKind.KeyDown
+      Event.KeyUp { .. } => EventKind.KeyUp
+      Event.Focus => EventKind.Focus
+      Event.Blur => EventKind.Blur
+      Event.Input { .. } => EventKind.Input
+      Event.Scroll { .. } => EventKind.Scroll
+      Event.Layout { .. } => EventKind.Layout
+      Event.PointerCancel { .. } => EventKind.PointerCancel
+      Event.GotPointerCapture => EventKind.GotPointerCapture
+      Event.LostPointerCapture => EventKind.LostPointerCapture
+    }
+  }
+}
+
+/// One event for the client. `path` holds the ids from the root to the target, so the client
+/// can run capture and bubbling over it.
+///
+/// Pointer down, up, move, click, wheel and key records are queued when the target or any
+/// node on its path listens for them (they bubble). Enter, leave, focus, blur, scroll and
+/// layout records are queued only for a target that listens itself.
+pub struct EventRecord {
+  pub target: NodeId,
+  pub path: List<NodeId>,
+  pub event: Event,
+}
+
+impl EventRecord {
+  /// Whether `node` is the target or one of its ancestors: whether the event reaches a
+  /// listener on `node` while bubbling.
+  pub fn hits(self: &Self, node: NodeId) -> bool {
+    let path = self.path.asSlice()
+    let mut i: usize = 0
+    while i < path.length {
+      if path[i].raw() == node.raw() {
+        return true
+      }
+      i = i + 1
+    }
+    return false
+  }
+
+  /// The record for the engine's `raw` record.
+  pub effect fn lift(raw: &RawEvent) -> EventRecord
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut path = List<NodeId>.make()
+    let ids = raw.path.asSlice()
+    let mut i: usize = 0
+    while i < ids.length {
+      run path.append(NodeId.of(ids[i]))
+      i = i + 1
+    }
+    let pointer = Pointer { x: raw.x, y: raw.y, modifiers: Modifiers.fromBits(raw.modifiers) }
+    let event = match raw.kind {
+      EventKind.PointerDown => Event.PointerDown {
+        pointer: pointer,
+        button: Button.fromNumber(raw.button),
+        count: raw.detail,
+      }
+      EventKind.PointerUp => Event.PointerUp {
+        pointer: pointer,
+        button: Button.fromNumber(raw.button),
+      }
+      EventKind.Click => Event.Click {
+        pointer: pointer,
+        button: Button.fromNumber(raw.button),
+        count: raw.detail,
+      }
+      EventKind.PointerMove => Event.PointerMove { pointer: pointer }
+      EventKind.PointerEnter => Event.PointerEnter { pointer: pointer }
+      EventKind.PointerLeave => Event.PointerLeave { pointer: pointer }
+      EventKind.Wheel => Event.Wheel { pointer: pointer, deltaX: raw.deltaX, deltaY: raw.deltaY }
+      EventKind.KeyDown => Event.KeyDown {
+        key: Key {
+          key: run String.copy(String.view(&raw.key)),
+          code: run String.copy(String.view(&raw.code)),
+          modifiers: Modifiers.fromBits(raw.modifiers),
+        },
+        repeat: raw.repeat,
+      }
+      EventKind.KeyUp => Event.KeyUp {
+        key: Key {
+          key: run String.copy(String.view(&raw.key)),
+          code: run String.copy(String.view(&raw.code)),
+          modifiers: Modifiers.fromBits(raw.modifiers),
+        },
+      }
+      EventKind.Focus => Event.Focus
+      EventKind.Blur => Event.Blur
+      EventKind.Input => Event.Input {
+        change: InputChange {
+          value: run String.copy(String.view(&raw.value)),
+          inputType: InputType.fromName(String.view(&raw.inputType)),
+          selection: Selection.range(raw.selectionStart, raw.selectionEnd),
+        },
+      }
+      EventKind.Scroll => Event.Scroll { x: raw.x, y: raw.y }
+      EventKind.Layout => Event.Layout { bounds: raw.bounds }
+      EventKind.PointerCancel => Event.PointerCancel { pointer: pointer }
+      EventKind.GotPointerCapture => Event.GotPointerCapture
+      EventKind.LostPointerCapture => Event.LostPointerCapture
+    }
+    return EventRecord { target: NodeId.of(raw.target), path: move path, event: move event }
+  }
+}
+
+/// Something the tree asks its host to do.
+pub union HostRequest {
+  /// Put `text` on the clipboard (copy and cut).
+  WriteClipboard { pub text: String },
+  /// Read the clipboard and answer with `Input.Paste { target, text }`.
+  ReadClipboard { pub target: NodeId },
+}
+
+impl HostRequest {
+  pub fn lift(raw: RawHostRequest) -> HostRequest {
+    return match move raw {
+      RawHostRequest.WriteClipboard { text } => HostRequest.WriteClipboard { text: move text }
+      RawHostRequest.ReadClipboard { target } => HostRequest.ReadClipboard {
+        target: NodeId.of(target),
+      }
+    }
+  }
+}
+
+/// The listener flags for `kinds`.
+pub fn listenFlags(kinds: &[EventKind]) -> u32 {
+  let mut flags: u32 = 0
+  let mut i: usize = 0
+  while i < kinds.length {
+    flags = flags | listenFlag(kinds[i])
+    i = i + 1
+  }
+  return flags
+}
+
+pub fn listenFlag(kind: EventKind) -> u32 {
+  return match kind {
+    EventKind.PointerDown => 1
+    EventKind.PointerUp => 2
+    EventKind.Click => 4
+    EventKind.PointerMove => 8
+    EventKind.PointerEnter => 16
+    EventKind.PointerLeave => 32
+    EventKind.Wheel => 64
+    EventKind.KeyDown => 128
+    EventKind.KeyUp => 256
+    EventKind.Focus => 512
+    EventKind.Blur => 1024
+    EventKind.Input => 2048
+    EventKind.Scroll => 4096
+    EventKind.Layout => 8192
+    EventKind.PointerCancel => 16384
+    EventKind.GotPointerCapture => 32768
+    EventKind.LostPointerCapture => 65536
+  }
+}
+
+/// Something the tree does by itself in answer to input, which a client can turn off: see
+/// `Tree.prevent` for a node that always opts out and `Tree.begin` for a decision per event.
+pub enum DefaultAction {
+  /// A primary press moves focus and starts a text selection.
+  Focus,
+  /// A wheel scrolls.
+  Scroll,
+  /// A key moves focus (Tab), clicks (Enter, Space) or edits, and types its text.
+  Keys,
+}
+
+/// The `PREVENT_*` flags for `actions`.
+pub fn preventFlags(actions: &[DefaultAction]) -> u32 {
+  let mut flags: u32 = 0
+  let mut i: usize = 0
+  while i < actions.length {
+    let flag: u32 = match actions[i] {
+      DefaultAction.Focus => 1
+      DefaultAction.Scroll => 2
+      DefaultAction.Keys => 4
+    }
+    flags = flags | flag
+    i = i + 1
+  }
+  return flags
+}
+
+/// Where an event is on its way through the tree, as DOM `Event.eventPhase`.
+pub enum Phase {
+  /// On the way down from the root, before the target.
+  Capture,
+  /// At the target.
+  Target,
+  /// On the way back up to the root.
+  Bubble,
+}
+
+/// One stop of an event: a node on the path and the phase it is visited in.
+pub struct Step {
+  pub node: NodeId,
+  pub phase: Phase,
+}
+
+impl Copy for Step {}
+
+/// Whether events of `kind` bubble. Enter, leave, focus, blur, scroll and layout do not, as
+/// in the DOM: they are captured on the way down and then delivered to the target only.
+pub fn bubbles(kind: EventKind) -> bool {
+  return match kind {
+    EventKind.PointerEnter => false
+    EventKind.PointerLeave => false
+    EventKind.Focus => false
+    EventKind.Blur => false
+    EventKind.Scroll => false
+    EventKind.Layout => false
+    _ => true
+  }
+}
+
+/// Walks one event record through its path in DOM order: capture from the root down, the
+/// target, then bubbling back up. Every client that runs handlers uses it, so they all agree
+/// on the order and on what stopping and preventing mean.
+///
+/// ```silk
+/// let mut walk = Propagation.over(&record)
+/// let mut step = walk.next()
+/// while step.isSome() {
+///   // run the handlers registered for this node and phase; they may call
+///   // walk.stopPropagation() and walk.preventDefault()
+///   step = walk.next()
+/// }
+/// run tree.finish(move pending, walk.defaultPrevented())
+/// ```
+pub struct Propagation<'r> {
+  record: &'r EventRecord,
+  /// Steps handed out so far.
+  taken: usize,
+  bubbling: bool,
+  stopped: bool,
+  prevented: bool,
+}
+
+impl<'r> Propagation<'r> {
+  pub fn over(record: &'r EventRecord) -> Propagation<'r> {
+    return Propagation {
+      record: record,
+      taken: 0,
+      bubbling: bubbles(record.event.kind()),
+      stopped: false,
+      prevented: false,
+    }
+  }
+
+  /// The next stop, or `None` when the walk is over or a handler stopped it.
+  pub fn next(self: &mut Self) -> Option<Step> {
+    let path = self.record.path.asSlice()
+    let length = path.length
+    if self.stopped || length == 0 {
+      return Option<Step>.None
+    }
+    let at = self.taken
+    if at + 1 < length {
+      self.taken = at + 1
+      return Option<Step>.Some { value: Step { node: path[at], phase: Phase.Capture } }
+    }
+    if at + 1 == length {
+      self.taken = at + 1
+      return Option<Step>.Some { value: Step { node: path[at], phase: Phase.Target } }
+    }
+
+    // Past the target: step `length + k` is the ancestor `k + 1` levels above it.
+    let above = at - length + 1
+    if !self.bubbling || above >= length {
+      return Option<Step>.None
+    }
+    self.taken = at + 1
+    return Option<Step>.Some {
+      value: Step { node: path[length - 1 - above], phase: Phase.Bubble },
+    }
+  }
+
+  /// No further node is visited, as DOM `stopPropagation`. Handlers left on the current node
+  /// are the client's to run or skip.
+  pub fn stopPropagation(self: &mut Self) -> () {
+    self.stopped = true
+  }
+
+  /// Asks for the default action to be skipped, as DOM `preventDefault`. It does not stop the
+  /// walk.
+  pub fn preventDefault(self: &mut Self) -> () {
+    self.prevented = true
+  }
+
+  /// The verdict to hand to `Tree.finish`.
+  pub fn defaultPrevented(self: &Self) -> bool {
+    return self.prevented
+  }
+}

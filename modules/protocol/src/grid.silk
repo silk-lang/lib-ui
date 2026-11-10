@@ -1,0 +1,189 @@
+//! Owned, portable Grid templates. Names are local to a template, so views never
+//! depend on the layout tree's intern tables. The full engine Grid vocabulary is
+//! re-exported, including repeat tracks, named areas, placement and subgrids.
+pub import layout.lib {
+  GridTemplate,
+  GridAxis,
+  GridTrack,
+  GridTrackKind,
+  GridBreadth,
+  GridBreadthKind,
+  GridNamedLine,
+  GridRepeat,
+  GridRepeatKind,
+  GridArea,
+  GridAutoFlow,
+  GridPlacement,
+  GridLine,
+  GridLineKind,
+  GridError
+}
+import layout.lib { Tree, NodeId, InvalidNode, validGridName, validGridAreaName }
+import silk.collections.list { List }
+import silk.text.string { String }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+
+pub struct Grid {
+  pub template: GridTemplate,
+  /// Local name 1 is names[0]; zero always means unnamed.
+  pub names: List<String>,
+}
+
+impl Grid {
+  /// An empty template, also used to clear a previous template.
+  pub fn make() -> Grid {
+    return Grid { template: GridTemplate.make(), names: List<String>.make() }
+  }
+
+  /// An equal-width column grid. Track sizing and item placement remain editable.
+  pub effect fn columns(count: usize) -> Grid
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut grid = Grid.make()
+    let mut i: usize = 0
+    while i < count {
+      run grid.template.columns.tracks.append(GridTrack.breadth(GridBreadth.flex(1.0)))
+      i = i + 1
+    }
+    return move grid
+  }
+
+  /// Interns a line name in this template. Handles survive copies and diffing.
+  pub effect fn name(self: &mut Self, value: string) -> usize
+    ! GridError | OutOfMemoryError
+    ? &mut Allocator {
+    if !validGridName(value) {
+      fail GridError {}
+    }
+    return run self.intern(value)
+  }
+
+  /// Interns an area name, using CSS's more permissive area-name grammar.
+  pub effect fn areaName(self: &mut Self, value: string) -> usize
+    ! GridError | OutOfMemoryError
+    ? &mut Allocator {
+    if !validGridAreaName(value) {
+      fail GridError {}
+    }
+    return run self.intern(value)
+  }
+
+  effect fn intern(self: &mut Self, value: string) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut i: usize = 0
+    while i < self.names.length() {
+      if String.view(&self.names.asSlice()[i]) == value {
+        return i + 1
+      }
+      i = i + 1
+    }
+    run self.names.append(run String.copy(value))
+    return self.names.length()
+  }
+
+  pub effect fn copy(self: &Self) -> Grid
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut result = Grid.make()
+    run copyAxis(&self.template.rows, &mut result.template.rows)
+    run copyAxis(&self.template.columns, &mut result.template.columns)
+    run result.template.autoRows.appendSlice(self.template.autoRows.asSlice())
+    run result.template.autoColumns.appendSlice(self.template.autoColumns.asSlice())
+    run result.template.areas.appendSlice(self.template.areas.asSlice())
+    result.template.areaRows = self.template.areaRows
+    result.template.areaColumns = self.template.areaColumns
+    result.template.flow = self.template.flow
+    result.template.dense = self.template.dense
+    result.template.placement = self.template.placement
+    let mut i: usize = 0
+    while i < self.names.length() {
+      run result.names.append(run String.copy(String.view(&self.names.asSlice()[i])))
+      i = i + 1
+    }
+    return move result
+  }
+
+  pub fn same(self: &Self, other: &Self) -> bool {
+    if !self.template.same(&other.template) || self.names.length() != other.names.length() {
+      return false
+    }
+    let mut i: usize = 0
+    while i < self.names.length() {
+      if String.view(&self.names.asSlice()[i]) != String.view(&other.names.asSlice()[i]) {
+        return false
+      }
+      i = i + 1
+    }
+    return true
+  }
+
+  /// Validates and transfers a template into the tree, remapping its local names.
+  pub effect fn install(self: Self, tree: &mut Tree, node: NodeId) -> ()
+    ! GridError | InvalidNode | OutOfMemoryError
+    ? &mut Allocator {
+    let mut value = move self
+    if !value.template.valid(value.names.length() + 1) {
+      fail GridError {}
+    }
+    let mut ids = List<usize>.make()
+    run ids.append(0)
+    let mut i: usize = 0
+    while i < value.names.length() {
+      run ids.append(run tree.internGridAreaName(String.view(&value.names.asSlice()[i])))
+      i = i + 1
+    }
+    run remapAxis(&mut value.template.rows, &value.names, &ids)
+    run remapAxis(&mut value.template.columns, &value.names, &ids)
+    let mut placement = value.template.placement
+    placement.rowStart = run remapLine(placement.rowStart, &value.names, &ids)
+    placement.rowEnd = run remapLine(placement.rowEnd, &value.names, &ids)
+    placement.columnStart = run remapLine(placement.columnStart, &value.names, &ids)
+    placement.columnEnd = run remapLine(placement.columnEnd, &value.names, &ids)
+    value.template.placement = placement
+    i = 0
+    while i < value.template.areas.length() {
+      let mut area = value.template.areas.get(i)
+      area.name = ids.get(area.name)
+      value.template.areas.set(i, area)
+      i = i + 1
+    }
+    run tree.setGrid(node, move value.template)
+  }
+}
+
+effect fn copyAxis(source: &GridAxis, target: &mut GridAxis) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  target.subgrid = source.subgrid
+  target.lineCount = source.lineCount
+  run target.tracks.appendSlice(source.tracks.asSlice())
+  run target.lines.appendSlice(source.lines.asSlice())
+  run target.repeats.appendSlice(source.repeats.asSlice())
+}
+
+effect fn remapLine(line: GridLine, names: &List<String>, ids: &List<usize>) -> GridLine
+  ! GridError {
+  let mut result = line
+  if line.name != 0 {
+    if !validGridName(String.view(&names.asSlice()[line.name - 1])) {
+      fail GridError {}
+    }
+    result.name = ids.get(line.name)
+  }
+  return result
+}
+
+effect fn remapAxis(axis: &mut GridAxis, names: &List<String>, ids: &List<usize>) -> ()
+  ! GridError {
+  let mut i: usize = 0
+  while i < axis.lines.length() {
+    let mut line = axis.lines.get(i)
+    if !validGridName(String.view(&names.asSlice()[line.name - 1])) {
+      fail GridError {}
+    }
+    line.name = ids.get(line.name)
+    axis.lines.set(i, line)
+    i = i + 1
+  }
+}
