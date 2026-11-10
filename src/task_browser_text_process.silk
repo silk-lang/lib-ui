@@ -1,0 +1,159 @@
+import silk.cli.task { TaskError }
+import silk.collections.bytes { Bytes }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Drop }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.num.isize
+import silk.platform.native.descriptor { NativeDescriptor }
+import silk.system.child_process { ChildProcess }
+import silk.system.filesystem { Path }
+import silk.system.subprocess { SpawnOptions, Stdio, Subprocess, SubprocessError }
+import silk.text.string { String }
+
+extern "C" struct TextPollFd { fd: i32, events: i16, revents: i16 }
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  import silk.platform.native.descriptor { __error }
+  @foreign(noCapture: .("fds"))
+  unsafe extern "C" fn poll(fds: [*]mut TextPollFd, count: u32, timeout: i32) -> i32
+  fn errno() -> i32 { unsafe { return Pointer.read<i32>(__error()) } }
+} else {
+  import silk.platform.native.descriptor { __errno_location }
+  @foreign(noCapture: .("fds"))
+  unsafe extern "C" fn poll(fds: [*]mut TextPollFd, count: usize, timeout: i32) -> i32
+  fn errno() -> i32 { unsafe { return Pointer.read<i32>(__errno_location()) } }
+}
+@foreign(noCapture: .("buffer"))
+unsafe extern "C" fn send(fd: i32, buffer: ?[*]const u8, length: usize, flags: i32) -> isize
+@foreign(noCapture: .("status"))
+unsafe extern "C" fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32
+unsafe extern "C" fn kill(pid: i32, signal: i32) -> i32
+
+struct TextChild {
+  pid: i32,
+  input: i32,
+  output: i32,
+  errors: i32,
+}
+impl Drop for TextChild {
+  fn drop(self: &mut Self) -> () {
+    Subprocess.closeDescriptor(self.input)
+    Subprocess.closeDescriptor(self.output)
+    Subprocess.closeDescriptor(self.errors)
+    if self.pid > 0 {
+      let _killed = unsafe kill(self.pid, 9)
+      let mut status: i32 = 0
+      while unsafe waitpid(self.pid, Pointer.fromMutRef<i32>(&mut status), 0) < 0 {
+        if errno() != 4 { break }
+      }
+    }
+  }
+}
+
+pub struct TextOutput { pub output: Bytes, pub errors: Bytes, pub status: i32 }
+
+// Poll all three streams together: large protocol input and diagnostics cannot deadlock each
+// other. The guard closes descriptors and reaps the child on every error path.
+pub effect fn executeText(program: &Path, directory: &Path, input: &[u8]) -> TextOutput
+  ! TaskError | OutOfMemoryError ? &mut Allocator {
+  let mut request = run ChildProcess.requestWithin(program, directory)
+  run Subprocess.inheritEnvironment(&mut request)
+  let mut options = SpawnOptions.make()
+  run SpawnOptions.setStdio(&mut options, 0, Stdio.pipe())
+  run SpawnOptions.setStdio(&mut options, 1, Stdio.pipe())
+  run SpawnOptions.setStdio(&mut options, 2, Stdio.pipe())
+  let started = run Effect.result(Subprocess.spawn(&request, &options))
+  let mut process = match move started {
+    Result<Subprocess, SubprocessError | OutOfMemoryError>.Success { value } => move value
+    Result<Subprocess, SubprocessError | OutOfMemoryError>.Failure { error } => {
+      match move error {
+        OutOfMemoryError exhausted => { fail move exhausted }
+        SubprocessError refused => {
+          let message = run String.copy("could not start ui-text-cli (native subprocess error)")
+          fail TaskError { message: move message, status: refused.code }
+        }
+      }
+    }
+  }
+  let mut child = TextChild {
+    pid: Subprocess.pid(&process),
+    input: Option<i32>.unwrapOr(Subprocess.takePipe(&mut process, 0), -1),
+    output: Option<i32>.unwrapOr(Subprocess.takePipe(&mut process, 1), -1),
+    errors: Option<i32>.unwrapOr(Subprocess.takePipe(&mut process, 2), -1),
+  }
+  if child.input < 0 || child.output < 0 || child.errors < 0 {
+    fail TaskError { message: run String.copy("ui-text-cli subprocess pipe missing"), status: 1 }
+  }
+  let mut output = Bytes.make()
+  let mut errors = Bytes.make()
+  let mut offset: usize = 0
+  while child.input >= 0 || child.output >= 0 || child.errors >= 0 {
+    if child.input >= 0 && offset == input.length {
+      Subprocess.closeDescriptor(child.input)
+      child.input = -1
+    }
+    let mut watched = [
+      TextPollFd { fd: child.input, events: 4, revents: 0 },
+      TextPollFd { fd: child.output, events: 1, revents: 0 },
+      TextPollFd { fd: child.errors, events: 1, revents: 0 },
+    ]
+    if child.input < 0 && child.output < 0 && child.errors < 0 { break }
+    let ready = unsafe poll(unsafe Pointer.assumeManyMut<TextPollFd>(Pointer.fromMutRef(&mut watched[0])), 3, -1)
+    if ready < 0 {
+      if errno() == 4 { continue }
+      fail TaskError { message: run String.copy("polling ui-text-cli failed"), status: 1 }
+    }
+    if child.input >= 0 && watched[0].revents != 0 {
+      let remaining = Slice.view<u8>(input, offset, input.length - offset)
+      let mut flags: i32 = 16384
+      static if Intrinsic.targetOperatingSystem() == "darwin" { flags = 524288 }
+      let sent = unsafe send(child.input, Pointer.fromSlice<u8>(remaining), remaining.length, flags)
+      if sent > 0 { offset = offset + isize.toUsize(sent) }
+      else if sent < 0 && (errno() == 4 || errno() == 11 || errno() == 35) {}
+      else {
+        // Capture stderr and the exit status even when the CLI rejects its input early.
+        Subprocess.closeDescriptor(child.input)
+        child.input = -1
+      }
+    }
+    if child.output >= 0 && watched[1].revents != 0 {
+      if run drain(child.output, &mut output) {
+        Subprocess.closeDescriptor(child.output)
+        child.output = -1
+      }
+    }
+    if child.errors >= 0 && watched[2].revents != 0 {
+      if run drain(child.errors, &mut errors) {
+        Subprocess.closeDescriptor(child.errors)
+        child.errors = -1
+      }
+    }
+  }
+  let mut status: i32 = 0
+  while unsafe waitpid(child.pid, Pointer.fromMutRef<i32>(&mut status), 0) < 0 {
+    if errno() != 4 {
+      fail TaskError { message: run String.copy("waiting for ui-text-cli failed"), status: 1 }
+    }
+  }
+  child.pid = -1
+  if status == 0 && offset != input.length {
+    fail TaskError { message: run String.copy("ui-text-cli closed stdin before consuming its protocol"), status: 1 }
+  }
+  return TextOutput { output: move output, errors: move errors, status: status }
+}
+
+effect fn drain(fd: i32, output: &mut Bytes) -> bool
+  ! TaskError | OutOfMemoryError ? &mut Allocator {
+  let mut buffer: [u8; 16384] = [0; 16384]
+  let mut count: usize = 0
+  let mut error: i32 = 0
+  if !(run NativeDescriptor.read(fd, &mut buffer, &mut count, &mut error)) {
+    if error == 11 || error == 35 { return false }
+    fail TaskError { message: run String.copy("reading ui-text-cli output failed"), status: 1 }
+  }
+  run Bytes.append(&mut output, Slice.view<u8>(&buffer, 0, count))
+  return count == 0
+}

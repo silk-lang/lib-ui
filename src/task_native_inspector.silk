@@ -1,0 +1,287 @@
+static if Intrinsic.targetOperatingSystem() == "darwin" || Intrinsic.targetOperatingSystem() == "linux" {
+import silk.cli.task { Task, TaskError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.io.writer { Writer, WriterError }
+import silk.io.writer_native { StdoutWriter }
+import silk.json.scanner { JsonError }
+import silk.json.value { Json, Value }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.child_process { ChildProcess, ProcessError }
+import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.text.string { String, InvalidUtf8 }
+import silk.num.i32
+import task_support { build, rootPath, pathText, require }
+import task_native_process { Process, Output, start, finish, poll, pause, milliseconds, execute, removeSocket }
+import task_native_display { Display, openDisplay, closeDisplay, joined, decimal, views }
+
+pub struct App { pub child: Process, pub socket: Path }
+pub effect fn say(message: string) -> () ! WriterError {
+  let mut writer = StdoutWriter.make()
+  run Writer.writeString(message) |> Effect.provideMut<Writer>(&mut writer)
+  run Writer.writeString("\n") |> Effect.provideMut<Writer>(&mut writer)
+}
+pub effect fn expect(condition: bool, message: string) -> () ! TaskError | OutOfMemoryError | WriterError ? &mut Allocator {
+  run require(condition, message)
+  let mut writer = StdoutWriter.make()
+  run Writer.writeString("ok: ") |> Effect.provideMut<Writer>(&mut writer)
+  run Writer.writeString(message) |> Effect.provideMut<Writer>(&mut writer)
+  run Writer.writeString("\n") |> Effect.provideMut<Writer>(&mut writer)
+}
+pub effect fn utf8(bytes: &[u8]) -> string ! TaskError | OutOfMemoryError ? &mut Allocator {
+  return match String.fromUtf8(bytes) {
+    Result<string, InvalidUtf8>.Success {value} => value
+    Result<string, InvalidUtf8>.Failure {..} => run Task.abort("Inspector output is not UTF-8")
+  }
+}
+pub effect fn json(bytes: &[u8]) -> Value ! TaskError | OutOfMemoryError ? &mut Allocator {
+  return match move run Effect.result(Json.parse(bytes)) {
+    Result<Value, JsonError | OutOfMemoryError>.Success {value} => move value
+    Result<Value, JsonError | OutOfMemoryError>.Failure {error} => match move error {
+      OutOfMemoryError failure => { fail move failure }
+      JsonError _error => run Task.abort("Invalid inspector JSON")
+    }
+  }
+}
+pub effect fn field<'a>(value: &'a Value, name: string) -> &'a Value ! TaskError | OutOfMemoryError ? &mut Allocator {
+  return match Json.field(value, name) {
+    Option<&Value>.Some {value: found} => found
+    Option<&Value>.None => run Task.abort("Missing inspector JSON field")
+  }
+}
+pub effect fn array(value: &Value) -> &[Value] ! TaskError | OutOfMemoryError ? &mut Allocator {
+  return match &value.* {
+    Value.Array {values} => values.asSlice()
+    _ => run Task.abort("Expected inspector JSON array")
+  }
+}
+pub fn number(value: &Value, name: string) -> i32 { return Json.field(value, name) |> Json.asI32 |> Option<i32>.unwrapOr(-1) }
+pub fn stringField<'a>(value: &'a Value, name: string) -> string<'a> { return Json.field(value, name) |> Json.asString |> Option<string<'a>>.unwrapOr("") }
+pub fn truth(value: &Value, name: string) -> bool {
+  return match Json.field(value, name) {
+    Option<&Value>.Some {value: found} => match &found.* {
+      Value.Bool {value: flag} => flag
+      _ => false
+    }
+    Option<&Value>.None => false
+  }
+}
+pub fn png(bytes: &[u8]) -> bool {
+  let signature: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10]
+  if bytes.length < 8 { return false }
+  let mut at: usize = 0
+  while at < 8 {
+    if bytes[at] != signature[at] { return false }
+    at = at + 1
+  }
+  return true
+}
+pub effect fn picture(path: &Path) -> ()
+! TaskError | FileError | OutOfMemoryError | WriterError ? &mut Allocator | &mut FileSystem {
+  let bytes = run FileSystem.readFile(path)
+  run expect(png(Bytes.asSlice(&bytes)), "PNG screenshot")
+}
+pub effect fn command(cli: string, socket: &Path, args: &[string], env: &[string]) -> Output
+! TaskError | FileError | HostInputError | OutOfMemoryError
+? &mut HostInput | &mut Allocator | &mut FileSystem {
+  let mut arguments = List<string>.make()
+  run arguments.append("--connect")
+  run arguments.append(pathText(socket))
+  let mut at: usize = 0
+  while at < args.length {
+    run arguments.append(args[at])
+    at = at + 1
+  }
+  let mut child = run start(cli, arguments.asSlice(), env, true, false, true)
+  return run finish(&mut child, 60000)
+}
+pub effect fn commandJson(cli: string, app: &App, args: &[string], env: &[string]) -> Value
+! TaskError | FileError | HostInputError | OutOfMemoryError
+? &mut HostInput | &mut Allocator | &mut FileSystem {
+  let output = run command(cli, &app.socket, args, env)
+  if output.code != 0 {
+    let error = run utf8(Bytes.asSlice(&output.errors))
+    if error != "" { run Task.abort(error) }
+    run Task.abort("Inspector command failed")
+  }
+  return run json(Bytes.asSlice(&output.output))
+}
+pub effect fn program(name: string, binary: string, args: &[string], env: &[string], cli: string) -> App
+! TaskError | FileError | HostInputError | OutOfMemoryError
+? &mut HostInput | &mut Allocator | &mut FileSystem {
+  let work = run rootPath(".cache/ui-inspect")
+  run FileSystem.createDirectoriesRecursively(&work)
+  let filename = run joined(name, ".sock")
+  let socket = run Path.join(&work, String.view(&filename))
+  run removeSocket(&socket)
+  let assignment = run joined("SILK_UI_INSPECT=", pathText(&socket))
+  let mut environment = List<string>.make()
+  let mut at: usize = 0
+  while at < env.length {
+    run environment.append(env[at])
+    at = at + 1
+  }
+  run environment.append(String.view(&assignment))
+  let mut child = run start(binary, args, environment.asSlice(), false, false, true)
+  let deadline = milliseconds() + 120000
+  while true {
+    let hello = run command(cli, &socket, &["hello"], env)
+    if hello.code == 0 { break }
+    if run poll(&mut child) { run Task.abort("Application exited before inspector became ready") }
+    if milliseconds() >= deadline { run Task.abort("Timed out waiting for application inspector") }
+    pause()
+  }
+  return App {child: move child, socket: move socket}
+}
+
+effect fn inspectWith(binary: string, cli: string, display: &Display) -> ()
+! TaskError | FileError | HostInputError | OutOfMemoryError | WriterError
+? &mut HostInput | &mut Allocator | &mut FileSystem {
+  let environment = run views(&display.environment)
+  let env = environment.asSlice()
+  let app = run program("inbox", binary, &[], env, cli)
+  let before = run command(cli, &app.socket, &["snapshot"], env)
+  let beforeText = run utf8(Bytes.asSlice(&before.output))
+  run expect(before.code == 0 && String.contains(beforeText, "role=button label=\"New\""), "snapshot lists New button")
+  run expect(!String.contains(beforeText, "A new message"), "no new row before click")
+  let clicked = run commandJson(cli, &app, &["click", "--role", "button", "--name", "New"], env)
+  run expect(number(&clicked, "node") == 10, "click New by role and name")
+  let waited = run command(cli, &app.socket, &["wait", "--text", "A new message", "--timeout", "10000"], env)
+  run expect(waited.code == 0, "click creates row")
+  let snapshot = run command(cli, &app.socket, &["snapshot"], env)
+  run expect(String.contains(run utf8(Bytes.asSlice(&snapshot.output)), "\"A new message\""), "snapshot contains row")
+  let highlighted = run commandJson(cli, &app, &["highlight", "--role", "button", "--name", "Archive"], env)
+  let nodes = run array(run field(&highlighted, "nodes"))
+  run expect(nodes.length == 1 && (Json.asI32(Option<&Value>.some(&nodes[0])) |> Option<i32>.unwrapOr(-1)) == 20, "highlight Archive")
+  let inspected = run command(cli, &app.socket, &["inspect", "--role", "button", "--name", "Archive"], env)
+  run expect(inspected.code == 0 && String.startsWith(run utf8(Bytes.asSlice(&inspected.output)), "box #20"), "inspect Archive")
+  let shot = run rootPath(".cache/ui-inspect/inspect.png")
+  if run FileSystem.exists(&shot) { run FileSystem.removeFile(&shot) }
+  let screenshot = run command(cli, &app.socket, &["screenshot", pathText(&shot)], env)
+  run expect(screenshot.code == 0, "capture inspector screenshot")
+  run picture(&shot)
+  let stats = run command(cli, &app.socket, &["stats"], env)
+  run expect(String.contains(run utf8(Bytes.asSlice(&stats.output)), "\"nodes\":"), "stats")
+  let missing = run command(cli, &app.socket, &["click", "--name", "no such button"], env)
+  run expect(missing.code == 1 && String.contains(run utf8(Bytes.asSlice(&missing.errors)), "no node matches"), "missing node is an error")
+}
+
+pub effect fn inspect() -> ()
+! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  let binary = run build("modules/tree/demo", false, false)
+  let cli = run build("modules/inspect/cli", false, false)
+  let display = run openDisplay("x11")
+  let result = run Effect.result(inspectWith(String.view(&binary), String.view(&cli), &display))
+  run closeDisplay(move display)
+  if let Result<(), TaskError | FileError | HostInputError | OutOfMemoryError | WriterError>.Failure {error} = move result { fail move error }
+}
+
+effect fn devtoolsCheck(app: &App, tools: &App, cli: string, env: &[string]) -> ()
+! TaskError | FileError | HostInputError | OutOfMemoryError | WriterError
+? &mut HostInput | &mut Allocator | &mut FileSystem {
+  let query = run commandJson(cli, app, &["query", "--role", "button", "--name", "Add", "--exact"], env)
+  let nodes = run array(run field(&query, "nodes"))
+  run expect(nodes.length == 1, "todo has one Add button")
+  let button = number(&nodes[0], "id")
+  run require(button >= 0, "Add button has invalid id")
+  let id = run decimal(i32.toUsize(button))
+  let row = run joined("element-", String.view(&id))
+  let listed = run command(cli, &tools.socket, &["wait", "--test-id", String.view(&row), "--timeout", "20000"], env)
+  run expect(listed.code == 0, "devtools lists Add element")
+  let snapshot = run command(cli, &tools.socket, &["snapshot"], env)
+  let snapshotText = run utf8(Bytes.asSlice(&snapshot.output))
+  run expect(String.contains(snapshotText, "label=\"button \\\"Add\\\"\"") && !String.contains(snapshotText, "cannot reach"), "devtools labels role/name and has no connection error")
+  let selected = run command(cli, &tools.socket, &["click", "--test-id", String.view(&row)], env)
+  run expect(selected.code == 0, "select Add row")
+  let deadline = milliseconds() + 15000
+  while true {
+    let hello = run commandJson(cli, app, &["hello"], env)
+    let highlight = run array(run field(&hello, "highlight"))
+    if highlight.length == 1 && (Json.asI32(Option<&Value>.some(&highlight[0])) |> Option<i32>.unwrapOr(-1)) == button { break }
+    if milliseconds() >= deadline { run Task.abort("Timed out: selected node highlights in todo") }
+    pause()
+  }
+  let title = run command(cli, &tools.socket, &["wait", "--test-id", "detail-title", "--timeout", "10000"], env)
+  run expect(title.code == 0, "styles panel appears")
+  let titleJson = run json(Bytes.asSlice(&title.output))
+  let node = run field(&titleJson, "node")
+  let titleId = number(node, "id")
+  run require(titleId >= 0, "Invalid detail-title node id")
+  let titleNumber = run decimal(i32.toUsize(titleId))
+  let styles = run command(cli, &tools.socket, &["snapshot", "--node", String.view(&titleNumber)], env)
+  run expect(String.contains(run utf8(Bytes.asSlice(&styles.output)), "button \\\"Add\\\""), "styles title names Add")
+  let panel = run command(cli, &tools.socket, &["snapshot", "--test-id", "panel"], env)
+  let panelText = run utf8(Bytes.asSlice(&panel.output))
+  run expect(String.contains(panelText, "\"  padding-left\"") && String.contains(panelText, ": 10px;"), "styles include todo button padding")
+  let boxTab = run command(cli, &tools.socket, &["click", "--role", "button", "--name", "Box model", "--exact"], env)
+  run expect(boxTab.code == 0, "open box model")
+  let content = run command(cli, &tools.socket, &["wait", "--test-id", "content", "--timeout", "10000"], env)
+  run expect(content.code == 0, "content box is drawn")
+  let boxes = run command(cli, &tools.socket, &["snapshot", "--test-id", "box-model"], env)
+  let boxesText = run utf8(Bytes.asSlice(&boxes.output))
+  run expect(String.contains(boxesText, "testId=\"padding\"") && String.contains(boxesText, "\"10\""), "box model displays padding widths")
+  let add = run command(cli, &app.socket, &["click", "--role", "button", "--name", "Add", "--exact"], env)
+  run expect(add.code == 0, "click Add in todo")
+  let events = run command(cli, &tools.socket, &["click", "--role", "button", "--name", "Events", "--exact"], env)
+  run expect(events.code == 0, "open events")
+  let eventLog = run command(cli, &tools.socket, &["wait", "--test-id", "event-log", "--timeout", "10000"], env)
+  run expect(eventLog.code == 0, "event log appears")
+  let logDeadline = milliseconds() + 15000
+  while true {
+    let log = run command(cli, &tools.socket, &["snapshot", "--test-id", "event-log"], env)
+    let logText = run utf8(Bytes.asSlice(&log.output))
+    if String.contains(logText, "\"click\"") && String.contains(logText, "button \\\"Add\\\"") { break }
+    if milliseconds() >= logDeadline { run Task.abort("Timed out: event log records Add click") }
+    pause()
+  }
+  let refreshed = run command(cli, &tools.socket, &["wait", "--text", "Task 4", "--timeout", "10000"], env)
+  run expect(refreshed.code == 0, "devtools tree refreshes with new todo")
+  let task = run command(cli, &app.socket, &["wait", "--text", "Task 4", "--timeout", "10000"], env)
+  run expect(task.code == 0, "todo displays new task")
+  let toolsShot = run rootPath(".cache/ui-inspect/devtools.png")
+  let toolsImage = run command(cli, &tools.socket, &["screenshot", pathText(&toolsShot)], env)
+  run expect(toolsImage.code == 0, "devtools screenshot")
+  run picture(&toolsShot)
+  let appShot = run rootPath(".cache/ui-inspect/todo.png")
+  let appImage = run command(cli, &app.socket, &["screenshot", pathText(&appShot)], env)
+  run expect(appImage.code == 0, "todo screenshot")
+  run picture(&appShot)
+}
+
+effect fn launchDevtools(toolsBinary: string, appBinary: string, args: &[string], cli: string, env: &[string], check: bool) -> ()
+! TaskError | FileError | HostInputError | OutOfMemoryError | WriterError
+? &mut HostInput | &mut Allocator | &mut FileSystem {
+  let absolute = run rootPath(appBinary)
+  let app = run program("todo", pathText(&absolute), args, env, cli)
+  if !check { return run execute(toolsBinary, &["--connect", pathText(&app.socket)], env, 2147483647) }
+  let tools = run program("devtools", toolsBinary, &["--connect", pathText(&app.socket)], env, cli)
+  run devtoolsCheck(&app, &tools, cli, env)
+}
+
+pub effect fn devtools(mode: string, connect: string, appBinary: string, appArgs: &[string], buildOnly: bool) -> ()
+! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  run require(mode == "run" || mode == "todo" || mode == "external" || mode == "check", "Unknown devtools mode")
+  let tools = run build("modules/inspect/devtools/app", false, false)
+  if buildOnly { return run say(String.view(&tools)) }
+  if mode == "run" {
+    if connect == "" { return run execute(String.view(&tools), &[], &[], 2147483647) }
+    return run execute(String.view(&tools), &["--connect", connect], &[], 2147483647)
+  }
+  let app = if mode == "external" { run String.copy(appBinary) } else { run build("modules/app/demo", false, false) }
+  run require(String.view(&app) != "", "external requires --app-binary PATH")
+  let cli = run build("modules/inspect/cli", false, false)
+  if mode != "check" { return run launchDevtools(String.view(&tools), String.view(&app), appArgs, String.view(&cli), &[], false) }
+  let display = run openDisplay("x11")
+  let env = run views(&display.environment)
+  let result = run Effect.result(launchDevtools(String.view(&tools), String.view(&app), appArgs, String.view(&cli), env.asSlice(), true))
+  drop env
+  run closeDisplay(move display)
+  if let Result<(), TaskError | FileError | HostInputError | OutOfMemoryError | WriterError>.Failure {error} = move result { fail move error }
+}
+}

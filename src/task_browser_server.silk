@@ -1,0 +1,393 @@
+// Native loopback HTTP host. The task subprocess owns its listener; the parent owns its lifetime.
+import silk.cli.task { TaskError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.io.writer { Writer, WriterError }
+import silk.io.writer_native { StdoutWriter, StderrWriter }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.net.address { Endpoint, IpAddress, Ipv4Address, Port }
+import silk.net.socket_native { Accepted, BoundAddress, Connection, Incoming, Listener, ListenOptions, NativeSocketError, RawSocket, Received, Sent, listen }
+import silk.num.i32
+import silk.num.u8
+import silk.num.u16
+import silk.num.u64
+import silk.num.usize
+import silk.system.child_process { ChildProcess, ProcessError }
+import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.system.monotonic_clock { MonotonicClock, ReadyWatch }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
+import silk.system.system_clock { Instant }
+import silk.text.format { Format }
+import silk.text.string { String }
+import task_support { hostPath, repositoryRoot, require, rootPath }
+
+static if Intrinsic.targetOperatingSystem() == "darwin" || Intrinsic.targetOperatingSystem() == "linux" {
+  import silk.platform.native.descriptor { NativeDescriptor }
+  import silk.system.subprocess { SpawnOptions, Stdio, Subprocess, SubprocessError }
+  import silk.system.system_info { SystemInfo, SystemInfoError }
+  import silk.system.system_info_native { OsSystemInfo }
+  pub struct Server { pub process: Subprocess, pub origin: String }
+}
+struct Client { socket: Connection, request: Bytes, header: Bytes, body: Bytes, sent: usize, ready: bool }
+struct Roots { wasm: Path, page: Path, ui: Path, native: Path, tree: bool }
+
+pub effect fn decimal(value: usize) -> String ! OutOfMemoryError ? &mut Allocator {
+  let mut digits: [u8; 20] = [0; 20]
+  let mut number = value
+  let mut start: usize = 20
+  while true {
+    start = start - 1
+    digits[start] = usize.toU8(number % 10) + 48
+    number = number / 10
+    if number == 0 { break }
+  }
+  return run String.copy(unsafe String.fromUtf8Unchecked(Slice.view<u8>(&digits, start, 20 - start)))
+}
+
+pub effect fn sleep(milliseconds: u64) -> () {
+  let mut clock = OsMonotonicClock.make()
+  run MonotonicClock.waitFor(milliseconds * 1000000) |> Effect.provideMut<MonotonicClock>(&mut clock)
+}
+
+pub effect fn report<Args>(static template: string<'static>, arguments: &Args) -> () ! WriterError {
+  let mut output = StdoutWriter.make()
+  run Format.format(template, arguments) |> Effect.provideMut<Writer>(&mut output)
+}
+
+effect fn socketFailure(error: NativeSocketError) -> never ! TaskError | OutOfMemoryError ? &mut Allocator {
+  StderrWriter.print("HTTP socket: {error:?}\n", &.{ error: error })
+  fail TaskError { message: run String.copy("browser HTTP socket operation failed"), status: 1 }
+}
+static if Intrinsic.targetOperatingSystem() == "darwin" || Intrinsic.targetOperatingSystem() == "linux" {
+effect fn processFailure(error: SubprocessError) -> never ! TaskError | OutOfMemoryError ? &mut Allocator {
+  StderrWriter.print("HTTP process errno: {code}\n", &.{ code: error.code })
+  fail TaskError { message: run String.copy("browser HTTP subprocess operation failed"), status: 1 }
+}
+effect fn executableFailure(error: SystemInfoError) -> never ! TaskError | OutOfMemoryError ? &mut Allocator {
+  StderrWriter.print("HTTP executable lookup native error: {code}\n", &.{ code: error.code })
+  fail TaskError { message: run String.copy("cannot locate the running Silk task executable"), status: 1 }
+}
+
+pub effect fn start(wasm: string, tree: bool) -> Server
+  ! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+  ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  let mut info = OsSystemInfo.make()
+  let executable = run Effect.catch(SystemInfo.executablePath(), executableFailure)
+    |> Effect.provideMut<SystemInfo>(&mut info)
+  let program = run Path.fromBytes(Bytes.asSlice(&executable))
+  let mut request = run ChildProcess.request(&program)
+  run ChildProcess.addArgument(&mut request, "browser")
+  run ChildProcess.addArgument(&mut request, "browser-tree-server")
+  run ChildProcess.addArgument(&mut request, "--wasm")
+  run ChildProcess.addArgument(&mut request, wasm)
+  run ChildProcess.addArgument(&mut request, "--port")
+  run ChildProcess.addArgument(&mut request, "0")
+  if tree { run ChildProcess.addArgument(&mut request, "--tree") }
+  run Subprocess.inheritEnvironment(&mut request)
+  let mut options = SpawnOptions.make()
+  run SpawnOptions.setStdio(&mut options, 1, Stdio.pipe())
+  run SpawnOptions.setStdio(&mut options, 2, Stdio.inherit(2))
+  let mut child = run Effect.catch(Subprocess.spawn(&request, &options), processFailure)
+  let pipe = match Subprocess.takePipe(&mut child, 1) {
+    Option<i32>.Some { value } => value
+    Option<i32>.None => { fail TaskError { message: run String.copy("HTTP server stdout pipe missing"), status: 1 } }
+  }
+  let attempted = run Effect.result(readOrigin(pipe))
+  Subprocess.closeDescriptor(pipe)
+  match move attempted {
+    Result.Success { value } => { return Server { process: move child, origin: move value } }
+    Result.Failure { error } => {
+      let mut server = Server { process: move child, origin: String.make() }
+      run stop(&mut server)
+      fail move error
+    }
+  }
+}
+
+effect fn readOrigin(pipe: i32) -> String
+  ! TaskError | OutOfMemoryError ? &mut Allocator {
+  let mut text = Bytes.make()
+  let mut elapsed: usize = 0
+  while elapsed < 30000 {
+    let mut buffer: [u8; 128] = [0; 128]
+    let mut count: usize = 0
+    let mut error: i32 = 0
+    let success = run NativeDescriptor.read(pipe, &mut buffer, &mut count, &mut error)
+    if success {
+      run require(count != 0, "HTTP server exited before announcing its address")
+      run Bytes.append(&mut text, Slice.view<u8>(&buffer, 0, count))
+      let view = unsafe String.fromUtf8Unchecked(Bytes.asSlice(&text))
+      if String.endsWith(view, "\n") {
+        run require(String.startsWith(view, "http://127.0.0.1:"), "invalid HTTP server readiness response")
+        return run String.copy(String.slice(view, 0, String.utf8Bytes(view).length - 1))
+      }
+      run require(Bytes.length(&text) < 128, "invalid HTTP server readiness response")
+    } else {
+      // read(2) on Subprocess pipes is nonblocking; EINTR and EAGAIN are ordinary readiness.
+      static if Intrinsic.targetOperatingSystem() == "darwin" {
+        run require(error == 4 || error == 35, "cannot read HTTP server readiness pipe")
+      } else {
+        run require(error == 4 || error == 11, "cannot read HTTP server readiness pipe")
+      }
+    }
+    run sleep(10)
+    elapsed = elapsed + 10
+  }
+  fail TaskError { message: run String.copy("HTTP server did not become ready within 30 seconds"), status: 1 }
+}
+
+pub effect fn stop(server: &mut Server) -> () ! TaskError | OutOfMemoryError ? &mut Allocator {
+  let pid = Subprocess.pid(&server.process)
+  let status = run Effect.catch(Subprocess.tryWait(pid), processFailure)
+  match move status {
+    Option.Some { .. } => { return () }
+    Option.None => {}
+  }
+  run Effect.catch(Subprocess.kill(pid, 15), processFailure)
+  while true {
+    match move (run Effect.catch(Subprocess.tryWait(pid), processFailure)) {
+      Option.Some { .. } => { return () }
+      Option.None => run sleep(10)
+    }
+  }
+}
+}
+
+// Interpret CLI filenames in the caller's working directory, including native Windows separators.
+pub effect fn inputPath(value: string) -> Path
+  ! TaskError | FileError | HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
+  let bytes = String.utf8Bytes(value)
+  if String.startsWith(value, "/") { return run hostPath(value) }
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    if bytes.length >= 2 && bytes[1] == 58 { return run hostPath(value) }
+  }
+  let cwdBytes = run HostInput.workingDirectory()
+  let cwdText = match String.fromUtf8(Bytes.asSlice(&cwdBytes)) {
+    Result.Success { value: decoded } => decoded
+    Result.Failure { .. } => { fail TaskError { message: run String.copy("working directory is not UTF-8"), status: 1 } }
+  }
+  let cwd = run hostPath(cwdText)
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    let mut normalized = run Bytes.copy(bytes)
+    let view = Bytes.asMutSlice(&mut normalized)
+    let mut index: usize = 0
+    while index < view.length {
+      if view[index] == 92 { view[index] = 47 }
+      index = index + 1
+    }
+    return run Path.resolve(&cwd, unsafe String.fromUtf8Unchecked(Bytes.asSlice(&normalized)))
+  } else {
+    return run Path.resolve(&cwd, value)
+  }
+}
+
+pub effect fn serve(wasmPath: string, port: u16) -> ()
+  ! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+  ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  run server(wasmPath, port, false)
+}
+
+// Internal task dispatch; stdout's first line is the readiness handshake, including the selected port.
+pub effect fn server(wasmPath: string, port: u16, tree: bool) -> ()
+  ! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+  ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  let roots = Roots {
+    wasm: run inputPath(wasmPath),
+    page: run rootPath(if tree { "modules/tree/browser/test-page.html" } else { "modules/tree/window/browser/index.html" }),
+    ui: run rootPath("modules/tree/window/browser"),
+    native: run repositoryRoot("lib-native"), tree: tree,
+  }
+  let endpoint = Endpoint.make(IpAddress.V4 { value: Ipv4Address.fromOctets([127, 0, 0, 1]) }, Port.fromU16(port))
+  let mut listener = run Effect.catch(listen(endpoint, ListenOptions.defaults()), socketFailure)
+  let actual = match Listener.boundAddress(&listener) {
+    BoundAddress.Tcp { endpoint: bound } => Port.value(&Endpoint.port(&bound))
+    _ => port
+  }
+  run report("http://127.0.0.1:{port}\n", &.{ port: actual })
+  let mut clock = OsMonotonicClock.make()
+  run Effect.catch(serveLoop(&mut listener, &roots), socketFailure)
+    |> Effect.provideMut<MonotonicClock>(&mut clock)
+}
+
+effect fn serveLoop(listener: &mut Listener, roots: &Roots) -> ()
+  ! NativeSocketError | TaskError | FileError | OutOfMemoryError | WriterError
+  ? &mut Allocator | &mut FileSystem | &mut MonotonicClock {
+  let mut clients = List<Client>.make()
+  let mut watches = List<ReadyWatch>.make()
+  while true {
+    while true {
+      match move (run Listener.tryAccept(&mut listener)) {
+        Incoming.WouldBlock => { break }
+        Incoming.Client { accepted } => run List.append(&mut clients, Client {
+          socket: Accepted.intoConnection(move accepted), request: Bytes.make(), header: Bytes.make(), body: Bytes.make(), sent: 0, ready: false,
+        })
+      }
+    }
+    let mut index: usize = 0
+    while index < List.length(&clients) {
+      let finished = run Effect.catch(step(&mut List.asMutSlice(&mut clients)[index], roots), clientFailure)
+      if finished { drop List.remove(&mut clients, index) } else { index = index + 1 }
+    }
+    List.clear(&mut watches)
+    run List.append(&mut watches, ReadyWatch.forRead(descriptor(Listener.rawDescriptor(&listener))))
+    let values = List.asSlice(&clients)
+    index = 0
+    while index < values.length {
+      let handle = descriptor(Connection.rawDescriptor(&values[index].socket))
+      run List.append(&mut watches, if values[index].ready { ReadyWatch.forWrite(handle) } else { ReadyWatch.forRead(handle) })
+      index = index + 1
+    }
+    let _ready = run MonotonicClock.waitReady(List.asMutSlice(&mut watches), Option<Instant>.none())
+  }
+}
+
+fn descriptor(value: RawSocket) -> usize {
+  static if Intrinsic.targetOperatingSystem() == "windows" { return value }
+  else { return i32.toUsize(value) }
+}
+
+effect fn clientFailure(error: NativeSocketError) -> bool {
+  // Navigation can cancel an in-flight response. It must not terminate the listener or other clients.
+  StderrWriter.print("HTTP client disconnected: {error:?}\n", &.{ error: error })
+  return true
+}
+
+effect fn step(client: &mut Client, roots: &Roots) -> bool
+  ! NativeSocketError | TaskError | FileError | OutOfMemoryError | WriterError ? &mut Allocator | &mut FileSystem {
+  if !client.ready {
+    let mut buffer: [u8; 8192] = [0; 8192]
+    match move (run Connection.tryRead(&mut client.socket, &mut buffer)) {
+      Received.End => { return true }
+      Received.WouldBlock => { return false }
+      Received.Data { count } => run Bytes.append(&mut client.request, Slice.view<u8>(&buffer, 0, count))
+    }
+    let request = match String.fromUtf8(Bytes.asSlice(&client.request)) {
+      Result.Success { value } => value
+      Result.Failure { .. } => {
+        run respond(&mut client, 400, "text/plain", run Bytes.copy(b"Invalid UTF-8 request"))
+        return false
+      }
+    }
+    if !String.contains(request, "\r\n\r\n") {
+      if Bytes.length(&client.request) > 65536 { run respond(&mut client, 431, "text/plain", Bytes.make()) }
+      return false
+    }
+    let route = run Effect.result(route(request, roots))
+    match move route {
+      Result.Success { value } => run respond(&mut client, value.status, value.mime, move value.body)
+      Result.Failure { error } => match move error {
+        OutOfMemoryError allocation => { fail move allocation }
+        TaskError invalid => {
+          StderrWriter.print("HTTP request: {message}\n", &.{ message: String.view(&invalid.message) })
+          run respond(&mut client, 400, "text/plain", run Bytes.copy(b"Invalid request path"))
+        }
+        FileError failed => {
+          StderrWriter.print("HTTP request: {error:?}\n", &.{ error: move failed })
+          run respond(&mut client, 500, "text/plain", run Bytes.copy(b"Static file request failed; see server stderr"))
+        }
+      }
+    }
+  }
+  let headLength = Bytes.length(&client.header)
+  let bodyLength = Bytes.length(&client.body)
+  let data = if client.sent < headLength {
+    Slice.view<u8>(Bytes.asSlice(&client.header), client.sent, headLength - client.sent)
+  } else { Slice.view<u8>(Bytes.asSlice(&client.body), client.sent - headLength, bodyLength - (client.sent - headLength)) }
+  match move (run Connection.tryWrite(&mut client.socket, data)) {
+    Sent.Count { count } => { client.sent = client.sent + count }
+    Sent.WouldBlock => {}
+  }
+  return client.sent == headLength + bodyLength
+}
+
+struct Response { status: usize, mime: string<'static>, body: Bytes }
+effect fn route(request: string, roots: &Roots) -> Response
+  ! TaskError | FileError | OutOfMemoryError ? &mut Allocator | &mut FileSystem {
+  if !String.startsWith(request, "GET ") { return Response { status: 405, mime: "text/plain", body: Bytes.make() } }
+  let bytes = String.utf8Bytes(request)
+  let mut end: usize = 4
+  while end < bytes.length && bytes[end] != 32 && bytes[end] != 63 { end = end + 1 }
+  let decoded = run decodePath(Slice.view<u8>(bytes, 4, end - 4))
+  let path = String.view(&decoded)
+  if path == "/favicon.ico" { return Response { status: 204, mime: "image/x-icon", body: Bytes.make() } }
+  if path == "/" { return Response { status: 200, mime: "text/html", body: run FileSystem.readFile(&roots.page) } }
+  if (roots.tree && path == "/ui.wasm") || (!roots.tree && path == "/app.wasm") {
+    return Response { status: 200, mime: "application/wasm", body: run FileSystem.readFile(&roots.wasm) }
+  }
+  if !String.endsWith(path, ".js") && !String.endsWith(path, ".ts") { return Response { status: 404, mime: "text/plain", body: Bytes.make() } }
+  // Reject traversal on decoded segments, including backslashes on hosts that interpret them.
+  if String.contains(path, "\\") || String.contains(path, "\x00") || String.contains(path, "/../") || String.contains(path, "/./") {
+    return Response { status: 404, mime: "text/plain", body: Bytes.make() }
+  }
+  let selected = if roots.tree {
+    if String.startsWith(path, "/") {
+      Option<Path>.some(run joinRoot(&roots.native, "modules/gpu/webgpu", path))
+    } else { Option<Path>.none() }
+  } else if String.startsWith(path, "/ui/tree/window/browser/") {
+    Option<Path>.some(run Path.join(&roots.ui, strip(path, "/ui/tree/window/browser/")))
+  } else if String.startsWith(path, "/native/platform/window/browser/") {
+    Option<Path>.some(run joinRoot(&roots.native, "modules/platform/window/browser/", strip(path, "/native/platform/window/browser/")))
+  } else if String.startsWith(path, "/native/gpu/webgpu/browser/") {
+    Option<Path>.some(run joinRoot(&roots.native, "modules/gpu/webgpu/browser/", strip(path, "/native/gpu/webgpu/browser/")))
+  } else { Option<Path>.none() }
+  match move selected {
+    Option.Some { value } => { return Response { status: 200, mime: "text/javascript", body: run FileSystem.readFile(&value) } }
+    Option.None => { return Response { status: 404, mime: "text/plain", body: Bytes.make() } }
+  }
+}
+fn strip<'a>(value: string<'a>, prefix: string) -> string<'a> {
+  let offset = String.utf8Bytes(prefix).length
+  return String.slice(value, offset, String.utf8Bytes(value).length - offset)
+}
+effect fn joinRoot(root: &Path, prefix: string, suffix: string) -> Path ! FileError | OutOfMemoryError ? &mut Allocator {
+  let mut value = run String.copy(prefix)
+  run String.append(&mut value, suffix)
+  return run Path.join(root, String.view(&value))
+}
+fn hex(value: u8) -> u8 {
+  if value >= 48 && value <= 57 { return value - 48 }
+  if value >= 65 && value <= 70 { return value - 55 }
+  if value >= 97 && value <= 102 { return value - 87 }
+  return 255
+}
+effect fn decodePath(input: &[u8]) -> String ! TaskError | OutOfMemoryError ? &mut Allocator {
+  let mut output = Bytes.make()
+  let mut index: usize = 0
+  while index < input.length {
+    let mut value = input[index]
+    if value == 37 {
+      run require(index + 2 < input.length, "truncated URL escape")
+      let high = hex(input[index + 1])
+      let low = hex(input[index + 2])
+      run require(high < 16 && low < 16, "invalid URL escape")
+      value = high * 16 + low
+      index = index + 2
+    }
+    run Bytes.append(&mut output, &[value])
+    index = index + 1
+  }
+  return match String.fromUtf8(Bytes.asSlice(&output)) {
+    Result.Success { value } => run String.copy(value)
+    Result.Failure { .. } => { fail TaskError { message: run String.copy("URL is not UTF-8"), status: 1 } }
+  }
+}
+
+effect fn respond(client: &mut Client, status: usize, mime: string, body: Bytes) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  let code = run decimal(status)
+  let length = run decimal(Bytes.length(&body))
+  run Bytes.append(&mut client.header, b"HTTP/1.1 ")
+  run Bytes.append(&mut client.header, String.utf8Bytes(String.view(&code)))
+  run Bytes.append(&mut client.header, b" Response\r\nContent-Type: ")
+  run Bytes.append(&mut client.header, String.utf8Bytes(mime))
+  run Bytes.append(&mut client.header, b"\r\nContent-Length: ")
+  run Bytes.append(&mut client.header, String.utf8Bytes(String.view(&length)))
+  run Bytes.append(&mut client.header, b"\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n")
+  client.body = move body
+  client.ready = true
+}

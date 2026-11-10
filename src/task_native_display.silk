@@ -1,0 +1,156 @@
+static if Intrinsic.targetOperatingSystem() == "darwin" || Intrinsic.targetOperatingSystem() == "linux" {
+import silk.cli.task { Task, TaskError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.filesystem { FileError, FileSystem, Path, TemporaryDirectory }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.text.string { String }
+import silk.num.usize
+import task_native_process { Process, start, poll, pause, milliseconds, socketExists }
+import task_support { pathText }
+
+pub struct Display {
+  pub environment: List<String>,
+  server: Option<Process>,
+  runtime: Option<TemporaryDirectory>,
+}
+
+pub fn inheritedDisplay() -> Display {
+  return Display {environment: List<String>.make(), server: Option<Process>.none(), runtime: Option<TemporaryDirectory>.none()}
+}
+
+pub effect fn decimal(number: usize) -> String ! OutOfMemoryError ? &mut Allocator {
+  let mut buffer: [u8; 24] = [0; 24]
+  let mut index: usize = 24
+  let mut left = number
+  while true {
+    index = index - 1
+    buffer[index] = usize.toU8(left % 10) + 48
+    left = left / 10
+    if left == 0 { break }
+  }
+  return run String.copy(unsafe String.fromUtf8Unchecked(Slice.view(&buffer, index, 24 - index)))
+}
+
+pub effect fn joined(left: string, right: string) -> String ! OutOfMemoryError ? &mut Allocator {
+  let mut result = run String.copy(left)
+  run String.append(&mut result, right)
+  return move result
+}
+
+pub effect fn views<'a>(items: &'a List<String>) -> List<string<'a>> ! OutOfMemoryError ? &mut Allocator {
+  let mut result = List<string<'a>>.make()
+  let values = List<String>.asSlice(items)
+  let mut index: usize = 0
+  while index < values.length {
+    run List<string<'a>>.append(&mut result, String.view(&values[index]))
+    index = index + 1
+  }
+  return move result
+}
+
+effect fn ready(process: &mut Process, socket: &Path) -> ()
+! TaskError | FileError | OutOfMemoryError ? &mut Allocator | &mut FileSystem {
+  let deadline = milliseconds() + 10000
+  while !run socketExists(socket) {
+    if run poll(&mut process.*) { run Task.abort("Display server exited before its socket became ready") }
+    if milliseconds() >= deadline { run Task.abort("Timed out waiting for display socket") }
+    pause()
+  }
+}
+
+pub effect fn closeDisplay(display: Display) -> ()
+! TaskError | HostInputError | FileError | OutOfMemoryError ? &mut HostInput | &mut Allocator | &mut FileSystem {
+  let Display {environment: _environment, server, runtime} = move display
+  drop server
+  if let Option<TemporaryDirectory>.Some {value} = move runtime {
+    // Weston can leave socket entries after SIGKILL; FileSystem's regular-file removal rejects them.
+    run Task.exec("rm", &["-rf", "--", pathText(&value.path)])
+  }
+}
+
+effect fn launch(display: &mut Display, backend: string) -> ()
+! TaskError | FileError | HostInputError | OutOfMemoryError
+? &mut HostInput | &mut Allocator | &mut FileSystem {
+  run List<String>.append(&mut display.environment, run joined("SILK_WINDOW_BACKEND=", backend))
+  if backend == "x11" {
+    let mut number: usize = 90
+    let mut socket = run Path.make("/tmp/.X11-unix/X90")
+    while true {
+      let digits = run decimal(number)
+      let name = run joined("/tmp/.X11-unix/X", String.view(&digits))
+      socket = run Path.make(String.view(&name))
+      let mut lock = run joined("/tmp/.X", String.view(&digits))
+      run String.append(&mut lock, "-lock")
+      let lockPath = run Path.make(String.view(&lock))
+      let socketTaken = run socketExists(&socket)
+      let lockTaken = run FileSystem.exists(&lockPath)
+      if !socketTaken && !lockTaken { break }
+      number = number + 1
+    }
+    let digits = run decimal(number)
+    let address = run joined(":", String.view(&digits))
+    run List<String>.append(&mut display.environment, run String.copy("-uWAYLAND_DISPLAY"))
+    run List<String>.append(&mut display.environment, run joined("DISPLAY=", String.view(&address)))
+    let env = run views(&display.environment)
+    let mut server = run start("Xvfb", &[String.view(&address), "-screen", "0", "1600x1000x24", "-nolisten", "tcp"], env.asSlice(), false, false, true)
+    run ready(&mut server, &socket)
+    display.server = Option<Process>.some(move server)
+  } else {
+    let mut parentValue = Option<Bytes>.none()
+    let candidates = ["TMPDIR", "TMP", "TEMP"]
+    let mut at: usize = 0
+    while at < candidates.length {
+      let value = run HostInput.variableNamed(candidates[at])
+      let nonempty = match &value {
+        Option<Bytes>.Some {value: bytes} => Bytes.length(&bytes) != 0
+        Option<Bytes>.None => false
+      }
+      if nonempty {
+        parentValue = move value
+        break
+      }
+      at = at + 1
+    }
+    let parent = match &parentValue {
+      Option<Bytes>.Some {value} => run Path.fromBytes(Bytes.asSlice(&value))
+      Option<Bytes>.None => run Path.make("/tmp")
+    }
+    let runtime = run FileSystem.temporaryDirectory(&parent, "silk-ui-weston-")
+    display.runtime = Option<TemporaryDirectory>.some(move runtime)
+    let runtimePath = match &display.runtime {
+      Option<TemporaryDirectory>.Some {value} => &value.path
+      Option<TemporaryDirectory>.None => Intrinsic.trap("Display runtime was just installed")
+    }
+    let socket = run Path.join(runtimePath, "silk-ui")
+    let assignment = run joined("XDG_RUNTIME_DIR=", pathText(runtimePath))
+    run List<String>.append(&mut display.environment, move assignment)
+    run List<String>.append(&mut display.environment, run String.copy("WAYLAND_DISPLAY=silk-ui"))
+    run List<String>.append(&mut display.environment, run String.copy("-uDISPLAY"))
+    let env = run views(&display.environment)
+    let mut server = run start("weston", &["--backend=headless", "--socket=silk-ui", "--width=1600", "--height=1000", "--idle-time=0"], env.asSlice(), false, false, true)
+    run ready(&mut server, &socket)
+    display.server = Option<Process>.some(move server)
+  }
+}
+
+pub effect fn openDisplay(backend: string) -> Display
+! TaskError | FileError | HostInputError | OutOfMemoryError
+? &mut HostInput | &mut Allocator | &mut FileSystem {
+  let mut display = Display {environment: List<String>.make(), server: Option<Process>.none(), runtime: Option<TemporaryDirectory>.none()}
+  static if Intrinsic.targetOperatingSystem() == "linux" {
+    if backend != "x11" && backend != "wayland" { run Task.abort("Unknown display backend") }
+    let result = run Effect.result(launch(&mut display, backend))
+    if let Result<(), TaskError | FileError | HostInputError | OutOfMemoryError>.Failure {error} = move result {
+      run closeDisplay(move display)
+      fail move error
+    }
+  }
+  return move display
+}
+}

@@ -27,15 +27,22 @@ Layout handles justification (extra space on word separators, or on every cluste
 
 ## Agreement with Chrome
 
-`scripts/chrome-text.mjs` lays out the cases in `tests/chrome/cases.json` with `tools/cli/` and
+`silk task browser chrome-text` lays out the cases in `tests/chrome/cases.json` with `tools/cli/` and
 with Chrome on the same font files, and compares the rectangle of every text fragment:
 The unchanged subset files and their OFL notices are owned under `modules/text/tests/fonts`.
 Both the unit tests and Chrome comparison run with the repository root as their working directory.
 
 ```sh
 silk build --manifest-path modules/text/tools/cli/silk.toml
-node modules/text/scripts/chrome-text.mjs --cli build/llvm/x86_64-unknown-linux-gnu/debug/ui-text-cli
+silk task browser chrome-text --cli build/llvm/x86_64-unknown-linux-gnu/debug/ui-text-cli
 ```
+
+Use `--chrome PATH` (or `CHROMIUM_EXECUTABLE`) to select Chrome; `--only NAME`, `--cases FILE`,
+`--verbose`, `--tolerance`, and `--block-tolerance` control the comparison. `UI_TEXT_CLI`
+can supply the CLI path. `silk task browser check` builds and runs all browser checks.
+The host automation is Silk; `tests/chrome/observe.js` runs only inside the browser.
+Managed browser checks require Darwin or Linux until [Silk #3034](https://github.com/silk-lang/silk/issues/3034)
+adds the Windows subprocess capability.
 
 The cases cover wrapping, kerning, mixed styles, line heights, alignment and justification,
 white space modes, soft hyphens, combining marks, Arabic and Japanese fallback, right to left

@@ -1,0 +1,90 @@
+import silk.cli.command { Command, CommandLine, Opt }
+import silk.cli.task { Task, TaskError, TaskSet }
+import silk.io.writer { WriterError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.child_process { ChildProcess, ProcessError }
+import silk.system.filesystem { FileError, FileSystem }
+import silk.system.host_input { HostInput, HostInputError }
+import task_assets { embed, photos }
+import task_checks { packages, unitTests, goldens, tools, browserExports }
+import task_support { setupCi }
+import task_native_cli { Tasks as NativeTasks }
+import task_browser_cli { Tasks as BrowserTasks }
+static if Intrinsic.targetOperatingSystem() != "windows" {
+  import task_native { httpCheck, httpFixture }
+}
+
+union Tasks {
+  Check,
+  CheckPackages,
+  UnitTests,
+  Goldens,
+  BuildTools,
+  GeneratePhotos,
+  EmbedAssets { pub check: bool },
+  GenerateBrowserExports { pub check: bool },
+  SetupCi { pub browser: bool, pub linuxGpu: bool },
+  Native { pub native: NativeTasks },
+  Browser { pub browserTasks: BrowserTasks },
+  HttpFixture,
+}
+
+impl CommandLine for Tasks {
+  static fn command() -> Command<Tasks> {
+    return Command<Tasks>.make("tasks", "UI maintenance, native integration and browser checks")
+      |> Command.variant("Check", "Check packages, tests, HTTP images, goldens, tools and generated sources")
+      |> Command.variant("CheckPackages", "Check every workspace package and portable wasm APIs")
+      |> Command.variant("UnitTests", "Run all ten UI unit-test roots")
+      |> Command.variant("Goldens", "Compare all five describe/PNG golden suites")
+      |> Command.variant("BuildTools", "Build text, inspector and MCP executables")
+      |> Command.variant("EmbedAssets", "Embed committed fonts, icons and photos")
+      |> Command.variant("GeneratePhotos", "Author procedural PNG/JPEG photos using native ImageMagick")
+      |> Command.variant("GenerateBrowserExports", "Copy exports from the pinned native dependency")
+      |> Command.variant("SetupCi", "Provision pinned native tools and CI environment")
+      |> Command.variant("HttpFixture", "Serve the loopback image fixture")
+      |> Command.option("check", Opt.about("Reject stale generated files without changing them"))
+      |> Command.variant("Native", "Native demos and integration checks")
+      |> Command.variant("Browser", "Browser builds, serving and Chromium checks")
+      |> Command.subcommand("native")
+      |> Command.subcommand("browserTasks")
+  }
+}
+
+impl TaskSet for Tasks {
+  effect fn perform(self: Tasks) -> ()
+    ! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+    ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+    match move self {
+      Tasks.CheckPackages => run packages()
+      Tasks.UnitTests => run unitTests()
+      Tasks.Goldens => run goldens()
+      Tasks.BuildTools => run tools()
+      Tasks.EmbedAssets { check } => run embed(check)
+      Tasks.GenerateBrowserExports { check } => run browserExports(check)
+      Tasks.GeneratePhotos => run photos()
+      Tasks.SetupCi { browser, linuxGpu } => run setupCi(browser, linuxGpu)
+      Tasks.Native { native } => run TaskSet.perform(move native)
+      Tasks.Browser { browserTasks } => run TaskSet.perform(move browserTasks)
+      Tasks.Check => {
+        static if Intrinsic.targetOperatingSystem() == "windows" {
+          run Task.abort("HTTP fixture lifecycle needs Windows subprocess support: https://github.com/silk-lang/silk/issues/3034")
+        } else {
+          run packages()
+          run unitTests()
+          run httpCheck("", "")
+          run goldens()
+          run tools()
+          run embed(true)
+          run browserExports(true)
+        }
+      }
+      Tasks.HttpFixture => {
+        static if Intrinsic.targetOperatingSystem() == "windows" {
+          run Task.abort("Windows managed subprocess support: https://github.com/silk-lang/silk/issues/3034")
+        } else { run httpFixture() }
+      }
+    }
+  }
+}
+
+pub effect fn main() -> i32 ? &mut HostInput { return run Task.main<Tasks>() }

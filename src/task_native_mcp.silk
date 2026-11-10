@@ -1,0 +1,207 @@
+static if Intrinsic.targetOperatingSystem() == "darwin" || Intrinsic.targetOperatingSystem() == "linux" {
+import silk.cli.task { Task, TaskError }
+import silk.collections.bytes { Bytes }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.encoding.base64 { Base64, Base64Error }
+import silk.io.writer { WriterError }
+import silk.json.value { Json, Value }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.child_process { ChildProcess, ProcessError }
+import silk.system.filesystem { FileError, FileSystem }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.system.subprocess { Subprocess }
+import silk.text.string { String }
+import silk.num.i32
+import task_support { build, rootPath, pathText, require }
+import task_native_process { Process, start, finish, send, receive, poll, pause, milliseconds }
+import task_native_display { Display, openDisplay, closeDisplay, views, joined, decimal }
+import task_native_inspector { program, expect, json, field, array, number, stringField, truth, png }
+
+struct Client { child: Process, id: usize }
+
+effect fn call(client: &mut Client, method: string, params: string) -> Value
+! TaskError | OutOfMemoryError ? &mut Allocator {
+  client.id = client.id + 1
+  let id = run decimal(client.id)
+  let mut request = run String.copy("{\"jsonrpc\":\"2.0\",\"id\":")
+  run String.append(&mut request, String.view(&id))
+  run String.append(&mut request, ",\"method\":\"")
+  run String.append(&mut request, method)
+  run String.append(&mut request, "\"")
+  if params != "" {
+    run String.append(&mut request, ",\"params\":")
+    run String.append(&mut request, params)
+  }
+  run String.append(&mut request, "}\n")
+  let deadline = milliseconds() + 60000
+  run send(&mut client.child, String.utf8Bytes(String.view(&request)), 60000)
+  let mut response = Bytes.make()
+  while true {
+    let eof = run receive(client.child.output, &mut response)
+    let bytes = Bytes.asSlice(&response)
+    let mut at: usize = 0
+    while at < bytes.length {
+      if bytes[at] == 10 {
+        run require(at + 1 == bytes.length, "Unexpected extra MCP response")
+        let reply = run json(Slice.view(bytes, 0, at))
+        run require(number(&reply, "id") >= 0 && i32.toUsize(number(&reply, "id")) == client.id, "Unexpected MCP response id")
+        return move reply
+      }
+      at = at + 1
+    }
+    if eof || run poll(&mut client.child) { run Task.abort("MCP server exited before answering") }
+    if milliseconds() >= deadline { run Task.abort("MCP request timed out") }
+    pause()
+  }
+  return Value.Null
+}
+
+effect fn tool(client: &mut Client, name: string, arguments: string) -> Value
+! TaskError | OutOfMemoryError | WriterError ? &mut Allocator {
+  let mut params = run String.copy("{\"name\":\"")
+  run String.append(&mut params, name)
+  run String.append(&mut params, "\",\"arguments\":")
+  run String.append(&mut params, arguments)
+  run String.append(&mut params, "}")
+  let reply = run call(&mut client.*, "tools/call", String.view(&params))
+  let noError = match Json.field(&reply, "error") {
+    Option<&Value>.None => true
+    Option<&Value>.Some {value} => match &value.* {
+      Value.Null => true
+      _ => false
+    }
+  }
+  run expect(noError, "MCP tool reply")
+  return run Json.copy(run field(&reply, "result"))
+}
+
+effect fn content(result: &Value) -> &Value ! TaskError | OutOfMemoryError ? &mut Allocator {
+  let items = run array(run field(result, "content"))
+  run require(items.length > 0, "MCP tool returned no content")
+  return &items[0]
+}
+
+effect fn contentText(result: &Value) -> string ! TaskError | OutOfMemoryError ? &mut Allocator {
+  return stringField(run content(result), "text")
+}
+
+effect fn decodeImage(encoded: string) -> Bytes ! TaskError | OutOfMemoryError ? &mut Allocator {
+  let input = String.utf8Bytes(encoded)
+  let length = match Base64.decodedLength(input) {
+    Result<usize, Base64Error>.Success {value} => value
+    Result<usize, Base64Error>.Failure {..} => run Task.abort("MCP screenshot has invalid base64")
+  }
+  let mut bytes = Bytes.make()
+  run Bytes.reserveExact(&mut bytes, length)
+  let zeros: [u8; 16384] = [0; 16384]
+  while Bytes.length(&bytes) < length {
+    let remaining = length - Bytes.length(&bytes)
+    run Bytes.append(&mut bytes, Slice.view(&zeros, 0, if remaining < 16384 { remaining } else { 16384 }))
+  }
+  match Base64.decodeInto(Bytes.asMutSlice(&mut bytes), input) {
+    Result<usize, Base64Error>.Success {value: _count} => {}
+    Result<usize, Base64Error>.Failure {..} => run Task.abort("MCP screenshot has invalid base64")
+  }
+  return move bytes
+}
+
+fn newButton(text: string) -> bool {
+  let bytes = String.utf8Bytes(text)
+  let mut start: usize = 0
+  let mut at: usize = 0
+  while at <= bytes.length {
+    if at == bytes.length || bytes[at] == 10 {
+      let line = String.slice(text, start, at - start)
+      if String.contains(line, "label=\"New\"") && String.contains(line, "role=button") { return true }
+      start = at + 1
+    }
+    at = at + 1
+  }
+  return false
+}
+
+effect fn assertions(client: &mut Client) -> () ! TaskError | FileError | HostInputError | OutOfMemoryError | WriterError
+? &mut HostInput | &mut Allocator | &mut FileSystem {
+  let initialized = run call(&mut client.*, "initialize", "{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"lib-ui-check\",\"version\":\"1\"}}")
+  let init = run field(&initialized, "result")
+  let capabilities = run field(init, "capabilities")
+  let hasTools = match Json.field(capabilities, "tools") {
+    Option<&Value>.Some {..} => true
+    Option<&Value>.None => false
+  }
+  run expect(stringField(init, "protocolVersion") == "2025-06-18" && hasTools, "MCP initialize")
+  run send(&mut client.child, b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n", 60000)
+  let listed = run call(&mut client.*, "tools/list", "")
+  let tools = run array(run field(run field(&listed, "result"), "tools"))
+  let required = ["ui_snapshot", "ui_click", "ui_wait", "ui_screenshot"]
+  let mut wanted: usize = 0
+  while wanted < required.length {
+    let mut found = false
+    let mut at: usize = 0
+    while at < tools.length {
+      if stringField(&tools[at], "name") == required[wanted] { found = true }
+      at = at + 1
+    }
+    run require(found, "MCP tools/list is missing a required tool")
+    wanted = wanted + 1
+  }
+  run expect(true, "MCP tools/list")
+  let before = run tool(&mut client.*, "ui_snapshot", "{}")
+  let beforeText = run contentText(&before)
+  run expect(newButton(beforeText), "MCP snapshot discovers New button")
+  run expect(!String.contains(beforeText, "A new message"), "MCP no row before click")
+  let clicked = run tool(&mut client.*, "ui_click", "{\"label\":\"New\",\"exact\":true}")
+  let click = run json(String.utf8Bytes(run contentText(&clicked)))
+  run expect(!truth(&clicked, "isError") && number(&click, "node") == 10, "MCP clicks by label")
+  let waited = run tool(&mut client.*, "ui_wait", "{\"text\":\"A new message\",\"timeout\":10000}")
+  run expect(!truth(&waited, "isError"), "MCP waits for new row")
+  let snapshot = run tool(&mut client.*, "ui_snapshot", "{}")
+  run expect(String.contains(run contentText(&snapshot), "\"A new message\""), "MCP snapshot shows new row")
+  let inspected = run tool(&mut client.*, "ui_inspect", "{\"role\":\"button\",\"name\":\"Archive\"}")
+  run expect(!truth(&inspected, "isError") && String.startsWith(run contentText(&inspected), "box #20"), "MCP inspect")
+  let highlighted = run tool(&mut client.*, "ui_highlight", "{\"role\":\"button\",\"name\":\"Archive\"}")
+  run expect(!truth(&highlighted, "isError"), "MCP highlight")
+  let screenshot = run tool(&mut client.*, "ui_screenshot", "{}")
+  let image = run content(&screenshot)
+  let bytes = run decodeImage(stringField(image, "data"))
+  run expect(stringField(image, "type") == "image" && stringField(image, "mimeType") == "image/png" && png(Bytes.asSlice(&bytes)), "MCP screenshot returns PNG image")
+  let destination = run rootPath(".cache/ui-inspect/mcp.png")
+  run FileSystem.writeFile(&destination, Bytes.asSlice(&bytes))
+  let missing = run tool(&mut client.*, "ui_click", "{\"name\":\"no such button\"}")
+  let missingText = run contentText(&missing)
+  run expect(truth(&missing, "isError") && missingText == "no node matches", "MCP missing node is tool error")
+}
+
+effect fn mcpWith(binary: string, cli: string, server: string, display: &Display) -> ()
+! TaskError | FileError | HostInputError | OutOfMemoryError | WriterError
+? &mut HostInput | &mut Allocator | &mut FileSystem {
+  let env = run views(&display.environment)
+  let app = run program("mcp-inbox", binary, &[], env.asSlice(), cli)
+  let assignment = run joined("SILK_UI_INSPECT=", pathText(&app.socket))
+  let mut serverEnv = run views(&display.environment)
+  run serverEnv.append(String.view(&assignment))
+  let child = run start(server, &[], serverEnv.asSlice(), true, true, true)
+  let mut client = Client {child: move child, id: 0}
+  let result = run Effect.result(assertions(&mut client))
+  Subprocess.closeDescriptor(client.child.input)
+  client.child.input = -1
+  let closed = run finish(&mut client.child, 10000)
+  run expect(closed.code == 0, "MCP exits when stdin closes")
+  if let Result<(), TaskError | FileError | HostInputError | OutOfMemoryError | WriterError>.Failure {error} = move result { fail move error }
+}
+
+pub effect fn mcp() -> ()
+! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  let binary = run build("modules/tree/demo", false, false)
+  let cli = run build("modules/inspect/cli", false, false)
+  let server = run build("modules/inspect/mcp", false, false)
+  let display = run openDisplay("x11")
+  let result = run Effect.result(mcpWith(String.view(&binary), String.view(&cli), String.view(&server), &display))
+  run closeDisplay(move display)
+  if let Result<(), TaskError | FileError | HostInputError | OutOfMemoryError | WriterError>.Failure {error} = move result { fail move error }
+}
+}

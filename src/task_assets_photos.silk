@@ -1,0 +1,257 @@
+import silk.cli.task { Task, TaskError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.io.writer { WriterError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f64
+import silk.num.i32
+import silk.num.u8
+import silk.num.usize
+import silk.system.child_process { ChildProcess, ProcessError }
+import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.text.string { String }
+import task_support { pathText, rootPath }
+
+pub effect fn photos() -> ()
+  ! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+  ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  let output = run rootPath("modules/assets/assets/photos")
+  run FileSystem.createDirectoriesRecursively(&output)
+  let temporary = run FileSystem.temporaryDirectory(&output, ".author-")
+  let source = run Path.join(&temporary.path, "scene.ppm")
+  let result = run Effect.result(author(&output, &source))
+  match move result {
+    Result<(), TaskError | FileError | HostInputError | OutOfMemoryError>.Success { .. } => {
+      run FileSystem.release(move temporary)
+    }
+    Result<(), TaskError | FileError | HostInputError | OutOfMemoryError>.Failure { error } => {
+      run FileSystem.releaseIgnored(move temporary)
+      fail move error
+    }
+  }
+}
+
+effect fn author(output: &Path, source: &Path) -> ()
+  ! TaskError | FileError | HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator | &mut FileSystem {
+  // Gaussian standard deviation 9, truncated at three standard deviations.
+  let mut weights = List<f64>.make()
+  let mut sum = 0.0
+  let mut offset: i32 = -27
+  while offset <= 27 {
+    let distance = i32.toF64(offset)
+    let weight = f64.exp(-(distance * distance) / 162.0)
+    run List<f64>.append(&mut weights, weight)
+    sum = sum + weight
+    offset = offset + 1
+  }
+  let mut normalized = List<f64>.asMutSlice(&mut weights)
+  let mut at: usize = 0
+  while at < normalized.length {
+    normalized[at] = normalized[at] / sum
+    at = at + 1
+  }
+  drop normalized
+
+  let mut index: usize = 0
+  while index < 12 {
+    let pixels = run scene(index, List<f64>.asSlice(&weights))
+    let mut ppm = run Bytes.copy(b"P6\n160 120\n255\n")
+    run Bytes.append(&mut ppm, Bytes.asSlice(&pixels))
+    run FileSystem.writeFile(source, Bytes.asSlice(&ppm))
+    let mut name = run String.copy("photo-")
+    run String.append(&mut name, if index < 10 { "0" } else { "1" })
+    run String.append(&mut name, String.slice("0123456789", index % 10, 1))
+    run String.append(&mut name, if index % 2 == 0 { ".png" } else { ".jpg" })
+    let destination = run Path.join(output, String.view(&name))
+    if index % 2 == 0 {
+      run Task.exec("magick", &[pathText(source), "-strip", "-depth", "8",
+        "-define", "png:color-type=2", "-define", "png:compression-level=9",
+        pathText(&destination)])
+    } else {
+      run Task.exec("magick", &[pathText(source), "-strip", "-sampling-factor", "2x2",
+        "-interlace", "none", "-quality", "82", "-define", "jpeg:optimize-coding=true",
+        pathText(&destination)])
+    }
+    index = index + 1
+  }
+}
+
+// RGB triples: sky top, sky bottom, sun, hills, ground.
+effect fn palette(index: usize) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  return match index {
+    0 => run Bytes.copy(&[26,42,108,178,31,31,253,187,45,60,30,60,30,20,40])
+    1 => run Bytes.copy(&[135,206,235,224,246,255,255,244,179,76,140,74,44,94,52])
+    2 => run Bytes.copy(&[15,32,39,44,83,100,230,230,240,32,58,67,12,22,28])
+    3 => run Bytes.copy(&[255,175,123,215,109,119,255,236,180,58,28,113,28,14,60])
+    4 => run Bytes.copy(&[86,204,242,47,128,237,255,255,255,230,240,250,200,220,240])
+    5 => run Bytes.copy(&[242,153,74,242,201,76,255,250,220,150,90,40,110,60,30])
+    6 => run Bytes.copy(&[20,30,48,36,59,85,255,255,230,20,40,30,10,20,15])
+    7 => run Bytes.copy(&[168,237,234,254,214,227,255,255,255,120,180,160,80,140,120])
+    8 => run Bytes.copy(&[67,198,172,25,22,84,248,255,174,20,60,70,10,30,40])
+    9 => run Bytes.copy(&[255,94,98,255,153,102,255,230,150,90,40,50,60,25,35])
+    10 => run Bytes.copy(&[131,96,195,46,191,145,250,250,210,40,80,70,25,50,45])
+    _ => run Bytes.copy(&[240,242,240,0,12,64,255,220,120,30,30,70,15,15,40])
+  }
+}
+
+effect fn scene(index: usize, weights: &[f64]) -> Bytes
+  ! OutOfMemoryError ? &mut Allocator {
+  let colors = run palette(index)
+  let rgb = Bytes.asSlice(&colors)
+  let sx = 30 + usize.toI32((index * 37) % 100)
+  let sy = 25 + usize.toI32((index * 13) % 30)
+  let mut disk = run Bytes.zeroed(160 * 120)
+  let mut alpha = Bytes.asMutSlice(&mut disk)
+  let mut y: usize = 0
+  while y < 120 {
+    let mut x: usize = 0
+    while x < 160 {
+      if inside(x, y, sx, sy, 20) { alpha[y * 160 + x] = 150 }
+      x = x + 1
+    }
+    y = y + 1
+  }
+  drop alpha
+  let horizontal = run blur(Bytes.asSlice(&disk), weights, true)
+  drop disk
+  let glow = run blur(Bytes.asSlice(&horizontal), weights, false)
+  drop horizontal
+  let opacity = Bytes.asSlice(&glow)
+  let mut pixels = run Bytes.zeroed(160 * 120 * 3)
+  let mut target = Bytes.asMutSlice(&mut pixels)
+  y = 0
+  while y < 120 {
+    let t = usize.toF64(y) / 119.0
+    let mut x: usize = 0
+    while x < 160 {
+      let alphaValue = u8.toF64(opacity[y * 160 + x]) / 255.0
+      let mut channel: usize = 0
+      while channel < 3 {
+        let top = u8.toF64(rgb[channel])
+        let bottom = u8.toF64(rgb[3 + channel])
+        let sky = u8.toF64(sample(top + (bottom - top) * t))
+        let sun = u8.toF64(rgb[6 + channel])
+        let value = if inside(x, y, sx, sy, 12) { rgb[6 + channel] }
+          else { sample(sky * (1.0 - alphaValue) + sun * alphaValue) }
+        target[(y * 160 + x) * 3 + channel] = value
+        channel = channel + 1
+      }
+      x = x + 1
+    }
+    y = y + 1
+  }
+  // Original hill polygons sample the sine curves every four pixels.
+  let mut layer: usize = 0
+  while layer < 2 {
+    let mut x: usize = 0
+    while x < 160 {
+      let left = x - x % 4
+      let first = hill(left, index, layer)
+      let last = hill(left + 4, index, layer)
+      let height = first + (last - first) * usize.toF64(x % 4) / 4.0
+      y = 0
+      while y < 120 {
+        if usize.toF64(y) >= height {
+          let mut channel: usize = 0
+          while channel < 3 {
+            target[(y * 160 + x) * 3 + channel] = rgb[9 + layer * 3 + channel]
+            channel = channel + 1
+          }
+        }
+        y = y + 1
+      }
+      x = x + 1
+    }
+    layer = layer + 1
+  }
+  drop target
+  return run smooth(Bytes.asSlice(&pixels))
+}
+
+fn inside(x: usize, y: usize, sx: i32, sy: i32, radius: i32) -> bool {
+  let dx = usize.toI32(x) - sx
+  let dy = usize.toI32(y) - sy
+  return dx * dx + dy * dy <= radius * radius
+}
+
+fn sample(value: f64) -> u8 {
+  // All callers supply bounded color/alpha averages in [0, 255].
+  return f64.toU8(f64.floor(value + 0.5))
+}
+
+fn hill(x: usize, index: usize, layer: usize) -> f64 {
+  let base = 70.0 + usize.toF64(layer) * 22.0
+  let amplitude = 14.0 - usize.toF64(layer) * 6.0
+  let phase = usize.toF64(index) * 0.9 + usize.toF64(layer) * 2.1
+  let position = usize.toF64(x)
+  return base + amplitude * f64.sin(position / 23.0 + phase)
+    + 5.0 * f64.sin(position / 7.0 + phase * 2.0)
+}
+
+effect fn blur(source: &[u8], weights: &[f64], horizontal: bool) -> Bytes
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut output = run Bytes.zeroed(160 * 120)
+  let mut target = Bytes.asMutSlice(&mut output)
+  let mut y: usize = 0
+  while y < 120 {
+    let mut x: usize = 0
+    while x < 160 {
+      let mut total = 0.0
+      let mut tap: usize = 0
+      while tap < weights.length {
+        let delta = usize.toI32(tap) - 27
+        let mut px = usize.toI32(x)
+        let mut py = usize.toI32(y)
+        if horizontal { px = px + delta } else { py = py + delta }
+        if px < 0 { px = 0 }
+        if px > 159 { px = 159 }
+        if py < 0 { py = 0 }
+        if py > 119 { py = 119 }
+        total = total + u8.toF64(source[i32.toUsize(py) * 160 + i32.toUsize(px)]) * weights[tap]
+        tap = tap + 1
+      }
+      target[y * 160 + x] = sample(total)
+      x = x + 1
+    }
+    y = y + 1
+  }
+  drop target
+  return move output
+}
+
+effect fn smooth(source: &[u8]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  // Pillow SMOOTH's 3x3 kernel: eight neighbors of weight 1, center of weight 5.
+  // Keep the outermost row and column unchanged.
+  let mut output = run Bytes.copy(source)
+  let mut target = Bytes.asMutSlice(&mut output)
+  let mut y: usize = 1
+  while y < 119 {
+    let mut x: usize = 1
+    while x < 159 {
+      let mut channel: usize = 0
+      while channel < 3 {
+        let position = (y * 160 + x) * 3 + channel
+        let mut sum = u8.toUsize(source[position]) * 4
+        let mut row = y - 1
+        while row <= y + 1 {
+          let mut column = x - 1
+          while column <= x + 1 {
+            sum = sum + u8.toUsize(source[(row * 160 + column) * 3 + channel])
+            column = column + 1
+          }
+          row = row + 1
+        }
+        target[position] = usize.toU8((sum + 6) / 13)
+        channel = channel + 1
+      }
+      x = x + 1
+    }
+    y = y + 1
+  }
+  drop target
+  return move output
+}

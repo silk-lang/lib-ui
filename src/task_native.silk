@@ -1,0 +1,122 @@
+import silk.cli.task { TaskError }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.io.writer { WriterError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.child_process { ChildProcess, ProcessError }
+import silk.system.filesystem { FileError, FileSystem }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.text.string { String }
+import task_support { build, require }
+
+static if Intrinsic.targetOperatingSystem() == "darwin" || Intrinsic.targetOperatingSystem() == "linux" {
+import task_native_process { execute }
+import task_native_display { openDisplay, closeDisplay, views }
+import task_native_inspector as Inspector
+import task_native_mcp as Mcp
+import task_native_http as Http
+
+pub effect fn checkWindow(binary: string, backend: string, arguments: &[string]) -> ()
+! TaskError | FileError | HostInputError | OutOfMemoryError | WriterError
+? &mut HostInput | &mut Allocator | &mut FileSystem {
+  run require(backend == "all" || backend == "x11" || backend == "wayland", "Unknown window backend")
+  if backend == "all" { run oneWindow(binary, "x11", arguments) }
+  else { run oneWindow(binary, backend, arguments) }
+  static if Intrinsic.targetOperatingSystem() == "linux" {
+    if backend == "all" { run oneWindow(binary, "wayland", arguments) }
+  }
+}
+
+effect fn oneWindow(binary: string, backend: string, arguments: &[string]) -> ()
+! TaskError | FileError | HostInputError | OutOfMemoryError | WriterError
+? &mut HostInput | &mut Allocator | &mut FileSystem {
+  run Inspector.say(backend)
+  let display = run openDisplay(backend)
+  let environment = run views(&display.environment)
+  let result = run Effect.result(execute(binary, arguments, environment.asSlice(), 300000))
+  drop environment
+  run closeDisplay(move display)
+  if let Result<(), TaskError | FileError | HostInputError | OutOfMemoryError>.Failure {error} = move result { fail move error }
+}
+
+pub effect fn demo(packagePath: string, arguments: &[string], defaultRelease: bool) -> ()
+! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  if packagePath == "modules/tree/demo" && arguments.length > 0 {
+    if arguments[0] == "inspect" { return run Inspector.inspect() }
+    if arguments[0] == "mcp" { return run Mcp.mcp() }
+  }
+  let mut release = defaultRelease
+  let mut debug = false
+  let mut check = false
+  let mut buildOnly = false
+  let mut backendIndex = arguments.length
+  let mut index: usize = 0
+  while index < arguments.length {
+    let arg = arguments[index]
+    if arg == "--release" { release = true }
+    if arg == "--debug" { debug = true }
+    if arg == "check" || arg == "--check" { check = true }
+    if arg == "--build-only" { buildOnly = true }
+    if arg == "--backend" && backendIndex == arguments.length {
+      run require(index + 1 < arguments.length, "--backend requires all, x11 or wayland")
+      backendIndex = index
+    }
+    index = index + 1
+  }
+  let binary = run build(packagePath, release && !debug, false)
+  if buildOnly { return run Inspector.say(String.view(&binary)) }
+  if check {
+    if backendIndex < arguments.length { return run checkWindow(String.view(&binary), arguments[backendIndex + 1], &["--check"]) }
+    return run checkWindow(String.view(&binary), "all", &["--check"])
+  }
+  let mut forwarded = List<string>.make()
+  index = 0
+  while index < arguments.length {
+    let arg = arguments[index]
+    if arg != "run" && arg != "--release" && arg != "--debug" && arg != "--build-only" && arg != "--backend" && !(backendIndex < arguments.length && index == backendIndex + 1) {
+      run forwarded.append(arg)
+    }
+    index = index + 1
+  }
+  run execute(String.view(&binary), forwarded.asSlice(), &[], 2147483647)
+}
+
+pub effect fn checkNative(backend: string) -> ()
+! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  let packages = ["modules/tree/demo", "modules/app/demo", "modules/components/demo", "modules/tree/window/demo"]
+  let mut index: usize = 0
+  while index < packages.length {
+    let binary = run build(packages[index], true, false)
+    run checkWindow(String.view(&binary), backend, &["--check"])
+    index = index + 1
+  }
+  run Inspector.inspect()
+  run Mcp.mcp()
+  run Inspector.devtools("check", "", "", &[], false)
+}
+
+pub effect fn inspect() -> ()
+! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem { run Inspector.inspect() }
+
+pub effect fn mcp() -> ()
+! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem { run Mcp.mcp() }
+
+pub effect fn devtools(mode: string, connect: string, appBinary: string, appArgs: &[string], buildOnly: bool) -> ()
+! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  run Inspector.devtools(mode, connect, appBinary, appArgs, buildOnly)
+}
+
+pub effect fn httpCheck(compiler: string, clang: string) -> ()
+! TaskError | FileError | HostInputError | OutOfMemoryError
+? &mut HostInput | &mut Allocator | &mut FileSystem { run Http.httpCheck(compiler, clang) }
+
+pub effect fn httpFixture() -> ()
+! TaskError | FileError | HostInputError | OutOfMemoryError
+? &mut HostInput | &mut Allocator | &mut FileSystem { run Http.httpFixture() }
+}

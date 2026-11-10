@@ -79,6 +79,12 @@ body limit. Dropping a manager joins any remaining workers. For synchronous reso
 `Batch.releaseResource` releases images or icons; destroying a view does not release a shared
 resource automatically. `UiTree.imageTile` provides managed atlas access for custom drawing.
 
+Run the image-loading HTTP integration tests from the repository root with
+`silk task native http-test` (`--compiler PATH` and `--clang PATH` select toolchain binaries).
+The task owns the loopback photo fixture at `127.0.0.1:28183` and stops it after the tests.
+Managed native tasks currently support macOS and GNU/Linux; Windows requires
+[Silk's managed subprocess support](https://github.com/silk-lang/silk/issues/3034).
+
 ## Custom drawing and text
 
 Implement `WindowContent` methods as needed; each has a default:

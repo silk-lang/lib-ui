@@ -1,0 +1,270 @@
+static if Intrinsic.targetOperatingSystem() == "darwin" || Intrinsic.targetOperatingSystem() == "linux" {
+import silk.cli.task { Task, TaskError }
+import silk.collections.bytes { Bytes }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Drop }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.system.child_process { ChildProcess }
+import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
+import silk.system.subprocess { Subprocess, SubprocessError, SpawnOptions, Stdio, ExitStatus }
+import silk.system.system_clock { SystemClock }
+import silk.text.string { String }
+import silk.num.i64
+import silk.num.isize
+import task_support { rootPath }
+
+@foreign(noCapture: .("buffer"))
+unsafe extern "C" fn read(fd: i32, buffer: ?[*]mut u8, count: usize) -> isize
+@foreign(noCapture: .("buffer"))
+unsafe extern "C" fn pipeSend(fd: i32, buffer: ?[*]const u8, count: usize, flags: i32) -> isize as "send"
+@foreign(noCapture: .("value"))
+unsafe extern "C" fn setsockopt(fd: i32, level: i32, name: i32, value: ?[*]const u8, length: u32) -> i32
+unsafe extern "C" fn kill(pid: i32, signal: i32) -> i32
+@foreign(noCapture: .("status"))
+unsafe extern "C" fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32
+@foreign(noCapture: .("path"))
+unsafe extern "C" fn access(path: ?[*]const u8, mode: i32) -> i32
+@foreign(noCapture: .("path"))
+unsafe extern "C" fn unlink(path: ?[*]const u8) -> i32
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  unsafe extern "C" fn __error() -> *mut i32
+} else {
+  unsafe extern "C" fn __errno_location() -> *mut i32
+}
+fn errorCode() -> i32 {
+  static if Intrinsic.targetOperatingSystem() == "darwin" { return unsafe Pointer.read(unsafe __error()) }
+  else { return unsafe Pointer.read(unsafe __errno_location()) }
+}
+
+pub fn noSignalFlag() -> i32 {
+  static if Intrinsic.targetOperatingSystem() == "linux" { return 16384 }
+  else { return 0 }
+}
+
+pub effect fn socketExists(path: &Path) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut name = run Bytes.copy(Path.rawBytes(path))
+  run Bytes.append(&mut name, b"\0")
+  return unsafe access(Pointer.fromSlice(Bytes.asSlice(&name)), 0) == 0
+}
+
+pub effect fn removeSocket(path: &Path) -> () ! TaskError | OutOfMemoryError ? &mut Allocator {
+  let mut name = run Bytes.copy(Path.rawBytes(path))
+  run Bytes.append(&mut name, b"\0")
+  if unsafe unlink(Pointer.fromSlice(Bytes.asSlice(&name))) != 0 && errorCode() != 2 { run Task.abort("Cannot remove stale inspector socket") }
+}
+
+pub struct Process {
+  child: Subprocess,
+  pub input: i32,
+  pub output: i32,
+  pub errors: i32,
+  running: bool,
+  pub code: i32,
+}
+
+impl Drop for Process {
+  fn drop(self: &mut Self) -> () {
+    stop(&mut self.*)
+    Subprocess.closeDescriptor(self.input)
+    Subprocess.closeDescriptor(self.output)
+    Subprocess.closeDescriptor(self.errors)
+  }
+}
+
+pub fn milliseconds() -> i64 {
+  let mut clock = OsMonotonicClock.make()
+  let now = run MonotonicClock.now() |> Effect.provideMut<MonotonicClock>(&mut clock)
+  return SystemClock.seconds(&now) * 1000 + SystemClock.nanoseconds(&now) / 1000000
+}
+pub fn pause() -> () {
+  let mut clock = OsMonotonicClock.make()
+  run MonotonicClock.waitFor(10000000) |> Effect.provideMut<MonotonicClock>(&mut clock)
+}
+
+pub fn stop(process: &mut Process) -> () {
+  if !process.running { return () }
+  let pid = process.child.pid()
+  let mut status: i32 = 0
+  let collected = unsafe waitpid(pid, Pointer.fromMutRef(&mut status), 1)
+  if collected == pid || (collected < 0 && errorCode() == 10) {
+    process.running = false
+    return ()
+  }
+  let _sent = unsafe kill(pid, 15)
+  let deadline = milliseconds() + 10000
+  while milliseconds() < deadline {
+    let result = unsafe waitpid(pid, Pointer.fromMutRef(&mut status), 1)
+    if result == pid || (result < 0 && errorCode() == 10) {
+      process.running = false
+      return ()
+    }
+    pause()
+  }
+  let _killed = unsafe kill(pid, 9)
+  while unsafe waitpid(pid, Pointer.fromMutRef(&mut status), 0) < 0 && errorCode() == 4 {}
+  process.running = false
+}
+
+pub effect fn poll(process: &mut Process) -> bool ! TaskError | OutOfMemoryError ? &mut Allocator {
+  if !process.running { return true }
+  let result = run Effect.result(Subprocess.tryWait(process.child.pid()))
+  return match move result {
+    Result<Option<ExitStatus>, SubprocessError>.Failure {error: _error} => run Task.abort("Cannot collect native child exit status")
+    Result<Option<ExitStatus>, SubprocessError>.Success {value} => match move value {
+      Option<ExitStatus>.None => false
+      Option<ExitStatus>.Some {value: status} => {
+        process.running = false
+        process.code = if status.signaled { 128 + status.signal } else { status.code }
+        true
+      }
+    }
+  }
+}
+
+// env is a native executable, not a shell: arguments remain distinct and no source is evaluated.
+// Its -u option lets the child inherit arbitrary host bytes while genuinely removing variables.
+pub effect fn start(binary: string, arguments: &[string], environment: &[string], capture: bool, interactive: bool, clean: bool) -> Process
+! TaskError | FileError | HostInputError | OutOfMemoryError
+? &mut HostInput | &mut Allocator | &mut FileSystem {
+  let env = run Path.make("/usr/bin/env")
+  let root = run rootPath("")
+  let mut request = run ChildProcess.requestWithin(&env, &root)
+  run Subprocess.inheritEnvironment(&mut request)
+  if clean {
+    run ChildProcess.addArgument(&mut request, "-u")
+    run ChildProcess.addArgument(&mut request, "SILK_UI_INSPECT")
+    run ChildProcess.addArgument(&mut request, "-u")
+    run ChildProcess.addArgument(&mut request, "SILK_WINDOW_FIBER")
+  }
+  let mut index: usize = 0
+  // Unsets precede assignments because env stops parsing options at the first assignment.
+  while index < environment.length {
+    if String.startsWith(environment[index], "-u") {
+      run ChildProcess.addArgument(&mut request, "-u")
+      let bytes = String.utf8Bytes(environment[index])
+      run ChildProcess.addArgumentBytes(&mut request, Slice.view(bytes, 2, bytes.length - 2))
+    }
+    index = index + 1
+  }
+  static if Intrinsic.targetOperatingSystem() == "linux" {
+    if clean {
+      let scale = run HostInput.variableNamed("SILK_WINDOW_SCALE")
+      if let Option<Bytes>.None = &scale { run ChildProcess.addArgument(&mut request, "SILK_WINDOW_SCALE=1") }
+      let icd = run HostInput.variableNamed("VK_ICD_FILENAMES")
+      let missing = match &icd {
+        Option<Bytes>.None => true
+        Option<Bytes>.Some {value} => Bytes.length(&value) == 0
+      }
+      let path = run Path.make("/usr/share/vulkan/icd.d/lvp_icd.json")
+      if missing && run FileSystem.exists(&path) {
+        run ChildProcess.addArgument(&mut request, "VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json")
+      }
+    }
+  }
+  index = 0
+  while index < environment.length {
+    if !String.startsWith(environment[index], "-u") { run ChildProcess.addArgument(&mut request, environment[index]) }
+    index = index + 1
+  }
+  run ChildProcess.addArgument(&mut request, binary)
+  index = 0
+  while index < arguments.length {
+    run ChildProcess.addArgument(&mut request, arguments[index])
+    index = index + 1
+  }
+  let mut options = SpawnOptions.make()
+  run options.setStdio(0, if interactive { Stdio.pipe() } else if capture { Stdio.ignore() } else { Stdio.inherit(0) })
+  run options.setStdio(1, if capture { Stdio.pipe() } else { Stdio.inherit(1) })
+  run options.setStdio(2, if capture && !interactive { Stdio.pipe() } else { Stdio.inherit(2) })
+  let spawned = run Effect.result(Subprocess.spawn(&request, &options))
+  let mut child = match move spawned {
+    Result<Subprocess, SubprocessError | OutOfMemoryError>.Success {value} => move value
+    Result<Subprocess, SubprocessError | OutOfMemoryError>.Failure {error} => match move error {
+      OutOfMemoryError exhausted => { fail move exhausted }
+      SubprocessError _error => run Task.abort("Cannot start native child")
+    }
+  }
+  let input = Option<i32>.unwrapOr(child.takePipe(0), -1)
+  let output = Option<i32>.unwrapOr(child.takePipe(1), -1)
+  let errors = Option<i32>.unwrapOr(child.takePipe(2), -1)
+  let process = Process {child: move child, input: input, output: output, errors: errors, running: true, code: 0}
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    if input >= 0 {
+      let enabled: i32 = 1
+      let bytes = unsafe Pointer.bytes<i32>(Pointer.fromRef(&enabled))
+      if unsafe setsockopt(input, 65535, 4130, bytes, 4) != 0 { run Task.abort("Cannot configure child input pipe") }
+    }
+  }
+  return move process
+}
+
+pub effect fn receive(fd: i32, target: &mut Bytes) -> bool ! TaskError | OutOfMemoryError ? &mut Allocator {
+  if fd < 0 { return true }
+  let mut buffer: [u8; 16384] = [0; 16384]
+  while true {
+    let count = unsafe read(fd, Pointer.fromMutSlice(&mut buffer), 16384)
+    if count == 0 { return true }
+    if count < 0 {
+      let code = errorCode()
+      if code == 4 { continue }
+      if code == 11 || code == 35 { return false }
+      run Task.abort("Cannot read child pipe")
+    }
+    if Bytes.length(&target.*) + isize.toUsize(count) > 33554432 { run Task.abort("Native child output exceeds 32 MiB") }
+    run Bytes.append(&mut target.*, Slice.view(&buffer, 0, isize.toUsize(count)))
+  }
+  return false
+}
+
+pub effect fn send(process: &mut Process, bytes: &[u8], timeout: i64) -> () ! TaskError | OutOfMemoryError ? &mut Allocator {
+  let deadline = milliseconds() + timeout
+  let mut offset: usize = 0
+  while offset < bytes.length {
+    let part = Slice.view(bytes, offset, bytes.length - offset)
+    let count = unsafe pipeSend(process.input, Pointer.fromSlice(part), part.length, noSignalFlag())
+    if count > 0 {
+      offset = offset + isize.toUsize(count)
+      continue
+    }
+    let code = errorCode()
+    if count < 0 && code != 4 && code != 11 && code != 35 { run Task.abort("Cannot write child pipe") }
+    if run poll(&mut process.*) { run Task.abort("Child exited while writing input") }
+    if milliseconds() >= deadline { run Task.abort("Timed out writing child input") }
+    pause()
+  }
+}
+
+pub struct Output { pub code: i32, pub output: Bytes, pub errors: Bytes }
+pub effect fn finish(process: &mut Process, timeout: i64) -> Output ! TaskError | OutOfMemoryError ? &mut Allocator {
+  let deadline = milliseconds() + timeout
+  let mut output = Bytes.make()
+  let mut errors = Bytes.make()
+  while true {
+    let outEnd = run receive(process.output, &mut output)
+    let errEnd = run receive(process.errors, &mut errors)
+    let ended = run poll(&mut process.*)
+    if ended && outEnd && errEnd { break }
+    if milliseconds() >= deadline {
+      let _killed = unsafe kill(process.child.pid(), 9)
+      run Task.abort("Native child timed out")
+    }
+    pause()
+  }
+  return Output {code: process.code, output: move output, errors: move errors}
+}
+
+pub effect fn execute(binary: string, arguments: &[string], environment: &[string], timeout: i64) -> ()
+! TaskError | FileError | HostInputError | OutOfMemoryError
+? &mut HostInput | &mut Allocator | &mut FileSystem {
+  let mut process = run start(binary, arguments, environment, false, false, true)
+  let output = run finish(&mut process, timeout)
+  if output.code != 0 { fail TaskError {message: run String.copy("Native child failed"), status: output.code} }
+}
+}
