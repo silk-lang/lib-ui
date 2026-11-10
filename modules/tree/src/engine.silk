@@ -14,11 +14,11 @@ import mutation {
   Mutation,
   NodeKind,
   StyleState,
-  Property,
+  Declaration,
+  CssProperty,
   Attribute,
   Role,
   Cursor,
-  Display,
   FontStyle,
   Overflow,
   WhiteSpace,
@@ -26,15 +26,18 @@ import mutation {
   LISTEN_FOCUS,
   LISTEN_BLUR,
   LISTEN_LAYOUT,
-  NOT_FOCUSABLE,
-  propertyKey
+  NOT_FOCUSABLE
 }
+import css
+import properties.declare
+import properties.values
 import input { Input }
 import interact
 import layers
 import edit
 import edit { EditState, HostRequest, Keymap, ImeArea, NATIVE_KEYMAP }
-import style { Computed, TextStyle, display }
+import style { Computed, TextStyle }
+import properties.computed { Display as CssDisplay, DisplayOutside, DisplayInside }
 import node {
   NONE,
   NO_INDEX,
@@ -132,39 +135,32 @@ effect fn viewFailed(error: CssomError) -> never
   fail TreeError.View { error: error }
 }
 
-fn defaultDisplay(kind: NodeKind) -> Display {
+fn defaultDisplay(kind: NodeKind) -> CssDisplay {
   return match kind {
-    NodeKind.Box => Display.Block
-    NodeKind.Text => Display.Inline
-    NodeKind.Image => Display.Inline
-    NodeKind.Icon => Display.Inline
-    NodeKind.Input => Display.InlineBlock
-    NodeKind.Canvas => Display.Block
+    NodeKind.Box => CssDisplay.Box { outside: DisplayOutside.Block, inside: DisplayInside.Flow }
+    NodeKind.Text => CssDisplay.Box { outside: DisplayOutside.Inline, inside: DisplayInside.Flow }
+    NodeKind.Image => CssDisplay.Box { outside: DisplayOutside.Inline, inside: DisplayInside.Flow }
+    NodeKind.Icon => CssDisplay.Box { outside: DisplayOutside.Inline, inside: DisplayInside.Flow }
+    NodeKind.Input => CssDisplay.Box { outside: DisplayOutside.Inline, inside: DisplayInside.FlowRoot }
+    NodeKind.Canvas => CssDisplay.Box { outside: DisplayOutside.Block, inside: DisplayInside.Flow }
   }
 }
 
-/// Sets `property` in `list`, replacing an earlier value of the same property.
-effect fn setProperty(list: &mut List<Property>, property: Property) -> ()
-  ! OutOfMemoryError
-  ? &mut Allocator {
-  let key = propertyKey(property)
-  let values = list.asMutSlice()
+fn applyAll(computed: &mut Computed, list: &List<Declaration>) -> () {
+  let items = list.asSlice()
+  // Font size first: `em` lengths in the same patch refer to it.
   let mut i: usize = 0
-  while i < values.length {
-    if propertyKey(values[i]) == key {
-      values[i] = property
-      return ()
+  while i < items.length {
+    if items[i].property == CssProperty.FontSize {
+      computed.apply(&items[i])
     }
     i = i + 1
   }
-  run list.append(property)
-}
-
-fn applyAll(computed: &mut Computed, list: &List<Property>) -> () {
-  let values = list.asSlice()
-  let mut i: usize = 0
-  while i < values.length {
-    computed.apply(values[i])
+  i = 0
+  while i < items.length {
+    if items[i].property != CssProperty.FontSize {
+      computed.apply(&items[i])
+    }
     i = i + 1
   }
 }
@@ -527,27 +523,27 @@ impl<'a> UiTree<'a> {
         let slot = run self.require(index, id)
         run self.destroy(index, slot)
       }
-      Mutation.SetStyle { id, state, properties } => {
+      Mutation.SetStyle { id, state, declarations } => {
         let slot = run self.require(index, id)
-        let values = properties.asSlice()
+        let values = declarations.asSlice()
         let node = self.nodeMut(slot)
         let mut i: usize = 0
         while i < values.length {
           match state {
             StyleState.Base => {
-              run setProperty(&mut node.base, values[i])
+              run css.set(&mut node.base, &values[i])
             }
             StyleState.Hover => {
-              run setProperty(&mut node.hover, values[i])
+              run css.set(&mut node.hover, &values[i])
             }
             StyleState.Active => {
-              run setProperty(&mut node.active, values[i])
+              run css.set(&mut node.active, &values[i])
             }
             StyleState.Focus => {
-              run setProperty(&mut node.focus, values[i])
+              run css.set(&mut node.focus, &values[i])
             }
             StyleState.FocusVisible => {
-              run setProperty(&mut node.focusVisible, values[i])
+              run css.set(&mut node.focusVisible, &values[i])
             }
           }
           i = i + 1
@@ -818,7 +814,7 @@ impl<'a> UiTree<'a> {
       }
     }
     let mut computed = Computed.inheriting(TextStyle.initial())
-    computed.layout.display = display(defaultDisplay(kind))
+    computed.layout.display = defaultDisplay(kind)
     let node = Node {
       id: id,
       kind: kind,
@@ -826,11 +822,11 @@ impl<'a> UiTree<'a> {
       css: css,
       inner: inner,
       parent: NONE,
-      base: List<Property>.make(),
-      hover: List<Property>.make(),
-      active: List<Property>.make(),
-      focus: List<Property>.make(),
-      focusVisible: List<Property>.make(),
+      base: List<Declaration>.make(),
+      hover: List<Declaration>.make(),
+      active: List<Declaration>.make(),
+      focus: List<Declaration>.make(),
+      focusVisible: List<Declaration>.make(),
       computed: computed,
       fontKey: 0,
       paintHash: 0,
@@ -1438,17 +1434,17 @@ impl<'a> UiTree<'a> {
 
     // CSS pointer-events inherits, but an explicit descendant auto remains targetable.
     if parent != NONE {
-      computed.pointerEvents = self.node(parent).computed.pointerEvents
+      computed.paint.pointerEvents = self.node(parent).computed.paint.pointerEvents
     }
-    computed.layout.display = display(defaultDisplay(node.kind))
+    computed.layout.display = defaultDisplay(node.kind)
     if node.kind == NodeKind.Input {
       // Inputs keep their spaces; one line scrolls sideways, several wrap and scroll down.
       if node.edit.multiline {
-        computed.apply(Property.WhiteSpace { value: WhiteSpace.PreWrap })
+        computed.apply(&declare.whiteSpace(WhiteSpace.PreWrap))
         computed.layout.overflowX = Overflow.Hidden
         computed.layout.overflowY = Overflow.Auto
       } else {
-        computed.apply(Property.WhiteSpace { value: WhiteSpace.Pre })
+        computed.apply(&declare.whiteSpace(WhiteSpace.Pre))
         computed.layout.overflowX = Overflow.Hidden
         computed.layout.overflowY = Overflow.Hidden
       }

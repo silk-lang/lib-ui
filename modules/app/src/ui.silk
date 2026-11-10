@@ -14,16 +14,15 @@
 //!   path, and handlers (`on`, `onClick`, ...) are called only there. Their replies bubble from
 //!   the target up. Handlers are lambdas that are never stored.
 pub import ui_tree.grid { Grid }
+import ui_tree.css { Value }
+import ui_tree.css
+import ui_tree.css { px, number, Keyword, Declaration }
 import ui_tree.anchoring { AnchorOptions }
 import virtual_list { VirtualList, VirtualOptions, VirtualRow }
 import heap { Heap }
 import ui_tree.mutation {
   NodeKind,
   StyleState,
-  Property,
-  Length,
-  Side,
-  Display,
   FlexDirection,
   Position,
   Overflow,
@@ -45,7 +44,6 @@ import ui_tree.mutation {
   LISTEN_SCROLL,
   LISTEN_LAYOUT
 }
-import ui_tree.mutation { propertyKey as keyOf }
 import ui_tree.node { Event, EventKind }
 pub import ui_tree.event { DefaultAction }
 import ui_tree.event { preventFlags }
@@ -244,11 +242,9 @@ impl Entry {
 pub struct StyleRecord {
   pub entry: u32,
   pub state: StyleState,
-  pub property: Property,
+  pub declaration: Declaration,
   pub next: u32,
 }
-
-impl Copy for StyleRecord {}
 
 /// A `lazy` region of a render: the entries, styles, text and canvas commands its body made.
 pub struct LazyRecord {
@@ -336,7 +332,15 @@ impl Arena {
       g = g + 1
     }
     run self.entries.appendSlice(other.entries.asSlice())
-    run self.styles.appendSlice(other.styles.asSlice())
+    let records = other.styles.asSlice()
+    let mut r: usize = 0
+    while r < records.length {
+      let copy = run css.cloneDeclaration(&records[r].declaration)
+      run self.styles.append(
+        StyleRecord { entry: records[r].entry, state: records[r].state, declaration: move copy, next: records[r].next },
+      )
+      r = r + 1
+    }
     run self.bytes.appendSlice(other.bytes.asSlice())
     run self.canvas.appendSlice(other.canvas.asSlice())
     run self.lazies.appendSlice(other.lazies.asSlice())
@@ -347,37 +351,21 @@ impl Arena {
     self: &Self,
     index: u32,
     state: StyleState,
-    out: &mut List<Property>,
+    out: &mut List<Declaration>,
   ) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
     out.clear()
+    let records = self.styles.asSlice()
     let mut at = self.entry(index).firstStyle
     while at != NO_ENTRY {
-      let record = self.styles.get(u32.toUsize(at))
+      let record = &records[u32.toUsize(at)]
       if record.state == state {
-        let key = propertyKey(record.property)
-        let mut replaced = false
-        let mut i: usize = 0
-        while i < out.length() {
-          if propertyKey(out.get(i)) == key {
-            out.set(i, record.property)
-            replaced = true
-            break
-          }
-          i = i + 1
-        }
-        if !replaced {
-          run out.append(record.property)
-        }
+        run css.set(&mut out.*, &record.declaration)
       }
       at = record.next
     }
   }
-}
-
-fn propertyKey(property: Property) -> u32 {
-  return keyOf(property)
 }
 
 /// What a handler answers: a message or not, and whether the event goes on to the handlers of
@@ -909,9 +897,9 @@ impl<M> Ui<M> {
     }
     self.style(
       &[
-        Property.OverflowY { value: Overflow.Auto },
-        Property.OverflowX { value: Overflow.Hidden },
-        Property.MinHeight { value: Length.px(0.0) },
+        css.overflowY(Overflow.Auto),
+        css.overflowX(Overflow.Hidden),
+        css.minHeight(px(0.0)),
       ],
     )
     let first = self.virtualLists.asSlice()[v].first
@@ -926,7 +914,7 @@ impl<M> Ui<M> {
       self.key(key(i))
       self.column(
         |ui| {
-          ui.style(&[Property.FlexShrink { value: 0.0 }])
+          ui.style(&[css.flexShrink(0.0)])
           if !ui.dispatching && !ui.searching {
             ui.heap.alloc(
               ui.virtualLists.asMutSlice()[v].rows.append(
@@ -973,8 +961,8 @@ impl<M> Ui<M> {
       |ui| {
         ui.style(
           &[
-            Property.Display { value: Display.Flex },
-            Property.FlexDirection { value: FlexDirection.Row },
+            css.display(Keyword.Flex),
+            css.flexDirection(FlexDirection.Row),
           ],
         )
         body(&mut ui)
@@ -989,8 +977,8 @@ impl<M> Ui<M> {
       |ui| {
         ui.style(
           &[
-            Property.Display { value: Display.Flex },
-            Property.FlexDirection { value: FlexDirection.Column },
+            css.display(Keyword.Flex),
+            css.flexDirection(FlexDirection.Column),
           ],
         )
         body(&mut ui)
@@ -1121,7 +1109,7 @@ impl<M> Ui<M> {
   pub fn grid(self: &mut Self, value: &Grid, body: fn(&mut Ui<M>) -> ()) -> () {
     self.box(
       |ui| {
-        ui.style(&[Property.Display { value: Display.Grid }])
+        ui.style(&[css.display(Keyword.Grid)])
         ui.gridTemplate(value)
         body(&mut ui)
       },
@@ -1414,19 +1402,25 @@ impl<M> Ui<M> {
     }
     let mut s = record.styleStart
     while s < record.styleEnd {
-      let mut style = self.previous.styles.get(u32.toUsize(s))
+      let source = &self.previous.styles.asSlice()[u32.toUsize(s)]
+      let mut style = StyleRecord {
+        entry: source.entry,
+        state: source.state,
+        declaration: self.heap.alloc(css.cloneDeclaration(&source.declaration)),
+        next: source.next,
+      }
       if inside(style.entry) {
         style.entry = u32.wrappingAdd(style.entry, entryShift)
         if style.next != NO_ENTRY {
           style.next = u32.wrappingAdd(style.next, styleShift)
         }
-        self.heap.alloc(self.arena.styles.append(style))
+        self.heap.alloc(self.arena.styles.append(move style))
       } else {
         // A style of the parent made by the body: dropped (see `lazy`), but its slot stays so
         // the shifts hold.
         style.entry = NO_ENTRY
         style.next = NO_ENTRY
-        self.heap.alloc(self.arena.styles.append(style))
+        self.heap.alloc(self.arena.styles.append(move style))
       }
       s = s + 1
     }
@@ -1508,7 +1502,7 @@ impl<M> Ui<M> {
   // Style.
 
   /// Adds `properties` to the open node's `state` look; later ones replace earlier ones.
-  pub fn styleFor(self: &mut Self, state: StyleState, properties: &[Property]) -> () {
+  pub fn styleFor(self: &mut Self, state: StyleState, properties: &[Declaration]) -> () {
     if self.dispatching {
       return ()
     }
@@ -1518,17 +1512,16 @@ impl<M> Ui<M> {
       let record = StyleRecord {
         entry: self.current,
         state: state,
-        property: properties[i],
+        declaration: self.heap.alloc(css.cloneDeclaration(&properties[i])),
         next: NO_ENTRY,
       }
-      self.heap.alloc(self.arena.styles.append(record))
+      self.heap.alloc(self.arena.styles.append(move record))
       let mut entry = self.arena.entry(self.current)
       if entry.lastStyle == NO_ENTRY {
         entry.firstStyle = at
       } else {
-        let mut last = self.arena.styles.get(u32.toUsize(entry.lastStyle))
-        last.next = at
-        self.arena.styles.set(u32.toUsize(entry.lastStyle), last)
+        let records = self.arena.styles.asMutSlice()
+        records[u32.toUsize(entry.lastStyle)].next = at
       }
       entry.lastStyle = at
       self.arena.setEntry(self.current, entry)
@@ -1537,77 +1530,69 @@ impl<M> Ui<M> {
   }
 
   /// Adds `properties` to the open node's base style.
-  pub fn style(self: &mut Self, properties: &[Property]) -> () {
+  pub fn style(self: &mut Self, properties: &[Declaration]) -> () {
     self.styleFor(StyleState.Base, properties)
   }
 
   /// The look while hovered.
-  pub fn hover(self: &mut Self, properties: &[Property]) -> () {
+  pub fn hover(self: &mut Self, properties: &[Declaration]) -> () {
     self.styleFor(StyleState.Hover, properties)
   }
 
   /// The look while pressed.
-  pub fn active(self: &mut Self, properties: &[Property]) -> () {
+  pub fn active(self: &mut Self, properties: &[Declaration]) -> () {
     self.styleFor(StyleState.Active, properties)
   }
 
   /// The look while focused.
-  pub fn focused(self: &mut Self, properties: &[Property]) -> () {
+  pub fn focused(self: &mut Self, properties: &[Declaration]) -> () {
     self.styleFor(StyleState.Focus, properties)
   }
 
   /// The look while focused from the keyboard (focus rings).
-  pub fn focusVisible(self: &mut Self, properties: &[Property]) -> () {
+  pub fn focusVisible(self: &mut Self, properties: &[Declaration]) -> () {
     self.styleFor(StyleState.FocusVisible, properties)
   }
 
   /// Padding on all four sides, in CSS pixels.
   pub fn padding(self: &mut Self, value: f32) -> () {
-    let length = Length.px(value)
-    self.style(
-      &[
-        Property.Padding { side: Side.Top, value: length },
-        Property.Padding { side: Side.Right, value: length },
-        Property.Padding { side: Side.Bottom, value: length },
-        Property.Padding { side: Side.Left, value: length },
-      ],
-    )
+    self.style(&[css.padding(px(value))])
   }
 
   /// The gap between rows and columns of a flex container.
   pub fn gap(self: &mut Self, value: f32) -> () {
     self.style(
       &[
-        Property.RowGap { value: Length.px(value) },
-        Property.ColumnGap { value: Length.px(value) },
+        css.rowGap(px(value)),
+        css.columnGap(px(value)),
       ],
     )
   }
 
   pub fn background(self: &mut Self, color: Rgba<f32>) -> () {
-    self.style(&[Property.BackgroundColor { color: color }])
+    self.style(&[css.backgroundColor(color)])
   }
 
   /// The text color.
   pub fn color(self: &mut Self, color: Rgba<f32>) -> () {
-    self.style(&[Property.Color { color: color }])
+    self.style(&[css.color(color)])
   }
 
   pub fn fontSize(self: &mut Self, value: f32) -> () {
-    self.style(&[Property.FontSize { value: value }])
+    self.style(&[css.fontSize(px(value))])
   }
 
-  pub fn width(self: &mut Self, value: Length) -> () {
-    self.style(&[Property.Width { value: value }])
+  pub fn width(self: &mut Self, value: Value) -> () {
+    self.style(&[css.width(move value)])
   }
 
-  pub fn height(self: &mut Self, value: Length) -> () {
-    self.style(&[Property.Height { value: value }])
+  pub fn height(self: &mut Self, value: Value) -> () {
+    self.style(&[css.height(move value)])
   }
 
   /// `flex-grow`.
   pub fn grow(self: &mut Self, value: f32) -> () {
-    self.style(&[Property.FlexGrow { value: value }])
+    self.style(&[css.flexGrow(value)])
   }
 
   // Attributes.
@@ -1915,11 +1900,11 @@ impl<M> Ui<M> {
   fn zeroBox(self: &mut Self) -> () {
     self.style(
       &[
-        Property.Position { value: Position.Absolute },
-        Property.Inset { side: Side.Top, value: Length.px(0.0) },
-        Property.Inset { side: Side.Left, value: Length.px(0.0) },
-        Property.Width { value: Length.px(0.0) },
-        Property.Height { value: Length.px(0.0) },
+        css.position(Position.Absolute),
+        css.top(px(0.0)),
+        css.left(px(0.0)),
+        css.width(px(0.0)),
+        css.height(px(0.0)),
       ],
     )
   }

@@ -51,7 +51,7 @@ run inspectNode(&tree, archive, InspectOptions.all(), &mut text)
 role, label, test id, text, parent and children; attributes; listeners; hover, active, focus,
 focus-visible and scroll state; the box model; the style patches the client set for each state
 (base, hover, active, focus, focus-visible); and the computed style (only the inherited text
-properties for text nodes). Properties print as CSS declarations (`writeProperty`).
+properties for text nodes). Properties print as CSS declarations (`writeDeclaration`).
 
 ## Synthetic input (`synth.silk`)
 

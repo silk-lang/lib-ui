@@ -13,20 +13,21 @@
 //!   whose old order is already right stays, and the others move with `InsertBefore`;
 //! - an entry `lazy` copied from the last render is skipped with its subtree;
 //! - last, a node that asks for focus (`takeFocus`) and did not in the last render gets it.
+import ui_tree.css
+import ui_tree.css { Declaration }
 import ui_tree.grid { Grid }
 import ui { Arena, Entry, NO_ENTRY, ROOT_ID }
-import equal { sameProperty, sameCommand }
+import equal { sameCommand }
+import ui_tree.css { Property }
 import ui_tree.mutation {
   Mutation,
   NodeKind,
   StyleState,
-  Property,
   Attribute,
   Role,
   Cursor,
   CanvasCommand,
   NOT_FOCUSABLE,
-  propertyKey
 }
 import silk.collections.hash { Hash, Word }
 import silk.collections.hash_map { HashMap }
@@ -45,9 +46,9 @@ pub struct DiffState {
   /// Tree id to entry index in the newest render.
   pub ids: HashMap<Word, u32>,
   used: List<bool>,
-  newStyle: List<Property>,
-  oldStyle: List<Property>,
-  changed: List<Property>,
+  newStyle: List<Declaration>,
+  oldStyle: List<Declaration>,
+  changed: List<Declaration>,
   children: List<u32>,
   positions: List<u32>,
   stable: List<bool>,
@@ -61,9 +62,9 @@ impl DiffState {
       nextId: ROOT_ID + 1,
       ids: HashMap<Word, u32>.make(Hash.seed(0xD1FF)),
       used: List<bool>.make(),
-      newStyle: List<Property>.make(),
-      oldStyle: List<Property>.make(),
-      changed: List<Property>.make(),
+      newStyle: List<Declaration>.make(),
+      oldStyle: List<Declaration>.make(),
+      changed: List<Declaration>.make(),
       children: List<u32>.make(),
       positions: List<u32>.make(),
       stable: List<bool>.make(),
@@ -502,43 +503,54 @@ effect fn styles(
   let fresh = differ.newStyle.asSlice()
   let stale = differ.oldStyle.asSlice()
 
-  // A property that is gone needs the whole look set again.
-  let mut removed = false
+  // A property that is gone needs the whole look set again. So does a changed shorthand:
+  // setting it alone would remove the longhands set after it.
+  let mut reset = false
   let mut i: usize = 0
   while i < stale.length {
-    if find(fresh, propertyKey(stale[i])) == usize.MAX {
-      removed = true
+    if find(fresh, stale[i].property) == usize.MAX {
+      reset = true
       break
     }
     i = i + 1
   }
-  if removed {
-    run out.append(Mutation.ClearStyle { id: id, state: state })
-    if fresh.length != 0 {
-      let mut all = List<Property>.make()
-      run all.appendSlice(fresh)
-      run out.append(Mutation.SetStyle { id: id, state: state, properties: move all })
-    }
-    return ()
-  }
-  let mut changed = List<Property>.make()
+  let mut changed = List<Declaration>.make()
   let mut j: usize = 0
-  while j < fresh.length {
-    let at = find(stale, propertyKey(fresh[j]))
-    if at == usize.MAX || !sameProperty(fresh[j], stale[at]) {
-      run changed.append(fresh[j])
+  while j < fresh.length && !reset {
+    let at = find(stale, fresh[j].property)
+    if at == usize.MAX || !css.sameDeclaration(&fresh[j], &stale[at]) {
+      if css.isShorthand(fresh[j].property) && stale.length != 0 {
+        reset = true
+      } else {
+        let copy = run css.cloneDeclaration(&fresh[j])
+        run changed.append(move copy)
+      }
     }
     j = j + 1
   }
+  if reset {
+    run out.append(Mutation.ClearStyle { id: id, state: state })
+    if fresh.length != 0 {
+      let mut all = run List<Declaration>.makeWithCapacity(fresh.length)
+      let mut k: usize = 0
+      while k < fresh.length {
+        let copy = run css.cloneDeclaration(&fresh[k])
+        run all.append(move copy)
+        k = k + 1
+      }
+      run out.append(Mutation.SetStyle { id: id, state: state, declarations: move all })
+    }
+    return ()
+  }
   if changed.length() != 0 {
-    run out.append(Mutation.SetStyle { id: id, state: state, properties: move changed })
+    run out.append(Mutation.SetStyle { id: id, state: state, declarations: move changed })
   }
 }
 
-fn find(properties: &[Property], key: u32) -> usize {
+fn find(declarations: &[Declaration], property: Property) -> usize {
   let mut i: usize = 0
-  while i < properties.length {
-    if propertyKey(properties[i]) == key {
+  while i < declarations.length {
+    if declarations[i].property == property {
       return i
     }
     i = i + 1
