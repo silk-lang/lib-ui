@@ -9,7 +9,9 @@
 //! An app runs with the inspector (modules/inspect/server) when it passes one that is on to
 //! [`runWindowWith`]: requests are served from the loop, input they dispatch is pumped to the app
 //! like window input, the records the app takes go to the inspector's event log, and the
-//! highlight is drawn over the frame.
+//! highlight is drawn over the frame. The program itself is the `silk-ui` extension's to report
+//! (ui-app-inspect): this host registers it with the inspector and serves it from the loop, as
+//! any framework would its own.
 //!
 //! Every app run this way can also show the devtools in its own process, in a window of their
 //! own or docked in the app's window (`SILK_UI_DEVTOOLS`, F12; see ui-inspect-devtools'
@@ -31,9 +33,9 @@ import ui_app.app { App, Perform }
 import ui_app.runtime { Runtime, pump, tick, resize, frame, frameRoot }
 import ui_app.harness { click, press }
 import ui_tree.legacy { UiTree, TreeError, FrameInput, Mutation }
-import ui_inspect_server.lib { Inspector, ProgramStep, ProgramStats }
+import ui_inspect_server.lib { Inspector }
+import ui_app_inspect.lib { SilkUi, ID as SILK_UI }
 import ui_devtools.embedded { EmbeddedDevtools }
-import ui_app.journal { Step }
 import font_collection.lib { FontCollection }
 import atlas.atlas { AtlasError }
 import vector.geometry_error { GeometryError }
@@ -43,7 +45,6 @@ import webgpu.runtime { GpuError }
 import silk.collections.list { List }
 import silk.core.option { Option }
 import silk.num.u32
-import silk.num.usize
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 
 /// Custom drawing integrated with the standard window, input, inspection and GPU lifecycle.
@@ -222,7 +223,12 @@ pub effect fn runWindowHosted<
 ) -> i32
   ! E | WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError
   ? R | &mut Allocator {
-  let mut client: AppClient<A, M, C, H> = AppClient<A, M, C, H> { content: &mut content }
+  let mut client: AppClient<A, M, C, H> = AppClient<A, M, C, H> {
+    content: &mut content,
+    silkUi: SilkUi.make(),
+  }
+  let mut inspector = move inspector
+  run inspector.extend(run SilkUi.extension())
   let mut devtools = run EmbeddedDevtools.fromEnvironment()
   return run host.runWindowWith<AppClient<A, M, C, H>, EmbeddedDevtools, Runtime<A, M, C>, E, R>(
     &mut app,
@@ -236,7 +242,9 @@ pub effect fn runWindowHosted<
 }
 
 struct AppClient<'a, A, M, C, H> {
-  content: &'a mut H
+  content: &'a mut H,
+  /// The `silk-ui` inspector extension: the program's messages and model.
+  silkUi: SilkUi,
 }
 
 impl<'a, A: App<M, C>, M, C: Perform<M, E, R>, H: WindowContent<A, M, C>, E, ? R> WindowClient<
@@ -355,45 +363,13 @@ impl<'a, A: App<M, C>, M, C: Perform<M, E, R>, H: WindowContent<A, M, C>, E, ? R
     return WindowContent<A, M, C>.scene(&self.content.*, tree)
   }
 
-  /// Hands the inspector the program: the journal's new steps, and with them the counters
-  /// and the subscriptions the model asks for now.
+  /// Serves the `silk-ui` extension: the journal's new steps go to its log, and it answers
+  /// what waits for it.
   effect fn report(self: &mut Self, state: &mut Runtime<A, M, C>, inspector: &mut Inspector) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
-    if !state.journal.on {
-      run state.record()
-      let program = inspector.program()
-      program.attached = true
-    }
-    if state.journal.steps.length() == 0 {
-      return ()
-    }
-    let mut steps = state.journal.take()
-    let lines = run state.subscriptionLines()
-    let log = inspector.program()
-    while steps.length() != 0 {
-      let Step { seq, time, cause, message, commands, model } = steps.remove(0)
-      run log.add(
-        ProgramStep {
-          seq: seq,
-          time: time,
-          cause: move cause,
-          message: move message,
-          commands: move commands,
-          model: move model,
-        },
-      )
-    }
-    log.subscriptions = move lines
-    log.stats = ProgramStats {
-      renders: state.stats.renders,
-      dispatches: state.stats.dispatches,
-      messages: state.stats.messages,
-      commands: state.stats.commands,
-      mutations: usize.toU64(state.stats.mutations),
-      nodes: usize.toU64(state.stats.nodes),
-      reused: u32.toU64(state.stats.reused),
-    }
+    run self.silkUi.record(&mut state)
+    run inspector.serveExtension(SILK_UI, &mut self.silkUi)
   }
 
   effect fn start(self: &mut Self, state: &mut Runtime<A, M, C>, tree: &mut UiTree<'_>) -> ()

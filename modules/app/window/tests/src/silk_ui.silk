@@ -1,0 +1,116 @@
+//! The `silk-ui` inspector extension (ui-app-inspect) as the window host serves it: a counter
+//! program's messages and model, over a session in the same process (`Inspector.openLocal`),
+//! and nothing of the program left in the inspector itself.
+import ui_app_inspect.lib { SilkUi, ID }
+import ui_app.app { NoCommand }
+import ui_app.harness { click }
+import ui_app.program as program
+import ui_app_examples.counter { Counter, Message as CounterMessage }
+import ui_app_examples.look { SANS }
+import ui_inspect_server.lib { Inspector, Channel, MemoryChannel }
+import ui_fixtures.fixtures as fixtures
+import ui_tree.legacy { UiTree, TreeError, Batch, FrameInput }
+import silk.core.effect { Effect }
+import silk.json.scanner { JsonError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+effect fn put(client: &mut MemoryChannel, line: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  drop run Channel.send(line) |> Effect.provideMut<Channel>(&mut client)
+}
+
+/// The next line at the client's end, or "".
+effect fn take(client: &mut MemoryChannel) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut line = String.make()
+  drop run Channel.receive(&mut line) |> Effect.provideMut<Channel>(&mut client)
+  return move line
+}
+
+fn has(line: &String, text: string) -> bool {
+  return String.contains(String.view(line), text)
+}
+
+effect fn body() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  let mut batch = Batch.make()
+  run batch.fontFamily(SANS, "Noto Sans, sans-serif")
+  run tree.apply(run batch.take())
+  let viewport = FrameInput { width: 360.0, height: 360.0, scale: 1.0, time: 0.0 }
+  let mut app = run program.make<Counter, CounterMessage, NoCommand>()
+
+  // As the window host does: registered at start, served on every turn of the loop.
+  let mut inspector = Inspector.off()
+  run inspector.extend(run SilkUi.extension())
+  let mut silkUi = SilkUi.make()
+  let mut client = run inspector.openLocal()
+  run silkUi.record(&mut app)
+  run app.start(&mut tree, 0.0)
+  run tree.frame(viewport)
+  run inspector.afterFrame(&tree)
+
+  run put(&mut client, "{\"id\":1,\"cmd\":\"hello\"}")
+  drop run inspector.serveLocal(&mut tree)
+  let hello = run take(&mut client)
+  run Testing.expect(has(&hello, "\"extensions\":[{\"id\":\"silk-ui\""), "hello lists silk-ui")
+  run Testing.expect(has(&hello, "\"silk-ui.messages\""), "and its commands")
+  run Testing.expect(!has(&hello, "\"program\":"), "the inspector says nothing of a program")
+
+  // The inspector itself has no program commands.
+  run put(&mut client, "{\"id\":2,\"cmd\":\"messages\"}")
+  drop run inspector.serveLocal(&mut tree)
+  let plain = run take(&mut client)
+  run Testing.expect(has(&plain, "\"error\":\"unknown cmd\""), "messages is not the inspector's")
+
+  // The program handles messages; the extension serves them when the loop serves it.
+  run put(&mut client, "{\"id\":3,\"cmd\":\"subscribe\",\"topics\":[\"silk-ui.message\"]}")
+  drop run inspector.serveLocal(&mut tree)
+  drop run take(&mut client)
+  drop run click(&mut app, &mut tree, viewport, "+")
+  drop run click(&mut app, &mut tree, viewport, "+")
+  run put(&mut client, "{\"id\":4,\"cmd\":\"silk-ui.messages\",\"since\":1}")
+  drop run inspector.serveLocal(&mut tree)
+  let waiting = run take(&mut client)
+  run Testing.expect(waiting.ownedByteLength() == 0, "no reply before the extension is served")
+  run silkUi.record(&mut app)
+  run inspector.serveExtension(ID, &mut silkUi)
+  let messages = run take(&mut client)
+  run Testing.expect(has(&messages, "\"id\":4,\"ok\":true,\"attached\":true"), "the reply comes")
+  run Testing.expect(has(&messages, "\"message\":\"Increment\""), "with the messages")
+  run Testing.expect(has(&messages, "\"next\":4"), "and where to go on from")
+  let news = run take(&mut client)
+  run Testing.expect(
+    has(&news, "\"event\":\"silk-ui.message\"") && has(&news, "\"next\":4"),
+    "the message topic is pushed",
+  )
+
+  run put(&mut client, "{\"id\":5,\"cmd\":\"silk-ui.model\",\"seq\":2}")
+  run put(&mut client, "{\"id\":6,\"cmd\":\"silk-ui.program\"}")
+  run put(&mut client, "{\"id\":7,\"cmd\":\"silk-ui.model\",\"seq\":99}")
+  drop run inspector.serveLocal(&mut tree)
+  run inspector.serveExtension(ID, &mut silkUi)
+  let model = run take(&mut client)
+  run Testing.expect(
+    has(&model, "{\"op\":\"-\",\"line\":\"  count: 0\"},{\"op\":\"+\",\"line\":\"  count: 1\"}"),
+    "a model is compared with the one before",
+  )
+  let described = run take(&mut client)
+  run Testing.expect(has(&described, "\"steps\":3") && has(&described, "count: 2"), "the program")
+  let missing = run take(&mut client)
+  run Testing.expect(has(&missing, "\"error\":\"no such step\""), "an unknown step")
+  let quiet = run take(&mut client)
+  run Testing.expect(quiet.ownedByteLength() == 0, "no news without messages")
+}
+
+test effect fn silkUiExtensionServesTheProgram() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run body() |> Effect.provideMut<Allocator>(&mut allocator)
+}

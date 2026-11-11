@@ -1,12 +1,8 @@
-//! What the inspector knows beyond the tree: the program that drives it (its messages, the
-//! model after each, its subscriptions) and the frames it drew.
-//!
-//! The tree cannot tell any of this. A host that runs a program hands it over as text
-//! (`Inspector.program`), and a host that times its frames says how long they took
-//! (`Inspector.timed`); `ui-app-window` does both.
-import reply { begin, finish, putKey, putText, putInt, putNumber, putFlag, writeString }
+//! The program log: what a silk-ui program did, one step per message, with the model after
+//! each, as the `silk-ui` extension serves it (`silk-ui.program`, `silk-ui.messages`,
+//! `silk-ui.model`). The tree cannot tell any of this; the runtime's journal can.
+import ui_inspect_server.reply { begin, finish, putKey, putText, putInt, putFlag, writeString }
 import ui_tree.inspect { writeInt, writeNumber }
-import ui_tree.node { FrameStats }
 import silk.collections.list { List }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
@@ -20,9 +16,6 @@ import silk.text.string { String }
 
 /// How many steps the log keeps; older ones are dropped.
 pub const STEP_LIMIT: usize = 200
-
-/// How many frames the timeline keeps.
-pub const FRAME_LIMIT: usize = 240
 
 /// The most cells the line comparison of two models fills. Past it, the lines between what
 /// the two share at their ends all count as changed.
@@ -389,135 +382,4 @@ pub effect fn diffLines(before: string, after: string, out: &mut String) -> usiz
   }
   run out.append("]")
   return changed
-}
-
-/// One frame the tree drew.
-pub struct FrameRecord {
-  pub stats: FrameStats,
-  /// How long layout and paint took, in milliseconds; zero when the host does not time them.
-  pub layout: f32,
-  pub paint: f32,
-}
-
-impl Copy for FrameRecord {}
-
-/// The last [`FRAME_LIMIT`] frames.
-pub struct Timeline {
-  pub frames: List<FrameRecord>,
-  layout: f32,
-  paint: f32,
-}
-
-impl Timeline {
-  pub fn make() -> Timeline {
-    return Timeline { frames: List<FrameRecord>.make(), layout: 0.0, paint: 0.0 }
-  }
-
-  /// How long the frame about to be recorded took.
-  pub fn timed(self: &mut Self, layout: f32, paint: f32) -> () {
-    self.layout = layout
-    self.paint = paint
-  }
-
-  /// Records the tree's last frame, once.
-  pub effect fn record(self: &mut Self, stats: FrameStats) -> ()
-    ! OutOfMemoryError
-    ? &mut Allocator {
-    let count = self.frames.length()
-    if count != 0 && self.frames.get(count - 1).stats.frame == stats.frame {
-      return ()
-    }
-    run self.frames.append(FrameRecord { stats: stats, layout: self.layout, paint: self.paint })
-    self.layout = 0.0
-    self.paint = 0.0
-    if self.frames.length() > FRAME_LIMIT {
-      drop self.frames.remove(0)
-    }
-  }
-
-  /// frames: the frames after `since` (a frame number, 0 for all), oldest first, at most
-  /// `limit` of the newest.
-  pub effect fn describe(self: &Self, request: &Value, out: &mut String) -> ()
-    ! OutOfMemoryError
-    ? &mut Allocator {
-    let since = match Json.asU64(Json.field(request, "since")) {
-      Option<u64>.Some { value } => value
-      Option<u64>.None => 0
-    }
-    let frames = self.frames.asSlice()
-    let mut first: usize = 0
-    while first < frames.length && frames[first].stats.frame <= since {
-      first = first + 1
-    }
-    match Json.asU64(Json.field(request, "limit")) {
-      Option<u64>.Some { value } => {
-        let limit = u64.toUsize(value)
-        if frames.length - first > limit {
-          first = frames.length - limit
-        }
-      }
-      Option<u64>.None => {}
-    }
-    run begin(&mut out, request)
-    run putKey(&mut out, "frames")
-    run out.append("[")
-    let mut slowest: f32 = 0.0
-    let mut total: f32 = 0.0
-    let mut i = first
-    while i < frames.length {
-      if i > first {
-        run out.append(",")
-      }
-      let f = frames[i]
-      let cost = f.layout + f.paint
-      total = total + cost
-      if cost > slowest {
-        slowest = cost
-      }
-      run out.append("{\"frame\":")
-      run writeInt(&mut out, f.stats.frame)
-      run out.append(",\"layoutMs\":")
-      run writeNumber(&mut out, f.layout)
-      run out.append(",\"paintMs\":")
-      run writeNumber(&mut out, f.paint)
-      run out.append(",\"layoutSkipped\":")
-      run out.append(
-        if f.stats.layoutSkipped {
-          "true"
-        } else {
-          "false"
-        },
-      )
-      run out.append(",\"layoutPasses\":")
-      run writeInt(&mut out, usize.toU64(f.stats.layout.passes))
-      run out.append(",\"repainted\":")
-      run writeInt(&mut out, usize.toU64(f.stats.repaintedSubtrees))
-      run out.append(",\"replayed\":")
-      run writeInt(&mut out, usize.toU64(f.stats.replayedSubtrees))
-      run out.append(",\"fragments\":")
-      run writeInt(&mut out, usize.toU64(f.stats.paintedFragments))
-      run out.append(",\"primitives\":")
-      run writeInt(&mut out, usize.toU64(f.stats.primitives))
-      run out.append(",\"glyphs\":")
-      run writeInt(&mut out, usize.toU64(f.stats.glyphs))
-      run out.append(",\"nodes\":")
-      run writeInt(&mut out, usize.toU64(f.stats.nodes))
-      run out.append("}")
-      i = i + 1
-    }
-    run out.append("]")
-    let count = frames.length - first
-    run putInt(&mut out, "count", usize.toU64(count))
-    run putNumber(&mut out, "slowestMs", slowest)
-    run putNumber(
-      &mut out,
-      "averageMs",
-      if count == 0 {
-        0.0
-      } else {
-        total / usize.toF32(count)
-      },
-    )
-    run finish(&mut out)
-  }
 }

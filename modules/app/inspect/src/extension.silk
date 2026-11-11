@@ -1,0 +1,164 @@
+//! The `silk-ui` inspector extension: what a silk-ui program adds to the inspector, which knows
+//! only the tree. It is registered and served the way any framework's would be
+//! (`Inspector.extend`, `Inspector.serveExtension`); the window host (`ui-app-window`) does both
+//! for every program it runs.
+//!
+//! | Name | What |
+//! |---|---|
+//! | `silk-ui.program` | Whether a program is attached, its counters, subscriptions and model now |
+//! | `silk-ui.messages` | The messages it handled after `since`, at most `limit` of the newest |
+//! | `silk-ui.model` | The model after step `seq` (the last without it) and its line diff |
+//! | topic `silk-ui.message` | The program handled messages; `next` is the seq the next one gets |
+//!
+//! The steps come from the runtime's journal ([`SilkUi.record`]), which the runtime keeps only
+//! once something asks for it.
+import program { ProgramLog, ProgramStep, ProgramStats }
+import ui_app.app { App }
+import ui_app.journal { Step }
+import ui_app.runtime { Runtime }
+import ui_inspect_server.extension { Extension, ExtensionHandler, News }
+import ui_inspect_server.reply { failure }
+import ui_tree.inspect { writeInt }
+import silk.json.value { Value }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.usize
+import silk.text.string { String }
+
+/// The extension's id: its commands are `silk-ui.<command>`.
+pub const ID: string = "silk-ui"
+
+pub const VERSION: string = "0.1.0"
+
+/// The extension's state: the program log and what its topic last said.
+pub struct SilkUi {
+  pub log: ProgramLog,
+  /// The seq of the last step the `message` topic announced.
+  announced: u64,
+}
+
+impl SilkUi {
+  pub fn make() -> SilkUi {
+    return SilkUi { log: ProgramLog.make(), announced: 0 }
+  }
+
+  /// What it adds to the inspector, for `Inspector.extend`.
+  pub effect fn extension() -> Extension
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut info = run Extension.make(ID, VERSION)
+    run info.command("program")
+    run info.command("messages")
+    run info.command("model")
+    run info.topic("message")
+    run info.tool(
+      "program",
+      "The program",
+      "The silk-ui program behind the UI: its model now as indented text, the subscriptions the model asks for, and counters (renders, messages, commands, mutations of the last render, nodes and how many it reused). attached is false until the program is attached.",
+      "",
+      true,
+    )
+    run info.tool(
+      "messages",
+      "Message log",
+      "Every message the program handled, oldest first: seq, the program's time, cause (what sent it: 'click #12', 'key binding', 'timer', 'port menu', 'command <the command>', 'task'), the message itself, the commands update returned, and whether the model changed. The last 200 are kept.",
+      r"""{"type":"object","properties":{"since":{"type":"integer","description":"Only steps after this seq (the reply's next minus one reads on from the last call)."},"limit":{"type":"integer","description":"At most this many of the newest steps."}}}""",
+      true,
+    )
+    run info.tool(
+      "model",
+      "Model at a step",
+      "The model after a step as indented text, and diff: its lines against the model before, each marked kept (' '), added ('+') or removed ('-'). changed counts the added and removed lines.",
+      r"""{"type":"object","properties":{"seq":{"type":"integer","description":"The step whose model to show; the last one without it."}}}""",
+      true,
+    )
+    return move info
+  }
+
+  /// Takes the steps the program's journal wrote since the last call, with its counters and the
+  /// subscriptions its model asks for now. The first call turns the journal on. The host calls
+  /// it on every turn of its loop while the inspector is on.
+  pub effect fn record<A: App<M, C>, M, C>(self: &mut Self, runtime: &mut Runtime<A, M, C>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !runtime.journal.on {
+      run runtime.record()
+      self.log.attached = true
+    }
+    if runtime.journal.steps.length() == 0 {
+      return ()
+    }
+    let mut steps = runtime.journal.take()
+    let lines = run runtime.subscriptionLines()
+    while steps.length() != 0 {
+      let Step { seq, time, cause, message, commands, model } = steps.remove(0)
+      run self.log.add(
+        ProgramStep {
+          seq: seq,
+          time: time,
+          cause: move cause,
+          message: move message,
+          commands: move commands,
+          model: move model,
+        },
+      )
+    }
+    self.log.subscriptions = move lines
+    self.log.stats = ProgramStats {
+      renders: runtime.stats.renders,
+      dispatches: runtime.stats.dispatches,
+      messages: runtime.stats.messages,
+      commands: runtime.stats.commands,
+      mutations: usize.toU64(runtime.stats.mutations),
+      nodes: usize.toU64(runtime.stats.nodes),
+      reused: u32.toU64(runtime.stats.reused),
+    }
+  }
+
+  /// The seq of the newest step, or 0.
+  fn last(self: &Self) -> u64 {
+    let steps = self.log.steps.asSlice()
+    if steps.length == 0 {
+      return 0
+    }
+    return steps[steps.length - 1].seq
+  }
+}
+
+impl ExtensionHandler for SilkUi {
+  effect fn command(self: &mut Self, name: string, request: &Value, out: &mut String) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if name == "program" {
+      run self.log.describe(request, &mut out)
+      return true
+    }
+    if name == "messages" {
+      run self.log.messages(request, &mut out)
+      return true
+    }
+    if name == "model" {
+      if !self.log.attached {
+        run failure(&mut out, request, "no program is attached")
+      } else if !run self.log.model(request, &mut out) {
+        run failure(&mut out, request, "no such step")
+      }
+      return true
+    }
+    return false
+  }
+
+  effect fn topics(self: &mut Self, news: &mut News) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let last = self.last()
+    if last == self.announced {
+      return ()
+    }
+    self.announced = last
+    let mut members = run String.copy("{\"next\":")
+    run writeInt(&mut members, last + 1)
+    run members.append("}")
+    run news.post("message", String.view(&members))
+  }
+}
