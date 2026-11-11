@@ -9,6 +9,11 @@
 //! close it is only a `CloseRequested` root event, which the client answers or not. Such a
 //! window is framed only when its root needs a frame (`needsFrameOf`), has no compositor
 //! scrolling and publishes no accessibility tree.
+//!
+//! `runWindowWith` also runs a [`Companion`] beside the client, in the same tree, on roots of
+//! its own: the host hands it the input, records and frames of those roots, every key first,
+//! and the inspector. Its root shows in a window of its own, or docked in the first window, the
+//! client's first root then laid out in the rest (see `companion.silk`).
 import ui_scene.scene { Scene }
 import ui_tree.inspect { findAll }
 import ui_tree.legacy { UiTree, TreeError, FrameInput, CpuSnapshot, Mutation }
@@ -17,6 +22,7 @@ import adapter { fastScrollOf, reportWindow, reportWindowOf, serveInput }
 import ui_tree.lib { RootSupport, RootEventKind, ExtraRoot, RootOptions }
 import ui_tree.mutation { FIRST_ROOT }
 import render_thread { FastScroll, FastScrolled, RenderSettings }
+import companion { Companion, Dock, NoCompanion, dockTarget, pointed }
 
 static if Intrinsic.targetArchitecture() == "wasm32" {
   // No threads in the browser: frames are drawn on this thread (render_inline.silk).
@@ -49,12 +55,15 @@ import silk.num.usize
 import console { StderrWriter }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import clock { Clock }
-import silk.text.string { String }
+import silk.text.string { String, InvalidUtf8 }
+import silk.collections.bytes { Bytes }
 import silk.num.f32
 import silk.num.f64
 import silk.num.u64
 import ui_tree.input { Input, BUTTON_PRIMARY }
 import ui_tree.inspect { info, NodeInfo }
+import ui_tree.node { NONE }
+import silk.geometry.rect { Rect }
 
 /// Client lifecycle hooks for the native tree host. Default hooks draw an ordinary tree.
 pub interface WindowClient<S, E, ? R> {
@@ -374,13 +383,15 @@ fn windowOf(event: &Event) -> u32 {
 
 /// Opens a window for each root past the first that opened since, applies the title and size
 /// of the ones that changed, and closes the windows of the roots that closed. A root whose
-/// window cannot open is closed again and hears `Failed`. Returns whether a root event was
-/// reported, for the client to hear.
+/// window cannot open is closed again and hears `Failed`. Root `docked` (a companion's, or
+/// NONE) is drawn in the first window and has none. Returns whether a root event was reported,
+/// for the client to hear.
 effect fn syncWindows(
   tree: &mut UiTree<'_>,
   platform: &mut HostPlatform,
   renderer: &mut RenderThread,
   windows: &mut List<RootWindow>,
+  docked: u32,
 ) -> bool
   ! GpuError | TreeError | OutOfMemoryError
   ? &mut Allocator {
@@ -392,7 +403,7 @@ effect fn syncWindows(
   let mut w: usize = 0
   while w < windows.length() {
     let root = windows.asSlice()[w].root
-    if contains(&open, root) {
+    if contains(&open, root) && root != docked {
       w = w + 1
     } else {
       let gone = windows.remove(w)
@@ -405,7 +416,7 @@ effect fn syncWindows(
   while i < roots.length {
     let root = roots[i]
     i = i + 1
-    if root == FIRST_ROOT {
+    if root == FIRST_ROOT || root == docked {
       continue
     }
     let mut title = String.make()
@@ -531,11 +542,14 @@ fn contains(list: &List<u32>, value: u32) -> bool {
 }
 
 /// Handles `event` for the window of a root past the first: frames it, reports what happened
-/// to it as root events, and feeds its input to its root.
-effect fn otherEvent<H: WindowClient<S, E, R>, S, E, ? R>(
+/// to it as root events, and feeds its input to its root. A companion's root is the
+/// companion's to frame and answer.
+effect fn otherEvent<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
   state: &mut S,
   tree: &mut UiTree<'_>,
   content: &mut H,
+  companion: &mut K,
+  inspector: &mut Inspector,
   platform: &mut HostPlatform,
   renderer: &mut RenderThread,
   snapshot: &mut CpuSnapshot,
@@ -546,6 +560,7 @@ effect fn otherEvent<H: WindowClient<S, E, R>, S, E, ? R>(
   ! E | GpuError | TreeError | OutOfMemoryError
   ? R | &mut Allocator {
   let root = shown.root
+  let theirs = companion.owns(root)
   run reportWindowOf(&mut tree, root, event)
   match &event.* {
     Event.RequestFrame { targetTime, .. } => {
@@ -560,7 +575,11 @@ effect fn otherEvent<H: WindowClient<S, E, R>, S, E, ? R>(
         scale: f64.toF32(shown.scale),
         time: targetTime,
       }
-      run content.layoutRoot(&mut state, &mut tree, root, input)
+      if theirs {
+        run companion.layout(&mut tree, &mut inspector, root, input)
+      } else {
+        run content.layoutRoot(&mut state, &mut tree, root, input)
+      }
       drop run tree.useRoot(root)
       run serveInput(&mut platform, shown.window, &mut tree, &mut shown.host)
       run snapshot.copyUploads(&tree)
@@ -573,42 +592,170 @@ effect fn otherEvent<H: WindowClient<S, E, R>, S, E, ? R>(
         height,
       )
       tree.clearUploads()
-      run content.pump(&mut state, &mut tree)
+      run pumpOwner(
+        &mut state,
+        &mut tree,
+        &mut content,
+        &mut companion,
+        &mut inspector,
+        theirs,
+        time,
+      )
       platform.setCursor(shown.window, windowCursor(tree.cursor()))
     }
     Event.Resized { size, scaleFactor, .. } => {
       shown.width = size.width
       shown.height = size.height
       shown.scale = scaleFactor
-      run content.pump(&mut state, &mut tree)
+      run pumpOwner(
+        &mut state,
+        &mut tree,
+        &mut content,
+        &mut companion,
+        &mut inspector,
+        theirs,
+        time,
+      )
       platform.requestFrame(shown.window)
     }
     Event.ScaleFactorChanged { scaleFactor, .. } => {
       shown.scale = scaleFactor
-      run content.pump(&mut state, &mut tree)
+      run pumpOwner(
+        &mut state,
+        &mut tree,
+        &mut content,
+        &mut companion,
+        &mut inspector,
+        theirs,
+        time,
+      )
       platform.requestFrame(shown.window)
     }
     Event.CloseRequested { .. } => {
-      // The window stays until the client closes its root.
-      run content.pump(&mut state, &mut tree)
+      // The window stays until its owner closes its root.
+      run pumpOwner(
+        &mut state,
+        &mut tree,
+        &mut content,
+        &mut companion,
+        &mut inspector,
+        theirs,
+        time,
+      )
     }
     _ => {
       if let Option<Input>.Some { value: input } = run toInput(event) {
+        if keyInput(&input) && run companion.key(&mut tree, &mut inspector, &input) {
+          return ()
+        }
         run tree.beginAt(root, &input)
-        let prevented = run content.decide(&mut state, &mut tree)
+
+        // Keys go to the key root, which may be another window's.
+        let into = tree.current
+        let mine = companion.owns(into)
+        let prevented = if mine {
+          run companion.decide(&mut tree, &mut inspector)
+        } else {
+          run content.decide(&mut state, &mut tree)
+        }
         run tree.finish(move input, prevented)
         drop run tree.useRoot(root)
         run serveInput(&mut platform, shown.window, &mut tree, &mut shown.host)
-        run content.pump(&mut state, &mut tree)
+        run pumpOwner(
+          &mut state,
+          &mut tree,
+          &mut content,
+          &mut companion,
+          &mut inspector,
+          mine,
+          time,
+        )
         drop run tree.useRoot(root)
         platform.setCursor(shown.window, windowCursor(tree.cursor()))
       } else {
         match &event.* {
-          Event.Focused { .. } => run content.pump(&mut state, &mut tree)
+          Event.Focused { .. } => run pumpOwner(
+            &mut state,
+            &mut tree,
+            &mut content,
+            &mut companion,
+            &mut inspector,
+            theirs,
+            time,
+          )
           _ => {}
         }
       }
     }
+  }
+}
+
+/// Pumps the companion when `theirs`, else the client.
+effect fn pumpOwner<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
+  state: &mut S,
+  tree: &mut UiTree<'_>,
+  content: &mut H,
+  companion: &mut K,
+  inspector: &mut Inspector,
+  theirs: bool,
+  time: f64,
+) -> ()
+  ! E | TreeError | OutOfMemoryError
+  ? R | &mut Allocator {
+  if theirs {
+    drop run companion.pump(&mut tree, &mut inspector, time)
+  } else {
+    run content.pump(&mut state, &mut tree)
+  }
+}
+
+/// Whether `input` is a key press or release, which a companion sees first.
+fn keyInput(input: &Input) -> bool {
+  return match &input.* {
+    Input.KeyDown { .. } => true
+    Input.KeyUp { .. } => true
+    _ => false
+  }
+}
+
+/// The part of a first window of `width` by `height` the client's first root has: all of it,
+/// or what `dock` leaves.
+fn clientSize(width: f64, height: f64, dock: &Option<Dock>) -> Size2<f64> {
+  return match &dock.* {
+    Option<Dock>.Some { value } => {
+      let w = if value.area.xMin > 0.0 {
+        f64.min(width, f32.toF64(value.area.xMin))
+      } else {
+        width
+      }
+      let h = if value.area.yMin > 0.0 {
+        f64.min(height, f32.toF64(value.area.yMin))
+      } else {
+        height
+      }
+      Size2<f64>.new(w, h)
+    }
+    Option<Dock>.None => Size2<f64>.new(width, height)
+  }
+}
+
+fn dockRoot(dock: &Option<Dock>) -> u32 {
+  return match &dock.* {
+    Option<Dock>.Some { value } => value.root
+    Option<Dock>.None => NONE
+  }
+}
+
+fn sameDock(a: &Option<Dock>, b: &Option<Dock>) -> bool {
+  return match &a.* {
+    Option<Dock>.Some { value: x } => match &b.* {
+      Option<Dock>.Some { value: y } => x.root == y.root && x.area.xMin == y.area.xMin
+        && x.area.yMin == y.area.yMin
+        && x.area.xMax == y.area.xMax
+        && x.area.yMax == y.area.yMax
+      Option<Dock>.None => false
+    }
+    Option<Dock>.None => b.isNone()
   }
 }
 
@@ -630,6 +777,31 @@ pub effect fn runWindow<H: WindowClient<S, E, R>, S, E, ? R>(
   options: RunOptions,
   inspector: Inspector,
   content: &mut H,
+) -> i32
+  ! E | WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError
+  ? R | &mut Allocator {
+  let mut none = NoCompanion {}
+  return run runWindowWith<H, NoCompanion, S, E, R>(
+    &mut state,
+    collection,
+    move resources,
+    move options,
+    move inspector,
+    &mut content,
+    &mut none,
+  )
+}
+
+/// [`runWindow`] with `companion` beside the client, in the same tree (see `companion.silk`).
+/// Check mode runs no companion.
+pub effect fn runWindowWith<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
+  state: &mut S,
+  collection: &FontCollection,
+  resources: List<Mutation>,
+  options: RunOptions,
+  inspector: Inspector,
+  content: &mut H,
+  companion: &mut K,
 ) -> i32
   ! E | WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError
   ? R | &mut Allocator {
@@ -657,6 +829,9 @@ pub effect fn runWindow<H: WindowClient<S, E, R>, S, E, ? R>(
     run content.report(&mut state, &mut inspector)
   }
   run content.start(&mut state, &mut tree)
+  if !check {
+    run companion.attach(&mut tree, &mut inspector)
+  }
   let mut snapshot = CpuSnapshot.make()
 
   let mut options = move options
@@ -696,20 +871,32 @@ pub effect fn runWindow<H: WindowClient<S, E, R>, S, E, ? R>(
   let mut fastScrolls = List<FastScrolled>.make()
   let mut fastSeq: u64 = 0
 
-  // The windows of the roots past the first, with those `start` opened.
-  let mut others = List<RootWindow>.make()
-  if run syncWindows(&mut tree, &mut platform, &mut renderer, &mut others) {
-    run content.pump(&mut state, &mut tree)
-  }
-
   let initial = platform.contentSize(window)
   let mut width = initial.width
   let mut height = initial.height
   let mut scale = platform.scaleFactor(window)
+
+  // The companion's root docked in this window, if one is: the client has the rest of it. The
+  // pointer is in one of the two, and a press keeps going to the one it began in.
+  let mut dock = if check {
+    Option<Dock>.None
+  } else {
+    companion.dock(f64.toF32(width), f64.toF32(height))
+  }
+  let mut pointerIn = FIRST_ROOT
+  let mut pressIn = NONE
+  let mut composed = Scene.make()
+
+  // The windows of the roots past the first, with those `start` opened.
+  let mut others = List<RootWindow>.make()
+  if run syncWindows(&mut tree, &mut platform, &mut renderer, &mut others, dockRoot(&dock)) {
+    run content.pump(&mut state, &mut tree)
+  }
   let mut drawn: u64 = 0
   let mut status: i32 = 0
   let mut pending = Option<Event>.None
-  run content.resize(&mut state, &mut tree, f64.toF32(width), f64.toF32(height))
+  let first = clientSize(width, height, &dock)
+  run content.resize(&mut state, &mut tree, f64.toF32(first.width), f64.toF32(first.height))
   platform.requestFrame(owner)
   while true {
     // The first root is current but while a window of another root is served.
@@ -738,6 +925,12 @@ pub effect fn runWindow<H: WindowClient<S, E, R>, S, E, ? R>(
       if let Option<f64>.Some { value } = content.wakeAfter(&state.*) {
         if deadline < 0.0 || value < deadline {
           deadline = f64.max(0.0, value)
+        }
+      }
+      if let Option<f64>.Some { value } = companion.nextDeadline() {
+        let due = f64.max(0.0, value - now)
+        if deadline < 0.0 || due < deadline {
+          deadline = due
         }
       }
       match inspector.pollInterval() {
@@ -832,6 +1025,8 @@ pub effect fn runWindow<H: WindowClient<S, E, R>, S, E, ? R>(
           &mut state,
           &mut tree,
           &mut content,
+          &mut companion,
+          &mut inspector,
           &mut platform,
           &mut renderer,
           &mut snapshot,
@@ -846,7 +1041,14 @@ pub effect fn runWindow<H: WindowClient<S, E, R>, S, E, ? R>(
       }
     } else if let Option<Event>.Some { value } = &next {
       let mut resized = false
+      let keyed = tree.keyRoot
       run reportWindow(&mut tree, &value)
+      if let Event.Focused { focused, .. } = &value {
+        // The window has the keyboard again: the dock keeps it if it had it.
+        if focused && keyed == dockRoot(&dock) {
+          run tree.reportRoot(keyed, RootEventKind.Focused)
+        }
+      }
       if let Event.AppearanceChanged { .. } = &value {
         // Every window shows in the one appearance.
         let list = others.asSlice()
@@ -862,9 +1064,10 @@ pub effect fn runWindow<H: WindowClient<S, E, R>, S, E, ? R>(
         match &value {
           Event.RequestFrame { targetTime, .. } => {
             if deviceSize(width, scale) > 0 && deviceSize(height, scale) > 0 {
+              let area = clientSize(width, height, &dock)
               let viewport = FrameInput {
-                width: f64.toF32(width),
-                height: f64.toF32(height),
+                width: f64.toF32(area.width),
+                height: f64.toF32(area.height),
                 scale: f64.toF32(scale),
                 time: targetTime,
               }
@@ -886,8 +1089,29 @@ pub effect fn runWindow<H: WindowClient<S, E, R>, S, E, ? R>(
                 f64.toF32((layoutEnd - frameStart) * 1000.0),
                 f64.toF32((canvasEnd - layoutEnd) * 1000.0),
               )
+              if let Option<Dock>.Some { value: docked } = dock {
+                // The dock is laid out at the whole window's size, over the client's root.
+                let whole = FrameInput {
+                  width: f64.toF32(width),
+                  height: f64.toF32(height),
+                  scale: f64.toF32(scale),
+                  time: targetTime,
+                }
+                run companion.layout(&mut tree, &mut inspector, docked.root, whole)
+                drop run tree.useRoot(FIRST_ROOT)
+              }
               run serve(&mut platform, owner, &mut tree, &mut host)
               run inspector.afterFrameScene(&tree, content.scene(&state.*, &tree))
+              if let Option<Dock>.Some { value: docked } = dock {
+                composed.clear()
+                run composed.replay(
+                  inspector.sceneWith(content.scene(&state.*, &tree)),
+                  0,
+                  usize.MAX,
+                )
+                run composed.replay(tree.sceneOf(docked.root), 0, usize.MAX)
+                run composed.finish()
+              }
               run snapshot.copyUploads(&tree)
               let deviceWidth = deviceSize(width, scale)
               let deviceHeight = deviceSize(height, scale)
@@ -902,19 +1126,36 @@ pub effect fn runWindow<H: WindowClient<S, E, R>, S, E, ? R>(
               } else {
                 run Pixmap.make(0, 0)
               }
+              let mut fast = if compositing {
+                run fastScrollOf(&tree, f64.toF32(scale))
+              } else {
+                FastScroll.make()
+              }
+              if let Option<Dock>.Some { value: docked } = dock {
+                // Wheels over the dock are the companion's to scroll.
+                let s = f64.toF32(scale)
+                run fast.blocked.append(
+                  Rect<f32>.new(
+                    docked.area.xMin * s,
+                    docked.area.yMin * s,
+                    docked.area.xMax * s,
+                    docked.area.yMax * s,
+                  ),
+                )
+              }
               run renderer.submit(
-                inspector.sceneWith(content.scene(&state.*, &tree)),
+                if dock.isSome() {
+                  &composed
+                } else {
+                  inspector.sceneWith(content.scene(&state.*, &tree))
+                },
                 &tree.atlas,
                 tree.pendingUploads(),
                 deviceWidth,
                 deviceHeight,
                 compared,
                 reference.data(),
-                if compositing {
-                  run fastScrollOf(&tree, f64.toF32(scale))
-                } else {
-                  FastScroll.make()
-                },
+                move fast,
                 fastSeq,
               )
               tree.clearUploads()
@@ -951,6 +1192,7 @@ pub effect fn runWindow<H: WindowClient<S, E, R>, S, E, ? R>(
               platform.setCursor(owner, windowCursor(tree.cursor()))
             }
             redraw = check || content.wantsFrames(&state.*) || content.needsFrame(&state.*, &tree)
+              || dock.isSome() && tree.needsFrameOf(dockRoot(&dock))
           }
           Event.Resized { size, scaleFactor, .. } => {
             width = size.width
@@ -983,27 +1225,89 @@ pub effect fn runWindow<H: WindowClient<S, E, R>, S, E, ? R>(
               run toInput(&value)
             }
             if let Option<Input>.Some { value: input } = move fed {
-              // The inspector's picker takes the pointer before the app sees it.
-              if inspector.picking() && run inspector.pickInput(&tree, &input) {
+              // The root the input is for: with a dock, the pointer's side, or the side a
+              // press began on until it ends.
+              let target = dockTarget(&input, &dock, pressIn, pointerIn)
+              if keyInput(&input) && run companion.key(&mut tree, &mut inspector, &input) {
+                // The companion's shortcut: nobody else sees it.
+                drop run tree.useRoot(FIRST_ROOT)
+                redraw = true
+              } else if target == FIRST_ROOT && inspector.picking()
+                && run inspector.pickInput(&tree, &input) {
+                // The inspector's picker takes the pointer before the app sees it.
                 redraw = true
               } else {
+                if dock.isSome() {
+                  if pointed(&input) && target != pointerIn {
+                    // The side the pointer left hears it leave, as when it leaves the window.
+                    run tree.dispatchTo(pointerIn, Input.PointerLeave)
+                    let left = companion.owns(pointerIn)
+                    run pumpOwner(
+                      &mut state,
+                      &mut tree,
+                      &mut content,
+                      &mut companion,
+                      &mut inspector,
+                      left,
+                      time,
+                    )
+                    pointerIn = target
+                  }
+                  match &input {
+                    Input.PointerDown { .. } => {
+                      pressIn = target
+
+                      // Keys follow the press, as between windows.
+                      if tree.keyRoot != target {
+                        run tree.reportRoot(target, RootEventKind.Focused)
+                      }
+                    }
+                    Input.PointerUp { .. } => {
+                      pressIn = NONE
+                    }
+                    Input.PointerCancel => {
+                      pressIn = NONE
+                    }
+                    _ => {}
+                  }
+                }
+
                 // As a browser does: the handlers of the input see it first, and the default
                 // action runs unless one of them prevented it.
-                run tree.beginAt(FIRST_ROOT, &input)
-                let prevented = run content.decide(&mut state, &mut tree)
-                run tree.finish(move input, prevented)
-                run serve(&mut platform, owner, &mut tree, &mut host)
-                run inspector.observe(&tree)
-                run content.pump(&mut state, &mut tree)
-                platform.setCursor(owner, windowCursor(tree.cursor()))
-                redraw = content.needsFrame(&state.*, &tree)
+                run tree.beginAt(target, &input)
+                let into = tree.current
+                if companion.owns(into) {
+                  let prevented = run companion.decide(&mut tree, &mut inspector)
+                  run tree.finish(move input, prevented)
+                  run serve(&mut platform, owner, &mut tree, &mut host)
+                  drop run companion.pump(&mut tree, &mut inspector, time)
+                  drop run tree.useRoot(into)
+                  platform.setCursor(owner, windowCursor(tree.cursor()))
+                  drop run tree.useRoot(FIRST_ROOT)
+                  redraw = true
+                } else {
+                  let prevented = run content.decide(&mut state, &mut tree)
+                  run tree.finish(move input, prevented)
+                  run serve(&mut platform, owner, &mut tree, &mut host)
+                  run inspector.observe(&tree)
+                  run content.pump(&mut state, &mut tree)
+                  platform.setCursor(owner, windowCursor(tree.cursor()))
+                  redraw = content.needsFrame(&state.*, &tree)
+                }
               }
             }
           }
         }
       }
       if resized {
-        run content.resize(&mut state, &mut tree, f64.toF32(width), f64.toF32(height))
+        let area = clientSize(width, height, &dock)
+        if dock.isSome() {
+          run tree.reportRoot(
+            FIRST_ROOT,
+            RootEventKind.Resized { width: f64.toF32(area.width), height: f64.toF32(area.height) },
+          )
+        }
+        run content.resize(&mut state, &mut tree, f64.toF32(area.width), f64.toF32(area.height))
         redraw = true
       }
     }
@@ -1011,13 +1315,14 @@ pub effect fn runWindow<H: WindowClient<S, E, R>, S, E, ? R>(
       redraw = true
     }
     if inspector.enabled() && (content.needsFrame(&state.*, &tree) || inspector.wantsFrame()) {
+      let area = clientSize(width, height, &dock)
       run content.prepare(&mut state, &mut tree)
       run content.layout(
         &mut state,
         &mut tree,
         FrameInput {
-          width: f64.toF32(width),
-          height: f64.toF32(height),
+          width: f64.toF32(area.width),
+          height: f64.toF32(area.height),
           scale: f64.toF32(scale),
           time: time,
         },
@@ -1029,8 +1334,35 @@ pub effect fn runWindow<H: WindowClient<S, E, R>, S, E, ? R>(
       redraw = true
     }
 
+    // The companion hears what came for it (the inspector's pushes, its timers) and may move
+    // its root between a window and the dock; the client's root then has the window's rest.
+    if !check {
+      let changed = run companion.pump(&mut tree, &mut inspector, time)
+      if changed && dock.isSome() {
+        redraw = true
+      }
+      drop run tree.useRoot(FIRST_ROOT)
+      let now = companion.dock(f64.toF32(width), f64.toF32(height))
+      if !sameDock(&dock, &now) {
+        dock = now
+        pointerIn = FIRST_ROOT
+        pressIn = NONE
+        let area = clientSize(width, height, &dock)
+        run tree.reportRoot(
+          FIRST_ROOT,
+          RootEventKind.Resized { width: f64.toF32(area.width), height: f64.toF32(area.height) },
+        )
+        run content.resize(&mut state, &mut tree, f64.toF32(area.width), f64.toF32(area.height))
+        redraw = true
+      }
+      if dock.isSome() && tree.needsFrameOf(dockRoot(&dock)) {
+        redraw = true
+      }
+      redraw = redraw || inspector.wantsFrame()
+    }
+
     // Windows open, change and close with their roots; each is framed when its root needs it.
-    if run syncWindows(&mut tree, &mut platform, &mut renderer, &mut others) {
+    if run syncWindows(&mut tree, &mut platform, &mut renderer, &mut others, dockRoot(&dock)) {
       run content.pump(&mut state, &mut tree)
       drop run tree.useRoot(FIRST_ROOT)
       redraw = redraw || content.needsFrame(&state.*, &tree)
@@ -1108,6 +1440,77 @@ pub effect fn startInspector(options: InspectorOptions) -> Inspector
       drop options
       return Inspector.off()
     }
+  }
+}
+
+/// The value of this process's environment variable `name`, for code that has no `HostInput`
+/// (see `startInspector`). None when it is not set, is not UTF-8 or the environment cannot be
+/// read.
+pub effect fn environmentVariable(name: string) -> Option<String>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    let captured = run Effect.result(WindowsHostInput.capture())
+    let mut inputs = match move captured {
+      Result.Success { value } => move value
+      Result.Failure { error } => match move error {
+        HostInputError _failure => {
+          return Option<String>.None
+        }
+        OutOfMemoryError failure => {
+          fail move failure
+        }
+      }
+    }
+    return run variableIn(name) |> Effect.provideMut<HostInput>(&mut inputs)
+  } else {
+    static if Intrinsic.targetOperatingSystem() == "darwin"
+      || Intrinsic.targetOperatingSystem() == "linux" {
+      let captured = run Effect.result(unsafe NativeHostInput.environmentSnapshot())
+      let snapshot = match move captured {
+        Result.Success { value } => move value
+        Result.Failure { error } => match move error {
+          HostInputError _failure => {
+            return Option<String>.None
+          }
+          OutOfMemoryError failure => {
+            fail move failure
+          }
+        }
+      }
+      let mut inputs = OsHostInput.make(move snapshot)
+      return run variableIn(name) |> Effect.provideMut<HostInput>(&mut inputs)
+    } else {
+      return Option<String>.None
+    }
+  }
+}
+
+effect fn variableIn(name: string) -> Option<String>
+  ! OutOfMemoryError
+  ? &mut HostInput | &mut Allocator {
+  let read = run Effect.result(HostInput.variableNamed(name))
+  let value = match move read {
+    Result.Success { value: found } => match move found {
+      Option<Bytes>.Some { value: bytes } => move bytes
+      Option<Bytes>.None => {
+        return Option<String>.None
+      }
+    }
+    Result.Failure { error } => match move error {
+      HostInputError _failure => {
+        return Option<String>.None
+      }
+      OutOfMemoryError failure => {
+        fail move failure
+      }
+    }
+  }
+  return match HostInput.text(value.asSlice()) {
+    Result<string, InvalidUtf8>.Success { value: text } => Option<String>.some(
+      run String.copy(text),
+    )
+    Result<string, InvalidUtf8>.Failure { error: _ } => Option<String>.None
   }
 }
 
