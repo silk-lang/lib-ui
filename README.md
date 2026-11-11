@@ -155,7 +155,7 @@ silk task generate-browser-exports --check
 
 Windows managed-process tasks are blocked by [silk#3034](https://github.com/silk-lang/silk/issues/3034): the standard library does not expose live child pipes, exit observation, and termination there. These tasks report the unsupported capability; duplicate Python/Node implementations are not retained.
 
-`check` checks every workspace package, all ten UI unit-test roots, the loopback HTTP image test, five describe/PNG golden runners, the text/inspector/MCP CLIs, portable wasm APIs, and generated-file freshness. It does not update goldens. `native check` runs four rendering/input scenarios plus socket inspector, MCP, and devtools interactions. Linux runs X11 and Wayland (`--backend x11` or `--backend wayland` selects one). `browser check` compares Chrome text, browser fixture trees, and the counter's real input.
+`check` checks every workspace package, all ten UI unit-test roots, the loopback HTTP image test, five describe/PNG golden runners, the text/inspector/MCP CLIs, portable wasm APIs, and generated-file freshness. It does not update goldens. `native check` runs five rendering/input scenarios (the mirror example opens a second window) plus socket inspector, MCP, and devtools interactions. Linux runs X11 and Wayland (`--backend x11` or `--backend wayland` selects one). `browser check` compares Chrome text, browser fixture trees, and the counter's real input.
 
 Individual entrypoints remain available:
 
