@@ -1,6 +1,7 @@
 //! The app contract: [`App`] (view, update, subscriptions) on the model, [`Perform`] on the
 //! command type, and the [`Context`] and [`Subscriptions`] builders they write into.
 import heap { Heap }
+import program { Submodel }
 import ui { Ui }
 import silk.collections.list { List }
 import silk.collections.slice { Slice }
@@ -8,6 +9,7 @@ import silk.core.effect { Effect }
 import silk.core.ownership { Copy }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.u32
+import silk.num.u64
 import silk.num.usize
 import silk.text.string { String }
 
@@ -259,4 +261,73 @@ impl<M> Subscriptions<M> {
       )
     }
   }
+
+  /// The subscriptions `body` asks for, as this builder's: each message goes through `wrap`.
+  /// `scope` keeps the keys in `body` apart from the ones around it, so two children may use
+  /// the same keys under different scopes.
+  pub fn lift<CM>(
+    self: &mut Self,
+    scope: u64,
+    body: fn(&mut Subscriptions<CM>) -> (),
+    wrap: fn(CM) -> M,
+  ) -> () {
+    let mut inner = Subscriptions<CM>.make()
+    body(&mut inner)
+    if !self.delivering {
+      let mut i: usize = 0
+      while i < inner.records.length() {
+        let mut record = inner.records.get(i)
+        let name = inner.keyName(record)
+        record.key = scoped(scope, record.key)
+        record.keyStart = usize.toU32(self.bytes.length())
+        self.heap.alloc(self.bytes.appendSlice(name))
+        self.add(record)
+        i = i + 1
+      }
+      return ()
+    }
+
+    // The delivery names a scoped key: find the key `body` gave it, and ask `body` again.
+    let mut i: usize = 0
+    while i < inner.records.length() {
+      let record = inner.records.get(i)
+      if record.kind == self.delivery.kind && scoped(scope, record.key) == self.delivery.key {
+        let mut delivery = self.delivery
+        delivery.key = record.key
+        inner.beginDelivery(delivery)
+        body(&mut inner)
+        while inner.messages.length() > 0 {
+          self.heap.alloc(self.messages.append(wrap(inner.messages.remove(0))))
+        }
+        return ()
+      }
+      i = i + 1
+    }
+  }
+
+  /// A child's subscriptions. `wrap` turns each of the child's messages into one of this
+  /// builder's, and `scope` tells this child from the others (see [`Subscriptions.lift`]).
+  pub fn submodel<Child: Submodel<CM, CC, CO>, CM, CC, CO>(
+    self: &mut Self,
+    scope: u64,
+    child: &Child,
+    wrap: fn(CM) -> M,
+  ) -> () {
+    self.lift(
+      scope,
+      |inner: &mut Subscriptions<CM>| Submodel.subscriptions(child, &mut inner),
+      wrap,
+    )
+  }
+}
+
+/// `key` as seen from outside the scope `scope`.
+fn scoped(scope: u64, key: u64) -> u64 {
+  let mut z = u64.wrappingAdd(
+    u64.bitXor(u64.wrappingMultiply(scope, 0x9E3779B97F4A7C15), key),
+    0x9E3779B97F4A7C15,
+  )
+  z = u64.wrappingMultiply(u64.bitXor(z, u64.shiftRight(z, 30)), 0xBF58476D1CE4E5B9)
+  z = u64.wrappingMultiply(u64.bitXor(z, u64.shiftRight(z, 27)), 0x94D049BB133111EB)
+  return u64.bitXor(z, u64.shiftRight(z, 31))
 }

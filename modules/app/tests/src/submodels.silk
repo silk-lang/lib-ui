@@ -1,0 +1,606 @@
+//! A parent that embeds counters by hand: the children's messages, commands, reports,
+//! requests and subscriptions all pass through the parent.
+import ui_app.app { Subscriptions }
+import ui_app.harness { click, clickAt }
+import ui_app.html { Html, Node }
+import ui_app.program as program
+import ui_app.program {
+  CommandSet,
+  fold,
+  foldInput,
+  lift,
+  NoOutput,
+  Program,
+  Receives,
+  Submodel,
+  Update
+}
+import ui_app.runtime { tick, drain }
+import ui_tree.inspect { NodeInfo, findAll, info }
+import ui_tree.legacy { UiTree, TreeError, FrameInput }
+import ui_fixtures.fixtures as fixtures
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.num.u64
+
+// The child: loads a saved value when it is made, counts on a timer, resets after a delay,
+// tells its parent when it reaches ten, and resets when its parent asks.
+
+/// Where saved values come from.
+service Vault {
+  effect fn load(saved: i64) -> i64 ? &mut Vault
+}
+
+struct MemoryVault {
+  calls: u64,
+}
+
+impl Vault for MemoryVault {
+  effect fn load(self: &mut Self, saved: i64) -> i64 {
+    self.calls = self.calls + 1
+    return saved
+  }
+}
+
+struct Counter {
+  count: i64,
+  saved: i64,
+  isLoading: bool,
+  isAuto: bool,
+  isResetting: bool,
+}
+
+union CounterMessage {
+  ClickedIncrement,
+  ClickedToggleAuto,
+  ClickedResetLater,
+  Ticked,
+  CompletedDelayReset,
+  SucceededLoadSaved { count: i64 },
+}
+
+union CounterInput {
+  RequestedReset,
+}
+
+union CounterOutput {
+  ReachedTen,
+}
+
+union CounterCommand {
+  LoadSaved { count: i64 },
+  DelayReset,
+}
+
+type Step = Update<Counter, CounterCommand, CounterOutput>
+
+fn counter(saved: i64) -> Counter {
+  return Counter { count: 0, saved: saved, isLoading: true, isAuto: false, isResetting: false }
+}
+
+fn countUp(mut model: Counter) -> Step {
+  model.count = model.count + 1
+  if model.count == 10 {
+    return Step.of(move model).reporting(CounterOutput.ReachedTen)
+  }
+  return Step.of(move model)
+}
+
+impl Submodel<CounterMessage, CounterCommand, CounterOutput> for Counter {
+  effect fn start(model: &Counter) -> List<CounterCommand>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut commands = List<CounterCommand>.make()
+    run commands.append(CounterCommand.LoadSaved { count: model.saved })
+    return move commands
+  }
+
+  effect fn update(mut model: Counter, message: CounterMessage) -> Step
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match move message {
+      CounterMessage.ClickedIncrement => {
+        return countUp(move model)
+      }
+      CounterMessage.ClickedToggleAuto => {
+        model.isAuto = !model.isAuto
+      }
+      CounterMessage.ClickedResetLater => {
+        model.isResetting = true
+        return run Step.with(move model, CounterCommand.DelayReset)
+      }
+      CounterMessage.Ticked => {
+        return countUp(move model)
+      }
+      CounterMessage.CompletedDelayReset => {
+        model.count = 0
+        model.isResetting = false
+      }
+      CounterMessage.SucceededLoadSaved { count } => {
+        model.count = count
+        model.isLoading = false
+      }
+    }
+    return Step.of(move model)
+  }
+
+  fn view(model: &Counter, h: &Html<CounterMessage>) -> Node {
+    if model.isLoading {
+      return h.row(&[], &[h.text("loading")])
+    }
+    return h.row(
+      &[],
+      &[
+        h.number(model.count),
+        h.button(&[h.onClick(CounterMessage.ClickedIncrement)], &[h.text("+")]),
+        h.button(
+          &[h.onClick(CounterMessage.ClickedToggleAuto)],
+          &[
+            h.text(
+              if model.isAuto {
+                "on"
+              } else {
+                "off"
+              },
+            ),
+          ],
+        ),
+        if model.isResetting {
+          h.text("soon")
+        } else {
+          h.button(&[h.onClick(CounterMessage.ClickedResetLater)], &[h.text("later")])
+        },
+      ],
+    )
+  }
+
+  fn subscriptions(model: &Counter, subs: &mut Subscriptions<CounterMessage>) -> () {
+    if model.isAuto {
+      subs.every(1, 1.0, |time| CounterMessage.Ticked)
+    }
+  }
+}
+
+impl Receives<CounterInput, CounterCommand, CounterOutput> for Counter {
+  effect fn receive(mut model: Counter, input: CounterInput) -> Step
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match move input {
+      CounterInput.RequestedReset => {
+        model.count = 0
+      }
+    }
+    return Step.of(move model)
+  }
+}
+
+impl CommandSet<CounterMessage ? &mut Vault> for CounterCommand {
+  effect fn execute(self: Self) -> CounterMessage
+    ! OutOfMemoryError
+    ? &mut Vault {
+    return match move self {
+      CounterCommand.LoadSaved { count } => CounterMessage.SucceededLoadSaved {
+        count: run Vault.load(count),
+      }
+      CounterCommand.DelayReset => CounterMessage.CompletedDelayReset
+    }
+  }
+}
+
+// The parent: a spotlight counter that can be replaced, and a list of counters.
+
+struct Row {
+  id: u64,
+  counter: Counter,
+}
+
+struct Board {
+  spotlight: Counter,
+  /// How many times the spotlight was replaced, so what an earlier one started is dropped.
+  generation: u64,
+  rows: List<Row>,
+  nextRowId: u64,
+  timesReachedTen: i64,
+}
+
+union Message {
+  ClickedReplaceSpotlight,
+  ClickedAddRow,
+  ClickedRemoveRow { id: u64 },
+  ClickedResetAll,
+  GotSpotlightMessage { generation: u64, message: CounterMessage },
+  GotCounterMessage { id: u64, message: CounterMessage },
+}
+
+union Command {
+  Spotlight { generation: u64, command: CounterCommand },
+  Counter { id: u64, command: CounterCommand },
+}
+
+impl CommandSet<Message ? &mut Vault> for Command {
+  effect fn execute(self: Self) -> Message
+    ! OutOfMemoryError
+    ? &mut Vault {
+    return match move self {
+      Command.Spotlight { generation, command } => Message.GotSpotlightMessage {
+        generation: generation,
+        message: run CommandSet.execute(move command),
+      }
+      Command.Counter { id, command } => Message.GotCounterMessage {
+        id: id,
+        message: run CommandSet.execute(move command),
+      }
+    }
+  }
+}
+
+type Next = Update<Board, Command, NoOutput>
+
+fn rowIndex(rows: &[Row], id: u64) -> Option<usize> {
+  let mut i: usize = 0
+  while i < rows.length {
+    if rows[i].id == id {
+      return Option<usize>.some(i)
+    }
+    i = i + 1
+  }
+  return Option<usize>.none()
+}
+
+fn reachedTen(out: &Option<CounterOutput>) -> bool {
+  return match &out.* {
+    Option.Some { value } => match &value {
+      CounterOutput.ReachedTen => true
+    }
+    Option.None => false
+  }
+}
+
+effect fn addRow(model: &mut Board, commands: &mut List<Command>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let id = model.nextRowId
+  model.nextRowId = id + 1
+  let child = counter(u64.toI64(id) * 2)
+  let started = run Submodel.start(&child)
+  run lift(
+    &mut commands.*,
+    move started,
+    |command: CounterCommand| Command.Counter { id: id, command: move command },
+  )
+  run model.rows.append(Row { id: id, counter: move child })
+}
+
+impl Program<Message, Command> for Board {
+  effect fn init() -> Next
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut commands = List<Command>.make()
+    let spotlight = counter(7)
+    let started = run Submodel.start(&spotlight)
+    run lift(
+      &mut commands,
+      move started,
+      |command: CounterCommand| Command.Spotlight { generation: 0, command: move command },
+    )
+    let mut model = Board {
+      spotlight: move spotlight,
+      generation: 0,
+      rows: List<Row>.make(),
+      nextRowId: 0,
+      timesReachedTen: 0,
+    }
+    run addRow(&mut model, &mut commands)
+    run addRow(&mut model, &mut commands)
+    return Next.batch(move model, move commands)
+  }
+
+  effect fn update(mut model: Board, message: Message) -> Next
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut commands = List<Command>.make()
+    match move message {
+      Message.ClickedReplaceSpotlight => {
+        model.generation = model.generation + 1
+        let generation = model.generation
+        model.spotlight = counter(3)
+        let started = run Submodel.start(&model.spotlight)
+        run lift(
+          &mut commands,
+          move started,
+          |command: CounterCommand| Command.Spotlight {
+            generation: generation,
+            command: move command,
+          },
+        )
+      }
+      Message.ClickedAddRow => {
+        run addRow(&mut model, &mut commands)
+      }
+      Message.ClickedRemoveRow { id } => {
+        match rowIndex(model.rows.asSlice(), id) {
+          Option.Some { value: at } => {
+            drop model.rows.remove(at)
+          }
+          Option.None => {}
+        }
+      }
+      Message.ClickedResetAll => {
+        let generation = model.generation
+        let folded = run foldInput(&mut model.spotlight, CounterInput.RequestedReset)
+        run lift(
+          &mut commands,
+          move folded.commands,
+          |command: CounterCommand| Command.Spotlight {
+            generation: generation,
+            command: move command,
+          },
+        )
+        let rows = model.rows.asMutSlice()
+        let mut i: usize = 0
+        while i < rows.length {
+          let id = rows[i].id
+          let answered = run foldInput(&mut rows[i].counter, CounterInput.RequestedReset)
+          run lift(
+            &mut commands,
+            move answered.commands,
+            |command: CounterCommand| Command.Counter { id: id, command: move command },
+          )
+          i = i + 1
+        }
+      }
+      Message.GotSpotlightMessage { generation, message: inner } => {
+        // What an earlier spotlight started must not reach the new one.
+        if generation == model.generation {
+          let folded = run fold(&mut model.spotlight, move inner)
+          run lift(
+            &mut commands,
+            move folded.commands,
+            |command: CounterCommand| Command.Spotlight {
+              generation: generation,
+              command: move command,
+            },
+          )
+          if reachedTen(&folded.out) {
+            model.timesReachedTen = model.timesReachedTen + 1
+          }
+        }
+      }
+      Message.GotCounterMessage { id, message: inner } => {
+        match rowIndex(model.rows.asSlice(), id) {
+          Option.Some { value: at } => {
+            let folded = run fold(&mut model.rows.asMutSlice()[at].counter, move inner)
+            run lift(
+              &mut commands,
+              move folded.commands,
+              |command: CounterCommand| Command.Counter { id: id, command: move command },
+            )
+            if reachedTen(&folded.out) {
+              model.timesReachedTen = model.timesReachedTen + 1
+            }
+          }
+          Option.None => {}
+        }
+      }
+    }
+    return Next.batch(move model, move commands)
+  }
+
+  fn view(model: &Board, h: &Html<Message>) -> Node {
+    let generation = model.generation
+    return h.column(
+      &[],
+      &[
+        h.row(
+          &[],
+          &[
+            h.submodel(
+              &model.spotlight,
+              |inner: CounterMessage| Message.GotSpotlightMessage {
+                generation: generation,
+                message: move inner,
+              },
+            ),
+            h.button(&[h.onClick(Message.ClickedReplaceSpotlight)], &[h.text("Replace")]),
+          ],
+        ),
+        h.each(model.rows.asSlice(), |row| rowView(row, h)),
+        h.row(
+          &[],
+          &[
+            h.button(&[h.onClick(Message.ClickedAddRow)], &[h.text("Add")]),
+            h.button(&[h.onClick(Message.ClickedResetAll)], &[h.text("Reset all")]),
+          ],
+        ),
+      ],
+    )
+  }
+
+  fn subscriptions(model: &Board, subs: &mut Subscriptions<Message>) -> () {
+    let generation = model.generation
+    subs.submodel(
+      0,
+      &model.spotlight,
+      |inner: CounterMessage| Message.GotSpotlightMessage {
+        generation: generation,
+        message: move inner,
+      },
+    )
+    let rows = model.rows.asSlice()
+    let mut i: usize = 0
+    while i < rows.length {
+      let id = rows[i].id
+      subs.submodel(
+        id + 1,
+        &rows[i].counter,
+        |inner: CounterMessage| Message.GotCounterMessage { id: id, message: move inner },
+      )
+      i = i + 1
+    }
+  }
+}
+
+fn rowView(row: &Row, h: &Html<Message>) -> Node {
+  let id = row.id
+  return h.keyed(
+    id,
+    h.row(
+      &[],
+      &[
+        h.submodel(
+          &row.counter,
+          |inner: CounterMessage| Message.GotCounterMessage { id: id, message: move inner },
+        ),
+        h.button(&[h.onClick(Message.ClickedRemoveRow { id: id })], &[h.text("Remove")]),
+      ],
+    ),
+  )
+}
+
+type Host = program.Host<Board, Message, Command>
+
+fn viewport() -> FrameInput {
+  return FrameInput { width: 600.0, height: 600.0, scale: 1.0, time: 0.0 }
+}
+
+/// The tree ids of the nodes whose text is `value`, in document order.
+effect fn idsOf(tree: &mut UiTree<'_>, value: string) -> List<u32>
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  run tree.frame(viewport())
+  let mut found = List<u32>.make()
+  run findAll(&tree, value, &mut found)
+  return move found
+}
+
+/// Clicks the node number `at` among the ones whose text is `value`.
+effect fn clickNth(app: &mut Host, tree: &mut UiTree<'_>, value: string, at: usize) -> bool
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator | &mut Vault {
+  let found = run idsOf(&mut tree, value)
+  if at >= found.length() {
+    return false
+  }
+  return match run info(&tree, found.get(at)) {
+    Option<NodeInfo>.Some { value: node } => {
+      let x = (node.bounds.xMin + node.bounds.xMax) * 0.5
+      let y = (node.bounds.yMin + node.bounds.yMax) * 0.5
+      run clickAt(&mut app, &mut tree, viewport(), x, y)
+      true
+    }
+    Option<NodeInfo>.None => false
+  }
+}
+
+/// Performs the commands that wait, and the ones their messages start.
+effect fn settle(app: &mut Host, tree: &mut UiTree<'_>) -> ()
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator | &mut Vault {
+  while app.deferred() != 0 {
+    let waiting = app.takeDeferred()
+    app.send(run CommandSet.execute(move waiting.command))
+    run drain(&mut app, &mut tree)
+  }
+}
+
+effect fn boardBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator | &mut Vault {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  let mut app = run program.make<Board, Message, Command>()
+  app.deferCommands()
+  run app.start(&mut tree, 0.0)
+  run drain(&mut app, &mut tree)
+
+  // The commands `init` and the children's `start` returned run at the first drain.
+  run Testing.expect(app.deferred() == 3, "every child's first command waits")
+  run Testing.expect((run idsOf(&mut tree, "loading")).length() == 3, "every child is loading")
+  run settle(&mut app, &mut tree)
+  run Testing.expect(app.model.value.spotlight.count == 7, "the spotlight loaded")
+  run Testing.expect(app.model.value.rows.asSlice()[1].counter.count == 2, "the second row loaded")
+  run Testing.expect((run idsOf(&mut tree, "loading")).length() == 0, "nothing is loading")
+
+  // A child's click reaches that child, through its parent's wrapper.
+  run Testing.expect(run clickNth(&mut app, &mut tree, "+", 0), "the spotlight's + is there")
+  run Testing.expect(app.model.value.spotlight.count == 8, "the first + is the spotlight's")
+  drop run clickNth(&mut app, &mut tree, "+", 2)
+  run Testing.expect(
+    app.model.value.rows.asSlice()[1].counter.count == 3,
+    "the third + is the second row's",
+  )
+  run Testing.expect(
+    app.model.value.rows.asSlice()[0].counter.count == 0,
+    "the first row did not move",
+  )
+
+  // A row added later starts its command; a removed row leaves the others their nodes.
+  drop run click(&mut app, &mut tree, viewport(), "Add")
+  run Testing.expect(app.deferred() == 1, "the new row's command waits")
+  run settle(&mut app, &mut tree)
+  run Testing.expect(app.model.value.rows.asSlice()[2].counter.count == 4, "the new row loaded")
+  let four = (run idsOf(&mut tree, "4")).get(0)
+  drop run clickNth(&mut app, &mut tree, "Remove", 0)
+  run Testing.expect(app.model.value.rows.length() == 2, "Remove removes a row")
+  run Testing.expect(app.model.value.rows.asSlice()[0].id == 1, "the first one")
+  run Testing.expect((run idsOf(&mut tree, "4")).get(0) == four, "the others keep their nodes")
+
+  // A child's report reaches its parent.
+  drop run clickNth(&mut app, &mut tree, "+", 0)
+  run Testing.expect(app.model.value.timesReachedTen == 0, "nine is not ten")
+  drop run clickNth(&mut app, &mut tree, "+", 0)
+  run Testing.expect(app.model.value.spotlight.count == 10, "the spotlight is at ten")
+  run Testing.expect(app.model.value.timesReachedTen == 1, "and its parent heard")
+
+  // What a replaced spotlight started does not reach the new one.
+  drop run clickNth(&mut app, &mut tree, "later", 0)
+  run Testing.expect(app.model.value.spotlight.isResetting, "the reset waits")
+  run Testing.expect(app.deferred() == 1, "as a command")
+  drop run click(&mut app, &mut tree, viewport(), "Replace")
+  run Testing.expect(app.deferred() == 2, "the new spotlight's load waits too")
+  run settle(&mut app, &mut tree)
+  run Testing.expect(
+    app.model.value.spotlight.count == 3,
+    "the new spotlight loaded and kept its value",
+  )
+
+  // Children on timers: the same key in every child, apart by scope.
+  run Testing.expect(app.nextDeadline().isNone(), "no timer yet")
+  drop run clickNth(&mut app, &mut tree, "off", 1)
+  run Testing.expect(app.model.value.rows.asSlice()[0].counter.isAuto, "the first row counts")
+  run tick(&mut app, &mut tree, 1.0, false)
+  run Testing.expect(app.model.value.rows.asSlice()[0].counter.count == 4, "its tick reached it")
+  run Testing.expect(app.model.value.spotlight.count == 3, "and nothing else")
+  drop run clickNth(&mut app, &mut tree, "off", 0)
+  run tick(&mut app, &mut tree, 2.0, false)
+  run Testing.expect(app.model.value.rows.asSlice()[0].counter.count == 5, "the row ticks again")
+  run Testing.expect(app.model.value.spotlight.count == 4, "and so does the spotlight")
+  run Testing.expect(app.model.value.rows.asSlice()[1].counter.count == 4, "the still row stays")
+
+  // A parent's request reaches every child.
+  drop run click(&mut app, &mut tree, viewport(), "Reset all")
+  run Testing.expect(app.model.value.spotlight.count == 0, "the spotlight reset")
+  run Testing.expect(
+    app.model.value.rows.asSlice()[0].counter.count == 0
+      && app.model.value.rows.asSlice()[1].counter.count == 0,
+    "and every row",
+  )
+
+  // A removed child's timer stops.
+  drop run clickNth(&mut app, &mut tree, "Remove", 0)
+  drop run clickNth(&mut app, &mut tree, "on", 0)
+  run Testing.expect(app.nextDeadline().isNone(), "no child counts, no timer")
+}
+
+test effect fn submodelsByHand() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut vault = MemoryVault { calls: 0 }
+  run boardBody()
+    |> Effect.provideMut<Vault>(&mut vault)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(vault.calls == 5, "every load went through the vault")
+}
