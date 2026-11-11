@@ -42,10 +42,10 @@ Frame timings stay in the inspector: the window host produces them.
 | Area | Fact | Where |
 |---|---|---|
 | Root | One root per tree; `setRoot` detaches the previous one | `modules/tree/src/engine.silk:187`, `:1026` |
-| Root | `ROOT_ID = 1`; `dispatch` drops events whose path does not start there | `modules/app/src/ui.silk:75`, `runtime.silk:734` |
+| Root | `ROOT_ID = 1`; `dispatch` drops events whose path starts at neither it nor a declared window's root node | `modules/app/src/ui.silk:75`, `runtime.silk` |
 | Backend | `Backend` has `mutate`, `events`, `viewport`, `measure`, `range`, `navigate`; no root parameter | `modules/app/src/backend.silk:26` |
 | Events | `Event.path` runs from the root node to the target; no window field | `modules/protocol/src/record.silk:33` |
-| Native | The host runs one tree in one window | `modules/tree/window/src/host.silk:301` |
+| Native | The host runs one tree, with a window per open root | `modules/tree/window/src/host.silk` |
 | Native | The platform thread is already keyed by `WindowId` | `modules/tree/window/src/platform_thread.silk:57` |
 | DOM | One `Runtime` + one `Dom` per page; JS tracks one `rootId` | `modules/app/dom/src/page.silk:68` |
 | Inspector | One JSON line in, one out, then close | `modules/inspect/server/README.md:73` |

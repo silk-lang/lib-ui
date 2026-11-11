@@ -8,10 +8,17 @@
 //!
 //! The runtime talks to the tree only through its public protocol: `Mutation` batches in
 //! (`apply`), `Event` records out (`takeEvents`).
+//!
+//! The windows the model declares besides the first (`App.windows`, see `windows`) render with
+//! the view, each into a root of its own, and the diff of their declarations against the
+//! windows open goes in the same batch: `OpenRoot`, `UpdateRoot` and `CloseRoot`. A record whose
+//! path starts at a window's root node dispatches through that window's view, and the root
+//! events of a window reach the model through the window's handlers.
 import ui_protocol.css
 import ui_protocol.css { percent, Keyword, Declaration }
 import app { App, Perform, Context, Subscriptions, SubscriptionKind, Delivery }
-import diff { DiffState, diff }
+import diff { DiffState, diffFrom }
+import windows { Windows, WindowEvent, WindowRecord }
 import journal { Journal, MODEL_LIMIT, eventName }
 import show { Printer, show, showTree }
 import ui { Ui, Identity, AnchorRect, NO_ENTRY, ROOT_ID }
@@ -28,7 +35,7 @@ import ui_protocol.record { Event, EventKind }
 import ui_tree.node { FrameInput }
 import ui_protocol.input { Input, MOD_ALT, MOD_CONTROL, MOD_META, MOD_SHIFT }
 import ui_protocol.options { VirtualItem, RootOptions }
-import ui_protocol.root { RootEvent }
+import ui_protocol.root { RootEvent, RootEventKind }
 import ui_tree.virtual_list { VirtualRange }
 import ui_tree.engine { UiTree, TreeError }
 import backend { Backend, Measured }
@@ -38,6 +45,8 @@ import silk.collections.hash { Hash }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
 import silk.core.result { Result }
+import silk.collections.slice { Slice }
+import silk.geometry.size { Size2 }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.u32
 import silk.num.usize
@@ -69,6 +78,24 @@ pub struct RenderStats {
 
 impl Copy for RenderStats {}
 
+/// A window the model declared, and what the runtime opened for it.
+struct OpenWindow<M> {
+  key: u64,
+  root: u32,
+  /// Its root box, and its view's builder and diff state.
+  node: u32,
+  ui: Ui<M>,
+  diffState: DiffState,
+  /// What it was opened or last updated with.
+  title: List<u8>,
+  width: f32,
+  height: f32,
+  resizable: bool,
+  /// The backend could not show it: it stays closed until the model stops declaring it.
+  failed: bool,
+  seen: bool,
+}
+
 /// Runs app model `A` with messages `M` and commands `C`. See the module documentation.
 pub struct Runtime<A, M, C> {
   pub model: A,
@@ -98,6 +125,15 @@ pub struct Runtime<A, M, C> {
   held: List<C>,
   /// What the program did, once a host asks (`record`).
   pub journal: Journal,
+  /// The windows the model declares besides the first, and the ones open, oldest first.
+  pub windows: Windows<M>,
+  opened: List<OpenWindow<M>>,
+  /// The root id the next window opens as.
+  nextRoot: u32,
+  /// While a window's view runs: its key. `self.ui` and `self.diffState` are that window's
+  /// then (see `enter`).
+  inWindow: bool,
+  windowKey: u64,
 }
 
 impl<A: App<M, C>, M, C> Runtime<A, M, C> {
@@ -135,6 +171,11 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
       deferring: false,
       held: List<C>.make(),
       journal: Journal.make(),
+      windows: Windows<M>.make(),
+      opened: List<OpenWindow<M>>.make(),
+      nextRoot: FIRST_ROOT + 1,
+      inWindow: false,
+      windowKey: 0,
     }
   }
 
@@ -279,14 +320,8 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
     self.time = time
     let mut batch = List<Mutation>.make()
     run batch.append(Mutation.Create { id: ROOT_ID, kind: NodeKind.Box })
-    let mut style = List<Declaration>.make()
-    run style.append(css.display(Keyword.Flex))
-    run style.append(css.flexDirection(FlexDirection.Column))
-    run style.append(css.width(percent(100.0)))
-    run style.append(css.height(percent(100.0)))
-    run style.append(css.boxSizing(BoxSizing.BorderBox))
     run batch.append(
-      Mutation.SetStyle { id: ROOT_ID, state: StyleState.Base, declarations: move style },
+      Mutation.SetStyle { id: ROOT_ID, state: StyleState.Base, declarations: run rootStyle() },
     )
     run batch.append(
       Mutation.OpenRoot { root: FIRST_ROOT, node: ROOT_ID, options: RootOptions.default() },
@@ -311,24 +346,51 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
     return self.head < self.queue.length()
   }
 
-  /// Renders the view into `tree`: the diff against the last render goes in as one batch.
+  /// Renders the view into `tree`: the diff against the last render goes in as one batch,
+  /// with the declared windows' (see the module documentation).
   pub effect fn render<B: Backend>(self: &mut Self, tree: &mut B) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
     run self.collectSubscriptions()
-    run self.readAnchors(&mut tree)
+    self.batch.clear()
+    run self.renderView(&mut tree, FIRST_ROOT)
+    let nodes = self.ui.arena.entries.length()
+    let reused = self.ui.reused
+    run self.renderWindows(&mut tree)
+    self.stats.renders = self.stats.renders + 1
+    self.stats.mutations = self.batch.length()
+    self.stats.nodes = nodes
+    self.stats.reused = reused
+
+    // Transfer the batch in constant time. Removing its first mutation repeatedly
+    // shifts the remaining array and makes mounting a large view quadratic.
+    let batch = Intrinsic.replace(self.batch, List<Mutation>.make())
+    run Backend.mutate(&mut tree, move batch)
+  }
+
+  /// Runs the view in `self.ui` (the first window's, or the one `enter` swapped in), whose
+  /// root is `root`, and appends its diff to the batch.
+  effect fn renderView<B: Backend>(self: &mut Self, tree: &mut B, root: u32) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    run self.readAnchorsIn(&mut tree, root)
     run self.ui.beginRender()
-    App<M, C>.view(&self.model, &mut self.ui)
+    self.runView()
     self.ui.endRender()
     if self.keyBindings {
       // Key records reach the root wherever focus is, but only when a node on the path
       // listens: the root listens for the bindings.
-      let mut root = self.ui.arena.entry(0)
-      root.listeners = u32.bitOr(root.listeners, LISTEN_KEY_DOWN)
-      self.ui.arena.setEntry(0, root)
+      let mut top = self.ui.arena.entry(0)
+      top.listeners = u32.bitOr(top.listeners, LISTEN_KEY_DOWN)
+      self.ui.arena.setEntry(0, top)
     }
-    self.batch.clear()
-    run diff(&mut self.ui.arena, &self.ui.previous, &mut self.diffState, &mut self.batch)
+    run diffFrom(
+      &mut self.ui.arena,
+      &self.ui.previous,
+      &mut self.diffState,
+      &mut self.batch,
+      self.ui.rootId,
+    )
     let mut anchors = HashMap<u64, u32>.make(Hash.seed(0x616e6368))
     let mut entryIndex: u32 = 0
     while entryIndex < self.ui.arena.length() {
@@ -379,15 +441,258 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
       run self.batch.append(Mutation.SetVirtualItems { id: id, items: move items })
       v = v + 1
     }
-    self.stats.renders = self.stats.renders + 1
-    self.stats.mutations = self.batch.length()
-    self.stats.nodes = self.ui.arena.entries.length()
-    self.stats.reused = self.ui.reused
+  }
 
-    // Transfer the batch in constant time. Removing its first mutation repeatedly
-    // shifts the remaining array and makes mounting a large view quadratic.
-    let batch = Intrinsic.replace(self.batch, List<Mutation>.make())
-    run Backend.mutate(&mut tree, move batch)
+  /// Runs the view whose builder `self.ui` is: the app's, or in a window, that window's.
+  fn runView(self: &mut Self) -> () {
+    if !self.inWindow {
+      App<M, C>.view(&self.model, &mut self.ui)
+      return ()
+    }
+    let ui = Intrinsic.replace(self.ui, Ui<M>.make())
+    self.windows.beginView(self.windowKey, move ui)
+    App<M, C>.windows(&self.model, &mut self.windows)
+    self.ui = self.windows.endView()
+  }
+
+  /// Makes window `at`'s view builder and diff state the runtime's, for `renderView` and
+  /// `dispatchView`, until `leave`. Tree ids stay one sequence.
+  fn enter(self: &mut Self, at: usize) -> () {
+    let nextId = self.diffState.nextId
+    let list = self.opened.asMutSlice()
+    let ui = Intrinsic.replace(list[at].ui, Ui<M>.make())
+    let state = Intrinsic.replace(list[at].diffState, DiffState.make())
+    let key = list[at].key
+    drop list
+    let mainUi = Intrinsic.replace(self.ui, move ui)
+    let mainState = Intrinsic.replace(self.diffState, move state)
+    self.diffState.nextId = nextId
+    let back = self.opened.asMutSlice()
+    back[at].ui = move mainUi
+    back[at].diffState = move mainState
+    self.inWindow = true
+    self.windowKey = key
+  }
+
+  /// Gives window `at` its view builder and diff state back.
+  fn leave(self: &mut Self, at: usize) -> () {
+    let nextId = self.diffState.nextId
+    let list = self.opened.asMutSlice()
+    let mainUi = Intrinsic.replace(list[at].ui, Ui<M>.make())
+    let mainState = Intrinsic.replace(list[at].diffState, DiffState.make())
+    drop list
+    let ui = Intrinsic.replace(self.ui, move mainUi)
+    let state = Intrinsic.replace(self.diffState, move mainState)
+    self.diffState.nextId = nextId
+    let back = self.opened.asMutSlice()
+    back[at].ui = move ui
+    back[at].diffState = move state
+    self.inWindow = false
+  }
+
+  /// The declared window with key `key` (`what` 0), root `value` (1) or root node `value` (2),
+  /// or `usize.MAX`.
+  fn windowWhere(self: &Self, what: u32, key: u64, value: u32) -> usize {
+    let list = self.opened.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      let found = if what == 0 {
+        list[i].key == key
+      } else if what == 1 {
+        list[i].root == value
+      } else {
+        list[i].node == value
+      }
+      if found {
+        return i
+      }
+      i = i + 1
+    }
+    return usize.MAX
+  }
+
+  /// Asks the model for its windows and appends what makes the open ones match to the
+  /// batch: new windows open with their view, gone ones close, changed ones update, and every
+  /// open one renders its view again.
+  effect fn renderWindows<B: Backend>(self: &mut Self, tree: &mut B) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    self.windows.beginCollect()
+    App<M, C>.windows(&self.model, &mut self.windows)
+    if self.windows.records.length() == 0 && self.opened.length() == 0 {
+      return ()
+    }
+    let mut records = List<WindowRecord>.make()
+    run records.appendSlice(self.windows.list())
+    let mut titles = List<u8>.make()
+    run titles.appendSlice(self.windows.bytes.asSlice())
+    let marks = self.opened.asMutSlice()
+    let mut m: usize = 0
+    while m < marks.length {
+      marks[m].seen = false
+      m = m + 1
+    }
+    let declared = records.asSlice()
+    let mut r: usize = 0
+    while r < declared.length {
+      let record = declared[r]
+      r = r + 1
+      let title = Slice.view(
+        titles.asSlice(),
+        u32.toUsize(record.titleStart),
+        u32.toUsize(record.titleLength),
+      )
+      let mut at = self.windowWhere(0, record.key, 0)
+      let opening = at == usize.MAX
+      if opening {
+        let node = self.diffState.nextId
+        self.diffState.nextId = self.diffState.nextId + 1
+        let root = self.nextRoot
+        self.nextRoot = self.nextRoot + 1
+        run self.batch.append(Mutation.Create { id: node, kind: NodeKind.Box })
+        run self.batch.append(
+          Mutation.SetStyle { id: node, state: StyleState.Base, declarations: run rootStyle() },
+        )
+        let mut ui = Ui<M>.make()
+        ui.rootId = node
+        let mut stored = List<u8>.make()
+        run stored.appendSlice(title)
+        run self.opened.append(
+          OpenWindow<M> {
+            key: record.key,
+            root: root,
+            node: node,
+            ui: move ui,
+            diffState: DiffState.make(),
+            title: move stored,
+            width: record.width,
+            height: record.height,
+            resizable: record.resizable,
+            failed: false,
+            seen: true,
+          },
+        )
+        at = self.opened.length() - 1
+      } else {
+        let list = self.opened.asMutSlice()
+        list[at].seen = true
+        if list[at].failed {
+          continue
+        }
+        let changed = !same(list[at].title.asSlice(), title) || list[at].width != record.width
+          || list[at].height != record.height
+          || list[at].resizable != record.resizable
+        if changed {
+          list[at].title.clear()
+          list[at].width = record.width
+          list[at].height = record.height
+          list[at].resizable = record.resizable
+          let root = list[at].root
+          drop list
+          let shown = self.opened.asMutSlice()
+          run shown[at].title.appendSlice(title)
+          run self.batch.append(
+            Mutation.UpdateRoot { root: root, options: run optionsOf(title, record) },
+          )
+        }
+      }
+      let root = self.opened.asSlice()[at].root
+      self.enter(at)
+      run self.renderView(&mut tree, root)
+      self.leave(at)
+      if opening {
+        let node = self.opened.asSlice()[at].node
+        run self.batch.append(
+          Mutation.OpenRoot { root: root, node: node, options: run optionsOf(title, record) },
+        )
+      }
+    }
+
+    // The windows the model no longer declares close, and their nodes go.
+    let mut i: usize = 0
+    while i < self.opened.length() {
+      if self.opened.asSlice()[i].seen {
+        i = i + 1
+      } else {
+        let gone = self.opened.remove(i)
+        if !gone.failed {
+          run self.batch.append(Mutation.CloseRoot { root: gone.root })
+          run self.batch.append(Mutation.Destroy { id: gone.node })
+        }
+      }
+    }
+  }
+
+  /// Hands the root events of the declared windows to their handlers; their messages join
+  /// the queue. A window the backend could not show is not opened again while the model
+  /// declares it, and its nodes go. The first root's events are the host's (resize, ports).
+  pub effect fn rootEvents<B: Backend>(
+    self: &mut Self,
+    tree: &mut B,
+    events: &List<RootEvent>,
+  ) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let list = events.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      let event = list[i]
+      i = i + 1
+      if event.root == FIRST_ROOT {
+        continue
+      }
+      let at = self.windowWhere(1, 0, event.root)
+      if at == usize.MAX {
+        continue
+      }
+      let key = self.opened.asSlice()[at].key
+      match event.kind {
+        RootEventKind.CloseRequested => run self.deliverWindow(key, true, WindowEvent.Failed)
+        RootEventKind.Resized { width, height } => run self.deliverWindow(
+          key,
+          false,
+          WindowEvent.Resized { width: width, height: height },
+        )
+        RootEventKind.Focused => run self.deliverWindow(key, false, WindowEvent.Focused)
+        RootEventKind.Blurred => run self.deliverWindow(key, false, WindowEvent.Blurred)
+        RootEventKind.Failed => {
+          let list = self.opened.asMutSlice()
+          if !list[at].failed {
+            list[at].failed = true
+            list[at].ui = Ui<M>.make()
+            list[at].diffState = DiffState.make()
+            let node = list[at].node
+            drop list
+            let mut batch = List<Mutation>.make()
+            run batch.append(Mutation.Destroy { id: node })
+            run Backend.mutate(&mut tree, move batch)
+            run self.deliverWindow(key, false, WindowEvent.Failed)
+          }
+        }
+        _ => {}
+      }
+    }
+  }
+
+  /// Delivers a close request (`closing`) or `event` to the handlers of window `key`.
+  effect fn deliverWindow(self: &mut Self, key: u64, closing: bool, event: WindowEvent) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.windows.beginDelivery(key, closing, event)
+    App<M, C>.windows(&self.model, &mut self.windows)
+    self.windows.beginCollect()
+    let first = self.queue.length()
+    while self.windows.messages.length() != 0 {
+      run self.queue.append(self.windows.messages.remove(0))
+    }
+    run self.caused(
+      first,
+      if closing {
+        "window close"
+      } else {
+        "window"
+      },
+    )
   }
 
   /// Reconciles backend range requests with the virtual view. The tree owns geometry.
@@ -426,7 +731,14 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
   pub effect fn readAnchors<B: Backend>(self: &mut Self, tree: &mut B) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
-    self.ui.viewportBounds = Backend.viewport(&tree, FIRST_ROOT)
+    run self.readAnchorsIn(&mut tree, FIRST_ROOT)
+  }
+
+  /// `readAnchors` for the view in `self.ui`, whose root is `root`.
+  effect fn readAnchorsIn<B: Backend>(self: &mut Self, tree: &mut B, root: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.ui.viewportBounds = Backend.viewport(&tree, root)
     self.ui.anchors.clear()
     let count = self.ui.arena.length()
     let mut i: u32 = 0
@@ -728,18 +1040,37 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
     return value
   }
 
-  /// Dispatches `record` through the view: the messages its handlers send join the queue.
-  /// A record from another root (its path does not start at the view's root node), or whose
-  /// path names a node that is gone (a later record of a batch whose earlier ones changed the
-  /// view), is dropped.
+  /// Dispatches `record` through the view, or the view of the declared window whose root
+  /// node its path starts at: the messages its handlers send join the queue. A record from
+  /// another root, or whose path names a node that is gone (a later record of a batch whose
+  /// earlier ones changed the view), is dropped.
   pub effect fn dispatch(self: &mut Self, record: Event) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
     self.path.clear()
-    let ids = record.path.asSlice()
-    if ids.length == 0 || ids[0] != ROOT_ID {
+    let first = if record.path.length() == 0 {
+      0
+    } else {
+      record.path.get(0)
+    }
+    if first == ROOT_ID {
+      run self.dispatchView(move record)
       return ()
     }
+    let at = self.windowWhere(2, 0, first)
+    if at == usize.MAX || self.opened.asSlice()[at].failed {
+      return ()
+    }
+    self.enter(at)
+    run self.dispatchView(move record)
+    self.leave(at)
+  }
+
+  /// `dispatch` through the view whose builder `self.ui` is.
+  effect fn dispatchView(self: &mut Self, record: Event) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let ids = record.path.asSlice()
 
     // Whether the record's target is a text input: the keys it types are not key bindings.
     let mut typing = false
@@ -775,7 +1106,7 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
     let kind = record.kind
     let target = record.target
     run self.ui.beginDispatch(move record, self.path.asSlice())
-    App<M, C>.view(&self.model, &mut self.ui)
+    self.runView()
     let before = self.queue.length()
     run self.ui.endDispatch(&mut self.queue)
     if self.journal.on && self.queue.length() != before {
@@ -993,12 +1324,18 @@ pub effect fn pump<A: App<M, C>, M, C: Perform<M, E, R>, E, B: Backend, ? R>(
   runtime.records.clear()
   run Backend.events(&mut tree, &mut runtime.records)
 
-  // A program shows the first root only, and hears what happens to its window from the host
-  // (resize, ports): root events have no one to go to here.
+  // A program hears what happens to its first window from the host (resize, ports), and to
+  // the windows it declared through their handlers.
   let mut rootEvents = List<RootEvent>.make()
   run Backend.rootEvents(&mut tree, &mut rootEvents)
-  drop rootEvents
-  let handled = runtime.records.length() != 0
+  let mut handled = runtime.records.length() != 0
+  if rootEvents.length() != 0 {
+    run runtime.rootEvents(&mut tree, &rootEvents)
+    if runtime.pending() {
+      handled = true
+      run drain(&mut runtime, &mut tree)
+    }
+  }
   while runtime.records.length() != 0 {
     let record = runtime.records.remove(0)
     run runtime.readAnchors(&mut tree)
@@ -1142,13 +1479,53 @@ pub effect fn frame<A: App<M, C>, M, C: Perform<M, E, R>, E, ? R>(
 ) -> ()
   ! E | TreeError | OutOfMemoryError
   ? R | &mut Allocator {
+  run frameRoot(&mut runtime, &mut tree, FIRST_ROOT, input)
+}
+
+/// [`frame`] for root `root`: the first window's, or a declared window's in its own window.
+pub effect fn frameRoot<A: App<M, C>, M, C: Perform<M, E, R>, E, ? R>(
+  runtime: &mut Runtime<A, M, C>,
+  tree: &mut UiTree<'_>,
+  root: u32,
+  input: FrameInput,
+) -> ()
+  ! E | TreeError | OutOfMemoryError
+  ? R | &mut Allocator {
   let mut pass: usize = 0
   while pass < 8 {
-    run tree.frame(input)
+    run tree.frameRoot(root, input)
     drop run pump(&mut runtime, &mut tree)
-    if !tree.needsFrame() {
+    if !tree.needsFrameOf(root) {
       return ()
     }
     pass = pass + 1
   }
+}
+
+/// The style of a root box: a column filling its viewport.
+effect fn rootStyle() -> List<Declaration>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut style = List<Declaration>.make()
+  run style.append(css.display(Keyword.Flex))
+  run style.append(css.flexDirection(FlexDirection.Column))
+  run style.append(css.width(percent(100.0)))
+  run style.append(css.height(percent(100.0)))
+  run style.append(css.boxSizing(BoxSizing.BorderBox))
+  return move style
+}
+
+/// The root options of declared window `record`, titled `title`.
+effect fn optionsOf(title: &[u8], record: WindowRecord) -> RootOptions
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut options = RootOptions.default()
+  if let Result<string, InvalidUtf8>.Success { value } = String.fromUtf8(title) {
+    options.title = run String.copy(value)
+  }
+  if record.width > 0.0 && record.height > 0.0 {
+    options.size = Option<Size2<f32>>.some(Size2<f32>.new(record.width, record.height))
+  }
+  options.resizable = record.resizable
+  return move options
 }

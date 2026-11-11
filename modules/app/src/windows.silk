@@ -1,0 +1,252 @@
+//! [`Windows`]: the windows a model wants besides the first, declared from the model as
+//! `view` declares its nodes and `subscriptions` its timers and ports.
+//!
+//! ```silk,ignore
+//! fn windows(model: &Counter, w: &mut Windows<Message>) -> () {
+//!   if model.second {
+//!     w.window(
+//!       SECOND,
+//!       WindowSpec.titled("Second").sized(320.0, 200.0),
+//!       |h| second(model, h),
+//!       || Message.CloseSecond,
+//!     )
+//!   }
+//! }
+//! ```
+//!
+//! The runtime asks after every update and compares the answer with the windows it opened,
+//! by key: a new key opens a root (`Mutation.OpenRoot`) with the window's view in it, a key
+//! that is gone closes it (`CloseRoot`), and a new title or size updates it (`UpdateRoot`).
+//! Every window shares the one model; each view renders into its own root node, and an event
+//! in a window is dispatched through that window's view. The first window is `view`, as it
+//! always was.
+//!
+//! A window stays open as long as the model declares it. When the user asks to close it, the
+//! `closed` handler's message tells the model, which decides. `w.listen(key, handler)` hears
+//! the window's other events: its size, its focus, and `Failed` from a backend that cannot
+//! show another root (a document, a page). A failed window is not opened again until the model
+//! stops declaring it and declares it again.
+//!
+//! As with subscriptions, handlers are lambdas that are never stored: the runtime asks again
+//! with the key it wants and calls the matching one.
+import document { Document, Node, render }
+import heap { Heap }
+import ui { Ui }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.num.u32
+import silk.num.usize
+import silk.text.string { String }
+
+/// What a declared window asks to be. Every field is a request, as `RootOptions`' are.
+pub struct WindowSpec<'a> {
+  pub title: string<'a>,
+  /// The content size in CSS pixels; 0 for the backend's choice.
+  pub width: f32,
+  pub height: f32,
+  pub resizable: bool,
+}
+
+impl<'a> Copy for WindowSpec<'a> {}
+
+impl<'a> WindowSpec<'a> {
+  /// A resizable window titled `title`, sized by the backend.
+  pub fn titled(title: string<'a>) -> WindowSpec<'a> {
+    return WindowSpec<'a> { title: title, width: 0.0, height: 0.0, resizable: true }
+  }
+
+  /// The same window, `width` by `height` CSS pixels.
+  pub fn sized(self: Self, width: f32, height: f32) -> WindowSpec<'a> {
+    return WindowSpec<'a> {
+      title: self.title,
+      width: width,
+      height: height,
+      resizable: self.resizable,
+    }
+  }
+
+  /// The same window, which the user cannot resize.
+  pub fn fixed(self: Self) -> WindowSpec<'a> {
+    return WindowSpec<'a> {
+      title: self.title,
+      width: self.width,
+      height: self.height,
+      resizable: false,
+    }
+  }
+}
+
+/// What happened to a declared window, for `Windows.listen`.
+pub union WindowEvent {
+  /// The window's content is now `width` by `height` CSS pixels.
+  Resized { pub width: f32, pub height: f32 },
+  /// The window took the keyboard.
+  Focused,
+  /// The window lost the keyboard.
+  Blurred,
+  /// The backend could not show the window, so it is not open.
+  Failed,
+}
+
+impl Copy for WindowEvent {}
+
+/// One window the model declared.
+pub struct WindowRecord {
+  pub key: u64,
+  pub titleStart: u32,
+  pub titleLength: u32,
+  pub width: f32,
+  pub height: f32,
+  pub resizable: bool,
+}
+
+impl Copy for WindowRecord {}
+
+/// What `windows` is asked for: the windows it wants, one window's view, or a handler.
+enum Mode {
+  Collect,
+  View,
+  Deliver,
+}
+
+/// The builder `windows` writes into. See the module documentation.
+pub struct Windows<M> {
+  pub heap: Heap,
+  pub records: List<WindowRecord>,
+  pub bytes: List<u8>,
+  mode: Mode,
+  /// The window whose view or handler is wanted.
+  key: u64,
+  /// The builder of that window's view, while it is wanted.
+  ui: Option<Ui<M>>,
+  /// The event being delivered: a close request, or one for `listen`.
+  closing: bool,
+  event: WindowEvent,
+  pub messages: List<M>,
+}
+
+impl<M> Windows<M> {
+  pub fn make() -> Windows<M> {
+    return Windows<M> {
+      heap: Heap.make(),
+      records: List<WindowRecord>.make(),
+      bytes: List<u8>.make(),
+      mode: Mode.Collect,
+      key: 0,
+      ui: Option<Ui<M>>.None,
+      closing: false,
+      event: WindowEvent.Failed,
+      messages: List<M>.make(),
+    }
+  }
+
+  /// Starts collecting the windows the model declares.
+  pub fn beginCollect(self: &mut Self) -> () {
+    self.records.clear()
+    self.bytes.clear()
+    self.mode = Mode.Collect
+  }
+
+  /// Starts asking for the view of window `key`, built in `ui`. `endView` gives `ui` back.
+  pub fn beginView(self: &mut Self, key: u64, ui: Ui<M>) -> () {
+    self.mode = Mode.View
+    self.key = key
+    self.ui = Option<Ui<M>>.some(move ui)
+  }
+
+  /// Ends what `beginView` started: the builder, with what the view wrote.
+  pub fn endView(self: &mut Self) -> Ui<M> {
+    self.mode = Mode.Collect
+    return match move Intrinsic.replace(self.ui, Option<Ui<M>>.None) {
+      Option<Ui<M>>.Some { value } => move value
+      Option<Ui<M>>.None => Ui<M>.make()
+    }
+  }
+
+  /// Starts delivering a close request (`closing`) or `event` to the handlers of window `key`;
+  /// their messages land in `messages`.
+  pub fn beginDelivery(self: &mut Self, key: u64, closing: bool, event: WindowEvent) -> () {
+    self.mode = Mode.Deliver
+    self.key = key
+    self.closing = closing
+    self.event = event
+  }
+
+  /// The collected windows.
+  pub fn list(self: &Self) -> &[WindowRecord] {
+    return self.records.asSlice()
+  }
+
+  /// The title of `record`.
+  pub fn title(self: &Self, record: WindowRecord) -> &[u8] {
+    return Slice.view(
+      self.bytes.asSlice(),
+      u32.toUsize(record.titleStart),
+      u32.toUsize(record.titleLength),
+    )
+  }
+
+  /// A window, under `key`, showing `view`. `closed()` is the message for a request to close
+  /// it; the window stays until the model stops declaring it.
+  pub fn window(
+    self: &mut Self,
+    key: u64,
+    spec: WindowSpec<'_>,
+    view: fn(&Document<M>) -> Node,
+    closed: fn() -> M,
+  ) -> () {
+    self.windowWith(key, spec, |ui| render<M>(&mut ui, view), closed)
+  }
+
+  /// [`Windows.window`] with a view that writes into the `Ui` builder, as an `App`'s does.
+  pub fn windowWith(
+    self: &mut Self,
+    key: u64,
+    spec: WindowSpec<'_>,
+    view: fn(&mut Ui<M>) -> (),
+    closed: fn() -> M,
+  ) -> () {
+    match self.mode {
+      Mode.Collect => {
+        let start = usize.toU32(self.bytes.length())
+        self.heap.alloc(self.bytes.appendSlice(String.utf8Bytes(spec.title)))
+        let record = WindowRecord {
+          key: key,
+          titleStart: start,
+          titleLength: usize.toU32(String.byteLength(spec.title)),
+          width: spec.width,
+          height: spec.height,
+          resizable: spec.resizable,
+        }
+        self.heap.alloc(self.records.append(record))
+      }
+      Mode.View => {
+        if key == self.key {
+          if let Option<Ui<M>>.Some { value } = &mut self.ui {
+            view(&mut value)
+          }
+        }
+      }
+      Mode.Deliver => {
+        if key == self.key && self.closing {
+          self.heap.alloc(self.messages.append(closed()))
+        }
+      }
+    }
+  }
+
+  /// `handler(event)` for what happens to window `key` but a request to close it: its size,
+  /// its focus, and `Failed` when the backend cannot show it.
+  pub fn listen(self: &mut Self, key: u64, handler: fn(WindowEvent) -> M) -> () {
+    match self.mode {
+      Mode.Deliver => {
+        if key == self.key && !self.closing {
+          self.heap.alloc(self.messages.append(handler(self.event)))
+        }
+      }
+      _ => {}
+    }
+  }
+}

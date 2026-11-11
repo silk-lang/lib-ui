@@ -130,6 +130,23 @@ pub struct RootState {
   pub focusVisible: bool,
   /// The input of the root's last frame: its viewport.
   pub input: FrameInput,
+  /// What the root's last layout and paint left behind, and what changed since, so a root
+  /// nothing reached while it waited is neither laid out nor painted again when it is current.
+  laidOut: FrameInput,
+  laidOutRevision: usize,
+  laidOutScrolls: usize,
+  replayable: bool,
+  stylesDirty: bool,
+  applied: bool,
+  paintDirty: bool,
+  paintCachesStale: bool,
+  layoutObserversDirty: bool,
+  facesDirty: bool,
+  paintedAt: u64,
+  /// Whether a change reached the root's nodes while it waited without making it current (a
+  /// node moved out of it, a resource or font family they use was defined again): its next
+  /// frame styles, lays out and hashes again.
+  pub touched: bool,
   output: LayoutTree,
   sceneA: Scene,
   sceneB: Scene,
@@ -173,6 +190,18 @@ impl RootState {
       focused: NONE,
       focusVisible: false,
       input: FrameInput { width: 0.0, height: 0.0, scale: 1.0, time: 0.0 },
+      laidOut: FrameInput { width: -1.0, height: -1.0, scale: 0.0, time: 0.0 },
+      laidOutRevision: usize.MAX,
+      laidOutScrolls: usize.MAX,
+      replayable: false,
+      stylesDirty: true,
+      applied: true,
+      paintDirty: false,
+      paintCachesStale: true,
+      layoutObserversDirty: true,
+      facesDirty: true,
+      paintedAt: 0,
+      touched: false,
       output: LayoutTree.make(),
       sceneA: Scene.make(),
       sceneB: Scene.make(),
@@ -218,6 +247,35 @@ fn keyboardInput(input: &Input) -> bool {
     Input.ImePreedit { .. } => true
     Input.Paste { .. } => true
     _ => false
+  }
+}
+
+/// The node a mutation is about, in whose root it applies, or NONE: a new node, a resource,
+/// a root, or the root that has the keyboard or the press.
+fn nodeOf(mutation: &Mutation) -> u32 {
+  return match &mutation.* {
+    Mutation.SetAnchor { id, .. } => id
+    Mutation.ClearAnchor { id } => id
+    Mutation.SetVirtualList { id, .. } => id
+    Mutation.SetVirtualItems { id, .. } => id
+    Mutation.ClearVirtualList { id } => id
+    Mutation.InsertBefore { parent, .. } => parent
+    Mutation.Remove { id } => id
+    Mutation.Destroy { id } => id
+    Mutation.SetStyle { id, .. } => id
+    Mutation.ClearStyle { id, .. } => id
+    Mutation.SetText { id, .. } => id
+    Mutation.SetSelection { id, .. } => id
+    Mutation.SetAttribute { id, .. } => id
+    Mutation.SetListeners { id, .. } => id
+    Mutation.Focus { id } => id
+    Mutation.SetPointerCapture { id } => id
+    Mutation.ScrollTo { id, .. } => id
+    Mutation.ScrollIntoView { id } => id
+    Mutation.SetGrid { id, .. } => id
+    Mutation.SetSource { id, .. } => id
+    Mutation.SetCanvas { id, .. } => id
+    _ => NONE
   }
 }
 
@@ -283,8 +341,9 @@ fn applyAll(computed: &mut Computed, list: &List<Declaration>) -> () {
 /// the geometry queries and pointer input are about it, and the per-root fields below (`root`,
 /// `focused`, `input`, `output`, the scenes, hover, press and capture) are its state. The other
 /// open roots wait in `parked`. [`UiTree.useRoot`] and [`UiTree.frameRoot`] change the current
-/// root; key and text input go to `keyRoot`. Changing roots lays out and paints the new one
-/// in full at its next frame.
+/// root; key and text input go to `keyRoot`. A root keeps what its last layout and paint left
+/// with its state, so changing roots costs no layout or paint of its own: a root is laid out
+/// and painted again only for what changed in it. `apply` leaves the current root as it was.
 pub struct UiTree<'a> {
   /// Tree-owned virtualization controllers. Use mutations and `virtualRange` to access them.
   pub virtualLists: List<VirtualList>,
@@ -325,6 +384,10 @@ pub struct UiTree<'a> {
   laidOut: FrameInput,
   laidOutRevision: usize,
   laidOutScrolls: usize,
+  /// The viewport size css-layout's root has: the last root laid out sets it.
+  styledViewport: FrameInput,
+  /// The frame the current root last painted at: its subtrees cached then can be replayed.
+  paintedAt: u64,
   pub stats: FrameStats,
   pub events: List<Event>,
   /// The node ids in the order the last frame painted them (replayed subtrees included).
@@ -464,6 +527,8 @@ impl<'a> UiTree<'a> {
       laidOut: FrameInput { width: -1.0, height: -1.0, scale: 0.0, time: 0.0 },
       laidOutRevision: usize.MAX,
       laidOutScrolls: usize.MAX,
+      styledViewport: FrameInput { width: -1.0, height: -1.0, scale: 0.0, time: 0.0 },
+      paintedAt: 0,
       stats: FrameStats.zero(),
       events: List<Event>.make(),
       paintOrder: List<u32>.make(),
@@ -596,8 +661,20 @@ impl<'a> UiTree<'a> {
   // Mutations.
 
   /// Applies `batch` in order. On a bad mutation it stops and fails with its index; the
-  /// mutations before it stay applied.
+  /// mutations before it stay applied. A mutation about a node of another open root applies
+  /// in that root (see `applyOne`); the root that was current is current again afterwards,
+  /// unless the batch closed it.
   pub effect fn apply(self: &mut Self, batch: List<Mutation>) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let before = self.current
+    run self.applyAll(move batch)
+    if self.current != before && self.rootOpen(before) {
+      drop run self.useRoot(before)
+    }
+  }
+
+  effect fn applyAll(self: &mut Self, batch: List<Mutation>) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
     let mut mutations = move batch
@@ -626,11 +703,20 @@ impl<'a> UiTree<'a> {
     }
   }
 
-  /// Applies one mutation; `index` is reported in errors.
+  /// Applies one mutation; `index` is reported in errors. A mutation about a node of another
+  /// open root makes that root current first, so what it changes is that root's to lay out and
+  /// paint, and the current root's last frame still stands.
   pub effect fn applyOne(self: &mut Self, index: usize, mutation: Mutation) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
     self.semanticRevision = self.semanticRevision + 1
+    let about = nodeOf(&mutation)
+    if about != NONE && self.parked.length() != 0 {
+      let slot = self.slotOf(about)
+      if slot != NONE {
+        run self.useRootOf(slot)
+      }
+    }
     self.applied = true
     match move mutation {
       Mutation.SetAnchor { id, target, options } => {
@@ -656,12 +742,10 @@ impl<'a> UiTree<'a> {
       }
       Mutation.Remove { id } => {
         let slot = run self.require(index, id)
-        run self.useRootOf(slot)
         run self.detach(index, slot)
       }
       Mutation.Destroy { id } => {
         let slot = run self.require(index, id)
-        run self.useRootOf(slot)
         run self.destroy(index, slot)
       }
       Mutation.SetStyle { id, state, declarations } => {
@@ -811,7 +895,11 @@ impl<'a> UiTree<'a> {
       }
       Mutation.OpenRoot { root, node, options } => {
         let slot = run self.require(index, node)
+        let owner = self.rootHolding(slot)
         run self.openRoot(index, root, slot, move options)
+        if owner != NONE && owner != root {
+          self.touchRoot(owner)
+        }
       }
       Mutation.UpdateRoot { root, options } => {
         if root == self.current {
@@ -831,7 +919,6 @@ impl<'a> UiTree<'a> {
       }
       Mutation.Focus { id } => {
         let slot = run self.require(index, id)
-        run self.useRootOf(slot)
         run self.focusSlot(slot)
       }
       Mutation.Blur => {
@@ -841,7 +928,6 @@ impl<'a> UiTree<'a> {
       }
       Mutation.SetPointerCapture { id } => {
         let slot = run self.require(index, id)
-        run self.useRootOf(slot)
         drop run interact.setCapture(&mut self, slot)
       }
       Mutation.ReleasePointerCapture => {
@@ -856,7 +942,6 @@ impl<'a> UiTree<'a> {
       }
       Mutation.ScrollIntoView { id } => {
         let slot = run self.require(index, id)
-        run self.useRootOf(slot)
         self.viewScrollState.interruptAll()
         self.viewScrollAnimations.clear()
         run self.reveal.append(interact.pair(slot, id))
@@ -914,6 +999,12 @@ impl<'a> UiTree<'a> {
           i = i + 1
         }
         self.stylesDirty = true
+        let parked = self.parked.asMutSlice()
+        let mut p: usize = 0
+        while p < parked.length {
+          parked[p].touched = true
+          p = p + 1
+        }
       }
       Mutation.DefineImage { resource, data } => {
         let ok = run Effect.catch<ResourceError>(
@@ -1107,6 +1198,7 @@ impl<'a> UiTree<'a> {
     }
     let parentCss = self.node(parentSlot).css
     let childCss = self.node(childSlot).css
+    let from = self.rootHolding(childSlot)
     run Effect.catchAll(
       self.layout.insertBefore(NodeId { index: parentCss }, NodeId { index: childCss }, beforeCss),
       layoutFailed,
@@ -1114,6 +1206,11 @@ impl<'a> UiTree<'a> {
     let moved = self.nodeMut(childSlot)
     moved.parent = parentSlot
     self.stylesDirty = true
+
+    // The child left another root, which is not current: that root changed all the same.
+    if from != NONE && from != self.current {
+      self.touchRoot(from)
+    }
   }
 
   effect fn detach(self: &mut Self, index: usize, slot: u32) -> ()
@@ -1165,6 +1262,7 @@ impl<'a> UiTree<'a> {
     while p < parked.length {
       if parked[p].focused != NONE && contains(&doomed, parked[p].focused) {
         parked[p].focused = NONE
+        parked[p].touched = true
       }
       p = p + 1
     }
@@ -1266,6 +1364,72 @@ impl<'a> UiTree<'a> {
     return Rect<f32>.new(0.0, 0.0, input.width, input.height)
   }
 
+  /// The options root `root` was opened or last updated with, or None when it is not open.
+  pub fn rootOptions(self: &Self, root: u32) -> Option<&RootOptions> {
+    if root == self.current {
+      if self.currentOpen {
+        return Option<&RootOptions>.some(&self.currentOptions)
+      }
+      return Option<&RootOptions>.None
+    }
+    let at = self.parkedIndex(root)
+    if at == usize.MAX {
+      return Option<&RootOptions>.None
+    }
+    return Option<&RootOptions>.some(&self.parked.asSlice()[at].options)
+  }
+
+  /// The id of the open root `slot` is in, or NONE for a node in none.
+  pub fn rootHolding(self: &Self, slot: u32) -> u32 {
+    let top = self.topOf(slot)
+    if top == self.root && self.currentOpen {
+      return self.current
+    }
+    let parked = self.parked.asSlice()
+    let mut i: usize = 0
+    while i < parked.length {
+      if parked[i].root == top {
+        return parked[i].id
+      }
+      i = i + 1
+    }
+    return NONE
+  }
+
+  /// Says that something reached open root `root`'s nodes from outside it, so its next frame
+  /// styles and lays out again (see `RootState.touched`).
+  fn touchRoot(self: &mut Self, root: u32) -> () {
+    if root == self.current {
+      self.stylesDirty = true
+      self.applied = true
+      return ()
+    }
+    let at = self.parkedIndex(root)
+    if at != usize.MAX {
+      let parked = self.parked.asMutSlice()
+      parked[at].touched = true
+    }
+  }
+
+  /// `needsFrame` for root `root`, current or not: whether its next frame would draw something
+  /// new. A host with a window per root frames only the roots that answer yes. False for a
+  /// root that is not open.
+  pub fn needsFrameOf(self: &Self, root: u32) -> bool {
+    if root == self.current {
+      return self.currentOpen && self.needsFrame()
+    }
+    let at = self.parkedIndex(root)
+    if at == usize.MAX {
+      return false
+    }
+    let s = &self.parked.asSlice()[at]
+    return s.touched || s.applied || s.stylesDirty || s.paintDirty || s.scrolled
+      || s.reveal.length() != 0
+      || !s.replayable
+      || s.laidOutRevision == usize.MAX
+      || s.laidOutScrolls == usize.MAX
+  }
+
   /// The slot at the top of `slot`'s ancestors: a root node, or the top of a detached subtree.
   fn topOf(self: &Self, slot: u32) -> u32 {
     let mut at = slot
@@ -1329,6 +1493,21 @@ impl<'a> UiTree<'a> {
         self.input,
         FrameInput { width: 0.0, height: 0.0, scale: 1.0, time: 0.0 },
       ),
+      laidOut: Intrinsic.replace(
+        self.laidOut,
+        FrameInput { width: -1.0, height: -1.0, scale: 0.0, time: 0.0 },
+      ),
+      laidOutRevision: Intrinsic.replace(self.laidOutRevision, usize.MAX),
+      laidOutScrolls: Intrinsic.replace(self.laidOutScrolls, usize.MAX),
+      replayable: Intrinsic.replace(self.replayable, false),
+      stylesDirty: Intrinsic.replace(self.stylesDirty, true),
+      applied: Intrinsic.replace(self.applied, true),
+      paintDirty: Intrinsic.replace(self.paintDirty, false),
+      paintCachesStale: Intrinsic.replace(self.paintCachesStale, true),
+      layoutObserversDirty: Intrinsic.replace(self.layoutObserversDirty, true),
+      facesDirty: Intrinsic.replace(self.facesDirty, true),
+      paintedAt: Intrinsic.replace(self.paintedAt, 0),
+      touched: false,
       output: Intrinsic.replace(self.output, LayoutTree.make()),
       sceneA: Intrinsic.replace(self.sceneA, Scene.make()),
       sceneB: Intrinsic.replace(self.sceneB, Scene.make()),
@@ -1363,8 +1542,7 @@ impl<'a> UiTree<'a> {
     }
   }
 
-  /// Makes `state` the current root's. The css-layout tree, the viewport and the scenes the
-  /// caches refer to were another root's, so its next frame lays out, styles and paints anew.
+  /// Makes `state` the current root's, with what its last layout and paint left behind.
   fn unpark(self: &mut Self, state: RootState) -> () {
     let mut s = move state
     self.current = s.id
@@ -1374,6 +1552,17 @@ impl<'a> UiTree<'a> {
     self.focused = s.focused
     self.focusVisible = s.focusVisible
     self.input = s.input
+    self.laidOut = s.laidOut
+    self.laidOutRevision = s.laidOutRevision
+    self.laidOutScrolls = s.laidOutScrolls
+    self.replayable = s.replayable
+    self.stylesDirty = s.stylesDirty
+    self.applied = s.applied
+    self.paintDirty = s.paintDirty
+    self.paintCachesStale = s.paintCachesStale
+    self.layoutObserversDirty = s.layoutObserversDirty
+    self.facesDirty = s.facesDirty
+    self.paintedAt = s.paintedAt
     self.output = Intrinsic.replace(s.output, LayoutTree.make())
     self.sceneA = Intrinsic.replace(s.sceneA, Scene.make())
     self.sceneB = Intrinsic.replace(s.sceneB, Scene.make())
@@ -1405,8 +1594,13 @@ impl<'a> UiTree<'a> {
     self.pointerY = s.pointerY
     self.pointerInside = s.pointerInside
     self.reveal = Intrinsic.replace(s.reveal, List<u64>.make())
+    if s.touched {
+      self.stylesDirty = true
+      self.applied = true
+      self.layoutObserversDirty = true
+      self.laidOutRevision = usize.MAX
+    }
     drop s
-    self.restart()
   }
 
   /// Forgets what the last layout and paint left behind, for state that belongs to another
@@ -1452,8 +1646,18 @@ impl<'a> UiTree<'a> {
     if at == usize.MAX {
       return false
     }
+
+    // A change to the leaving root that its layout has not seen yet must not be caught up
+    // with below when it comes back.
+    if self.layout.revision() != self.laidOutRevision {
+      self.laidOutRevision = usize.MAX
+    }
+    if self.layout.scrollRevision() != self.laidOutScrolls {
+      self.laidOutScrolls = usize.MAX
+    }
     run self.mountCurrent(false)
     let next = self.parked.remove(at)
+    let untouched = !next.touched
     let previous = self.park()
     if self.currentOpen {
       run self.parked.append(move previous)
@@ -1462,6 +1666,13 @@ impl<'a> UiTree<'a> {
     }
     self.unpark(move next)
     run self.mountCurrent(true)
+
+    // Moving root nodes in and out of css-layout's viewport, and the other roots' changes,
+    // moved css-layout's revisions but not this root's nodes: its last layout stands.
+    if untouched && self.laidOutRevision != usize.MAX && self.laidOutScrolls != usize.MAX {
+      self.laidOutRevision = self.layout.revision()
+      self.laidOutScrolls = self.layout.scrollRevision()
+    }
     return true
   }
 
@@ -1812,7 +2023,7 @@ impl<'a> UiTree<'a> {
   /// The scroll offset of node `id`, (0, 0) when it does not scroll or does not exist.
   /// Node `id` was scrolled to (`x`, `y`) outside the tree, as a compositor scrolls the last
   /// frame without the tree: the tree takes the offset and tells scroll listeners, as a wheel
-  /// scroll does.
+  /// scroll does. The node's root becomes current.
   pub effect fn scrolledElsewhere(self: &mut Self, id: u32, x: f32, y: f32) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
@@ -1820,6 +2031,7 @@ impl<'a> UiTree<'a> {
     if slot == NONE {
       return ()
     }
+    run self.useRootOf(slot)
     self.viewScrollState.interruptTarget(
       ViewTarget { kind: ViewTargetKind.Element, id: u32.toUsize(id) },
     )
@@ -1934,6 +2146,12 @@ impl<'a> UiTree<'a> {
         let node = self.nodeMut(slot)
         node.content = node.content + 1
         self.paintCachesStale = true
+        if self.parked.length() != 0 {
+          let holder = self.rootHolding(slot)
+          if holder != NONE && holder != self.current {
+            self.touchRoot(holder)
+          }
+        }
         run self.updateNatural(slot)
       }
       slot = slot + 1
@@ -2303,18 +2521,22 @@ impl<'a> UiTree<'a> {
   effect fn layoutFrame(self: &mut Self) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
-    if self.input.width != self.laidOut.width || self.input.height != self.laidOut.height {
-      let mut viewport = CssStyle.make()
-      viewport.width = Dimension.px(self.input.width)
-      viewport.height = Dimension.px(self.input.height)
-      let viewportId = self.layout.root()
-      run Effect.catchAll(self.layout.setStyle(viewportId, move viewport), layoutFailed)
-    }
     if self.layout.revision() == self.laidOutRevision
       && self.layout.scrollRevision() == self.laidOutScrolls
       && self.input.width == self.laidOut.width
       && self.input.height == self.laidOut.height {
       return ()
+    }
+
+    // css-layout has one viewport, sized by whichever root was laid out last.
+    if self.input.width != self.styledViewport.width
+      || self.input.height != self.styledViewport.height {
+      let mut viewport = CssStyle.make()
+      viewport.width = Dimension.px(self.input.width)
+      viewport.height = Dimension.px(self.input.height)
+      let viewportId = self.layout.root()
+      run Effect.catchAll(self.layout.setStyle(viewportId, move viewport), layoutFailed)
+      self.styledViewport = self.input
     }
     let viewport = OptionalSize.definite(self.input.width, self.input.height)
     let moved = self.layout.revision() == self.laidOutRevision
@@ -2532,6 +2754,7 @@ impl<'a> UiTree<'a> {
         stats: &mut self.stats,
         order: &mut self.paintOrder,
         frame: self.frameNumber,
+        previousFrame: self.paintedAt,
         scale: self.input.scale,
         time: self.input.time,
         seed: self.seed,
@@ -2570,6 +2793,7 @@ impl<'a> UiTree<'a> {
         stats: &mut self.stats,
         order: &mut self.paintOrder,
         frame: self.frameNumber,
+        previousFrame: self.paintedAt,
         scale: self.input.scale,
         time: self.input.time,
         seed: self.seed,
@@ -2582,6 +2806,7 @@ impl<'a> UiTree<'a> {
       self.stats.primitives = self.sceneA.primitiveCount()
     }
     self.replayable = true
+    self.paintedAt = self.frameNumber
     self.paintIndexOf.clear()
     run self.paintIndexOf.appendRepeated(NONE, self.nodes.length())
     let mut orderIndex: usize = 0
@@ -2636,6 +2861,7 @@ impl<'a> UiTree<'a> {
       stats: &mut stats,
       order: &mut order,
       frame: self.frameNumber,
+      previousFrame: self.paintedAt,
       scale: self.input.scale,
       time: self.input.time,
       seed: self.seed,
@@ -2700,9 +2926,15 @@ impl<'a> UiTree<'a> {
     self.uploads.clear()
   }
 
-  /// Forces the next frame to paint everything again.
+  /// Forces the next frame of every root to paint everything again.
   pub fn invalidatePaint(self: &mut Self) -> () {
     self.replayable = false
+    let parked = self.parked.asMutSlice()
+    let mut i: usize = 0
+    while i < parked.length {
+      parked[i].replayable = false
+      i = i + 1
+    }
   }
 }
 

@@ -16,6 +16,12 @@
 //! new offsets and the UI thread learns them afterwards. Offsets a frame of the UI thread already
 //! took ([`RenderThread.submit`]'s `fastSeq`) are dropped.
 //!
+//! Windows past the first draw on the same thread, device and atlas textures, each through a
+//! surface of its own ([`RenderThread.openSurface`], [`RenderThread.submitTo`]); the compositor
+//! scrolls the first window only. Atlas pixels do not travel with a frame: every window's
+//! uploads join one queue, in the order the frames were painted, and the render thread writes
+//! them before it draws anything, so a window has the tiles another window's frame uploaded.
+//!
 //! Everything a frame carries lives in the process heap, never in a caller's arena: the copies
 //! are made with the system allocator, whatever allocator the caller provides.
 import ui_scene.scene { Scene }
@@ -112,8 +118,6 @@ impl Transferable for SurfaceHandle {}
 /// One frame for the render thread.
 struct FrameJob {
   scene: Scene,
-  textures: List<TextureInfo>,
-  uploads: Pending,
   width: u32,
   height: u32,
   /// The CPU reference to compare the drawn surface with, when `compare` is set.
@@ -171,8 +175,45 @@ pub struct FastScrolled {
 
 impl Copy for FastScrolled {}
 
+/// A frame of a window past the first, for its surface `surface`.
+struct ExtraJob {
+  surface: u32,
+  scene: Scene,
+  width: u32,
+  height: u32,
+}
+
+impl Transferable for ExtraJob {}
+
+/// A surface to make for a window past the first.
+struct SurfaceRequest {
+  surface: u32,
+  raw: RawSurface,
+  window: WindowId,
+}
+
+impl Transferable for SurfaceRequest {}
+
+/// The render thread's answer to a `SurfaceRequest`.
+struct SurfaceAnswer {
+  surface: u32,
+  made: bool,
+}
+
+impl Copy for SurfaceAnswer {}
+
 struct State {
   job: Option<FrameJob>,
+  /// The atlas pixels every frame handed over, oldest first, and the atlas's texture list as
+  /// of the newest frame.
+  uploads: Pending,
+  textures: List<TextureInfo>,
+  /// The newest frame of each window past the first that waits, surfaces to make and to
+  /// release, and the answers to the requests to make one.
+  extraJobs: List<ExtraJob>,
+  opening: List<SurfaceRequest>,
+  closing: List<u32>,
+  answers: List<SurfaceAnswer>,
   /// Draw the current frame again: the compositor moved a scroller.
   redraw: bool,
   /// The current frame's scroll groups and offsets, for the compositor's hit test.
@@ -203,6 +244,8 @@ pub struct RenderThread {
   /// Wakes the render thread.
   wake: Unparker,
   handle: Option<JoinHandle<i32>>,
+  /// The id the next surface of a window past the first gets.
+  nextSurface: u32,
 }
 
 impl RenderThread {
@@ -247,6 +290,7 @@ impl RenderThread {
       parker: move parker,
       wake: move wake,
       handle: Option<JoinHandle<i32>>.some(move handle),
+      nextSurface: 1,
     }
     run thread.waitReady()
     return move thread
@@ -307,8 +351,6 @@ impl RenderThread {
     }
     let job = FrameJob {
       scene: move copy,
-      textures: move textures,
-      uploads: Pending.make(),
       width: width,
       height: height,
       expected: move reference,
@@ -316,8 +358,81 @@ impl RenderThread {
       fast: move fast,
       fastSeq: fastSeq,
     }
-    run post(&self.shared, move job, uploads) |> Effect.provideMut<Allocator>(&mut heap)
+    run post(&self.shared, move job, move textures, uploads)
+      |> Effect.provideMut<Allocator>(&mut heap)
     self.wake.unpark()
+  }
+
+  /// Makes a surface for `window`, a window past the first, on the render thread and waits
+  /// for it. Returns its id for `submitTo`, or None when the surface cannot be made. Fails with
+  /// the render thread's error if it has stopped on one.
+  pub effect fn openSurface(self: &mut Self, raw: RawSurface, window: WindowId) -> Option<u32>
+    ! GpuError | OutOfMemoryError {
+    run raise(&self.shared)
+    let surface = self.nextSurface
+    self.nextSurface = self.nextSurface + 1
+    let mut heap = Allocator.systemAllocatorProvider()
+    run requestSurface(&self.shared, SurfaceRequest { surface: surface, raw: raw, window: window })
+      |> Effect.provideMut<Allocator>(&mut heap)
+    self.wake.unpark()
+    while true {
+      match answerOf(&self.shared, surface) {
+        Option<bool>.Some { value } => {
+          return if value {
+            Option<u32>.some(surface)
+          } else {
+            Option<u32>.None
+          }
+        }
+        Option<bool>.None => {
+          if stopped(&self.shared) {
+            break
+          }
+          self.parker.park()
+        }
+      }
+    }
+    run raise(&self.shared)
+    return Option<u32>.None
+  }
+
+  /// Hands a finished frame of the window of `surface` to the render thread, as `submit` does
+  /// for the first window: a frame of that window that waits is replaced.
+  pub effect fn submitTo(
+    self: &mut Self,
+    surface: u32,
+    scene: &Scene,
+    atlas: &Atlas,
+    uploads: &Pending,
+    width: u32,
+    height: u32,
+  ) -> ()
+    ! GpuError | OutOfMemoryError {
+    run raise(&self.shared)
+    let mut heap = Allocator.systemAllocatorProvider()
+    let mut copy = Scene.make()
+    run copy.copyFrom(scene) |> Effect.provideMut<Allocator>(&mut heap)
+    let mut textures = List<TextureInfo>.make()
+    let mut i: usize = 0
+    while i < atlas.textureCount() {
+      run textures.append(atlas.texture(i)) |> Effect.provideMut<Allocator>(&mut heap)
+      i = i + 1
+    }
+    let job = ExtraJob { surface: surface, scene: move copy, width: width, height: height }
+    run postExtra(&self.shared, move job, move textures, uploads)
+      |> Effect.provideMut<Allocator>(&mut heap)
+    self.wake.unpark()
+  }
+
+  /// Releases `surface` and waits until the render thread has, so its window can close.
+  pub fn closeSurface(self: &mut Self, surface: u32) -> () {
+    let mut heap = Allocator.systemAllocatorProvider()
+    drop run Effect.result(requestClose(&self.shared, surface))
+      |> Effect.provideMut<Allocator>(&mut heap)
+    self.wake.unpark()
+    while closing(&self.shared, surface) && !stopped(&self.shared) {
+      self.parker.park()
+    }
   }
 
   /// The handle the platform thread scrolls through.
@@ -397,22 +512,23 @@ fn takeFailure(shared: &Arc<Mutex<State>>) -> Option<GpuError> {
   return Intrinsic.replace(guard.getMut().failure, Option<GpuError>.None)
 }
 
-/// Puts `job` in the mailbox. A job still waiting there is replaced: its uploads go in front of
-/// `uploads`, and its scene's storage becomes the spare.
-effect fn post(shared: &Arc<Mutex<State>>, job: FrameJob, uploads: &Pending) -> ()
+/// Puts `job` in the mailbox, and its uploads and texture list in the queue. A job still
+/// waiting there is replaced, and its scene's storage becomes the spare.
+effect fn post(
+  shared: &Arc<Mutex<State>>,
+  job: FrameJob,
+  textures: List<TextureInfo>,
+  uploads: &Pending,
+) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
-  let mut next = move job
   let mut guard = shared.get().lock()
   let state = guard.getMut()
   let replaced = Intrinsic.replace(state.job, Option<FrameJob>.None)
   match move replaced {
     Option<FrameJob>.Some { value } => {
-      run next.uploads.appendAll(&value.uploads)
       let FrameJob {
         scene: old,
-        textures: t,
-        uploads: u,
         width: _,
         height: _,
         expected: e,
@@ -420,15 +536,98 @@ effect fn post(shared: &Arc<Mutex<State>>, job: FrameJob, uploads: &Pending) -> 
         fast: _,
         fastSeq: _
       } = move value
-      drop t
-      drop u
       drop e
       state.spare = Option<Scene>.some(move old)
     }
     Option<FrameJob>.None => ()
   }
-  run next.uploads.appendAll(uploads)
-  state.job = Option<FrameJob>.some(move next)
+  run state.uploads.appendAll(uploads)
+  state.textures = move textures
+  state.job = Option<FrameJob>.some(move job)
+}
+
+/// Puts `job` with the frames of windows past the first, replacing one of its window that
+/// waits, and its uploads and texture list in the queue.
+effect fn postExtra(
+  shared: &Arc<Mutex<State>>,
+  job: ExtraJob,
+  textures: List<TextureInfo>,
+  uploads: &Pending,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut guard = shared.get().lock()
+  let state = guard.getMut()
+  let mut i: usize = 0
+  while i < state.extraJobs.length() {
+    if state.extraJobs.asSlice()[i].surface == job.surface {
+      drop state.extraJobs.remove(i)
+    } else {
+      i = i + 1
+    }
+  }
+  run state.uploads.appendAll(uploads)
+  state.textures = move textures
+  run state.extraJobs.append(move job)
+}
+
+effect fn requestSurface(shared: &Arc<Mutex<State>>, request: SurfaceRequest) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut guard = shared.get().lock()
+  run guard.getMut().opening.append(move request)
+}
+
+effect fn requestClose(shared: &Arc<Mutex<State>>, surface: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut guard = shared.get().lock()
+  let state = guard.getMut()
+  let mut i: usize = 0
+  while i < state.extraJobs.length() {
+    if state.extraJobs.asSlice()[i].surface == surface {
+      drop state.extraJobs.remove(i)
+    } else {
+      i = i + 1
+    }
+  }
+  run state.closing.append(surface)
+}
+
+/// The render thread's answer for `surface`, taken: whether it was made, or None before it
+/// answered.
+fn answerOf(shared: &Arc<Mutex<State>>, surface: u32) -> Option<bool> {
+  let mut guard = shared.get().lock()
+  let state = guard.getMut()
+  let mut i: usize = 0
+  while i < state.answers.length() {
+    let answer = state.answers.get(i)
+    if answer.surface == surface {
+      drop state.answers.remove(i)
+      return Option<bool>.some(answer.made)
+    }
+    i = i + 1
+  }
+  return Option<bool>.None
+}
+
+/// Whether `surface` waits to be released.
+fn closing(shared: &Arc<Mutex<State>>, surface: u32) -> bool {
+  let guard = shared.get().lock()
+  let list = guard.get().closing.asSlice()
+  let mut i: usize = 0
+  while i < list.length {
+    if list[i] == surface {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+fn stopped(shared: &Arc<Mutex<State>>) -> bool {
+  let guard = shared.get().lock()
+  return guard.get().quit
 }
 
 effect fn makeShared() -> Arc<Mutex<State>>
@@ -436,6 +635,12 @@ effect fn makeShared() -> Arc<Mutex<State>>
   ? &mut Allocator {
   let state = State {
     job: Option<FrameJob>.None,
+    uploads: Pending.make(),
+    textures: List<TextureInfo>.make(),
+    extraJobs: List<ExtraJob>.make(),
+    opening: List<SurfaceRequest>.make(),
+    closing: List<u32>.make(),
+    answers: List<SurfaceAnswer>.make(),
     redraw: false,
     groups: List<ScrollGroup>.make(),
     painted: List<ScrollPosition>.make(),
@@ -498,6 +703,8 @@ union Work {
   Job { job: FrameJob },
   /// Draw the current frame again at newer scroll offsets.
   Redraw,
+  /// Make or release surfaces of windows past the first, or draw their frames.
+  Others,
   Quit
 }
 
@@ -531,9 +738,169 @@ fn takeWork(shared: &Arc<Mutex<State>>) -> Option<Work> {
     Option<FrameJob>.None => if state.redraw {
       state.redraw = false
       Option<Work>.some(Work.Redraw)
+    } else if state.extraJobs.length() != 0 || state.opening.length() != 0
+      || state.closing.length() != 0 {
+      Option<Work>.some(Work.Others)
     } else {
       Option<Work>.None
     }
+  }
+}
+
+/// A surface of a window past the first, on the render thread.
+struct ExtraSurface<'w> {
+  id: u32,
+  surface: Surface<'w>,
+  width: u32,
+  height: u32,
+}
+
+/// Makes the surfaces asked for and releases the ones asked to go, answering each.
+effect fn serveSurfaces<'w>(
+  shared: &Arc<Mutex<State>>,
+  wakeUi: &Unparker,
+  instance: &Instance,
+  owner: &'w WindowId,
+  surfaces: &mut List<ExtraSurface<'w>>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut guard = shared.get().lock()
+  let state = guard.getMut()
+  let mut opening = Intrinsic.replace(state.opening, List<SurfaceRequest>.make())
+  let closing = Intrinsic.replace(state.closing, List<u32>.make())
+  drop guard
+  if opening.length() == 0 && closing.length() == 0 {
+    return ()
+  }
+  let mut answers = List<SurfaceAnswer>.make()
+  while opening.length() != 0 {
+    let request = opening.remove(0)
+    let made = match unsafe targetOf(owner, request.raw) {
+      Option<SurfaceTarget>.Some { value } => {
+        let created = run Effect.result(
+          Surface.create(instance, &value, String.utf8Bytes("ui tree window")),
+        )
+        match move created {
+          Result.Success { value: surface } => {
+            run surfaces.append(
+              ExtraSurface<'w> { id: request.surface, surface: move surface, width: 0, height: 0 },
+            )
+            true
+          }
+          Result.Failure { error } => {
+            drop error
+            false
+          }
+        }
+      }
+      Option<SurfaceTarget>.None => false
+    }
+    run answers.append(SurfaceAnswer { surface: request.surface, made: made })
+  }
+  let gone = closing.asSlice()
+  let mut g: usize = 0
+  while g < gone.length {
+    let mut i: usize = 0
+    while i < surfaces.length() {
+      if surfaces.asSlice()[i].id == gone[g] {
+        let leaving = surfaces.remove(i)
+        leaving.surface.unconfigure()
+        drop leaving
+      } else {
+        i = i + 1
+      }
+    }
+    g = g + 1
+  }
+  let mut held = shared.get().lock()
+  run held.getMut().answers.appendSlice(answers.asSlice())
+  drop held
+  wakeUi.unpark()
+}
+
+/// Writes the atlas pixels that wait, with the texture list they go with.
+effect fn writeUploads(
+  shared: &Arc<Mutex<State>>,
+  device: &Device,
+  queue: &Queue,
+  textures: &mut GpuAtlas,
+) -> ()
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut guard = shared.get().lock()
+  let state = guard.getMut()
+  if state.uploads.entries().length == 0 && state.textures.length() == 0 {
+    return ()
+  }
+  let uploads = Intrinsic.replace(state.uploads, Pending.make())
+  let infos = Intrinsic.replace(state.textures, List<TextureInfo>.make())
+  drop guard
+  if infos.length() != 0 {
+    run textures.syncInfos(device, infos.asSlice())
+  }
+  let list = uploads.entries()
+  let mut i: usize = 0
+  while i < list.length {
+    textures.write(queue, list[i].tile, uploads.pixels(list[i]))
+    i = i + 1
+  }
+}
+
+/// Draws the frames of windows past the first that wait, each on its own surface.
+effect fn drawOthers<'w>(
+  shared: &Arc<Mutex<State>>,
+  device: &Device,
+  queue: &Queue,
+  renderer: &mut UiRenderer,
+  textures: &GpuAtlas,
+  surfaces: &mut List<ExtraSurface<'w>>,
+  format: u32,
+  alphaMode: u32,
+) -> ()
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut guard = shared.get().lock()
+  let mut jobs = Intrinsic.replace(guard.getMut().extraJobs, List<ExtraJob>.make())
+  drop guard
+  while jobs.length() != 0 {
+    let job = jobs.remove(0)
+    let mut at = usize.MAX
+    let mut i: usize = 0
+    while i < surfaces.length() {
+      if surfaces.asSlice()[i].id == job.surface {
+        at = i
+      }
+      i = i + 1
+    }
+    if at == usize.MAX || job.width == 0 || job.height == 0 {
+      continue
+    }
+    let target = &mut surfaces.asMutSlice()[at]
+    if job.width != target.width || job.height != target.height {
+      let mut configuration = SurfaceConfiguration.make(device, format, job.width, job.height)
+      if alphaMode != 0 {
+        configuration.setAlphaMode(alphaMode)
+      }
+      target.surface.configure(&configuration)
+      target.width = job.width
+      target.height = job.height
+    }
+    let texture = run target.surface.getCurrentTexture()
+    let view = run texture.texture.createView(&TextureViewDescriptor.default())
+    run renderer.setScrolls(&[])
+    run renderer.draw(
+      device,
+      queue,
+      &job.scene,
+      textures,
+      &view,
+      job.width,
+      job.height,
+      color.white(),
+    )
+    run target.surface.present()
+    run device.checkErrors()
   }
 }
 
@@ -596,8 +963,6 @@ fn retire(shared: &Arc<Mutex<State>>, job: FrameJob) -> () {
   if Option<Scene>.isNone(&values.spare) {
     let FrameJob {
       scene: used,
-      textures: t,
-      uploads: u,
       width: _,
       height: _,
       expected: e,
@@ -605,8 +970,6 @@ fn retire(shared: &Arc<Mutex<State>>, job: FrameJob) -> () {
       fast: f,
       fastSeq: _
     } = move job
-    drop t
-    drop u
     drop e
     drop f
     values.spare = Option<Scene>.some(move used)
@@ -680,11 +1043,17 @@ effect fn renderLoop(
     configuration.setUsage(flags.WGPUTextureUsage_RenderAttachment | flags.WGPUTextureUsage_CopySrc)
     renderer.setTextSettings(TextSettings.none())
   }
-  if capabilities.alphaModes().length != 0 {
-    configuration.setAlphaMode(capabilities.alphaModes()[0])
+  let alphaMode = if capabilities.alphaModes().length != 0 {
+    capabilities.alphaModes()[0]
+  } else {
+    0
+  }
+  if alphaMode != 0 {
+    configuration.setAlphaMode(alphaMode)
   }
   markReady(shared, format)
   wakeUi.unpark()
+  let mut others = List<ExtraSurface>.make()
 
   let mut configuredWidth: u32 = 0
   let mut configuredHeight: u32 = 0
@@ -693,6 +1062,27 @@ effect fn renderLoop(
   let mut newer = List<ScrollPosition>.make()
   while true {
     let work = nextWork(shared, parker)
+
+    // Whatever the work, surfaces change and atlas pixels are written first, and the other
+    // windows' frames are drawn, so the first window's frame below has every tile too.
+    let quitting = match &work {
+      Work.Quit => true
+      _ => false
+    }
+    if !quitting {
+      run serveSurfaces(shared, wakeUi, &instance, &owner, &mut others)
+      run writeUploads(shared, &device, &queue, &mut textures)
+      run drawOthers(
+        shared,
+        &device,
+        &queue,
+        &mut renderer,
+        &textures,
+        &mut others,
+        format,
+        alphaMode,
+      )
+    }
     let fresh = match move work {
       Work.Job { job } => {
         let mut next = move job
@@ -704,6 +1094,9 @@ effect fn renderLoop(
         true
       }
       Work.Redraw => false
+      Work.Others => {
+        continue
+      }
       Work.Quit => {
         break
       }
@@ -727,16 +1120,6 @@ effect fn renderLoop(
       configuredHeight = job.height
     }
     let start = run seconds(&mut clock)
-    if fresh {
-      run textures.syncInfos(&device, job.textures.asSlice())
-      let list = job.uploads.entries()
-      let mut i: usize = 0
-      while i < list.length {
-        textures.write(&queue, list[i].tile, job.uploads.pixels(list[i]))
-        i = i + 1
-      }
-      job.uploads.clear()
-    }
     let uploaded = run seconds(&mut clock)
     let texture = run gpuSurface.getCurrentTexture()
     let view = run texture.texture.createView(&TextureViewDescriptor.default())
@@ -790,6 +1173,11 @@ effect fn renderLoop(
     recordFrame(shared, report)
     wakeUi.unpark()
     previousPresented = presented
+  }
+  while others.length() != 0 {
+    let leaving = others.remove(0)
+    leaving.surface.unconfigure()
+    drop leaving
   }
   gpuSurface.unconfigure()
 }

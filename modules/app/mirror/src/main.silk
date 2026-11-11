@@ -1,0 +1,89 @@
+//! The mirror example in native windows: one count, shown and changed in two windows.
+//!
+//!   ui-app-mirror [--check]
+//!
+//! "Open second window" opens the second window; its close button, its Close button and the
+//! first window's "Close second window" close it. Either window's + and - change the count
+//! both show.
+//!
+//! `--check` ignores real input: it clicks "Open second window", which opens the second
+//! window, expects "Close second window", and compares the first window's surface with the
+//! CPU reference of the same frame. Exit code 0 within tolerance, 1 outside, 2 on an error.
+import ui_app_examples.mirror { Mirror, Message }
+import ui_app_examples.look { SANS }
+import ui_app.app { NoCommand }
+import ui_app_window.program { Launched, Window, launch, show, failed }
+import ui_fixtures.fixtures as fixtures
+import silk.collections.bytes { Bytes }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.host_input { HostInput, HostInputError }
+
+fn same(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < a.length {
+    if a[i] != b[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+effect fn checkMode() -> bool
+  ! HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator {
+  let count = run HostInput.argumentCount()
+  let mut i: usize = 1
+  while i < count {
+    if let Option<Bytes>.Some { value } = run HostInput.argument(i) {
+      if same(Bytes.asSlice(&value), b"--check") {
+        return true
+      }
+    }
+    i = i + 1
+  }
+  return false
+}
+
+effect fn noCheck<E>(error: E) -> bool {
+  drop error
+  return false
+}
+
+effect fn mirror(check: bool, platform: Option<Launched>) -> i32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut window = run Window.make("Mirror", 360.0, 200.0)
+  run window.font(SANS, "Noto Sans, sans-serif")
+  if check {
+    window.checking("Open second window", "Close second window")
+  }
+  let fonts = run fixtures.fonts()
+  return run show<Mirror, Message, NoCommand, never>(move window, &fonts, move platform)
+}
+
+/// The app, on the UI thread `launch` made.
+fn app(check: bool, platform: Option<Launched>) -> i32 {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(mirror(check, move platform), failed)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+pub effect fn main() -> i32
+  ? &mut HostInput {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let check = run Effect.catchAll(checkMode(), noCheck)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+
+  // The main thread keeps the OS event loop; the app runs on its own thread.
+  return launch(
+    fn(platform: Option<Launched>) -> i32 {
+      return app(check, move platform)
+    },
+  )
+}
