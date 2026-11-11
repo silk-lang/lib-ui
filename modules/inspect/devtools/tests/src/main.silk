@@ -1,17 +1,28 @@
 //! Goldens for the devtools window: each scene runs the devtools headless against the todo
 //! example (through the inspector protocol, as the tests do), then compares the devtools tree's
 //! `describe` snapshot (exactly) and its CPU drawing (each channel may differ by 2) with
-//! `<scene>.txt` and `<scene>.png` in the goldens directory. The last scene is the todo app
-//! itself with the highlight the devtools asked for drawn over it.
+//! `<scene>.txt` and `<scene>.png` in the goldens directory. Most scenes are at the design's
+//! 1440 by 900; one is docked (1280 by 360), one narrow enough to stack the inspector. The last
+//! scene is the todo app itself with the highlight the devtools asked for drawn over it.
 //!
 //! `ui-inspect-devtools-tests <goldens directory> [--update]`, from the repository root. With
 //! `--update` it writes the files instead. Exits 0 when everything matches, 1 on a mismatch, 2
 //! on an error.
 import inspected { Inspected }
 import replay { pullViews, clickView }
-import ui_devtools.lib { Devtools, Message, Command, Link, ViewHost }
-import ui_app.runtime { Runtime, drain }
-import ui_app.harness { click }
+import ui_devtools.lib {
+  Devtools,
+  Message,
+  Command,
+  Link,
+  ViewHost,
+  FONT,
+  MONO,
+  UI_FAMILIES,
+  MONO_FAMILIES
+}
+import ui_app.runtime { Runtime, drain, pump }
+import ui_app.harness { click, hover, typeText }
 import ui_inspect.query { Query, queryFirst }
 import ui_fixtures.fixtures as fixtures
 import ui_tree.legacy {
@@ -52,24 +63,36 @@ static if Intrinsic.targetOperatingSystem() == "windows" {
 
 const TOLERANCE: u32 = 2
 
-const SCENES: u32 = 9
+const SCENES: u32 = 13
 
 fn sceneName(index: u32) -> string<'static> {
   return match index {
-    0 => "devtools-styles"
-    1 => "devtools-box-model"
-    2 => "devtools-events"
-    3 => "devtools-program"
-    4 => "devtools-frames"
-    5 => "devtools-audit"
-    6 => "devtools-changes"
-    7 => "devtools-styles-edited"
+    0 => "devtools-design"
+    1 => "devtools-design-edited"
+    2 => "devtools-autocomplete"
+    3 => "devtools-styles"
+    4 => "devtools-styles-edited"
+    5 => "devtools-events"
+    6 => "devtools-program"
+    7 => "devtools-frames"
+    8 => "devtools-audit"
+    9 => "devtools-changes"
+    10 => "devtools-docked"
+    11 => "devtools-narrow"
     _ => "todo-highlight"
   }
 }
 
-fn viewport() -> FrameInput {
-  return FrameInput { width: 900.0, height: 560.0, scale: 1.0, time: 0.0 }
+/// The devtools at the design's size; docked at the bottom of a 1280 by 800 window (45%, the
+/// dock's share); in a window narrow enough to stack the inspector.
+fn viewport(index: u32) -> FrameInput {
+  if index == 10 {
+    return FrameInput { width: 1280.0, height: 360.0, scale: 1.0, time: 0.0 }
+  }
+  if index == 11 {
+    return FrameInput { width: 720.0, height: 520.0, scale: 1.0, time: 0.0 }
+  }
+  return FrameInput { width: 1440.0, height: 900.0, scale: 1.0, time: 0.0 }
 }
 
 effect fn say(text: string) -> ()
@@ -115,10 +138,29 @@ fn sameBytes(a: &[u8], b: &[u8]) -> bool {
   return true
 }
 
+/// Edits on the Add button as the inspector or an agent make them: its padding and radius,
+/// as the design shows, and a comment.
+effect fn editAdd(app: &mut Inspected<'_>, comment: bool) -> ()
+  ! TreeError | JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut reply = String.make()
+  run app.ask(
+    "{\"cmd\":\"setStyle\",\"role\":\"button\",\"name\":\"Add\",\"style\":\"padding: 4px 14px; border-radius: 8px\"}",
+    &mut reply,
+  )
+  if comment {
+    run app.ask(
+      "{\"cmd\":\"comment\",\"role\":\"button\",\"name\":\"Add\",\"text\":\"Match the radius of the title input next to it.\",\"author\":\"julia\"}",
+      &mut reply,
+    )
+  }
+}
+
 /// Runs the devtools against the todo app up to scene `index`.
 effect fn script(index: u32, app: &mut Inspected<'_>, tree: &mut UiTree<'_>) -> ()
   ! TreeError | JsonError | OutOfMemoryError
   ? &mut Allocator {
+  let at = viewport(index)
   let mut devtools = Runtime<Devtools, Message, Command>.make(run Devtools.make("todo (golden)"))
   run devtools.start(&mut tree, 0.0)
   devtools.send(Message.Refresh)
@@ -126,69 +168,92 @@ effect fn script(index: u32, app: &mut Inspected<'_>, tree: &mut UiTree<'_>) -> 
   let add = run queryFirst(&app.tree, &run Query.byRoleNamed(Role.Button, "Add"))
   let mut row = run String.copy("element-")
   run writeInt(&mut row, u32.toU64(add))
-  drop run click(&mut devtools, &mut tree, viewport(), String.view(&row))
+  drop run click(&mut devtools, &mut tree, at, String.view(&row))
     |> Effect.provideMut<Link>(&mut app)
-  if index == 1 {
-    drop run click(&mut devtools, &mut tree, viewport(), "Box model")
-      |> Effect.provideMut<Link>(&mut app)
-  }
-  if index == 2 {
-    let mut reply = String.make()
-    run app.ask("{\"cmd\":\"click\",\"role\":\"checkbox\",\"name\":\"Walk the dog\"}", &mut reply)
-    run app.ask("{\"cmd\":\"click\",\"role\":\"button\",\"name\":\"Add\"}", &mut reply)
-    drop run click(&mut devtools, &mut tree, viewport(), "Events")
-      |> Effect.provideMut<Link>(&mut app)
-    devtools.send(Message.Refresh)
-    run drain(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
-  }
-  if index == 3 {
-    // silk-ui's Program panel: the app renders it, the devtools replay it.
-    run app.reportProgram()
-    drop run click(&mut devtools, &mut tree, viewport(), "Program")
-      |> Effect.provideMut<Link>(&mut app)
-    let mut views = ViewHost.make()
-    run pullViews(&mut devtools, &mut tree, &mut views, &mut app)
-    drop run clickView(&mut devtools, &mut tree, viewport(), &mut views, &mut app, "Added")
-    run pullViews(&mut devtools, &mut tree, &mut views, &mut app)
-  }
-  if index == 4 {
-    let mut reply = String.make()
-    run app.ask("{\"cmd\":\"click\",\"role\":\"checkbox\",\"name\":\"Walk the dog\"}", &mut reply)
-    run app.ask("{\"cmd\":\"click\",\"role\":\"button\",\"name\":\"Add\"}", &mut reply)
-    drop run click(&mut devtools, &mut tree, viewport(), "Frames")
-      |> Effect.provideMut<Link>(&mut app)
-  }
-  if index == 5 {
-    drop run click(&mut devtools, &mut tree, viewport(), "Audit")
-      |> Effect.provideMut<Link>(&mut app)
-    drop run click(&mut devtools, &mut tree, viewport(), "Run audit")
-      |> Effect.provideMut<Link>(&mut app)
-  }
-  if index == 6 || index == 7 {
-    // Style edits, as the Styles panel or an agent make them, and comments with a thread.
-    let mut reply = String.make()
-    run app.ask(
-      "{\"cmd\":\"setStyle\",\"role\":\"button\",\"name\":\"Add\",\"style\":\"padding-left: 16px; border-top-left-radius: 8px\"}",
-      &mut reply,
-    )
-    if index == 6 {
-      run app.ask(
-        "{\"cmd\":\"comment\",\"role\":\"button\",\"name\":\"Add\",\"text\":\"Rounder corners all round\",\"author\":\"julia\"}",
-        &mut reply,
-      )
+  if index == 1 || index == 4 || index == 9 {
+    run editAdd(&mut app, index != 4)
+    if index == 9 {
+      let mut reply = String.make()
       run app.ask(
         "{\"cmd\":\"comment\",\"reply\":3,\"text\":\"Done in look.silk\",\"author\":\"agent\"}",
         &mut reply,
       )
       run app.ask("{\"cmd\":\"comment\",\"text\":\"The list looks cramped\"}", &mut reply)
-      run app.ask("{\"cmd\":\"resolve\",\"entry\":2}", &mut reply)
-      drop run click(&mut devtools, &mut tree, viewport(), "Changes")
-        |> Effect.provideMut<Link>(&mut app)
-    } else {
-      devtools.send(Message.Refresh)
+      run app.ask(
+        "{\"cmd\":\"setStyle\",\"role\":\"button\",\"name\":\"Add\",\"style\":\"font-weight: 600\"}",
+        &mut reply,
+      )
+    }
+    devtools.send(Message.Refresh)
+    run drain(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
+    if index == 9 {
+      // The weight is resolved: the code does it now.
+      let mut weight: u64 = 0
+      let rows = devtools.model.changes.asSlice()
+      let mut i: usize = 0
+      while i < rows.length {
+        if String.view(&rows[i].property) == "font-weight" {
+          weight = rows[i].id
+        }
+        i = i + 1
+      }
+      devtools.send(Message.Resolve { id: weight, reopen: false })
       run drain(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
     }
   }
+  if index == 2 {
+    drop run click(&mut devtools, &mut tree, at, "style-draft") |> Effect.provideMut<Link>(&mut app)
+    run typeText(&mut devtools, &mut tree, at, "font-") |> Effect.provideMut<Link>(&mut app)
+  }
+  if index == 3 || index == 4 {
+    drop run click(&mut devtools, &mut tree, at, "Declarations")
+      |> Effect.provideMut<Link>(&mut app)
+  }
+  if index == 5 {
+    let mut reply = String.make()
+    run app.ask("{\"cmd\":\"click\",\"role\":\"checkbox\",\"name\":\"Walk the dog\"}", &mut reply)
+    run app.ask("{\"cmd\":\"click\",\"role\":\"button\",\"name\":\"Add\"}", &mut reply)
+    drop run click(&mut devtools, &mut tree, at, "Events") |> Effect.provideMut<Link>(&mut app)
+    devtools.send(Message.Refresh)
+    run drain(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
+  }
+  if index == 6 || index == 10 {
+    // silk-ui's Program panel: the app renders it, the devtools replay it.
+    run app.reportProgram()
+    drop run click(&mut devtools, &mut tree, at, "Program") |> Effect.provideMut<Link>(&mut app)
+    let mut views = ViewHost.make()
+    run pullViews(&mut devtools, &mut tree, &mut views, &mut app)
+    drop run clickView(&mut devtools, &mut tree, at, &mut views, &mut app, "Added")
+    run pullViews(&mut devtools, &mut tree, &mut views, &mut app)
+  }
+  if index == 7 {
+    let mut reply = String.make()
+    run app.ask("{\"cmd\":\"click\",\"role\":\"checkbox\",\"name\":\"Walk the dog\"}", &mut reply)
+    run app.ask("{\"cmd\":\"click\",\"role\":\"button\",\"name\":\"Add\"}", &mut reply)
+    drop run click(&mut devtools, &mut tree, at, "Frames") |> Effect.provideMut<Link>(&mut app)
+  }
+  if index == 8 {
+    drop run click(&mut devtools, &mut tree, at, "Audit") |> Effect.provideMut<Link>(&mut app)
+    drop run click(&mut devtools, &mut tree, at, "Run audit") |> Effect.provideMut<Link>(&mut app)
+  }
+  if index == 9 {
+    drop run click(&mut devtools, &mut tree, at, "Edits") |> Effect.provideMut<Link>(&mut app)
+  }
+  if index == 11 {
+    drop run click(&mut devtools, &mut tree, at, "Inspector") |> Effect.provideMut<Link>(&mut app)
+  }
+  if index == 0 || index == SCENES - 1 {
+    // The pointer on another row: the app washes that node and keeps the selection's ring.
+    let heading = run queryFirst(&app.tree, &run Query.byText("Todos"))
+    let mut over = run String.copy("element-")
+    run writeInt(&mut over, u32.toU64(heading))
+    drop run hover(&mut devtools, &mut tree, at, String.view(&over))
+      |> Effect.provideMut<Link>(&mut app)
+  }
+
+  // The last frame's layout records (the devtools' width) are taken before the picture.
+  run tree.frame(at)
+  drop run pump(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
 }
 
 /// Runs scene `index` and returns its pixels and snapshot.
@@ -198,7 +263,8 @@ effect fn draw(index: u32, collection: &FontCollection, text: &mut String) -> Pi
   let mut app = run Inspected.make(collection)
   let mut tree = run UiTree.make(collection)
   let mut batch = Batch.make()
-  run batch.fontFamily(1, "Noto Sans, sans-serif")
+  run batch.fontFamily(FONT, UI_FAMILIES)
+  run batch.fontFamily(MONO, MONO_FAMILIES)
   run tree.apply(run batch.take())
   run script(index, &mut app, &mut tree)
   if index == SCENES - 1 {
@@ -207,7 +273,7 @@ effect fn draw(index: u32, collection: &FontCollection, text: &mut String) -> Pi
     run describe(&app.tree, DescribeOptions.plain(), &mut text)
     return run app.pixels.renderScene(&app.tree, app.protocol.overlayScene())
   }
-  run tree.frame(viewport())
+  run tree.frame(viewport(index))
   let mut snapshot = CpuSnapshot.make()
   run snapshot.sync(&mut tree)
   run describe(&tree, DescribeOptions.plain(), &mut text)

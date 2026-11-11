@@ -376,7 +376,8 @@ silk task native inspect      # the CLI drives the demo in a window
   the wire yet; sessions are still in memory
   (ui-inspect's `Session`).
 - Screenshots come from the CPU renderer, not a GPU readback.
-- The highlight has no name tag over the node.
+- The highlight has no name tag over the node: text needs glyphs in the tree's atlas, and the
+  overlay, composed over a finished frame, does not touch it.
 - The edit log lives as long as the app: it is not saved anywhere, and an app started again
   starts with none. Edits have no source location.
 - `edits` with `since` lists what changed after a seq, but not the entries that left the log

@@ -444,7 +444,10 @@ client's declarations it hides; it takes a comment on the selected node. Of the 
 paragraph: completion of property names from the css package's catalog and of values (the
 property's initial value and the CSS-wide keywords: the package has no per-property keyword
 table), and ArrowUp and ArrowDown stepping the last number (Shift 10, Alt 0.1), applied at
-once. The design sidebar is left for the visual redesign.
+once. The design sidebar came with the visual redesign: the inspector's Design segment has
+fields for the common properties, read from the computed style and written as declarations
+through the same layer, so each lands in the log; the Changes tab became the inspector's
+Edits segment, and the Styles panel its Declarations segment.
 
 **Deviations.** The layer is in `ui-tree` rather than the inspector, as the cleanest seam: the
 tree resolves styles, and anything that reapplied on restyle would have had to intercept the
@@ -470,7 +473,9 @@ demo restyles Archive when New adds a row.
 | 6 | Override layer, edit log, comments, MCP tools (done) | Agent workflow |
 | 7 | Tokens, TOML file, two-way editing | Theme editing |
 
-The Paper redesign can be built from step 2 onward. DOM multi-root and
+The Paper redesign (instrument black and amber, Geist and Geist Mono, three columns) is
+built: `theme.silk` and `design.silk` in the devtools, the Program panel in `panel.silk`, the
+highlight in `ui-inspect`'s overlay. DOM multi-root and
 inspecting DOM programs follow step 3 and are not scheduled here.
 
 ## Decisions

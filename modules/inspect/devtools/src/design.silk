@@ -1,0 +1,724 @@
+//! The Design segment's fields: the common properties of the selected node (size, direction,
+//! gap, padding, alignment, fill, border, radius, font, size and line height, weight), read out
+//! of its node view (the `inspect` text the devtools already have), and what to set when one is
+//! typed into: plain declarations for `setStyle`, so an edit made here is an edit like any
+//! other, laid over the app and logged.
+import data { Detail, MARK_EDITED }
+import silk.color.rgba { Rgba }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+import silk.text.string { String }
+
+pub const FIELD_WIDTH: u32 = 0
+
+pub const FIELD_HEIGHT: u32 = 1
+
+pub const FIELD_DIRECTION: u32 = 2
+
+pub const FIELD_GAP: u32 = 3
+
+pub const FIELD_PADDING: u32 = 4
+
+pub const FIELD_ALIGN: u32 = 5
+
+pub const FIELD_FILL: u32 = 6
+
+pub const FIELD_BORDER: u32 = 7
+
+pub const FIELD_RADIUS: u32 = 8
+
+/// The font family: shown, not edited (families are ids the app defines).
+pub const FIELD_FONT: u32 = 9
+
+/// Font size and line height, as `13 / 16`.
+pub const FIELD_TEXT: u32 = 10
+
+pub const FIELD_WEIGHT: u32 = 11
+
+pub const FIELD_COUNT: u32 = 12
+
+/// No field is being typed into.
+pub const NO_FIELD: u32 = 4294967295
+
+/// The label a field shows in front of its value (empty for the fill, border and text fields,
+/// which lead with a swatch or nothing).
+pub fn fieldLabel(field: u32) -> string<'static> {
+  return match field {
+    0 => "W"
+    1 => "H"
+    2 => "↔"
+    3 => "Gap"
+    4 => "Pad"
+    5 => "Align"
+    8 => "Radius"
+    _ => ""
+  }
+}
+
+/// The name a field goes by for assistive technology and tests.
+pub fn fieldName(field: u32) -> string<'static> {
+  return match field {
+    0 => "Width"
+    1 => "Height"
+    2 => "Direction"
+    3 => "Gap"
+    4 => "Padding"
+    5 => "Align items"
+    6 => "Fill"
+    7 => "Border"
+    8 => "Radius"
+    9 => "Font family"
+    10 => "Font size and line height"
+    _ => "Font weight"
+  }
+}
+
+/// The test id of a field's input.
+pub fn fieldTestId(field: u32) -> string<'static> {
+  return match field {
+    0 => "field-width"
+    1 => "field-height"
+    2 => "field-direction"
+    3 => "field-gap"
+    4 => "field-padding"
+    5 => "field-align"
+    6 => "field-fill"
+    7 => "field-border"
+    8 => "field-radius"
+    9 => "field-font"
+    10 => "field-text"
+    _ => "field-weight"
+  }
+}
+
+/// Whether property `property` is one field `field` sets or shows.
+pub fn fieldCovers(field: u32, property: string) -> bool {
+  return match field {
+    0 => property == "width" || property == "flex-grow"
+    1 => property == "height"
+    2 => property == "flex-direction" || property == "display"
+    3 => property == "gap" || property == "row-gap" || property == "column-gap"
+    4 => property == "padding" || String.startsWith(property, "padding-")
+    5 => property == "align-items"
+    6 => property == "background-color" || property == "background"
+    7 => property == "border" || property == "border-style" || property == "border-color"
+      || (String.startsWith(property, "border-") && String.endsWith(property, "-width"))
+      || (String.startsWith(property, "border-") && String.endsWith(property, "-color"))
+      || (String.startsWith(property, "border-") && String.endsWith(property, "-style"))
+    8 => property == "border-radius" || String.endsWith(property, "-radius")
+    9 => property == "font-family"
+    10 => property == "font-size" || property == "line-height"
+    _ => property == "font-weight"
+  }
+}
+
+/// Whether some field covers property `property`: the Design segment lists the rest under
+/// other declarations.
+pub fn covered(property: string) -> bool {
+  let mut field: u32 = 0
+  while field < FIELD_COUNT {
+    if fieldCovers(field, property) {
+      return true
+    }
+    field = field + 1
+  }
+  return false
+}
+
+/// The property a declaration line of the node view (`  name: value;`) declares, or "" for
+/// another line.
+pub fn nameOf<'a>(line: string<'a>) -> string<'a> {
+  if !String.startsWith(line, "  ") {
+    return ""
+  }
+  return match String.find(line, ": ") {
+    Option<usize>.Some { value: colon } => String.slice(line, 2, colon - 2)
+    Option<usize>.None => ""
+  }
+}
+
+/// The value a declaration line declares, without its `;`, or "".
+pub fn valueOf<'a>(line: string<'a>) -> string<'a> {
+  if !String.startsWith(line, "  ") {
+    return ""
+  }
+  return match String.find(line, ": ") {
+    Option<usize>.Some { value: colon } => {
+      let mut end = String.byteLength(line)
+      if String.endsWith(line, ";") {
+        end = end - 1
+      }
+      String.slice(line, colon + 2, end - colon - 2)
+    }
+    Option<usize>.None => ""
+  }
+}
+
+/// The section a heading line opens (`style base edited {` opens `base edited`), or "".
+fn sectionOf<'a>(line: string<'a>) -> string<'a> {
+  if String.startsWith(line, "style ") && String.endsWith(line, " {") {
+    return String.slice(line, 6, String.byteLength(line) - 8)
+  }
+  return ""
+}
+
+/// The value of `property` in section `section` of the node view, or "".
+pub fn valueIn<'a>(detail: &'a Detail, section: string, property: string) -> string<'a> {
+  let at = lineIn(detail, section, property)
+  if at == usize.MAX {
+    return ""
+  }
+  return valueOf(String.view(&detail.lines.asSlice()[at]))
+}
+
+/// The index of the line declaring `property` in section `section`, or `usize.MAX`.
+fn lineIn(detail: &Detail, section: string, property: string) -> usize {
+  let lines = detail.lines.asSlice()
+  let mut inside = false
+  let mut found = usize.MAX
+  let mut i: usize = 0
+  while i < lines.length {
+    let line = String.view(&lines[i])
+    let heading = sectionOf(line)
+    if heading != "" {
+      inside = heading == section
+    } else if line == "}" {
+      inside = false
+    } else if inside && nameOf(line) == property {
+      found = i
+    }
+    i = i + 1
+  }
+  return found
+}
+
+/// The computed value of `property`, or "".
+pub fn computed<'a>(detail: &'a Detail, property: string) -> string<'a> {
+  return valueIn(detail, "computed", property)
+}
+
+/// What the app declares for `property` in the base state, the edit laid over it first, or "".
+pub fn declared<'a>(detail: &'a Detail, property: string) -> string<'a> {
+  let edited = valueIn(detail, "base edited", property)
+  if edited != "" {
+    return edited
+  }
+  return valueIn(detail, "base", property)
+}
+
+/// Whether an edit of the node sets a property field `field` covers.
+pub fn fieldEdited(detail: &Detail, field: u32) -> bool {
+  let lines = detail.lines.asSlice()
+  let marks = detail.marks.asSlice()
+  let mut i: usize = 0
+  while i < lines.length && i < marks.length {
+    if marks[i] == MARK_EDITED {
+      let name = nameOf(String.view(&lines[i]))
+      if name != "" && fieldCovers(field, name) {
+        return true
+      }
+    }
+    i = i + 1
+  }
+  return false
+}
+
+/// `value` without a trailing `px`.
+pub fn bare<'a>(value: string<'a>) -> string<'a> {
+  if String.endsWith(value, "px") {
+    return String.slice(value, 0, String.byteLength(value) - 2)
+  }
+  return value
+}
+
+/// Appends `value` with its first letter in capitals.
+effect fn appendCapital(out: &mut String, value: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let bytes = String.utf8Bytes(value)
+  if bytes.length != 0 && bytes[0] >= 97 && bytes[0] <= 122 {
+    run out.append(String.slice("ABCDEFGHIJKLMNOPQRSTUVWXYZ", u8.toUsize(bytes[0] - 97), 1))
+    run out.append(String.slice(value, 1, bytes.length - 1))
+  } else {
+    run out.append(value)
+  }
+}
+
+/// Appends every space-separated length of `value` without its `px`.
+effect fn appendBare(out: &mut String, value: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut parts = String.split(value, " ")
+  let mut first = true
+  while true {
+    match parts.next() {
+      Option<string>.Some { value: part } => {
+        if part != "" {
+          if !first {
+            run out.append(" ")
+          }
+          first = false
+          run out.append(bare(part))
+        }
+      }
+      Option<string>.None => {
+        break
+      }
+    }
+  }
+}
+
+fn isFlex(detail: &Detail) -> bool {
+  return String.contains(computed(detail, "display"), "flex")
+}
+
+fn number(text: string) -> Option<u32> {
+  let bytes = String.utf8Bytes(text)
+  if bytes.length == 0 {
+    return Option<u32>.None
+  }
+  let mut value: u32 = 0
+  let mut i: usize = 0
+  while i < bytes.length {
+    if bytes[i] < 48 || bytes[i] > 57 {
+      return Option<u32>.None
+    }
+    value = value * 10 + u8.toU32(bytes[i] - 48)
+    i = i + 1
+  }
+  return Option<u32>.some(value)
+}
+
+/// A computed color (`rgb(r, g, b)` or `rgba(r, g, b, a)`) as its channels 0 to 255 and its alpha
+/// 0 to 1, or None for anything else (a gradient).
+pub fn channels(value: string) -> Option<[f32; 4]> {
+  let open = match String.find(value, "(") {
+    Option<usize>.Some { value: at } => at
+    Option<usize>.None => {
+      return Option<[f32; 4]>.None
+    }
+  }
+  if !String.startsWith(value, "rgb") || !String.endsWith(value, ")") {
+    return Option<[f32; 4]>.None
+  }
+  let inner = String.slice(value, open + 1, String.byteLength(value) - open - 2)
+  let mut out: [f32; 4] = [0.0, 0.0, 0.0, 1.0]
+  let mut parts = String.split(inner, ",")
+  let mut k: usize = 0
+  while k < 4 {
+    match parts.next() {
+      Option<string>.Some { value: raw } => {
+        let part = String.trim(raw)
+        if k < 3 {
+          match number(part) {
+            Option<u32>.Some { value: n } => {
+              out[k] = u32.toF32(n)
+            }
+            Option<u32>.None => {
+              return Option<[f32; 4]>.None
+            }
+          }
+        } else {
+          out[3] = fraction(part)
+        }
+      }
+      Option<string>.None => {
+        if k < 3 {
+          return Option<[f32; 4]>.None
+        }
+      }
+    }
+    k = k + 1
+  }
+  return Option<[f32; 4]>.some(out)
+}
+
+/// A decimal between 0 and 1 (`0.5`, `1`, `0`).
+fn fraction(text: string) -> f32 {
+  let bytes = String.utf8Bytes(text)
+  let mut whole: f32 = 0.0
+  let mut part: f32 = 0.0
+  let mut scale: f32 = 1.0
+  let mut point = false
+  let mut i: usize = 0
+  while i < bytes.length {
+    let b = bytes[i]
+    if b == 46 {
+      point = true
+    } else if b >= 48 && b <= 57 {
+      if point {
+        scale = scale / 10.0
+        part = part + u8.toF32(b - 48) * scale
+      } else {
+        whole = whole * 10.0 + u8.toF32(b - 48)
+      }
+    }
+    i = i + 1
+  }
+  return whole + part
+}
+
+const DIGITS: string = "0123456789ABCDEF"
+
+effect fn appendHex(out: &mut String, channel: f32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let n = f32.toU32(f32.floor(channel + 0.5))
+  run out.append(String.slice(DIGITS, u32.toUsize(n / 16), 1))
+  run out.append(String.slice(DIGITS, u32.toUsize(n % 16), 1))
+}
+
+/// A computed color as `#RRGGBB` (and its opacity in percent when not opaque), or `none` when
+/// it is clear.
+pub effect fn colorText(value: string, out: &mut String) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match channels(value) {
+    Option<[f32; 4]>.Some { value: c } => {
+      if c[3] == 0.0 {
+        run out.append("none")
+        return ()
+      }
+      run out.append("#")
+      run appendHex(&mut out, c[0])
+      run appendHex(&mut out, c[1])
+      run appendHex(&mut out, c[2])
+      if c[3] < 1.0 {
+        run out.append(" ")
+        let percent = f32.toU32(f32.floor(c[3] * 100.0 + 0.5))
+        run appendInt(&mut out, percent)
+        run out.append("%")
+      }
+    }
+    Option<[f32; 4]>.None => {
+      if String.startsWith(value, "linear-gradient") {
+        run out.append("gradient")
+      } else {
+        run out.append(value)
+      }
+    }
+  }
+}
+
+effect fn appendInt(out: &mut String, value: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if value >= 10 {
+    run appendInt(&mut out, value / 10)
+  }
+  run out.append(String.slice("0123456789", u32.toUsize(value % 10), 1))
+}
+
+/// The swatch color of a computed color, and whether it is clear.
+pub fn swatchOf(value: string) -> Option<Rgba<f32>> {
+  return match channels(value) {
+    Option<[f32; 4]>.Some { value: c } => {
+      if c[3] == 0.0 {
+        Option<Rgba<f32>>.None
+      } else {
+        Option<Rgba<f32>>.some(
+          Rgba<f32> { r: c[0] / 255.0, g: c[1] / 255.0, b: c[2] / 255.0, a: c[3] },
+        )
+      }
+    }
+    Option<[f32; 4]>.None => Option<Rgba<f32>>.None
+  }
+}
+
+/// A size field's text: the declared length without `px`, `Fill` for a node that grows or is as
+/// wide as its parent, `Hug` for one sized by its content.
+effect fn sizeText(detail: &Detail, property: string, grows: bool, out: &mut String) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let value = computed(detail, property)
+  if value == "100%" || ((value == "auto" || value == "") && grows) {
+    run out.append("Fill")
+  } else if value == "auto" || value == "" {
+    run out.append("Hug")
+  } else {
+    run out.append(bare(value))
+  }
+}
+
+/// The text field `field` shows for the inspected node.
+pub effect fn fieldText(detail: &Detail, field: u32, out: &mut String) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  let flex = isFlex(detail)
+  if field == FIELD_WIDTH {
+    let grow = computed(detail, "flex-grow")
+    run sizeText(detail, "width", grow != "" && grow != "0", &mut out)
+  } else if field == FIELD_HEIGHT {
+    run sizeText(detail, "height", false, &mut out)
+  } else if field == FIELD_DIRECTION {
+    if flex {
+      run appendCapital(&mut out, computed(detail, "flex-direction"))
+    } else {
+      run appendCapital(&mut out, computed(detail, "display"))
+    }
+  } else if field == FIELD_GAP {
+    if !flex {
+      run out.append("-")
+    } else {
+      let direction = computed(detail, "flex-direction")
+      let gap = if String.startsWith(direction, "column") {
+        computed(detail, "row-gap")
+      } else {
+        computed(detail, "column-gap")
+      }
+      if gap == "normal" || gap == "" {
+        run out.append("0")
+      } else {
+        run out.append(bare(gap))
+      }
+    }
+  } else if field == FIELD_PADDING {
+    let t = bare(computed(detail, "padding-top"))
+    let r = bare(computed(detail, "padding-right"))
+    let b = bare(computed(detail, "padding-bottom"))
+    let l = bare(computed(detail, "padding-left"))
+    run out.append(t)
+    if !(t == r && t == b && t == l) {
+      run out.append(" ")
+      run out.append(r)
+      if !(t == b && r == l) {
+        run out.append(" ")
+        run out.append(b)
+        run out.append(" ")
+        run out.append(l)
+      }
+    }
+  } else if field == FIELD_ALIGN {
+    if flex {
+      run appendCapital(&mut out, computed(detail, "align-items"))
+    } else {
+      run out.append("-")
+    }
+  } else if field == FIELD_FILL {
+    run colorText(computed(detail, "background-color"), &mut out)
+  } else if field == FIELD_BORDER {
+    let width = bare(computed(detail, "border-top-width"))
+    let style = computed(detail, "border-style")
+    if width == "0" || width == "" || style == "none" || style == "" {
+      run out.append("none")
+    } else {
+      run out.append(width)
+      run out.append(" ")
+      run out.append(style)
+      run out.append(" ")
+      run colorText(computed(detail, "border-color"), &mut out)
+    }
+  } else if field == FIELD_RADIUS {
+    run appendBare(&mut out, computed(detail, "border-radius"))
+  } else if field == FIELD_FONT {
+    run out.append("family ")
+    run out.append(computed(detail, "font-family"))
+  } else if field == FIELD_TEXT {
+    run out.append(bare(computed(detail, "font-size")))
+    let line = computed(detail, "line-height")
+    if line != "normal" && line != "" {
+      run out.append(" / ")
+      run out.append(bare(line))
+    }
+  } else {
+    run out.append(computed(detail, "font-weight"))
+  }
+}
+
+/// A value as an edit card shows it: lengths without `px`, and four (or two) equal sides as
+/// one (`6px 6px 6px 6px` is `6`).
+pub effect fn shortValue(value: string, out: &mut String) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  let mut parts = String.split(value, " ")
+  let mut first = String.make()
+  let mut same = true
+  let mut count: usize = 0
+  while true {
+    match parts.next() {
+      Option<string>.Some { value: part } => {
+        if part != "" {
+          if count == 0 {
+            run first.append(bare(part))
+          } else if bare(part) != String.view(&first) {
+            same = false
+          }
+          count = count + 1
+        }
+      }
+      Option<string>.None => {
+        break
+      }
+    }
+  }
+  if same && count > 1 && numeric(String.view(&first)) {
+    run out.append(String.view(&first))
+    return ()
+  }
+  run appendBare(&mut out, value)
+}
+
+/// Whether `text` is a plain number (`12`, `-4`, `0.5`).
+pub fn numeric(text: string) -> bool {
+  let bytes = String.utf8Bytes(text)
+  if bytes.length == 0 {
+    return false
+  }
+  let mut digits = false
+  let mut i: usize = 0
+  while i < bytes.length {
+    let b = bytes[i]
+    if b >= 48 && b <= 57 {
+      digits = true
+    } else if !(b == 46 || (b == 45 && i == 0)) {
+      return false
+    }
+    i = i + 1
+  }
+  return digits
+}
+
+/// Appends `text` with `px` after each plain number in it.
+effect fn appendLengths(out: &mut String, text: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut parts = String.split(text, " ")
+  let mut first = true
+  while true {
+    match parts.next() {
+      Option<string>.Some { value: part } => {
+        if part != "" {
+          if !first {
+            run out.append(" ")
+          }
+          first = false
+          run out.append(part)
+          if numeric(part) {
+            run out.append("px")
+          }
+        }
+      }
+      Option<string>.None => {
+        break
+      }
+    }
+  }
+}
+
+/// The declarations typing `typed` into field `field` sets, into `out`. False when there is
+/// nothing to set: an empty field, or the font family (read only).
+pub effect fn fieldCss(field: u32, typed: string, out: &mut String) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  let text = String.trim(typed)
+  if text == "" || field == FIELD_FONT || field >= FIELD_COUNT {
+    return false
+  }
+  let low = run lower(text)
+  let value = String.view(&low)
+  if field == FIELD_WIDTH || field == FIELD_HEIGHT {
+    let property = if field == FIELD_WIDTH {
+      "width"
+    } else {
+      "height"
+    }
+    run out.append(property)
+    run out.append(": ")
+    if value == "hug" {
+      run out.append("auto")
+    } else if value == "fill" {
+      run out.append("100%")
+    } else {
+      run appendLengths(&mut out, value)
+    }
+  } else if field == FIELD_DIRECTION {
+    if String.startsWith(value, "row") || String.startsWith(value, "column") {
+      run out.append("display: flex; flex-direction: ")
+    } else {
+      run out.append("display: ")
+    }
+    run out.append(value)
+  } else if field == FIELD_GAP {
+    run out.append("gap: ")
+    run appendLengths(&mut out, value)
+  } else if field == FIELD_PADDING {
+    run out.append("padding: ")
+    run appendLengths(&mut out, value)
+  } else if field == FIELD_ALIGN {
+    run out.append("align-items: ")
+    if value == "start" || value == "end" {
+      run out.append("flex-")
+    }
+    run out.append(value)
+  } else if field == FIELD_FILL {
+    run out.append("background-color: ")
+    if value == "none" {
+      run out.append("transparent")
+    } else {
+      run out.append(text)
+    }
+  } else if field == FIELD_BORDER {
+    if value == "none" {
+      run out.append("border-style: none")
+    } else {
+      run out.append("border: ")
+      run appendLengths(&mut out, text)
+    }
+  } else if field == FIELD_RADIUS {
+    run out.append("border-radius: ")
+    run appendLengths(&mut out, value)
+  } else if field == FIELD_TEXT {
+    match String.find(value, "/") {
+      Option<usize>.Some { value: slash } => {
+        let size = String.trim(String.slice(value, 0, slash))
+        let line = String.trim(String.slice(value, slash + 1, String.byteLength(value) - slash - 1))
+        if size != "" {
+          run out.append("font-size: ")
+          run appendLengths(&mut out, size)
+        }
+        if line != "" {
+          if size != "" {
+            run out.append("; ")
+          }
+          run out.append("line-height: ")
+          run appendLengths(&mut out, line)
+        }
+      }
+      Option<usize>.None => {
+        run out.append("font-size: ")
+        run appendLengths(&mut out, value)
+      }
+    }
+  } else {
+    run out.append("font-weight: ")
+    run out.append(value)
+  }
+  return out.ownedByteLength() != 0
+}
+
+/// `text` with ASCII capitals in small letters.
+effect fn lower(text: string) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let bytes = String.utf8Bytes(text)
+  let mut out = String.make()
+  let mut start: usize = 0
+  let mut i: usize = 0
+  while i < bytes.length {
+    if bytes[i] >= 65 && bytes[i] <= 90 {
+      run out.append(String.slice(text, start, i - start))
+      run out.append(String.slice("abcdefghijklmnopqrstuvwxyz", u8.toUsize(bytes[i] - 65), 1))
+      start = i + 1
+    }
+    i = i + 1
+  }
+  run out.append(String.slice(text, start, bytes.length - start))
+  return move out
+}

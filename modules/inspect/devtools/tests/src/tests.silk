@@ -12,12 +12,19 @@ import ui_devtools.lib {
   Message,
   Command,
   Panel,
+  Segment,
   Link,
   NO_PARENT,
   ViewHost,
-  REMOTE_FIRST
+  REMOTE_FIRST,
+  FONT,
+  MONO,
+  UI_FAMILIES,
+  MONO_FAMILIES,
+  columnsFor,
+  STACKED_BELOW
 }
-import ui_app.runtime { Runtime, drain }
+import ui_app.runtime { Runtime, drain, pump }
 import ui_app.harness { click, hover, moveTo, press, snapshot, typeText }
 import ui_inspect.query { Query, queryFirst }
 import ui_fixtures.fixtures as fixtures
@@ -32,8 +39,9 @@ import silk.num.usize
 import silk.testing.testing { Testing, AssertionError }
 import silk.text.string { String }
 
+/// The devtools' own window at its first size.
 fn viewport() -> FrameInput {
-  return FrameInput { width: 900.0, height: 560.0, scale: 1.0, time: 0.0 }
+  return FrameInput { width: 1280.0, height: 800.0, scale: 1.0, time: 0.0 }
 }
 
 effect fn devtoolsTree(collection: &FontCollection) -> UiTree<'_>
@@ -41,7 +49,8 @@ effect fn devtoolsTree(collection: &FontCollection) -> UiTree<'_>
   ? &mut Allocator {
   let mut tree = run UiTree.make(collection)
   let mut batch = Batch.make()
-  run batch.fontFamily(1, "Noto Sans, sans-serif")
+  run batch.fontFamily(FONT, UI_FAMILIES)
+  run batch.fontFamily(MONO, MONO_FAMILIES)
   run tree.apply(run batch.take())
   return move tree
 }
@@ -55,9 +64,16 @@ effect fn rowId(id: u32) -> String
   return move text
 }
 
+/// Whether the app shows node `id` pointed at (washed and outlined) and nothing else so.
 effect fn highlighted(app: &Inspected<'_>, id: u32) -> bool {
   let list = app.protocol.highlight.nodes.asSlice()
   return list.length == 1 && list[0] == id
+}
+
+/// Whether the app rings node `id` as the selection, and points at nothing.
+effect fn ringed(app: &Inspected<'_>, id: u32) -> bool {
+  let list = app.protocol.highlight.selected.asSlice()
+  return list.length == 1 && list[0] == id && app.protocol.highlight.nodes.length() == 0
 }
 
 effect fn body() -> ()
@@ -98,7 +114,7 @@ effect fn body() -> ()
     "the row is there",
   )
   run Testing.expect(devtools.model.selected == add, "the row is selected")
-  run Testing.expect(run highlighted(&app, add), "the app highlights the node")
+  run Testing.expect(run ringed(&app, add), "the app rings the node")
   run Testing.expect(devtools.model.detail.id == add, "the node is inspected")
   run Testing.expect(
     String.view(&devtools.model.detail.title) == "button \"Add\"",
@@ -109,6 +125,14 @@ effect fn body() -> ()
   run Testing.expect(devtools.model.detail.box.width > 10.0, "content width")
   run Testing.expect(devtools.model.detail.box.padding.left == 10.0, "padding from the look")
   run Testing.expect(devtools.model.detail.box.border.top == 1.0, "border from the look")
+  let design = run snapshot(&mut tree, viewport())
+  run Testing.expect(
+    String.contains(String.view(&design), "testId=\"field-padding\" \"4 10\""),
+    "the Design segment shows its padding",
+  )
+  drop run click(&mut devtools, &mut tree, viewport(), "Declarations")
+    |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(devtools.model.segment == Segment.Declarations, "the Declarations segment")
   let styles = run snapshot(&mut tree, viewport())
   run Testing.expect(
     String.contains(String.view(&styles), "\"  padding-left\""),
@@ -128,15 +152,17 @@ effect fn body() -> ()
   run Testing.expect(devtools.model.hovered == root, "the row is hovered")
   run Testing.expect(run highlighted(&app, root), "the app highlights the hovered node")
   run Testing.expect(app.requests > requests, "the highlight went to the app")
-  run moveTo(&mut devtools, &mut tree, viewport(), 880.0, 540.0)
+  run Testing.expect(
+    app.protocol.highlight.selected.length() == 1
+      && app.protocol.highlight.selected.asSlice()[0] == add,
+    "the selection keeps its ring meanwhile",
+  )
+  run moveTo(&mut devtools, &mut tree, viewport(), 700.0, 760.0)
     |> Effect.provideMut<Link>(&mut app)
   run Testing.expect(devtools.model.hovered == NO_PARENT, "the pointer left the rows")
-  run Testing.expect(run highlighted(&app, add), "the selection is highlighted again")
+  run Testing.expect(run ringed(&app, add), "the selection alone is highlighted again")
 
-  // The box model tab.
-  drop run click(&mut devtools, &mut tree, viewport(), "Box model")
-    |> Effect.provideMut<Link>(&mut app)
-  run Testing.expect(devtools.model.panel == Panel.BoxModel, "the box model tab opens")
+  // The box model, in the Declarations segment.
   let boxes = run snapshot(&mut tree, viewport())
   run Testing.expect(
     String.contains(String.view(&boxes), "testId=\"content\""),
@@ -171,13 +197,13 @@ effect fn body() -> ()
   run press(&mut devtools, &mut tree, viewport(), "ArrowDown", 0)
     |> Effect.provideMut<Link>(&mut app)
   run Testing.expect(devtools.model.selected != add, "ArrowDown moves on")
-  run Testing.expect(run highlighted(&app, devtools.model.selected), "and highlights there")
+  run Testing.expect(run ringed(&app, devtools.model.selected), "and rings it there")
   run press(&mut devtools, &mut tree, viewport(), "Escape", 0) |> Effect.provideMut<Link>(&mut app)
   run Testing.expect(devtools.model.selected == NO_PARENT, "Escape clears the selection")
-  run Testing.expect(app.protocol.highlight.nodes.length() == 0, "and the highlight")
+  run Testing.expect(!app.protocol.highlighting(), "and the highlight")
 
   // Folding the root hides everything below it.
-  drop run click(&mut devtools, &mut tree, viewport(), "-") |> Effect.provideMut<Link>(&mut app)
+  drop run click(&mut devtools, &mut tree, viewport(), "Fold") |> Effect.provideMut<Link>(&mut app)
   let mut visible: usize = 0
   let rows = devtools.model.rows.asSlice()
   let mut i: usize = 0
@@ -188,7 +214,8 @@ effect fn body() -> ()
     i = i + 1
   }
   run Testing.expect(visible == 1, "folding the root leaves one row")
-  drop run click(&mut devtools, &mut tree, viewport(), "+") |> Effect.provideMut<Link>(&mut app)
+  drop run click(&mut devtools, &mut tree, viewport(), "Unfold")
+    |> Effect.provideMut<Link>(&mut app)
   run Testing.expect(devtools.model.rows.asSlice()[1].visible, "unfolding shows them again")
 
   // silk-ui's Program panel: a view the app renders, replayed in the devtools' tree with ids
@@ -207,19 +234,31 @@ effect fn body() -> ()
   run Testing.expect(views.local(1) >= REMOTE_FIRST, "with ids of the devtools' own")
   let program = run snapshot(&mut tree, viewport())
   run Testing.expect(String.contains(String.view(&program), "click #12"), "a cause shows")
-  run Testing.expect(String.contains(String.view(&program), "Save { count: 4 }"), "and a command")
+  run Testing.expect(
+    String.contains(String.view(&program), "Save { count: 4 }"),
+    "and the newest step's command",
+  )
+  run Testing.expect(
+    String.contains(String.view(&program), "  items: 4")
+      && !String.contains(String.view(&program), "\"+ \""),
+    "and its model, in full",
+  )
   run Testing.expect(
     run clickView(&mut devtools, &mut tree, viewport(), &mut views, &mut app, "Added"),
     "a message row is clicked",
   )
   run pullViews(&mut devtools, &mut tree, &mut views, &mut app)
   let diff = run snapshot(&mut tree, viewport())
-  run Testing.expect(String.contains(String.view(&diff), "  items: 4"), "the app opened its model")
+  run Testing.expect(
+    String.contains(String.view(&diff), "\"+ \"")
+      && String.contains(String.view(&diff), "  items: 4"),
+    "the app opened its model, as a diff",
+  )
   run Testing.expect(views.applied == 3, "and sent what changed")
   drop run clickView(&mut devtools, &mut tree, viewport(), &mut views, &mut app, "Added")
   run pullViews(&mut devtools, &mut tree, &mut views, &mut app)
   let closed = run snapshot(&mut tree, viewport())
-  run Testing.expect(!String.contains(String.view(&closed), "  items: 4"), "and closes it")
+  run Testing.expect(!String.contains(String.view(&closed), "\"+ \""), "and closes it")
 
   // Another tab closes the view: the app stops rendering it, and nothing more comes.
   drop run click(&mut devtools, &mut tree, viewport(), "Events")
@@ -248,7 +287,7 @@ effect fn body() -> ()
   // A style typed into the styles panel lands on the node in the app.
   devtools.send(Message.Select { id: add })
   run drain(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
-  drop run click(&mut devtools, &mut tree, viewport(), "Styles")
+  drop run click(&mut devtools, &mut tree, viewport(), "Design")
     |> Effect.provideMut<Link>(&mut app)
   let width = devtools.model.detail.box.width
   run Testing.expect(
@@ -266,6 +305,8 @@ effect fn body() -> ()
     |> Effect.provideMut<Link>(&mut app)
   run press(&mut devtools, &mut tree, viewport(), "Enter", 0) |> Effect.provideMut<Link>(&mut app)
   run Testing.expect(devtools.model.styleError.ownedByteLength() != 0, "a bad style says why")
+  drop run click(&mut devtools, &mut tree, viewport(), "Declarations")
+    |> Effect.provideMut<Link>(&mut app)
   drop run click(&mut devtools, &mut tree, viewport(), "Reset") |> Effect.provideMut<Link>(&mut app)
   run Testing.expect(devtools.model.detail.box.width == width, "Reset takes the edit back")
 
@@ -394,4 +435,75 @@ test effect fn devtoolsShowAnExtensionsDataPanel() -> ()
   ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   run dataPanelBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// The columns keep the design's widths in a wide window, narrow below 1180, and under
+/// `STACKED_BELOW` the inspector moves into the middle column as a tab; each column scrolls on
+/// its own, so a short dock keeps all three.
+effect fn columnsBody() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  let wide = columnsFor(1440.0)
+  run Testing.expect(
+    wide.tree == 320.0 && wide.inspector == 340.0 && !wide.stacked,
+    "designed widths",
+  )
+  let unknown = columnsFor(0.0)
+  run Testing.expect(unknown.tree == 320.0 && !unknown.stacked, "wide before the first layout")
+  let medium = columnsFor(1000.0)
+  run Testing.expect(medium.tree == 280.0 && medium.inspector == 320.0, "narrower under 1180")
+  let small = columnsFor(STACKED_BELOW)
+  run Testing.expect(
+    small.tree == 240.0 && small.inspector == 300.0 && !small.stacked,
+    "three still",
+  )
+  let stacked = columnsFor(STACKED_BELOW - 1.0)
+  run Testing.expect(stacked.stacked && stacked.inspector == 0.0, "then the inspector stacks")
+  run Testing.expect(columnsFor(400.0).tree == 180.0, "and the tree keeps 180")
+
+  // Drawn 700 wide: two columns, the inspector a tab of the middle one.
+  let narrow = FrameInput { width: 700.0, height: 400.0, scale: 1.0, time: 0.0 }
+  let collection = run fixtures.fonts()
+  let mut app = run Inspected.make(&collection)
+  let mut tree = run devtoolsTree(&collection)
+  let mut devtools = Runtime<Devtools, Message, Command>.make(run Devtools.make("todo (test)"))
+  run devtools.start(&mut tree, 0.0)
+  devtools.send(Message.Refresh)
+  run drain(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
+  run tree.frame(narrow)
+  drop run pump(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(devtools.model.width == 700.0, "the devtools know their width")
+  let two = run snapshot(&mut tree, narrow)
+  run Testing.expect(
+    !String.contains(String.view(&two), "testId=\"inspector\"")
+      && String.contains(String.view(&two), "label=\"Inspector\""),
+    "no inspector column, an Inspector tab",
+  )
+  run Testing.expect(
+    run click(&mut devtools, &mut tree, narrow, "Inspector") |> Effect.provideMut<Link>(&mut app),
+    "the tab",
+  )
+  let shown = run snapshot(&mut tree, narrow)
+  run Testing.expect(
+    String.contains(String.view(&shown), "testId=\"inspector\""),
+    "shows the inspector in the middle column",
+  )
+  drop run click(&mut devtools, &mut tree, narrow, "Events") |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(!devtools.model.inspector, "another tab gives the column back")
+
+  // Docked: short and wide, the three columns stay, the inspector's segment scrolls.
+  let docked = FrameInput { width: 1280.0, height: 300.0, scale: 1.0, time: 0.0 }
+  run tree.frame(docked)
+  drop run pump(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
+  let dock = run snapshot(&mut tree, docked)
+  run Testing.expect(
+    devtools.model.width == 1280.0 && String.contains(String.view(&dock), "testId=\"inspector\""),
+    "docked, all three columns",
+  )
+}
+
+test effect fn devtoolsColumnsFollowTheWidth() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run columnsBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }

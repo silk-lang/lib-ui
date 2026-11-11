@@ -3,7 +3,22 @@
 //! listed (with a comment) in the Changes panel, resolve, reopen and reset there, and an edit
 //! that outlasts the app re-rendering.
 import inspected { Inspected }
-import ui_devtools.lib { Devtools, Message, Command, Panel, Link, MARK_EDITED, MARK_OVERRIDDEN }
+import ui_devtools.lib {
+  Devtools,
+  Message,
+  Command,
+  Segment,
+  Link,
+  MARK_EDITED,
+  MARK_OVERRIDDEN,
+  FONT,
+  MONO,
+  UI_FAMILIES,
+  MONO_FAMILIES,
+  FIELD_PADDING,
+  FIELD_RADIUS,
+  fieldEdited
+}
 import ui_app.runtime { Runtime, drain }
 import ui_app.harness { click, press, snapshot, typeText }
 import ui_inspect.query { Query, queryFirst }
@@ -19,8 +34,9 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.testing.testing { Testing, AssertionError }
 import silk.text.string { String }
 
+/// The devtools' own window at its first size.
 fn viewport() -> FrameInput {
-  return FrameInput { width: 900.0, height: 560.0, scale: 1.0, time: 0.0 }
+  return FrameInput { width: 1280.0, height: 800.0, scale: 1.0, time: 0.0 }
 }
 
 effect fn devtoolsTree(collection: &FontCollection) -> UiTree<'_>
@@ -28,7 +44,8 @@ effect fn devtoolsTree(collection: &FontCollection) -> UiTree<'_>
   ? &mut Allocator {
   let mut tree = run UiTree.make(collection)
   let mut batch = Batch.make()
-  run batch.fontFamily(1, "Noto Sans, sans-serif")
+  run batch.fontFamily(FONT, UI_FAMILIES)
+  run batch.fontFamily(MONO, MONO_FAMILIES)
   run tree.apply(run batch.take())
   return move tree
 }
@@ -121,15 +138,22 @@ effect fn body() -> ()
   )
   run Testing.expect(
     hasMark(&devtools, MARK_EDITED) && hasMark(&devtools, MARK_OVERRIDDEN),
-    "the Styles panel marks the edit and the app's declaration it hides",
+    "the node view marks the edit and the app's declaration it hides",
   )
+  drop run click(&mut devtools, &mut tree, viewport(), "Declarations")
+    |> Effect.provideMut<Link>(&mut app)
   let styles = run snapshot(&mut tree, viewport())
   run Testing.expect(
     String.contains(String.view(&styles), "testId=\"edited-styles\""),
     "an edited section",
   )
 
-  // A comment from the selected node.
+  // A comment from the selected node, in the Edits segment.
+  run Testing.expect(
+    run click(&mut devtools, &mut tree, viewport(), "Edits") |> Effect.provideMut<Link>(&mut app),
+    "the Edits segment",
+  )
+  run Testing.expect(devtools.model.segment == Segment.Edits, "opens")
   drop run click(&mut devtools, &mut tree, viewport(), "comment-draft")
     |> Effect.provideMut<Link>(&mut app)
   run typeText(&mut devtools, &mut tree, viewport(), "Rounder corners")
@@ -140,18 +164,14 @@ effect fn body() -> ()
     "the comment is in the log",
   )
 
-  // The Changes panel lists both under the node.
-  run Testing.expect(
-    run click(&mut devtools, &mut tree, viewport(), "Changes") |> Effect.provideMut<Link>(&mut app),
-    "the Changes tab",
-  )
-  run Testing.expect(devtools.model.panel == Panel.Changes, "opens")
+  // The Edits segment lists both, a card each.
   let listed = run snapshot(&mut tree, viewport())
   run Testing.expect(
-    String.contains(String.view(&listed), "\"padding-left\"")
-      && String.contains(String.view(&listed), "\"11px\"")
+    String.contains(String.view(&listed), " · padding-left\"")
+      && String.contains(String.view(&listed), "\"10\"")
+      && String.contains(String.view(&listed), "\"11\"")
       && String.contains(String.view(&listed), "\"Rounder corners\""),
-    "with the edit and the comment",
+    "with the edit, from 10 to 11, and the comment",
   )
   let edit = devtools.model.changes.asSlice()[0].id
   let note = devtools.model.changes.asSlice()[1].id
@@ -193,6 +213,72 @@ effect fn body() -> ()
     devtools.model.openChanges == 0 && devtools.model.changes.length() == 1,
     "a resolved comment stays, resolved",
   )
+}
+
+/// The Design segment's fields: one typed into lands in the app's edit log as a declaration,
+/// is marked edited, and the arrows step a field's number and set it.
+effect fn designBody() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut app = run Inspected.make(&collection)
+  let mut tree = run devtoolsTree(&collection)
+  let mut devtools = Runtime<Devtools, Message, Command>.make(run Devtools.make("todo (test)"))
+  run devtools.start(&mut tree, 0.0)
+  devtools.send(Message.Refresh)
+  run drain(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
+  let add = run queryFirst(&app.tree, &run Query.byRoleNamed(Role.Button, "Add"))
+  devtools.send(Message.Select { id: add })
+  run drain(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(devtools.model.segment == Segment.Design, "Design shows first")
+  run Testing.expect(!fieldEdited(&devtools.model.detail, FIELD_PADDING), "nothing edited yet")
+
+  // Padding typed as the field shows it, set with Enter.
+  run Testing.expect(
+    run click(&mut devtools, &mut tree, viewport(), "field-padding")
+      |> Effect.provideMut<Link>(&mut app),
+    "the padding field",
+  )
+  devtools.send(Message.FieldInput { field: FIELD_PADDING, value: run String.copy("4 14") })
+  run drain(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
+  run press(&mut devtools, &mut tree, viewport(), "Enter", 0) |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(
+    devtools.model.changes.length() == 1
+      && String.view(&devtools.model.changes.asSlice()[0].property) == "padding"
+      && String.view(&devtools.model.changes.asSlice()[0].after) == "4px 14px",
+    "the edit log has the padding the field set",
+  )
+  run Testing.expect(
+    app.protocol.edits.openCount() == 1 && app.tree.overridden(add, StyleState.Base),
+    "laid over the app",
+  )
+  run Testing.expect(devtools.model.detail.box.padding.left == 14.0, "which draws it")
+  run Testing.expect(fieldEdited(&devtools.model.detail, FIELD_PADDING), "the field is marked")
+  let marked = run snapshot(&mut tree, viewport())
+  run Testing.expect(
+    String.contains(String.view(&marked), "testId=\"field-padding\" \"4 14\"")
+      && String.contains(String.view(&marked), "label=\"edited\""),
+    "with its value and the edited dot",
+  )
+
+  // ArrowUp in the radius field steps it and sets it at once.
+  drop run click(&mut devtools, &mut tree, viewport(), "field-radius")
+    |> Effect.provideMut<Link>(&mut app)
+  run press(&mut devtools, &mut tree, viewport(), "ArrowUp", 0) |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(
+    devtools.model.changes.length() == 2 && fieldEdited(&devtools.model.detail, FIELD_RADIUS),
+    "the radius is stepped into the log",
+  )
+  run Testing.expect(
+    String.view(&devtools.model.changes.asSlice()[1].after) == "7px",
+    "one up from the app's 6px",
+  )
+}
+
+test effect fn devtoolsDesignFieldsEditThroughTheLog() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run designBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
 test effect fn devtoolsEditAndListChanges() -> ()

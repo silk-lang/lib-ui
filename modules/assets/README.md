@@ -1,12 +1,16 @@
 # ui-assets
 
-Embedded fonts, icons and photos for UI fixtures, tests and demos: two Noto Sans subsets, the
+Embedded fonts, icons and photos for UI fixtures, tests and demos: two Noto Sans subsets, Geist
+and Geist Mono (the devtools' faces), the
 toolbar and card icons, an animated orbit SVG, and procedural photos. They were the
 [graphics demo](https://github.com/silk-lang/nonstd/tree/7d6c3693a9ad1fec24127985626ab4224f9f1995/examples/graphics-demo)'s assets, and moved here because ui-tree's fixtures,
 ui-app tests and several demos use them too. Import `assets` for typed accessors (`regularFont`,
 `icon(index)`, `photo(index)` and the icon constants).
 
-Fonts are subsets of Noto Sans (SIL Open Font License, `assets/fonts/Noto-LICENSE-OFL.txt`).
+Fonts are subsets of Noto Sans (SIL Open Font License, `assets/fonts/Noto-LICENSE-OFL.txt`)
+and of the Geist and Geist Mono variable fonts (SIL Open Font License,
+`assets/fonts/Geist-LICENSE-OFL.txt`), cut to Latin, punctuation and arrows with fontTools
+`subset`, keeping their weight axis (100 to 900).
 Icons were drawn for the graphics demo. Photos are committed procedural landscapes. The optional
 `silk task generate-photos` authoring task requires ImageMagick 7's native `magick` executable on
 `PATH`; it is never part of a normal build or check. Silk renders the twelve original palettes,
