@@ -1,0 +1,202 @@
+//! The Changes panel and the editing in the Styles panel, against the todo example: completion
+//! from the css tables, ArrowUp stepping a number live, the edit marked in the Styles panel and
+//! listed (with a comment) in the Changes panel, resolve, reopen and reset there, and an edit
+//! that outlasts the app re-rendering.
+import inspected { Inspected }
+import ui_devtools.lib { Devtools, Message, Command, Panel, Link, MARK_EDITED, MARK_OVERRIDDEN }
+import ui_app.runtime { Runtime, drain }
+import ui_app.harness { click, press, snapshot, typeText }
+import ui_inspect.query { Query, queryFirst }
+import ui_fixtures.fixtures as fixtures
+import ui_tree.legacy { UiTree, TreeError, Batch, FrameInput, Role }
+import ui_tree.inspect { writeInt }
+import ui_tree.mutation { StyleState }
+import ui_tree.input { MOD_SHIFT }
+import font_collection.lib { FontCollection }
+import silk.core.effect { Effect }
+import silk.json.scanner { JsonError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+fn viewport() -> FrameInput {
+  return FrameInput { width: 900.0, height: 560.0, scale: 1.0, time: 0.0 }
+}
+
+effect fn devtoolsTree(collection: &FontCollection) -> UiTree<'_>
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut tree = run UiTree.make(collection)
+  let mut batch = Batch.make()
+  run batch.fontFamily(1, "Noto Sans, sans-serif")
+  run tree.apply(run batch.take())
+  return move tree
+}
+
+/// `<kind>-<id>`, a test id in the Changes panel.
+effect fn testId(kind: string, id: u64) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = run String.copy(kind)
+  run text.append("-")
+  run writeInt(&mut text, id)
+  return move text
+}
+
+fn hasMark(devtools: &Runtime<Devtools, Message, Command>, mark: u8) -> bool {
+  let marks = devtools.model.detail.marks.asSlice()
+  let mut i: usize = 0
+  while i < marks.length {
+    if marks[i] == mark {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+effect fn body() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut app = run Inspected.make(&collection)
+  let mut tree = run devtoolsTree(&collection)
+  let mut devtools = Runtime<Devtools, Message, Command>.make(run Devtools.make("todo (test)"))
+  run devtools.start(&mut tree, 0.0)
+  devtools.send(Message.Refresh)
+  run drain(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
+  let add = run queryFirst(&app.tree, &run Query.byRoleNamed(Role.Button, "Add"))
+  devtools.send(Message.Select { id: add })
+  run drain(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(devtools.model.changes.length() == 0, "no changes yet")
+
+  // Completion from the css package's property table, then the value typed.
+  run Testing.expect(
+    run click(&mut devtools, &mut tree, viewport(), "style-draft")
+      |> Effect.provideMut<Link>(&mut app),
+    "the declarations field",
+  )
+  run typeText(&mut devtools, &mut tree, viewport(), "padding-le")
+    |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(
+    devtools.model.suggestions.length() == 1
+      && String.view(&devtools.model.suggestions.asSlice()[0]) == "padding-left",
+    "the property completes",
+  )
+  let offered = run snapshot(&mut tree, viewport())
+  run Testing.expect(String.contains(String.view(&offered), "testId=\"suggestions\""), "and shows")
+  devtools.send(Message.Complete { index: 0 })
+  run drain(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(String.view(&devtools.model.draft) == "padding-left: ", "with its colon")
+  devtools.send(Message.StyleDraft { value: run String.copy("padding-left: in") })
+  run drain(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(
+    devtools.model.suggestions.length() == 2,
+    "values complete too: inherit, initial",
+  )
+  devtools.send(Message.StyleDraft { value: run String.copy("padding-left: 20px") })
+  run drain(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
+
+  // ArrowUp steps the number and sets it at once; Shift steps by ten.
+  run press(&mut devtools, &mut tree, viewport(), "ArrowUp", 0) |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(String.view(&devtools.model.draft) == "padding-left: 21px", "ArrowUp steps")
+  run Testing.expect(
+    app.protocol.edits.openCount() == 1 && app.tree.overridden(add, StyleState.Base),
+    "and the app has the edit",
+  )
+  run press(&mut devtools, &mut tree, viewport(), "ArrowDown", MOD_SHIFT)
+    |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(
+    String.view(&devtools.model.draft) == "padding-left: 11px",
+    "Shift steps by ten",
+  )
+  run Testing.expect(devtools.model.selected == add, "the arrows did not move the selection")
+  run press(&mut devtools, &mut tree, viewport(), "Enter", 0) |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(devtools.model.draft.ownedByteLength() == 0, "Enter sets it and clears")
+  run Testing.expect(
+    devtools.model.changes.length() == 1 && devtools.model.openChanges == 1
+      && String.view(&devtools.model.changes.asSlice()[0].after) == "11px"
+      && String.view(&devtools.model.changes.asSlice()[0].before) == "10px",
+    "one edit, from the app's 10px to the last value",
+  )
+  run Testing.expect(
+    hasMark(&devtools, MARK_EDITED) && hasMark(&devtools, MARK_OVERRIDDEN),
+    "the Styles panel marks the edit and the app's declaration it hides",
+  )
+  let styles = run snapshot(&mut tree, viewport())
+  run Testing.expect(
+    String.contains(String.view(&styles), "testId=\"edited-styles\""),
+    "an edited section",
+  )
+
+  // A comment from the selected node.
+  drop run click(&mut devtools, &mut tree, viewport(), "comment-draft")
+    |> Effect.provideMut<Link>(&mut app)
+  run typeText(&mut devtools, &mut tree, viewport(), "Rounder corners")
+    |> Effect.provideMut<Link>(&mut app)
+  run press(&mut devtools, &mut tree, viewport(), "Enter", 0) |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(
+    devtools.model.openChanges == 2 && devtools.model.comment.ownedByteLength() == 0,
+    "the comment is in the log",
+  )
+
+  // The Changes panel lists both under the node.
+  run Testing.expect(
+    run click(&mut devtools, &mut tree, viewport(), "Changes") |> Effect.provideMut<Link>(&mut app),
+    "the Changes tab",
+  )
+  run Testing.expect(devtools.model.panel == Panel.Changes, "opens")
+  let listed = run snapshot(&mut tree, viewport())
+  run Testing.expect(
+    String.contains(String.view(&listed), "\"padding-left\"")
+      && String.contains(String.view(&listed), "\"11px\"")
+      && String.contains(String.view(&listed), "\"Rounder corners\""),
+    "with the edit and the comment",
+  )
+  let edit = devtools.model.changes.asSlice()[0].id
+  let note = devtools.model.changes.asSlice()[1].id
+
+  // The app re-renders: the edit stays.
+  let mut reply = String.make()
+  run app.ask("{\"cmd\":\"click\",\"role\":\"button\",\"name\":\"Add\"}", &mut reply)
+  run Testing.expect(app.tree.overridden(add, StyleState.Base), "the edit outlasts a re-render")
+
+  // Resolve, reopen, reset.
+  let resolve = run testId("resolve", edit)
+  run Testing.expect(
+    run click(&mut devtools, &mut tree, viewport(), String.view(&resolve))
+      |> Effect.provideMut<Link>(&mut app),
+    "the edit's Resolve",
+  )
+  run Testing.expect(
+    !devtools.model.changes.asSlice()[0].open && !app.tree.overridden(add, StyleState.Base),
+    "resolving takes the edit off the app",
+  )
+  let reopen = run testId("reopen", edit)
+  drop run click(&mut devtools, &mut tree, viewport(), String.view(&reopen))
+    |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(
+    devtools.model.changes.asSlice()[0].open && app.tree.overridden(add, StyleState.Base),
+    "reopening lays it on again",
+  )
+  let reset = run testId("reset", edit)
+  drop run click(&mut devtools, &mut tree, viewport(), String.view(&reset))
+    |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(
+    devtools.model.changes.length() == 1 && !app.tree.overridden(add, StyleState.Base),
+    "Reset takes the edit back and out of the log",
+  )
+  let resolveNote = run testId("resolve", note)
+  drop run click(&mut devtools, &mut tree, viewport(), String.view(&resolveNote))
+    |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(
+    devtools.model.openChanges == 0 && devtools.model.changes.length() == 1,
+    "a resolved comment stays, resolved",
+  )
+}
+
+test effect fn devtoolsEditAndListChanges() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run body() |> Effect.provideMut<Allocator>(&mut allocator)
+}

@@ -1,5 +1,6 @@
 //! The devtools window as a ui-app app: the inspected app's element tree on the left, and on
-//! the right the selected node's styles (which can be edited), its box model, the event log,
+//! the right the selected node's styles (which can be edited), the changes made (style edits and
+//! comments, kept in the app for an agent to carry into the code), its box model, the event log,
 //! the frame timeline, an accessibility audit and the frame stats, then a tab for each panel the
 //! app's extensions add (`hello` lists them). It talks to the app only through the inspector
 //! protocol (the same requests ui-inspect-cli and ui-inspect-mcp send), over a [`Link`] the host
@@ -15,8 +16,14 @@
 //! notification says changed (the host sends [`Message.Pull`] when one comes); while the app
 //! cannot be reached, they try again every [`RETRY_INTERVAL`] seconds. Keys: ArrowDown and
 //! ArrowUp move the selection, Escape clears it, F5 refreshes.
+//!
+//! Style edits go through the app's override layer (`setStyle`): they stay over what the app
+//! sets until reset or resolved, and the Styles panel marks edited declarations and the app's
+//! that they hide. The declarations field completes property names and values from the css
+//! package's tables, and ArrowUp and ArrowDown in it step the last number (Shift by 10, Alt by
+//! 0.1), applying it at once.
 import ui_tree.css
-import ui_tree.css { px, percent, none, Property }
+import ui_tree.css { px, percent, none, Property, Keyword }
 import data {
   Row,
   Detail,
@@ -35,8 +42,16 @@ import data {
   parseIssues,
   parseExtensions,
   parseData,
+  parseChanges,
+  suggest,
+  complete,
+  step,
   matches,
   PanelInfo,
+  ChangeRow,
+  MARK_EDITED,
+  MARK_OVERRIDDEN,
+  MARK_EDIT_HEAD,
   DataRow,
   ASK_DATA,
   Asked,
@@ -50,6 +65,7 @@ import data {
   PART_EVENTS,
   PART_DETAIL,
   PART_PICK,
+  PART_EDITS,
   PART_ALL
 }
 import link { Link }
@@ -60,6 +76,7 @@ import ui_inspect_server.topics {
   TOPIC_EVENTS,
   TOPIC_ROOTS,
   TOPIC_PICK,
+  TOPIC_EDITS,
   TOPIC_COUNT,
   TOPIC_NAMES,
   topicNamed
@@ -68,8 +85,18 @@ import ui_app.app { App, Perform, Context, Subscriptions }
 import ui_app.ui { Ui, Reply }
 import ui_inspect_server.reply { textField, flagField, idField, writeString }
 import ui_tree.inspect { writeInt }
-import ui_tree.mutation { Align, Role, Cursor, BorderStyle, Overflow, WhiteSpace, TextAlign }
-import ui_tree.node { EventKind }
+import ui_tree.mutation {
+  Align,
+  Role,
+  Cursor,
+  BorderStyle,
+  Overflow,
+  WhiteSpace,
+  TextAlign,
+  FlexWrap
+}
+import ui_tree.input { MOD_SHIFT, MOD_ALT }
+import ui_tree.node { Event, EventKind }
 import silk.collections.list { List }
 import silk.color.rgba { Rgba }
 import silk.core.effect { Effect }
@@ -96,6 +123,8 @@ pub const FONT: u32 = 1
 /// The tabs of the side panel.
 pub enum Panel {
   Styles,
+  /// The edit log: style edits and comments.
+  Changes,
   BoxModel,
   Events,
   /// The frame timeline.
@@ -145,10 +174,25 @@ pub union Message {
   StyleDraft { pub value: String },
   /// Set the typed declarations on the selected node.
   ApplyStyle,
-  /// Take every style edit back.
+  /// Step the last number of the typed declarations by `by`, and set them.
+  StepStyle { pub by: f32 },
+  /// Take completion `index` of the typed declarations.
+  Complete { pub index: usize },
+  /// Take the selected node's style edits back.
   ResetStyles,
-  /// The app took the edit; `detail` is the node after it.
-  Styled { pub detail: Detail },
+  /// Take every style edit back.
+  ResetAll,
+  /// Take back the edit at `index` of `Devtools.changes`.
+  ResetChange { pub index: usize },
+  /// Mark entry `id` of the edit log resolved, or open again.
+  Resolve { pub id: u64, pub reopen: bool },
+  /// The comment being typed for the selected node.
+  CommentDraft { pub value: String },
+  /// Comment on the selected node.
+  AddComment,
+  /// The app took an edit: the edit log and `detail`, the selected node after it; `draft` says
+  /// whether the typed declarations were set (and are cleared).
+  Edited { pub changes: List<ChangeRow>, pub open: usize, pub detail: Detail, pub draft: bool },
   StyleRefused { pub error: String },
   /// A request went out whose reply comes with the notifications.
   Asked { pub asked: Asked },
@@ -184,10 +228,11 @@ pub union Command {
   Unhighlight,
   /// Turn picking in the app's window on or off.
   Pick { pub on: bool },
-  /// Set declarations `css` on node `node`.
-  SetStyle { pub node: u32, pub css: String },
-  /// Take every style edit back, and inspect `selected` again.
-  ResetStyles { pub selected: u32 },
+  /// Set declarations `css` on node `node`; `draft` as in `Message.Edited`.
+  SetStyle { pub node: u32, pub css: String, pub draft: bool },
+  /// Send edit log request `line` (`resetStyles`, `resolve`, `comment`), then read the log and
+  /// node `selected` again.
+  Edit { pub line: String, pub selected: u32 },
   Audit,
 }
 
@@ -217,8 +262,14 @@ pub struct Devtools {
   pub search: String,
   /// Whether the app's window is waiting for a pick.
   pub picking: bool,
-  /// The declarations being typed for the selected node.
+  /// The declarations being typed for the selected node, and the completions offered.
   pub draft: String,
+  pub suggestions: List<String>,
+  /// The comment being typed for the selected node.
+  pub comment: String,
+  /// The edit log, and how many of its entries are open.
+  pub changes: List<ChangeRow>,
+  pub openChanges: usize,
   /// Why the app refused the last style edit, or empty.
   pub styleError: String,
   pub frames: FrameView,
@@ -266,6 +317,10 @@ impl Devtools {
       search: String.make(),
       picking: false,
       draft: String.make(),
+      suggestions: List<String>.make(),
+      comment: String.make(),
+      changes: List<ChangeRow>.make(),
+      openChanges: 0,
       styleError: String.make(),
       frames: FrameView.none(),
       issues: List<Issue>.make(),
@@ -506,7 +561,7 @@ impl Devtools {
     if !self.live {
       return TOPIC_PICK
     }
-    let mut topics = TOPIC_TREE | TOPIC_ROOTS | TOPIC_EVENTS | TOPIC_PICK
+    let mut topics = TOPIC_TREE | TOPIC_ROOTS | TOPIC_EVENTS | TOPIC_PICK | TOPIC_EDITS
     if self.panel == Panel.Stats || self.panel == Panel.Frames {
       topics = topics | TOPIC_FRAME
     }
@@ -736,6 +791,8 @@ fn emptySnapshot(since: u64) -> Snapshot {
     frames: Option<FrameView>.None,
     picking: false,
     picked: NO_PARENT,
+    changes: List<ChangeRow>.make(),
+    openChanges: 0,
   }
 }
 
@@ -812,6 +869,12 @@ effect fn syncAll(
     Option<Value>.Some { value } => {
       snapshot.picking = flagField(&value, "on", false)
       snapshot.picked = pickedOf(&value)
+    }
+    Option<Value>.None => {}
+  }
+  match run ask("{\"cmd\":\"edits\"}", &mut quiet) {
+    Option<Value>.Some { value } => {
+      snapshot.openChanges = run parseChanges(&value, &mut snapshot.changes)
     }
     Option<Value>.None => {}
   }
@@ -930,6 +993,15 @@ effect fn pull(since: u64, selected: u32, panel: Panel) -> Message
       Option<Value>.None => {}
     }
   }
+  if u32.bitAnd(changed, TOPIC_EDITS) != 0 {
+    match run ask("{\"cmd\":\"edits\"}", &mut quiet) {
+      Option<Value>.Some { value } => {
+        snapshot.openChanges = run parseChanges(&value, &mut snapshot.changes)
+        snapshot.parts = snapshot.parts | PART_EDITS
+      }
+      Option<Value>.None => {}
+    }
+  }
   return Message.Synced { snapshot: move snapshot }
 }
 
@@ -974,8 +1046,9 @@ effect fn pick(on: bool) -> Message
   }
 }
 
-/// What the styles panel shows after an edit: the node again, or why the app refused.
-effect fn afterEdit(line: string, node: u32) -> Message
+/// What the panels show after an edit: the edit log and the node again, or why the app
+/// refused.
+effect fn afterEdit(line: string, node: u32, draft: bool) -> Message
   ! OutOfMemoryError
   ? &mut Link | &mut Allocator {
   let mut error = String.make()
@@ -985,16 +1058,24 @@ effect fn afterEdit(line: string, node: u32) -> Message
       return Message.StyleRefused { error: move error }
     }
   }
-  if node == NO_PARENT {
-    return Message.Styled { detail: Detail.none() }
+  let mut changes = List<ChangeRow>.make()
+  let mut open: usize = 0
+  let mut quiet = String.make()
+  if let Option<Value>.Some { value } = run ask("{\"cmd\":\"edits\"}", &mut quiet) {
+    open = run parseChanges(&value, &mut changes)
   }
-  return match run inspectNode(node) {
-    Option<Detail>.Some { value } => Message.Styled { detail: move value }
-    Option<Detail>.None => Message.Styled { detail: Detail.none() }
+  let detail = if node == NO_PARENT {
+    Detail.none()
+  } else {
+    match run inspectNode(node) {
+      Option<Detail>.Some { value } => move value
+      Option<Detail>.None => Detail.none()
+    }
   }
+  return Message.Edited { changes: move changes, open: open, detail: move detail, draft: draft }
 }
 
-effect fn setStyle(node: u32, declarations: string) -> Message
+effect fn setStyle(node: u32, declarations: string, draft: bool) -> Message
   ! OutOfMemoryError
   ? &mut Link | &mut Allocator {
   let mut line = run String.copy("{\"cmd\":\"setStyle\",\"node\":")
@@ -1002,7 +1083,7 @@ effect fn setStyle(node: u32, declarations: string) -> Message
   run line.append(",\"style\":")
   run writeString(&mut line, declarations)
   run line.append("}")
-  return run afterEdit(String.view(&line), node)
+  return run afterEdit(String.view(&line), node, draft)
 }
 
 /// Sends `line` without waiting for its reply.
@@ -1079,8 +1160,12 @@ impl Perform<Message, OutOfMemoryError ? &mut Link | &mut Allocator> for Command
       Command.Inspect { node } => run highlightAndInspect(node)
       Command.Unhighlight => run unhighlight()
       Command.Pick { on } => run pick(on)
-      Command.SetStyle { node, css: declarations } => run setStyle(node, String.view(&declarations))
-      Command.ResetStyles { selected } => run afterEdit("{\"cmd\":\"resetStyles\"}", selected)
+      Command.SetStyle { node, css: declarations, draft } => run setStyle(
+        node,
+        String.view(&declarations),
+        draft,
+      )
+      Command.Edit { line, selected } => run afterEdit(String.view(&line), selected, false)
       Command.Audit => run runAudit()
     }
   }
@@ -1127,6 +1212,93 @@ const LAYOUT_BAR: u32 = 0xF59E0B
 
 const WARNING: u32 = 0xB45309
 
+/// The background of an edit's declarations in the Styles panel.
+const EDITED: u32 = 0xEFF6FF
+
+/// The look of the one-line text fields.
+fn fieldLook(ui: &mut Ui<Message>) -> () {
+  ui.style(
+    &[
+      css.flexGrow(1.0),
+      css.flexShrink(1.0),
+      css.flexBasis(px(0.0)),
+      css.minWidth(px(0.0)),
+      css.height(px(22.0)),
+      css.paddingLeft(px(6.0)),
+      css.paddingRight(px(6.0)),
+      css.borderTopWidth(px(1.0)),
+      css.borderRightWidth(px(1.0)),
+      css.borderBottomWidth(px(1.0)),
+      css.borderLeftWidth(px(1.0)),
+      css.borderStyle(BorderStyle.Solid),
+      css.borderColor(rgb(LINE)),
+      css.backgroundColor(rgb(0xFFFFFF)),
+    ],
+  )
+  ui.focused(&[css.borderColor(rgb(ACCENT))])
+}
+
+/// What ArrowUp and ArrowDown do in the declarations field: step the last number by 1, by 10
+/// with Shift, by 0.1 with Alt, instead of moving the caret.
+fn stepKey(event: &Event) -> Reply<Message> {
+  let key = String.view(&event.key)
+  if key != "ArrowUp" && key != "ArrowDown" {
+    return Reply<Message>.Pass
+  }
+  let mut by: f32 = 1.0
+  if u32.bitAnd(event.modifiers, MOD_SHIFT) != 0 {
+    by = 10.0
+  } else if u32.bitAnd(event.modifiers, MOD_ALT) != 0 {
+    by = 0.1
+  }
+  if key == "ArrowDown" {
+    by = -by
+  }
+  return Reply<Message>.Custom {
+    message: Option<Message>.some(Message.StepStyle { by: by }),
+    stopPropagation: true,
+    preventDefault: true,
+  }
+}
+
+/// The declarations field of the Styles panel.
+fn draftField(ui: &mut Ui<Message>, value: string) -> () {
+  ui.input(
+    value,
+    |ui| {
+      ui.testId("style-draft")
+      ui.label("Declarations to set")
+      ui.placeholder("Try a style: width: 200px; color: red (arrows step numbers)")
+      fieldLook(&mut ui)
+      ui.onInput(|value| Message.StyleDraft { value: move value })
+      ui.onKeyDown(|event| stepKey(event))
+    },
+  )
+}
+
+/// A small button with test id `<kind>-<id>`.
+fn smallButton(
+  ui: &mut Ui<Message>,
+  kind: string,
+  id: u64,
+  label: string,
+  onPress: fn() -> Message,
+) -> () {
+  ui.pressable(
+    onPress,
+    |ui| {
+      let testId = ui.alloc(kindTestId(kind, id))
+      ui.testId(String.view(&testId))
+      ui.style(&[css.flexShrink(0.0)])
+      paddings(&mut ui, 1.0, 6.0)
+      ui.color(rgb(ACCENT))
+      ui.hover(&[css.backgroundColor(rgb(0xE5E7EB))])
+      ui.focusVisible(&[css.backgroundColor(rgb(SELECTED))])
+      ui.text(label)
+    },
+  )
+}
+
 /// A one-line text field in the look of the toolbar.
 fn field(
   ui: &mut Ui<Message>,
@@ -1142,25 +1314,7 @@ fn field(
       ui.testId(testId)
       ui.label(label)
       ui.placeholder(hint)
-      ui.style(
-        &[
-          css.flexGrow(1.0),
-          css.flexShrink(1.0),
-          css.flexBasis(px(0.0)),
-          css.minWidth(px(0.0)),
-          css.height(px(22.0)),
-          css.paddingLeft(px(6.0)),
-          css.paddingRight(px(6.0)),
-          css.borderTopWidth(px(1.0)),
-          css.borderRightWidth(px(1.0)),
-          css.borderBottomWidth(px(1.0)),
-          css.borderLeftWidth(px(1.0)),
-          css.borderStyle(BorderStyle.Solid),
-          css.borderColor(rgb(LINE)),
-          css.backgroundColor(rgb(0xFFFFFF)),
-        ],
-      )
-      ui.focused(&[css.borderColor(rgb(ACCENT))])
+      fieldLook(&mut ui)
       ui.onInput(onChange)
     },
   )
@@ -1207,12 +1361,28 @@ fn paddings(ui: &mut Ui<Message>, vertical: f32, horizontal: f32) -> () {
   )
 }
 
-/// A flat toolbar or tab button; `selected` underlines it in the accent color.
+/// A flat toolbar button; `selected` underlines it in the accent color.
 fn barButton(ui: &mut Ui<Message>, label: string, selected: bool, onPress: fn() -> Message) -> () {
+  flatButton(&mut ui, label, selected, 10.0, onPress)
+}
+
+/// A tab of the side panel: a flat button a little narrower, so every tab fits.
+fn tabButton(ui: &mut Ui<Message>, label: string, selected: bool, onPress: fn() -> Message) -> () {
+  flatButton(&mut ui, label, selected, 8.0, onPress)
+}
+
+fn flatButton(
+  ui: &mut Ui<Message>,
+  label: string,
+  selected: bool,
+  side: f32,
+  onPress: fn() -> Message,
+) -> () {
   ui.pressable(
     onPress,
     |ui| {
-      paddings(&mut ui, 4.0, 10.0)
+      paddings(&mut ui, 4.0, side)
+      ui.style(&[css.whiteSpace(WhiteSpace.NoWrap), css.flexShrink(0.0)])
       ui.style(
         &[
           css.borderBottomWidth(px(2.0)),
@@ -1304,6 +1474,113 @@ effect fn positionText(box: &BoxNumbers) -> String
     run text.append(" fragments")
   }
   return move text
+}
+
+effect fn kindTestId(kind: string, id: u64) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = run String.copy(kind)
+  run text.append("-")
+  run writeInt(&mut text, id)
+  return move text
+}
+
+effect fn changeTestId(id: u64) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return run kindTestId("change", id)
+}
+
+effect fn nodeText(id: u32) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = run String.copy("#")
+  run writeInt(&mut text, u32.toU64(id))
+  return move text
+}
+
+effect fn authorText(author: string) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = run String.copy("— ")
+  run text.append(author)
+  return move text
+}
+
+effect fn stateText(state: string) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = run String.copy("(")
+  run text.append(state)
+  run text.append(")")
+  return move text
+}
+
+effect fn replyText(reply: string) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = run String.copy("↳ ")
+  run text.append(reply)
+  return move text
+}
+
+/// The Changes panel's summary line.
+effect fn changesLine(open: usize, all: usize) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = String.make()
+  run writeInt(&mut text, usize.toU64(open))
+  run text.append(" open of ")
+  run writeInt(&mut text, usize.toU64(all))
+  run text.append(
+    ". Edits stay over the app until resolved or reset; agents read them with ui_edits.",
+  )
+  return move text
+}
+
+/// `{"cmd":"resetStyles"}` for the selected node (`node`), or for every node with NO_PARENT;
+/// for one state and property when `state` is not empty.
+effect fn resetLine(node: u32, state: string, property: string) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut line = run String.copy("{\"cmd\":\"resetStyles\"")
+  if node != NO_PARENT {
+    run line.append(",\"node\":")
+    run writeInt(&mut line, u32.toU64(node))
+  }
+  if state != "" {
+    run line.append(",\"state\":")
+    run writeString(&mut line, state)
+    run line.append(",\"property\":")
+    run writeString(&mut line, property)
+  }
+  run line.append("}")
+  return move line
+}
+
+effect fn resolveLine(id: u64, reopen: bool) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut line = run String.copy("{\"cmd\":\"resolve\",\"entry\":")
+  run writeInt(&mut line, id)
+  if reopen {
+    run line.append(",\"reopen\":true")
+  }
+  run line.append("}")
+  return move line
+}
+
+effect fn commentLine(node: u32, text: string) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut line = run String.copy("{\"cmd\":\"comment\",\"text\":")
+  run writeString(&mut line, text)
+  if node != NO_PARENT {
+    run line.append(",\"node\":")
+    run writeInt(&mut line, u32.toU64(node))
+  }
+  run line.append("}")
+  return move line
 }
 
 effect fn seqText(seq: u64) -> String
@@ -1611,37 +1888,64 @@ impl Devtools {
             ui.accessRole(Role.TabList)
             ui.background(rgb(BAR))
             border(&mut ui, Property.BorderBottomWidth, LINE)
-            barButton(
+            tabButton(
               &mut ui,
               "Styles",
               self.panel == Panel.Styles,
               || Message.Show { panel: Panel.Styles },
             )
-            barButton(
+            ui.row(
+              |ui| {
+                ui.testId("changes-tab")
+                ui.style(&[css.alignItems(Align.Center)])
+                tabButton(
+                  &mut ui,
+                  "Changes",
+                  self.panel == Panel.Changes,
+                  || Message.Show { panel: Panel.Changes },
+                )
+                if self.openChanges != 0 {
+                  ui.box(
+                    |ui| {
+                      ui.testId("changes-count")
+                      ui.background(rgb(ACCENT))
+                      ui.color(rgb(0xFFFFFF))
+                      ui.style(
+                        &[css.marginRight(px(6.0)), css.fontSize(px(10.0)), css.fontWeight(700.0)],
+                      )
+                      paddings(&mut ui, 0.0, 5.0)
+                      let count = ui.alloc(seqText(usize.toU64(self.openChanges)))
+                      ui.text(String.view(&count))
+                    },
+                  )
+                }
+              },
+            )
+            tabButton(
               &mut ui,
               "Box model",
               self.panel == Panel.BoxModel,
               || Message.Show { panel: Panel.BoxModel },
             )
-            barButton(
+            tabButton(
               &mut ui,
               "Events",
               self.panel == Panel.Events,
               || Message.Show { panel: Panel.Events },
             )
-            barButton(
+            tabButton(
               &mut ui,
               "Frames",
               self.panel == Panel.Frames,
               || Message.Show { panel: Panel.Frames },
             )
-            barButton(
+            tabButton(
               &mut ui,
               "Audit",
               self.panel == Panel.Audit,
               || Message.Show { panel: Panel.Audit },
             )
-            barButton(
+            tabButton(
               &mut ui,
               "Stats",
               self.panel == Panel.Stats,
@@ -1654,7 +1958,7 @@ impl Devtools {
               |panel| 0,
               |ui, index, panel| {
                 ui.key(usize.toU64(index) + 1)
-                barButton(
+                tabButton(
                   &mut ui,
                   String.view(&panel.title),
                   self.panel == Panel.Extension && self.shown == index,
@@ -1672,6 +1976,7 @@ impl Devtools {
             paddings(&mut ui, 6.0, 10.0)
             match self.panel {
               Panel.Styles => self.styles(&mut ui)
+              Panel.Changes => self.changesPanel(&mut ui)
               Panel.BoxModel => self.boxModel(&mut ui)
               Panel.Events => self.eventLog(&mut ui)
               Panel.Frames => self.framesPanel(&mut ui)
@@ -1710,18 +2015,40 @@ impl Devtools {
         ui.style(&[css.alignItems(Align.Center), css.marginTop(px(4.0)), css.marginBottom(px(4.0))])
         ui.gap(4.0)
         ui.onEnter(|| Message.ApplyStyle)
-        field(
-          &mut ui,
-          "style-draft",
-          "Declarations to set",
-          "Try a style: width: 200px; color: red",
-          String.view(&self.draft),
-          |value| Message.StyleDraft { value: move value },
-        )
+        draftField(&mut ui, String.view(&self.draft))
         barButton(&mut ui, "Apply", false, || Message.ApplyStyle)
         barButton(&mut ui, "Reset", false, || Message.ResetStyles)
       },
     )
+    if self.suggestions.length() != 0 {
+      ui.row(
+        |ui| {
+          ui.testId("suggestions")
+          ui.accessRole(Role.List)
+          ui.label("Completions")
+          ui.style(&[css.marginBottom(px(4.0)), css.flexWrap(FlexWrap.Wrap)])
+          ui.gap(4.0)
+          ui.enumerate(
+            self.suggestions.asSlice(),
+            |suggestion| 0,
+            |ui, index, suggestion| {
+              ui.key(usize.toU64(index))
+              ui.pressable(
+                || Message.Complete { index: index },
+                |ui| {
+                  ui.accessRole(Role.Option)
+                  paddings(&mut ui, 1.0, 6.0)
+                  ui.background(rgb(BAR))
+                  ui.color(rgb(ATTRIBUTE))
+                  ui.hover(&[css.backgroundColor(rgb(SELECTED))])
+                  ui.text(String.view(&suggestion))
+                },
+              )
+            },
+          )
+        },
+      )
+    }
     if self.styleError.ownedByteLength() != 0 {
       ui.box(
         |ui| {
@@ -1731,40 +2058,294 @@ impl Devtools {
         },
       )
     }
+    ui.row(
+      |ui| {
+        ui.style(&[css.alignItems(Align.Center), css.marginBottom(px(4.0))])
+        ui.gap(4.0)
+        ui.onEnter(|| Message.AddComment)
+        field(
+          &mut ui,
+          "comment-draft",
+          "Comment on this element",
+          "Comment on this element, for whoever changes the code",
+          String.view(&self.comment),
+          |value| Message.CommentDraft { value: move value },
+        )
+        barButton(&mut ui, "Comment", false, || Message.AddComment)
+      },
+    )
+    let marks = self.detail.marks.asSlice()
     ui.enumerate(
       self.detail.lines.asSlice(),
       |line| 0,
       |ui, index, line| {
         let text = String.view(&line)
+        let mark = if index < marks.length {
+          marks[index]
+        } else {
+          0
+        }
         ui.key(usize.toU64(index))
         ui.row(
           |ui| {
             ui.style(&[css.whiteSpace(WhiteSpace.Pre)])
+            if mark == MARK_EDITED || mark == MARK_EDIT_HEAD {
+              // An edit laid over the app's declarations: marked down its left side.
+              ui.background(rgb(EDITED))
+              border(&mut ui, Property.BorderLeftWidth, ACCENT)
+            }
             if String.startsWith(text, "style ") {
               ui.style(&[css.fontWeight(700.0), css.marginTop(px(6.0))])
+              if mark == MARK_EDIT_HEAD {
+                ui.testId("edited-styles")
+                ui.color(rgb(ACCENT))
+              }
               ui.text(text)
             } else if String.startsWith(text, "  ") {
-              match String.find(text, ": ") {
-                Option<usize>.Some { value: colon } => {
-                  ui.box(
-                    |ui| {
-                      ui.color(rgb(ATTRIBUTE))
-                      ui.text(String.slice(text, 0, colon))
-                    },
-                  )
-                  ui.text(String.slice(text, colon, String.byteLength(text) - colon))
-                }
-                Option<usize>.None => {
-                  ui.text(text)
+              if mark == MARK_OVERRIDDEN {
+                // The app's own declaration, hidden by an edit.
+                ui.style(&[css.textDecorationLine(Keyword.LineThrough)])
+                ui.color(rgb(MUTED))
+                ui.label("overridden")
+                ui.text(text)
+              } else {
+                match String.find(text, ": ") {
+                  Option<usize>.Some { value: colon } => {
+                    ui.box(
+                      |ui| {
+                        ui.color(
+                          rgb(
+                            if mark == MARK_EDITED {
+                              ACCENT
+                            } else {
+                              ATTRIBUTE
+                            },
+                          ),
+                        )
+                        ui.text(String.slice(text, 0, colon))
+                      },
+                    )
+                    ui.text(String.slice(text, colon, String.byteLength(text) - colon))
+                  }
+                  Option<usize>.None => {
+                    ui.text(text)
+                  }
                 }
               }
-            } else if text == "}" {
-              ui.color(rgb(MUTED))
-              ui.text(text)
             } else {
               ui.color(rgb(MUTED))
               ui.text(text)
             }
+          },
+        )
+      },
+    )
+  }
+
+  /// The edit log: the style edits and comments, by node, each with what it changed, and
+  /// buttons to resolve, reopen or take back.
+  fn changesPanel(self: &Self, ui: &mut Ui<Message>) -> () {
+    ui.row(
+      |ui| {
+        ui.style(&[css.alignItems(Align.Center)])
+        ui.box(
+          |ui| {
+            ui.testId("changes-line")
+            ui.grow(1.0)
+            ui.color(rgb(MUTED))
+            let line = ui.alloc(changesLine(self.openChanges, self.changes.length()))
+            ui.text(String.view(&line))
+          },
+        )
+        barButton(&mut ui, "Reset all", false, || Message.ResetAll)
+      },
+    )
+    if self.changes.length() == 0 {
+      muted(
+        &mut ui,
+        "No changes yet. Edit a style or comment on an element in the Styles panel; an agent reads them with ui_edits.",
+      )
+      return ()
+    }
+    ui.column(
+      |ui| {
+        ui.testId("changes")
+        ui.accessRole(Role.List)
+        let rows = self.changes.asSlice()
+        let mut i: usize = 0
+        while i < rows.length {
+          // One group per node, in the order its first entry came.
+          let node = rows[i].node
+          let mut first = true
+          let mut j: usize = 0
+          while j < i {
+            if rows[j].node == node {
+              first = false
+            }
+            j = j + 1
+          }
+          if first {
+            ui.key(u32.toU64(node) + 1)
+            self.changeGroup(&mut ui, node)
+          }
+          i = i + 1
+        }
+      },
+    )
+  }
+
+  /// The entries of node `node` (NO_PARENT: the app), under the node's label.
+  fn changeGroup(self: &Self, ui: &mut Ui<Message>, node: u32) -> () {
+    let rows = self.changes.asSlice()
+    ui.column(
+      |ui| {
+        ui.style(&[css.marginTop(px(6.0))])
+        ui.row(
+          |ui| {
+            ui.gap(6.0)
+            border(&mut ui, Property.BorderBottomWidth, LINE)
+            if node != NO_PARENT {
+              ui.cursor(Cursor.Pointer)
+              ui.onClick(|| Message.Select { id: node })
+            }
+            let mut k: usize = 0
+            while k < rows.length && rows[k].node != node {
+              k = k + 1
+            }
+            ui.box(
+              |ui| {
+                ui.style(&[css.fontWeight(700.0)])
+                ui.color(rgb(TAG))
+                ui.text(String.view(&rows[k].label))
+              },
+            )
+            if node != NO_PARENT {
+              let id = ui.alloc(nodeText(node))
+              muted(&mut ui, String.view(&id))
+            }
+          },
+        )
+        ui.enumerate(
+          rows,
+          |row| row.id,
+          |ui, index, row| {
+            if row.node == node {
+              self.changeRow(&mut ui, index, row)
+            }
+          },
+        )
+      },
+    )
+  }
+
+  fn changeRow(self: &Self, ui: &mut Ui<Message>, index: usize, row: &ChangeRow) -> () {
+    ui.column(
+      |ui| {
+        let testId = ui.alloc(changeTestId(row.id))
+        ui.testId(String.view(&testId))
+        ui.accessRole(Role.ListItem)
+        border(&mut ui, Property.BorderBottomWidth, BAR)
+        paddings(&mut ui, 2.0, 0.0)
+        ui.row(
+          |ui| {
+            ui.style(&[css.alignItems(Align.Center), css.whiteSpace(WhiteSpace.NoWrap)])
+            ui.gap(6.0)
+            ui.box(
+              |ui| {
+                ui.grow(1.0)
+                ui.style(
+                  &[css.flexBasis(px(0.0)), css.minWidth(px(0.0)), css.overflowX(Overflow.Hidden)],
+                )
+                if !row.open {
+                  ui.color(rgb(MUTED))
+                }
+                if row.comment {
+                  ui.row(
+                    |ui| {
+                      ui.gap(6.0)
+                      ui.box(
+                        |ui| {
+                          ui.color(rgb(ACCENT))
+                          ui.text("comment")
+                        },
+                      )
+                      ui.text(String.view(&row.text))
+                      if row.author.ownedByteLength() != 0 {
+                        let author = ui.alloc(authorText(String.view(&row.author)))
+                        muted(&mut ui, String.view(&author))
+                      }
+                    },
+                  )
+                } else {
+                  ui.row(
+                    |ui| {
+                      ui.gap(6.0)
+                      ui.box(
+                        |ui| {
+                          ui.color(rgb(ATTRIBUTE))
+                          ui.text(String.view(&row.property))
+                        },
+                      )
+                      ui.box(
+                        |ui| {
+                          ui.color(rgb(MUTED))
+                          ui.style(&[css.textDecorationLine(Keyword.LineThrough)])
+                          ui.text(String.view(&row.before))
+                        },
+                      )
+                      ui.text("→")
+                      ui.text(String.view(&row.after))
+                      if String.view(&row.state) != "base" {
+                        let state = ui.alloc(stateText(String.view(&row.state)))
+                        muted(&mut ui, String.view(&state))
+                      }
+                      if row.open && !row.applied {
+                        muted(&mut ui, "(not applied: the node is gone)")
+                      }
+                    },
+                  )
+                }
+              },
+            )
+            if !row.open {
+              muted(&mut ui, "resolved")
+            }
+            let id = row.id
+            if row.open {
+              smallButton(
+                &mut ui,
+                "resolve",
+                id,
+                "Resolve",
+                || Message.Resolve { id: id, reopen: false },
+              )
+              if !row.comment {
+                smallButton(&mut ui, "reset", id, "Reset", || Message.ResetChange { index: index })
+              }
+            } else {
+              smallButton(
+                &mut ui,
+                "reopen",
+                id,
+                "Reopen",
+                || Message.Resolve { id: id, reopen: true },
+              )
+            }
+          },
+        )
+        ui.enumerate(
+          row.thread.asSlice(),
+          |reply| 0,
+          |ui, k, reply| {
+            ui.key(usize.toU64(k))
+            ui.box(
+              |ui| {
+                ui.style(&[css.paddingLeft(px(16.0))])
+                ui.color(rgb(MUTED))
+                let line = ui.alloc(replyText(String.view(&reply)))
+                ui.text(String.view(&line))
+              },
+            )
           },
         )
       },
@@ -2280,20 +2861,77 @@ impl App<Message, Command> for Devtools {
       }
       Message.StyleDraft { value } => {
         self.draft = move value
+        cx.alloc(suggest(String.view(&self.draft), &mut self.suggestions))
       }
       Message.ApplyStyle => {
         if self.selected != NO_PARENT && self.draft.ownedByteLength() != 0 {
           let declarations = cx.alloc(String.copy(String.view(&self.draft)))
-          cx.command(Command.SetStyle { node: self.selected, css: move declarations })
+          cx.command(Command.SetStyle { node: self.selected, css: move declarations, draft: true })
+        }
+      }
+      Message.StepStyle { by } => {
+        let mut next = String.make()
+        if self.selected != NO_PARENT && cx.alloc(step(String.view(&self.draft), by, &mut next)) {
+          self.draft = move next
+          self.suggestions.clear()
+          let declarations = cx.alloc(String.copy(String.view(&self.draft)))
+          cx.command(Command.SetStyle { node: self.selected, css: move declarations, draft: false })
+        }
+      }
+      Message.Complete { index } => {
+        if index < self.suggestions.length() {
+          let mut next = String.make()
+          cx.alloc(
+            complete(
+              String.view(&self.draft),
+              String.view(&self.suggestions.asSlice()[index]),
+              &mut next,
+            ),
+          )
+          self.draft = move next
+          cx.alloc(suggest(String.view(&self.draft), &mut self.suggestions))
         }
       }
       Message.ResetStyles => {
-        cx.command(Command.ResetStyles { selected: self.selected })
+        let line = cx.alloc(resetLine(self.selected, "", ""))
+        cx.command(Command.Edit { line: move line, selected: self.selected })
       }
-      Message.Styled { detail } => {
+      Message.ResetAll => {
+        let line = cx.alloc(resetLine(NO_PARENT, "", ""))
+        cx.command(Command.Edit { line: move line, selected: self.selected })
+      }
+      Message.ResetChange { index } => {
+        if index < self.changes.length() {
+          let row = &self.changes.asSlice()[index]
+          let line = cx.alloc(
+            resetLine(row.node, String.view(&row.state), String.view(&row.property)),
+          )
+          cx.command(Command.Edit { line: move line, selected: self.selected })
+        }
+      }
+      Message.Resolve { id, reopen } => {
+        let line = cx.alloc(resolveLine(id, reopen))
+        cx.command(Command.Edit { line: move line, selected: self.selected })
+      }
+      Message.CommentDraft { value } => {
+        self.comment = move value
+      }
+      Message.AddComment => {
+        if self.comment.ownedByteLength() != 0 {
+          let line = cx.alloc(commentLine(self.selected, String.view(&self.comment)))
+          self.comment.clear()
+          cx.command(Command.Edit { line: move line, selected: self.selected })
+        }
+      }
+      Message.Edited { changes, open, detail, draft } => {
         self.styleError.clear()
-        self.draft.clear()
-        if detail.id != NO_PARENT {
+        if draft {
+          self.draft.clear()
+          self.suggestions.clear()
+        }
+        self.changes = move changes
+        self.openChanges = open
+        if detail.id != NO_PARENT && detail.id == self.selected {
           self.detail = move detail
         }
       }
@@ -2361,6 +2999,10 @@ impl App<Message, Command> for Devtools {
         }
         if u32.bitAnd(s.parts, PART_STATS) != 0 {
           self.stats = Intrinsic.replace(s.stats, List<Stat>.make())
+        }
+        if u32.bitAnd(s.parts, PART_EDITS) != 0 {
+          self.changes = Intrinsic.replace(s.changes, List<ChangeRow>.make())
+          self.openChanges = s.openChanges
         }
 
         if u32.bitAnd(s.parts, PART_EVENTS) != 0 {
