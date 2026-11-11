@@ -24,19 +24,25 @@ is removed when nothing answers on it.
 
 ## In the app's frame loop
 
-The server is polled from the window loop. It serves at most one waiting request per poll,
-then yields to native input and timers. Screenshot rendering is synchronous; connected socket
-reads/writes have bounded deadlines. Waiting for future clients never blocks the frame loop.
-The poll clock probes socket readiness without waiting and advances to its deadline when nothing
-is ready, preserving this behavior with Silk's `MonotonicClock.waitReady` interface.
+A thread accepts clients, and each connection gets a pump (`channel.bridge`, two threads: one
+reads the socket, one writes) that queues its lines for the UI thread. The frame loop only
+touches those queues: `poll` serves at most one waiting line per call, then yields to native
+input and timers, so neither waiting for clients nor a slow client ever blocks it. Screenshot
+rendering is synchronous.
+
+`inspector.wakeWith(wake)` hands the inspector a `Wake` (the window host passes its `Nudge`,
+the same one a `Poster` uses), and an arriving line ends the loop's wait for the next event;
+`pollInterval` is then None while nothing waits, and 0 while lines wait. A host that never
+calls `wakeWith` is polled: `pollInterval` says 20 ms.
 
 ```silk
 let mut inspector = run Inspector.start(InspectorOptions.make())
-let wait = match inspector.pollInterval() {          // wake up to serve requests while idle
-  Option<f64>.Some { value } => Wait.Seconds { seconds: value }
-  Option<f64>.None => Wait.Forever
-}
+run inspector.wakeWith(platform.nudge())             // a request line ends the wait below
 while true {
+  let wait = match inspector.pollInterval() {        // 0 while lines wait
+    Option<f64>.Some { value } => Wait.Seconds { seconds: value }
+    Option<f64>.None => Wait.Forever
+  }
   let next = run platform.nextEvent(wait)
   if run inspector.poll(&mut tree) {                 // a request dispatched input or highlighted
     while true {
@@ -51,7 +57,7 @@ while true {
   ...
   run tree.frame(input)
   // upload tree.pendingUploads() to the GPU, then:
-  run inspector.afterFrame(&tree)                    // before the uploads are cleared
+  run inspector.afterFrame(&tree)                    // before the uploads are cleared; pushes topics
   run renderer.draw(..., inspector.scene(&tree), ...) // the frame, with the highlight on top
 }
 run inspector.close()
@@ -64,19 +70,55 @@ handler's focus, capture, or view changes apply before up. Protocol-only integra
 `Protocol.dispatchNext` with the same contract. No input command calls application actions.
 
 After a request dispatches input, the next request waits until the app has drawn a frame
-(`afterFrame`), so every request sees the app's answer to the one before. Call `inspector.observe(&tree)` before every
+(`afterFrame`), so every request sees the app's answer to the one before. `afterFrame` and
+`poll` also send subscribed sessions their notifications; `wantsFrame` is true when a topic
+changed again in a frame that already sent it, so it goes out with the next frame. Call `inspector.observe(&tree)` before every
 `takeEvents` (window input too) so the `events` log sees what the app sees. `modules/tree/demo` is
 the worked example; ui-app apps get all of this from `runWindowWith` in modules/app/window.
 
 ## Protocol
 
-One request per connection: the client writes one JSON object and a newline, the server writes
-one JSON object and a newline and closes the connection. (std's `accept` only lends a
-connection to a callback, so a connection cannot stay open across frames yet; a later std
-change can keep it open without changing the messages.)
+Protocol 3: JSON lines over a connection that stays open. Each line is a JSON object. A
+request with an `id` (a number or a string) gets a reply with the same `id`; a line without one
+is a notification and gets no reply. Replies have `"ok": true` and the command's members, or
+`"ok": false` and an `error`. Lines from the app with an `event` member are notifications
+(see Topics); a client ignores events it does not know.
 
-Requests have a `cmd` and an optional `id` (a number or a string) that the reply echoes.
-Replies have `"ok": true` and the command's members, or `"ok": false` and an `error`.
+A client opens a session by sending `hello` with `"protocol": 3` first:
+
+```text
+→ {"id":1,"cmd":"hello","protocol":3,"client":"devtools","wants":["tree","events"]}
+← {"id":1,"ok":true,"protocol":3,"capabilities":{"commands":[...],"topics":[...],"sessions":true},"extensions":[],"roots":[...],...}
+← {"event":"tree","frame":12,"width":360,"height":300,"scale":2,"nodes":40,"revision":7}
+→ {"cmd":"highlight","nodes":[41]}          // no id, no reply
+```
+
+A connection whose first line is anything else is protocol 2: that one request is answered
+(with or without an `id`), and the server closes the connection. So the CLI and scripts send
+one request on a fresh connection, as before. A session over the same `Channel` in memory
+(`MemoryChannel`, `Session.open()`) is open from the start.
+
+`Protocol.handle` has no transport in it, and `Session` (`session.silk`) only a `Channel`
+(`channel.silk`): `MemoryChannel` is a pair of line queues, `SocketChannel` is one whose other
+end a pump joins to a socket (`client.openSession` connects one to an app).
+
+### Topics
+
+`subscribe` and `unsubscribe` take `topics` (names; all of them when left out) and answer with
+the topics subscribed now; `hello` takes the same names in `wants`. Unknown names are ignored.
+The app then sends `{"event": <topic>, "frame", ...}` when the topic changes, at most once per
+topic per frame:
+
+| topic | when | members |
+| --- | --- | --- |
+| `tree` | nodes, text, styles or geometry changed (the tree's `semanticRevision`) | `width`, `height`, `scale`, `nodes` (count), `revision` |
+| `frame` | a frame was drawn | `width`, `height`, `scale`, `nodes` |
+| `events` | the event log has new records | `next`: the `seq` the next record gets |
+| `roots` | a root opened or closed | `roots`, as `tree` lists them |
+| `highlight` | the highlight changed | `nodes` |
+| `pick` | the picker turned on or off, or picked | `on`, `picked` (an id) |
+
+Nothing is computed for a topic no session subscribed to.
 
 Commands that pick a node take a target, either at the top level or in a `query` object:
 `node` (the client id), `role` (the ARIA name `describe` prints: `button`, `listitem`, ...),
@@ -88,7 +130,9 @@ Node objects in replies are `{"id", "kind", "role", "name", "testId", "x", "y", 
 
 | cmd | members | reply |
 | --- | --- | --- |
-| `hello` | | `protocol` (2), `commands`, `width`, `height`, `scale`, `frame`, `root`, `nodes`, `highlight` |
+| `hello` | `protocol` (3 opens a session), `client`, `wants` (topics) | `protocol` (3), `commands`, `capabilities` (`commands`, `topics`, `sessions`), `extensions` (none yet), `width`, `height`, `scale`, `frame`, `root`, `roots`, `nodes`, `highlight` |
+| `subscribe` | `topics` | `topics`: subscribed now (sessions only) |
+| `unsubscribe` | `topics` | `topics`: subscribed now (sessions only) |
 | `snapshot` | target (optional, a subtree), `styles` | `text`: `describe` output, `frame` |
 | `query` | target, `limit` | `count`, `nodes` (node objects, tree order) |
 | `inspect` | target, `patches`, `computed` | `node`, `text`: the devtools-style node view; `box`: the `margin`, `border`, `padding` and `content` rects of the first fragment and the `fragments` count (left out when the node has no box) |
@@ -163,16 +207,23 @@ silk task native inspect      # the CLI drives the demo in a window
   inspect equals `inspectNode`, queries by role and name, pick, highlight and screenshots (with
   and without the overlay, one node cropped), click (the app sees the click record), Tab,
   scroll, type, wait (holds, pending, gone, timed out) and the error replies.
-- Over a real Unix socket (not on Windows): hello, a click followed by a query that waits for the app's frame,
-  a pending wait, bad JSON, and `close` removing the socket file.
+- Sessions over a `MemoryChannel`: replies by id (numbers and strings), a notification with no
+  reply, `wants` and `subscribe` pushing `highlight` and `events`, two changes in one frame sent
+  once with the next frame, `unsubscribe`, a one-shot first line, and closing one end.
+- Over a real Unix socket (not on Windows): protocol 2 clients (hello, a click followed by a
+  query that waits for the app's frame, a pending wait, bad JSON, `close` removing the socket
+  file), and a protocol 3 session: several requests on one connection, a pushed topic, a
+  one-shot client beside it, and the session ending with its connection.
 - The MCP bridge over the same fixture (see [ui-inspect-mcp](../mcp/README.md#tests)).
 - `demo inspect` (CI job `demo` in ui-inspect.yml): snapshot, click New by role and name, wait
   for the new row, highlight Archive, inspect it, screenshot to a PNG.
 
 ## Limits
 
-- One request per connection (see above); `wait` is answered `pending` and the client asks
-  again (ui-inspect-cli does, every 50 ms).
+- `wait` is answered `pending` and the client asks again (ui-inspect-cli does, every 50 ms),
+  in a session too.
+- A connection costs two pump threads, besides the one accept thread. Closing the inspector
+  waits for them, up to a read pause (0.2 s).
 - `type` sends `TextInput` records (Enter and Tab for newlines and tabs); IME preedit is not driven.
 - The program log keeps the last 200 steps and the timeline the last 240 frames. A model is
   text (what `show` prints), so `model` diffs lines, not values, and there is no time travel:

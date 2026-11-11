@@ -5,7 +5,7 @@
 import inspected { Inspected }
 import ui_devtools.lib { Devtools, Message, Command, Panel, Link, NO_PARENT }
 import ui_app.runtime { Runtime, drain }
-import ui_app.harness { click, press, snapshot, typeText }
+import ui_app.harness { click, hover, moveTo, press, snapshot, typeText }
 import ui_inspect.query { Query, queryFirst }
 import ui_fixtures.fixtures as fixtures
 import ui_tree.legacy { UiTree, TreeError, Batch, FrameInput, Role }
@@ -102,6 +102,24 @@ effect fn body() -> ()
     "the styles panel shows the declarations",
   )
 
+  // Hovering a row highlights its node in the app; leaving it gives the selection its
+  // highlight back. Nothing waits for an answer.
+  let root = devtools.model.rows.asSlice()[0].id
+  let rootRow = run rowId(root)
+  let requests = app.requests
+  run Testing.expect(
+    run hover(&mut devtools, &mut tree, viewport(), String.view(&rootRow))
+      |> Effect.provideMut<Link>(&mut app),
+    "the root's row is there",
+  )
+  run Testing.expect(devtools.model.hovered == root, "the row is hovered")
+  run Testing.expect(run highlighted(&app, root), "the app highlights the hovered node")
+  run Testing.expect(app.requests > requests, "the highlight went to the app")
+  run moveTo(&mut devtools, &mut tree, viewport(), 880.0, 540.0)
+    |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(devtools.model.hovered == NO_PARENT, "the pointer left the rows")
+  run Testing.expect(run highlighted(&app, add), "the selection is highlighted again")
+
   // The box model tab.
   drop run click(&mut devtools, &mut tree, viewport(), "Box model")
     |> Effect.provideMut<Link>(&mut app)
@@ -113,15 +131,18 @@ effect fn body() -> ()
   )
   run Testing.expect(String.contains(String.view(&boxes), "testId=\"margin\""), "margin box drawn")
 
-  // Input to the app shows in the event log at the next refresh.
+  // Input to the app is pushed: the devtools read the event log and the tree again.
   let mut reply = String.make()
+  let syncs = devtools.model.syncs
   run app.ask("{\"cmd\":\"click\",\"role\":\"button\",\"name\":\"Add\"}", &mut reply)
   run Testing.expect(app.app.model.items.length() == 4, "the click reached the todo app")
+  run Testing.expect(app.notified(), "the app tells the devtools")
+  devtools.send(Message.Pull)
+  run drain(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(devtools.model.syncs == syncs + 1, "they read what changed")
+  run Testing.expect(devtools.model.events.length() >= 1, "the event log has the click")
   drop run click(&mut devtools, &mut tree, viewport(), "Events")
     |> Effect.provideMut<Link>(&mut app)
-  devtools.send(Message.Tick { time: 1.0 })
-  run drain(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
-  run Testing.expect(devtools.model.events.length() >= 1, "the event log has the click")
   let log = run snapshot(&mut tree, viewport())
   run Testing.expect(String.contains(String.view(&log), "\"click\""), "the log shows a click")
   run Testing.expect(
@@ -248,19 +269,28 @@ effect fn body() -> ()
   run Testing.expect(devtools.model.picking && app.protocol.picking, "the app waits for a pick")
   app.protocol.picked = add
   app.protocol.picking = false
-  devtools.send(Message.Tick { time: 1.5 })
+  app.protocol.changes.pick = true
+  run app.frame()
+  devtools.send(Message.Pull)
   run drain(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
   run Testing.expect(!devtools.model.picking, "the pick ends")
   run Testing.expect(devtools.model.selected == add, "with the picked node selected")
   run Testing.expect(devtools.model.detail.id == add, "and inspected")
 
-  // Live refreshes stop when Live is off.
-  let syncs = devtools.model.syncs
+  // With Live off, the devtools unsubscribe: a change in the app is not pushed.
   drop run click(&mut devtools, &mut tree, viewport(), "Live") |> Effect.provideMut<Link>(&mut app)
   run Testing.expect(!devtools.model.live, "Live toggles off")
-  devtools.send(Message.Tick { time: 2.0 })
+  run app.ask("{\"cmd\":\"click\",\"role\":\"button\",\"name\":\"Add\"}", &mut reply)
+  run Testing.expect(!app.notified(), "nothing is pushed while not live")
+  let rowCount = devtools.model.rows.length()
+  devtools.send(Message.Pull)
   run drain(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
-  run Testing.expect(devtools.model.syncs == syncs, "no refresh while not live")
+  run Testing.expect(devtools.model.rows.length() == rowCount, "and nothing is read")
+  drop run click(&mut devtools, &mut tree, viewport(), "Live") |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(
+    devtools.model.rows.length() == app.tree.nodeCount(),
+    "Live on reads everything again",
+  )
 
   // An app that cannot be reached shows in the status line.
   app.down = true

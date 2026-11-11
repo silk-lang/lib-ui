@@ -4,10 +4,12 @@
 //! audit and the frame stats. It talks to the app only through the inspector protocol (the
 //! same requests ui-inspect-cli and ui-inspect-mcp send), over a [`Link`] the host provides.
 //!
-//! Selecting a row inspects that node and highlights it in the app's window; Pick selects the
-//! node pressed in the app's window instead. While live (the default), the window refreshes
-//! every [`LIVE_INTERVAL`] seconds. Keys: ArrowDown and ArrowUp move the selection, Escape
-//! clears it, F5 refreshes.
+//! Hovering a row highlights its node in the app's window; selecting a row inspects that node
+//! and keeps it highlighted; Pick selects the node pressed in the app's window instead. While
+//! live (the default), the devtools subscribe to the app's topics and read again only what a
+//! notification says changed (the host sends [`Message.Pull`] when one comes); while the app
+//! cannot be reached, they try again every [`RETRY_INTERVAL`] seconds. Keys: ArrowDown and
+//! ArrowUp move the selection, Escape clears it, F5 refreshes.
 import ui_tree.css
 import ui_tree.css { px, percent, none, Property }
 import data {
@@ -38,9 +40,27 @@ import data {
   Issue,
   ADDED,
   REMOVED,
-  FRAME_BUDGET
+  FRAME_BUDGET,
+  PART_STATUS,
+  PART_ROWS,
+  PART_STATS,
+  PART_EVENTS,
+  PART_DETAIL,
+  PART_STEPS,
+  PART_PICK,
+  PART_ALL
 }
 import link { Link }
+import ui_inspect_server.topics {
+  TOPIC_TREE,
+  TOPIC_FRAME,
+  TOPIC_EVENTS,
+  TOPIC_ROOTS,
+  TOPIC_PICK,
+  TOPIC_COUNT,
+  TOPIC_NAMES,
+  topicNamed
+}
 import ui_app.app { App, Perform, Context, Subscriptions }
 import ui_app.ui { Ui, Reply }
 import ui_inspect_server.reply { textField, flagField, idField, writeString }
@@ -60,8 +80,8 @@ import silk.num.u64
 import silk.num.usize
 import silk.text.string { String }
 
-/// Seconds between refreshes while live.
-pub const LIVE_INTERVAL: f64 = 0.5
+/// Seconds between tries while the app cannot be reached.
+pub const RETRY_INTERVAL: f64 = 1.0
 
 /// How many event records the log keeps.
 pub const MAX_LOG: usize = 200
@@ -92,8 +112,15 @@ const BAR_HEIGHT: f32 = 96.0
 pub union Message {
   /// Read everything again.
   Refresh,
-  /// The live timer.
+  /// The timer that tries again while the app cannot be reached.
   Tick { pub time: f64 },
+  /// Notifications from the app wait: read what they say changed.
+  Pull,
+  /// The pointer entered or left the row of node `id`.
+  Hover { pub id: u32 },
+  Unhover { pub id: u32 },
+  /// A notification went to the app.
+  Sent,
   ToggleLive,
   /// Inspect and highlight node `id`.
   Select { pub id: u32 },
@@ -130,9 +157,15 @@ pub union Message {
 }
 
 pub union Command {
-  /// Status, tree, stats, the events after `since`, the messages after `step`, what `panel`
-  /// shows besides, and node `selected` again.
-  Sync { pub since: u64, pub step: u64, pub selected: u32, pub panel: Panel },
+  /// Subscribe to `topics` (`TOPIC_*` bits), then read status, tree, stats, the events after
+  /// `since`, the messages after `step`, what `panel` shows besides, and node `selected` again.
+  Sync { pub since: u64, pub step: u64, pub selected: u32, pub panel: Panel, pub topics: u32 },
+  /// Take the app's notifications and read again what they say changed.
+  Pull { pub since: u64, pub step: u64, pub selected: u32, pub panel: Panel },
+  /// Subscribe to exactly `topics`.
+  Subscribe { pub topics: u32 },
+  /// Highlight node `node` alone, or nothing for NO_PARENT, without waiting for an answer.
+  Highlight { pub node: u32 },
   /// Highlight node `node` and inspect it.
   Inspect { pub node: u32 },
   /// Clear the highlight.
@@ -189,6 +222,10 @@ pub struct Devtools {
   pub issues: List<Issue>,
   /// The audit's summary, or empty before the first one.
   pub auditLine: String,
+  /// The node whose row the pointer is over, or NO_PARENT.
+  pub hovered: u32,
+  /// The topics subscribed to, as `TOPIC_*` bits.
+  pub topics: u32,
 }
 
 impl Devtools {
@@ -225,6 +262,8 @@ impl Devtools {
       frames: FrameView.none(),
       issues: List<Issue>.make(),
       auditLine: String.make(),
+      hovered: NO_PARENT,
+      topics: 0,
     }
   }
 
@@ -332,15 +371,39 @@ impl Devtools {
     return self.selected
   }
 
-  fn sync(self: &Self, cx: &mut Context<Command>) -> () {
+  /// What to subscribe to: while live, the tree, its roots, the event log and the picker, and
+  /// frames for the panels that show what each frame changes; the picker alone otherwise.
+  pub fn wanted(self: &Self) -> u32 {
+    if !self.live {
+      return TOPIC_PICK
+    }
+    let mut topics = TOPIC_TREE | TOPIC_ROOTS | TOPIC_EVENTS | TOPIC_PICK
+    if self.panel == Panel.Stats || self.panel == Panel.Frames || self.panel == Panel.Program {
+      topics = topics | TOPIC_FRAME
+    }
+    return topics
+  }
+
+  /// Subscribes to what is wanted and reads everything.
+  fn sync(self: &mut Self, cx: &mut Context<Command>) -> () {
+    self.topics = self.wanted()
     cx.command(
       Command.Sync {
         since: self.since,
         step: self.sinceStep,
         selected: self.selected,
         panel: self.panel,
+        topics: self.topics,
       },
     )
+  }
+
+  /// Subscribes to what is wanted, when that changed.
+  fn resubscribe(self: &mut Self, cx: &mut Context<Command>) -> () {
+    if self.wanted() != self.topics {
+      self.topics = self.wanted()
+      cx.command(Command.Subscribe { topics: self.topics })
+    }
   }
 
   /// Unfolds what hides node `id` and drops a filter that does.
@@ -449,11 +512,64 @@ effect fn inspectNode(node: u32) -> Option<Detail>
   }
 }
 
-effect fn syncAll(since: u64, step: u64, selected: u32, panel: Panel) -> Message
+/// `{"cmd":"subscribe","topics":[...]}` for `topics` (`TOPIC_*` bits).
+effect fn subscribeLine(topics: u32) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut line = run String.copy("{\"cmd\":\"subscribe\",\"topics\":[")
+  let mut first = true
+  let mut i: usize = 0
+  while i < TOPIC_COUNT {
+    if u32.bitAnd(topics, u32.shiftLeft(1, usize.toU32(i))) != 0 {
+      if !first {
+        run line.append(",")
+      }
+      first = false
+      run writeString(&mut line, TOPIC_NAMES[i])
+    }
+    i = i + 1
+  }
+  run line.append("]}")
+  return move line
+}
+
+/// Subscribes to exactly `topics`, with two notifications. The app handles lines in order, so
+/// the requests sent after them see the subscription.
+effect fn subscribe(topics: u32) -> bool
+  ! OutOfMemoryError
+  ? &mut Link | &mut Allocator {
+  if !run Link.notify("{\"cmd\":\"unsubscribe\"}") {
+    return false
+  }
+  let line = run subscribeLine(topics)
+  return run Link.notify(String.view(&line))
+}
+
+/// A snapshot with nothing read yet.
+fn emptySnapshot(since: u64, step: u64) -> Snapshot {
+  return Snapshot {
+    parts: 0,
+    status: String.make(),
+    rows: List<Row>.make(),
+    stats: List<Stat>.make(),
+    events: List<LogRow>.make(),
+    next: since + 1,
+    detail: Option<Detail>.None,
+    steps: List<StepRow>.make(),
+    stepNext: step + 1,
+    program: Option<ProgramView>.None,
+    frames: Option<FrameView>.None,
+    picking: false,
+    picked: NO_PARENT,
+  }
+}
+
+effect fn syncAll(since: u64, step: u64, selected: u32, panel: Panel, topics: u32) -> Message
   ! OutOfMemoryError
   ? &mut Link | &mut Allocator {
   let mut error = String.make()
   let mut snapshot = Snapshot {
+    parts: PART_ALL,
     status: String.make(),
     rows: List<Row>.make(),
     stats: List<Stat>.make(),
@@ -474,6 +590,12 @@ effect fn syncAll(since: u64, step: u64, selected: u32, panel: Panel) -> Message
     Option<Value>.None => {
       return Message.Failed { error: move error }
     }
+  }
+
+  // Before the reads, so no change after them goes unheard.
+  if !run subscribe(topics) {
+    run error.append("cannot reach the app")
+    return Message.Failed { error: move error }
   }
   match run ask("{\"cmd\":\"tree\"}", &mut error) {
     Option<Value>.Some { value } => {
@@ -548,6 +670,146 @@ fn pickedOf(reply: &Value) -> u32 {
     }
     Option<&Value>.None => NO_PARENT
   }
+}
+
+/// Takes the app's notifications and reads again what they say changed: the element tree and
+/// the selected node after `tree` or `roots`, the event log after `events`, what `panel` shows
+/// after `frame` (or `tree`, for the program), the picker after `pick`. The status line comes
+/// with `tree` and `frame` notifications themselves.
+effect fn pull(since: u64, step: u64, selected: u32, panel: Panel) -> Message
+  ! OutOfMemoryError
+  ? &mut Link | &mut Allocator {
+  let mut notes = List<String>.make()
+  let open = run Link.take(&mut notes)
+  let mut snapshot = emptySnapshot(since, step)
+  let mut changed: u32 = 0
+  let list = notes.asSlice()
+  let mut i: usize = 0
+  while i < list.length {
+    let parsed = run Effect.result(Json.parse(list[i].ownedUtf8Bytes()))
+    match move parsed {
+      Result<Value, JsonError | OutOfMemoryError>.Success { value } => {
+        let topic = topicNamed(textField(&value, "event"))
+        changed = changed | topic
+        if topic == TOPIC_TREE || topic == TOPIC_FRAME {
+          run parseStatus(&value, &mut snapshot.status)
+          snapshot.parts = snapshot.parts | PART_STATUS
+        }
+      }
+      Result<Value, JsonError | OutOfMemoryError>.Failure { error } => {
+        drop error
+      }
+    }
+    i = i + 1
+  }
+  let mut error = String.make()
+  if !open && changed == 0 {
+    run error.append("cannot reach the app: it closed the session")
+    return Message.Failed { error: move error }
+  }
+  if u32.bitAnd(changed, TOPIC_TREE | TOPIC_ROOTS) != 0 {
+    match run ask("{\"cmd\":\"tree\"}", &mut error) {
+      Option<Value>.Some { value } => {
+        run parseTree(&value, &mut snapshot.rows)
+        snapshot.parts = snapshot.parts | PART_ROWS
+      }
+      Option<Value>.None => {
+        return Message.Failed { error: move error }
+      }
+    }
+    if selected != NO_PARENT {
+      snapshot.detail = run inspectNode(selected)
+      snapshot.parts = snapshot.parts | PART_DETAIL
+    }
+  }
+  if u32.bitAnd(changed, TOPIC_EVENTS) != 0 {
+    let events = run requestLine("events", "since", since)
+    match run ask(String.view(&events), &mut error) {
+      Option<Value>.Some { value } => {
+        snapshot.next = run parseEvents(&value, &mut snapshot.events)
+        snapshot.parts = snapshot.parts | PART_EVENTS
+      }
+      Option<Value>.None => {
+        return Message.Failed { error: move error }
+      }
+    }
+  }
+  let mut quiet = String.make()
+  if u32.bitAnd(changed, TOPIC_FRAME | TOPIC_TREE) != 0 {
+    if panel == Panel.Stats {
+      match run ask("{\"cmd\":\"stats\"}", &mut error) {
+        Option<Value>.Some { value } => {
+          run parseStats(&value, &mut snapshot.stats)
+          snapshot.parts = snapshot.parts | PART_STATS
+        }
+        Option<Value>.None => {
+          return Message.Failed { error: move error }
+        }
+      }
+    }
+    if panel == Panel.Frames {
+      let frames = run requestLine("frames", "limit", MAX_FRAMES)
+      match run ask(String.view(&frames), &mut quiet) {
+        Option<Value>.Some { value } => {
+          snapshot.frames = Option<FrameView>.Some { value: run parseFrames(&value) }
+        }
+        Option<Value>.None => {}
+      }
+    }
+    if panel == Panel.Program {
+      let messages = run requestLine("messages", "since", step)
+      match run ask(String.view(&messages), &mut quiet) {
+        Option<Value>.Some { value } => {
+          snapshot.stepNext = run parseSteps(&value, &mut snapshot.steps)
+          snapshot.parts = snapshot.parts | PART_STEPS
+        }
+        Option<Value>.None => {}
+      }
+      match run ask("{\"cmd\":\"program\"}", &mut quiet) {
+        Option<Value>.Some { value } => {
+          snapshot.program = Option<ProgramView>.Some { value: run parseProgram(&value) }
+        }
+        Option<Value>.None => {}
+      }
+    }
+  }
+  if u32.bitAnd(changed, TOPIC_PICK) != 0 {
+    match run ask("{\"cmd\":\"pickMode\"}", &mut quiet) {
+      Option<Value>.Some { value } => {
+        snapshot.picking = flagField(&value, "on", false)
+        snapshot.picked = pickedOf(&value)
+        snapshot.parts = snapshot.parts | PART_PICK
+      }
+      Option<Value>.None => {}
+    }
+  }
+  return Message.Synced { snapshot: move snapshot }
+}
+
+/// highlight, as a notification: hovering rows sends many, and none waits for an answer.
+effect fn highlightNode(node: u32) -> Message
+  ! OutOfMemoryError
+  ? &mut Link | &mut Allocator {
+  let mut line = run String.copy("{\"cmd\":\"highlight\"")
+  if node != NO_PARENT {
+    run line.append(",\"nodes\":[")
+    run writeInt(&mut line, u32.toU64(node))
+    run line.append("]")
+  }
+  run line.append("}")
+  if !run Link.notify(String.view(&line)) {
+    return Message.Failed { error: run String.copy("cannot reach the app") }
+  }
+  return Message.Sent
+}
+
+effect fn subscribed(topics: u32) -> Message
+  ! OutOfMemoryError
+  ? &mut Link | &mut Allocator {
+  if !run subscribe(topics) {
+    return Message.Failed { error: run String.copy("cannot reach the app") }
+  }
+  return Message.Sent
 }
 
 effect fn pick(on: bool) -> Message
@@ -656,7 +918,16 @@ impl Perform<Message, OutOfMemoryError ? &mut Link | &mut Allocator> for Command
     ! OutOfMemoryError
     ? &mut Link | &mut Allocator {
     return match &self {
-      Command.Sync { since, step, selected, panel } => run syncAll(since, step, selected, panel)
+      Command.Sync { since, step, selected, panel, topics } => run syncAll(
+        since,
+        step,
+        selected,
+        panel,
+        topics,
+      )
+      Command.Pull { since, step, selected, panel } => run pull(since, step, selected, panel)
+      Command.Subscribe { topics } => run subscribed(topics)
+      Command.Highlight { node } => run highlightNode(node)
       Command.Inspect { node } => run highlightAndInspect(node)
       Command.Unhighlight => run unhighlight()
       Command.Pick { on } => run pick(on)
@@ -1126,6 +1397,16 @@ impl Devtools {
         ui.testId(String.view(&testId))
         ui.cursor(Cursor.Pointer)
         ui.onClick(|| Message.Select { id: row.id })
+
+        // The app highlights the node under the pointer, as Chrome's devtools do.
+        ui.on(
+          EventKind.PointerEnter,
+          |event| Reply<Message>.Emit { message: Message.Hover { id: row.id } },
+        )
+        ui.on(
+          EventKind.PointerLeave,
+          |event| Reply<Message>.Emit { message: Message.Unhover { id: row.id } },
+        )
         ui.style(
           &[
             css.alignItems(Align.Center),
@@ -1915,12 +2196,39 @@ impl App<Message, Command> for Devtools {
         self.sync(&mut cx)
       }
       Message.Tick { time: _ } => {
-        if self.live || self.picking {
+        if self.error.ownedByteLength() != 0 {
           self.sync(&mut cx)
         }
       }
+      Message.Pull => {
+        cx.command(
+          Command.Pull {
+            since: self.since,
+            step: self.sinceStep,
+            selected: self.selected,
+            panel: self.panel,
+          },
+        )
+      }
+      Message.Hover { id } => {
+        self.hovered = id
+        cx.command(Command.Highlight { node: id })
+      }
+      Message.Unhover { id } => {
+        // The selection keeps its highlight; the pointer may already be on another row.
+        if self.hovered == id {
+          self.hovered = NO_PARENT
+          cx.command(Command.Highlight { node: self.selected })
+        }
+      }
+      Message.Sent => {}
       Message.ToggleLive => {
         self.live = !self.live
+        if self.live {
+          self.sync(&mut cx)
+        } else {
+          self.resubscribe(&mut cx)
+        }
       }
       Message.Select { id } => {
         self.select(id, &mut cx)
@@ -2017,54 +2325,67 @@ impl App<Message, Command> for Devtools {
       }
       Message.Synced { snapshot } => {
         let mut s = move snapshot
+        if s.parts == 0 && s.program.isNone() && s.frames.isNone() {
+          return ()
+        }
         self.syncs = self.syncs + 1
         self.error.clear()
-        self.status = Intrinsic.replace(s.status, String.make())
-        self.rows = Intrinsic.replace(s.rows, List<Row>.make())
-        self.updateVisibility()
-        self.stats = Intrinsic.replace(s.stats, List<Stat>.make())
+        if u32.bitAnd(s.parts, PART_STATUS) != 0 {
+          self.status = Intrinsic.replace(s.status, String.make())
+        }
+        if u32.bitAnd(s.parts, PART_ROWS) != 0 {
+          self.rows = Intrinsic.replace(s.rows, List<Row>.make())
+          self.updateVisibility()
+        }
+        if u32.bitAnd(s.parts, PART_STATS) != 0 {
+          self.stats = Intrinsic.replace(s.stats, List<Stat>.make())
+        }
 
-        // Two syncs may be out at once and answer with the same records.
-        while s.events.length() != 0 {
-          let e = s.events.remove(0)
-          if e.seq > self.since {
-            cx.alloc(self.events.append(move e))
+        if u32.bitAnd(s.parts, PART_EVENTS) != 0 {
+          // Two reads may be out at once and answer with the same records.
+          while s.events.length() != 0 {
+            let e = s.events.remove(0)
+            if e.seq > self.since {
+              cx.alloc(self.events.append(move e))
+            }
+          }
+          while self.events.length() > MAX_LOG {
+            drop self.events.remove(0)
+          }
+
+          // `next` is the seq the next record gets; ask for the ones after the last.
+          self.since = if s.next > 0 {
+            s.next - 1
+          } else {
+            0
           }
         }
-        while self.events.length() > MAX_LOG {
-          drop self.events.remove(0)
-        }
 
-        // `next` is the seq the next record gets; ask for the ones after the last.
-        self.since = if s.next > 0 {
-          s.next - 1
-        } else {
-          0
-        }
-
-        // A program that started again counts from one: what was read is another run's.
-        if s.stepNext <= self.sinceStep {
-          self.steps.clear()
-          self.opened = ModelView.none()
-        }
-        let mut held: u64 = 0
-        if self.steps.length() != 0 {
-          held = self.steps.asSlice()[self.steps.length() - 1].seq
-        }
-        while s.steps.length() != 0 {
-          let step = s.steps.remove(0)
-          if step.seq > held {
-            held = step.seq
-            cx.alloc(self.steps.append(move step))
+        if u32.bitAnd(s.parts, PART_STEPS) != 0 {
+          // A program that started again counts from one: what was read is another run's.
+          if s.stepNext <= self.sinceStep {
+            self.steps.clear()
+            self.opened = ModelView.none()
           }
-        }
-        while self.steps.length() > MAX_LOG {
-          drop self.steps.remove(0)
-        }
-        self.sinceStep = if s.stepNext > 0 {
-          s.stepNext - 1
-        } else {
-          0
+          let mut held: u64 = 0
+          if self.steps.length() != 0 {
+            held = self.steps.asSlice()[self.steps.length() - 1].seq
+          }
+          while s.steps.length() != 0 {
+            let step = s.steps.remove(0)
+            if step.seq > held {
+              held = step.seq
+              cx.alloc(self.steps.append(move step))
+            }
+          }
+          while self.steps.length() > MAX_LOG {
+            drop self.steps.remove(0)
+          }
+          self.sinceStep = if s.stepNext > 0 {
+            s.stepNext - 1
+          } else {
+            0
+          }
         }
         match Intrinsic.replace(s.program, Option<ProgramView>.None) {
           Option<ProgramView>.Some { value } => {
@@ -2080,7 +2401,7 @@ impl App<Message, Command> for Devtools {
         }
 
         // The press in the app's window ends the pick: select what it chose.
-        if self.picking && !s.picking {
+        if u32.bitAnd(s.parts, PART_PICK) != 0 && self.picking && !s.picking {
           self.picking = false
           if s.picked != NO_PARENT {
             self.expose(s.picked)
@@ -2088,7 +2409,7 @@ impl App<Message, Command> for Devtools {
             return ()
           }
         }
-        if self.selected != NO_PARENT {
+        if u32.bitAnd(s.parts, PART_DETAIL) != 0 && self.selected != NO_PARENT {
           match Intrinsic.replace(s.detail, Option<Detail>.None) {
             Option<Detail>.Some { value } => {
               self.detail = move value
@@ -2114,8 +2435,8 @@ impl App<Message, Command> for Devtools {
   }
 
   fn subscriptions(self: &Self, subs: &mut Subscriptions<Message>) -> () {
-    if self.live || self.picking {
-      subs.every(1, LIVE_INTERVAL, |time| Message.Tick { time: time })
+    if self.error.ownedByteLength() != 0 {
+      subs.every(1, RETRY_INTERVAL, |time| Message.Tick { time: time })
     }
     subs.keyBinding(2, "ArrowDown", 0, || Message.SelectNext)
     subs.keyBinding(3, "ArrowUp", 0, || Message.SelectPrevious)

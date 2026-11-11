@@ -25,7 +25,13 @@ import ui_inspect_server.lib {
   Bridge,
   Action,
   writeValue,
-  ProgramStep
+  ProgramStep,
+  Channel,
+  MemoryChannel,
+  MemoryPair,
+  Session,
+  TOPIC_HIGHLIGHT,
+  TOPIC_EVENTS
 }
 import ui_tree.input { Input }
 import ui_inspect.lib { InspectOptions, inspectNode }
@@ -197,7 +203,7 @@ effect fn readOnlyBody() -> ()
 
   let hello = run ask(&mut protocol, &mut tree, "{\"id\":7,\"cmd\":\"hello\"}")
   run Testing.expect(ok(&hello) && int(&hello, "id") == 7, "hello echoes the id")
-  run Testing.expect(int(&hello, "protocol") == 2, "protocol version 2")
+  run Testing.expect(int(&hello, "protocol") == 3, "protocol version 3")
   run Testing.expect(int(&hello, "root") == 1, "the inbox panel is the root")
 
   let snap = run ask(&mut protocol, &mut tree, "{\"cmd\":\"snapshot\"}")
@@ -465,24 +471,39 @@ test effect fn addressesParse() -> ()
 
 const SOCKET: string = "/tmp/ui-inspect-server-test.sock"
 
-effect fn send(line: string) -> Connection
-  ! NativeSocketError | ByteIoError
+const SESSION_SOCKET: string = "/tmp/ui-inspect-server-session.sock"
+
+effect fn connectTo(path: string) -> Connection
+  ! NativeSocketError
   ? &mut MonotonicClock {
   let start = run MonotonicClock.now()
-  let mut c = run connectUnixOwned(
-    String.utf8Bytes(SOCKET),
+  return run connectUnixOwned(
+    String.utf8Bytes(path),
     ConnectOptions.defaults(),
     Option<Instant>.some(MonotonicClock.deadlineAfter(&start, 2000000000)),
   )
-  let bytes = String.utf8Bytes(line)
+}
+
+effect fn write(c: &mut Connection, line: string) -> ()
+  ! ByteIoError
+  ? &mut MonotonicClock {
+  let start = run MonotonicClock.now()
   drop run ByteDuplex.writeSome(
-    bytes,
+    String.utf8Bytes(line),
     Option<Instant>.some(MonotonicClock.deadlineAfter(&start, 2000000000)),
   )
-    |> Effect.provideMut<ByteDuplex>(&mut c)
+    |> Effect.provideMut<ByteDuplex>(&mut c.*)
+}
+
+effect fn send(line: string) -> Connection
+  ! NativeSocketError | ByteIoError
+  ? &mut MonotonicClock {
+  let mut c = run connectTo(SOCKET)
+  run write(&mut c, line)
   return move c
 }
 
+/// Reads to the end of the stream: the server closes a one-shot connection after its reply.
 effect fn receive(c: &mut Connection) -> Value
   ! ByteIoError | JsonError | OutOfMemoryError
   ? &mut MonotonicClock | &mut Allocator {
@@ -507,6 +528,115 @@ effect fn receive(c: &mut Connection) -> Value
   return move reply
 }
 
+/// Lines from a connection that stays open.
+struct Lines {
+  buffer: Bytes,
+}
+
+/// The next line from `c`, parsed.
+effect fn nextLine(lines: &mut Lines, c: &mut Connection) -> Value
+  ! ByteIoError | JsonError | OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator {
+  let start = run MonotonicClock.now()
+  let mut chunk: [u8; 4096] = [0; 4096]
+  while true {
+    let held = lines.buffer.asSlice()
+    let mut i: usize = 0
+    while i < held.length {
+      if held[i] == 10 {
+        let line = run Json.parse(Slice.view(held, 0, i))
+        let mut rest = Bytes.make()
+        run rest.append(Slice.view(held, i + 1, held.length - i - 1))
+        lines.buffer = move rest
+        return move line
+      }
+      i = i + 1
+    }
+    match run ByteDuplex.readSome(
+      &mut chunk,
+      Option<Instant>.some(MonotonicClock.deadlineAfter(&start, 2000000000)),
+    )
+      |> Effect.provideMut<ByteDuplex>(&mut c.*) {
+      ReadTransfer.Data { count } => {
+        run lines.buffer.append(Slice.view(&chunk, 0, count))
+      }
+      ReadTransfer.End => {
+        break
+      }
+    }
+  }
+  let end = run Json.parse(b"{\"end\":true}")
+  return move end
+}
+
+/// The next reply from `c`, past the notifications before it.
+effect fn nextReply(lines: &mut Lines, c: &mut Connection) -> Value
+  ! ByteIoError | JsonError | OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator {
+  while true {
+    let line = run nextLine(&mut lines, &mut c)
+    if !has(&line, "event") {
+      return move line
+    }
+  }
+  return run Json.parse(b"{}")
+}
+
+/// The next notification for `topic` from `c`, past other lines.
+effect fn nextEvent(lines: &mut Lines, c: &mut Connection, topic: string) -> Value
+  ! ByteIoError | JsonError | OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator {
+  while true {
+    let line = run nextLine(&mut lines, &mut c)
+    if text(&line, "event") == topic || has(&line, "end") {
+      return move line
+    }
+  }
+  return run Json.parse(b"{}")
+}
+
+fn has(value: &Value, key: string) -> bool {
+  return match Json.field(value, key) {
+    Option<&Value>.Some { value: _ } => true
+    Option<&Value>.None => false
+  }
+}
+
+/// Polls until the inspector served `count` requests in all (lines come in on other threads),
+/// for at most two seconds. Returns whether a poll said the app has work.
+effect fn pollUntil(inspector: &mut Inspector, tree: &mut UiTree<'_>, count: u64) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock {
+  let mut work = false
+  let mut tries: u64 = 0
+  while inspector.served < count && tries < 1000 {
+    if run inspector.poll(&mut tree) {
+      work = true
+    }
+    if inspector.served < count {
+      run MonotonicClock.waitFor(2000000)
+    }
+    tries = tries + 1
+  }
+  return work
+}
+
+/// Polls for a fifth of a second.
+effect fn pollAWhile(inspector: &mut Inspector, tree: &mut UiTree<'_>) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock {
+  let mut work = false
+  let mut tries: u64 = 0
+  while tries < 100 {
+    if run inspector.poll(&mut tree) {
+      work = true
+    }
+    run MonotonicClock.waitFor(2000000)
+    tries = tries + 1
+  }
+  return work
+}
+
 effect fn socketBody() -> ()
   ! AssertionError<'static>
     | TreeError
@@ -522,34 +652,34 @@ effect fn socketBody() -> ()
   run Testing.expect(inspector.enabled(), "listening")
   run Testing.expect(!run inspector.poll(&mut tree), "nothing to serve yet")
 
+  // A protocol 2 client: one request, one reply, then the server closes the connection.
   let mut a = run send("{\"id\":1,\"cmd\":\"hello\"}\n")
-  run Testing.expect(!run inspector.poll(&mut tree), "hello changes nothing")
+  run Testing.expect(!run pollUntil(&mut inspector, &mut tree, 1), "hello changes nothing")
   let hello = run receive(&mut a)
-  run Testing.expect(ok(&hello) && int(&hello, "protocol") == 2, "hello over the socket")
+  run Testing.expect(ok(&hello) && int(&hello, "protocol") == 3, "hello over the socket")
 
   // A click, then a query sent before the app drew a frame: the query waits for the frame.
   let mut b = run send("{\"id\":2,\"cmd\":\"click\",\"node\":10}\n")
-  let mut c = run send("{\"id\":3,\"cmd\":\"query\",\"role\":\"button\"}\n")
-  run Testing.expect(run inspector.poll(&mut tree), "a click is work for the app")
+  run Testing.expect(run pollUntil(&mut inspector, &mut tree, 2), "a click is work for the app")
   while run inspector.dispatchNext(&mut tree) {}
-  run Testing.expect(inspector.served == 2, "one request served")
-  run Testing.expect(!run inspector.poll(&mut tree), "the next waits for a frame")
-  run Testing.expect(inspector.served == 2, "still one")
+  let mut c = run send("{\"id\":3,\"cmd\":\"query\",\"role\":\"button\"}\n")
+  drop run pollAWhile(&mut inspector, &mut tree)
+  run Testing.expect(inspector.served == 2, "the next waits for a frame")
   let click = run receive(&mut b)
   run Testing.expect(ok(&click) && int(&click, "id") == 2, "the click reply")
   run tree.frame(FrameInput { width: 360.0, height: 440.0, scale: 2.0, time: 0.1 })
   run inspector.afterFrame(&tree)
-  drop run inspector.poll(&mut tree)
+  drop run pollUntil(&mut inspector, &mut tree, 3)
   let query = run receive(&mut c)
   run Testing.expect(int(&query, "id") == 3 && int(&query, "count") == 3, "served after it")
 
   // A wait that does not hold yet answers pending; bad JSON is an error.
   let mut d = run send("{\"cmd\":\"wait\",\"name\":\"never\"}\n")
-  drop run inspector.poll(&mut tree)
+  drop run pollUntil(&mut inspector, &mut tree, 4)
   let wait = run receive(&mut d)
   run Testing.expect(pending(&wait), "pending over the socket")
   let mut e = run send("{oops\n")
-  drop run inspector.poll(&mut tree)
+  drop run pollUntil(&mut inspector, &mut tree, 5)
   let bad = run receive(&mut e)
   run Testing.expect(!ok(&bad), "bad JSON")
 
@@ -585,6 +715,250 @@ test effect fn requestsOverAUnixSocket() -> ()
       |> Effect.provideMut<Allocator>(&mut allocator)
       |> Effect.provideMut<MonotonicClock>(&mut clock)
   }
+}
+
+effect fn sessionSocketBody() -> ()
+  ! AssertionError<'static>
+    | TreeError
+    | JsonError
+    | NativeSocketError
+    | ByteIoError
+    | OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock {
+  let collection = run fixtures.fonts()
+  let mut tree = run inbox(&collection)
+  let mut inspector = run Inspector.listenAt(
+    Address.Unix { path: run String.copy(SESSION_SOCKET) },
+    false,
+  )
+  run Testing.expect(inspector.enabled(), "listening")
+
+  // A protocol 3 client keeps its connection: several requests, replies matched by id.
+  let mut c = run connectTo(SESSION_SOCKET)
+  let mut lines = Lines { buffer: Bytes.make() }
+  run write(&mut c, "{\"id\":1,\"cmd\":\"hello\",\"protocol\":3,\"client\":\"test\"}\n")
+  drop run pollUntil(&mut inspector, &mut tree, 1)
+  let hello = run nextReply(&mut lines, &mut c)
+  run Testing.expect(int(&hello, "id") == 1 && int(&hello, "protocol") == 3, "a session opens")
+  run Testing.expect(
+    Json.field(Json.field(&hello, "capabilities").unwrapOr(&hello), "topics").isSome(),
+    "hello lists the topics",
+  )
+  run write(
+    &mut c,
+    "{\"id\":2,\"cmd\":\"query\",\"role\":\"button\"}\n{\"id\":3,\"cmd\":\"stats\"}\n",
+  )
+  drop run pollUntil(&mut inspector, &mut tree, 3)
+  let query = run nextReply(&mut lines, &mut c)
+  run Testing.expect(int(&query, "id") == 2 && int(&query, "count") == 3, "the first reply")
+  let stats = run nextReply(&mut lines, &mut c)
+  run Testing.expect(int(&stats, "id") == 3 && ok(&stats), "then the second, same connection")
+
+  // A notification is not answered; a subscribed topic is pushed.
+  run write(&mut c, "{\"id\":4,\"cmd\":\"subscribe\",\"topics\":[\"highlight\"]}\n")
+  run write(&mut c, "{\"cmd\":\"highlight\",\"nodes\":[10]}\n{\"id\":5,\"cmd\":\"stats\"}\n")
+  drop run pollUntil(&mut inspector, &mut tree, 6)
+  let subscribed = run nextReply(&mut lines, &mut c)
+  run Testing.expect(int(&subscribed, "id") == 4, "subscribe answers")
+  let pushed = run nextLine(&mut lines, &mut c)
+  run Testing.expect(text(&pushed, "event") == "highlight", "the highlight is pushed")
+  run Testing.expect(inspector.state().highlight.nodes.length() == 1, "it highlighted")
+  let next = run nextLine(&mut lines, &mut c)
+  run Testing.expect(int(&next, "id") == 5, "the highlight sent no reply")
+  let nodes = match Json.field(&pushed, "nodes") {
+    Option<&Value>.Some { value } => match &value.* {
+      Value.Array { values } => values.length()
+      _ => 0
+    }
+    Option<&Value>.None => 0
+  }
+  run Testing.expect(nodes == 1, "the highlight is pushed")
+
+  // A protocol 2 client is still answered while the session is open.
+  let mut d = run connectTo(SESSION_SOCKET)
+  run write(&mut d, "{\"cmd\":\"stats\"}\n")
+  drop run pollUntil(&mut inspector, &mut tree, 7)
+  let single = run receive(&mut d)
+  run Testing.expect(ok(&single), "a one-shot request beside a session")
+
+  // When the client leaves, its session ends.
+  drop run Effect.result(c.close())
+  let mut tries: u64 = 0
+  while inspector.sessionCount() != 0 && tries < 1000 {
+    drop run inspector.poll(&mut tree)
+    run MonotonicClock.waitFor(2000000)
+    tries = tries + 1
+  }
+  run Testing.expect(inspector.sessionCount() == 0, "the session ends with the connection")
+  run inspector.close()
+}
+
+test effect fn sessionsOverAUnixSocket() -> ()
+  ! AssertionError<'static>
+    | TreeError
+    | JsonError
+    | NativeSocketError
+    | ByteIoError
+    | HostInputError
+    | OutOfMemoryError {
+  static if Intrinsic.targetOperatingSystem() != "windows" {
+    let mut allocator = Allocator.systemAllocatorProvider()
+    let mut clock = OsMonotonicClock.make()
+    run sessionSocketBody()
+      |> Effect.provideMut<Allocator>(&mut allocator)
+      |> Effect.provideMut<MonotonicClock>(&mut clock)
+  }
+}
+
+// Sessions over a memory channel: the same code as over a socket, without one.
+
+/// Serves every line waiting at `end`, with the app's part between, as the window loop does.
+effect fn serveAll(
+  session: &mut Session,
+  protocol: &mut Protocol,
+  tree: &mut UiTree<'_>,
+  end: &mut MemoryChannel,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  while run session.serveNext(&mut protocol, &mut tree) |> Effect.provideMut<Channel>(&mut end) {
+    while run protocol.dispatchNext(&mut tree) {}
+    run protocol.observe(&tree)
+    let mut taken = List<Event>.make()
+    run tree.takeEvents(&mut taken)
+  }
+}
+
+/// Tells the session what changed, as the inspector does after each poll and frame.
+effect fn publishTo(
+  session: &mut Session,
+  protocol: &mut Protocol,
+  tree: &UiTree<'_>,
+  end: &mut MemoryChannel,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let topics = run protocol.takeChanges(tree, session.topics)
+  run session.publish(&protocol.*, tree, topics) |> Effect.provideMut<Channel>(&mut end)
+}
+
+/// The next line at the client's end, parsed, or `{"none":true}`.
+effect fn take(client: &mut MemoryChannel) -> Value
+  ! JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut line = String.make()
+  if !run Channel.receive(&mut line) |> Effect.provideMut<Channel>(&mut client) {
+    return run Json.parse(b"{\"none\":true}")
+  }
+  let value = run Json.parse(line.ownedUtf8Bytes())
+  return move value
+}
+
+effect fn put(client: &mut MemoryChannel, line: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  drop run Channel.send(line) |> Effect.provideMut<Channel>(&mut client)
+}
+
+effect fn memoryBody() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run inbox(&collection)
+  let mut protocol = Protocol.make()
+  let pair = run MemoryChannel.pair()
+  let MemoryPair { first, second } = move pair
+  let mut app = move first
+  let mut client = move second
+  let mut session = Session.open()
+
+  // Request and reply by id; `wants` subscribes at hello.
+  run put(&mut client, "{\"id\":1,\"cmd\":\"hello\",\"protocol\":3,\"wants\":[\"highlight\"]}")
+  run put(&mut client, "{\"id\":\"two\",\"cmd\":\"stats\"}")
+  run serveAll(&mut session, &mut protocol, &mut tree, &mut app)
+  let hello = run take(&mut client)
+  run Testing.expect(int(&hello, "id") == 1 && int(&hello, "protocol") == 3, "hello by id")
+  let stats = run take(&mut client)
+  run Testing.expect(text(&stats, "id") == "two" && ok(&stats), "a string id is echoed")
+  run Testing.expect(session.topics == TOPIC_HIGHLIGHT, "subscribed to what it wanted")
+
+  // A line without an id is a notification: no reply. The change it made is pushed.
+  run put(&mut client, "{\"cmd\":\"highlight\",\"nodes\":[10]}")
+  run serveAll(&mut session, &mut protocol, &mut tree, &mut app)
+  run Testing.expect(protocol.highlight.nodes.length() == 1, "the highlight is set")
+  run publishTo(&mut session, &mut protocol, &tree, &mut app)
+  let pushed = run take(&mut client)
+  run Testing.expect(text(&pushed, "event") == "highlight", "the highlight is pushed")
+  let none1 = run take(&mut client)
+  run Testing.expect(has(&none1, "none"), "once, and no reply")
+
+  // Coalescing: a second change in the same frame waits for the next frame.
+  run put(&mut client, "{\"cmd\":\"highlight\",\"nodes\":[11]}")
+  run put(&mut client, "{\"cmd\":\"highlight\",\"nodes\":[12]}")
+  run serveAll(&mut session, &mut protocol, &mut tree, &mut app)
+  run publishTo(&mut session, &mut protocol, &tree, &mut app)
+  let none2 = run take(&mut client)
+  run Testing.expect(has(&none2, "none"), "not twice in one frame")
+  run Testing.expect(protocol.changes.held == TOPIC_HIGHLIGHT, "held for the next frame")
+  run tree.frame(FrameInput { width: 360.0, height: 440.0, scale: 2.0, time: 0.1 })
+  run protocol.afterFrame(&tree)
+  run publishTo(&mut session, &mut protocol, &tree, &mut app)
+  let later = run take(&mut client)
+  run Testing.expect(text(&later, "event") == "highlight", "pushed with the next frame")
+  run Testing.expect(int(&later, "frame") == int(&pushed, "frame") + 1, "a frame later")
+  let none3 = run take(&mut client)
+  run Testing.expect(has(&none3, "none"), "once for both changes")
+
+  // subscribe: events. A click logs records, and the log's next seq is pushed.
+  run put(&mut client, "{\"id\":2,\"cmd\":\"subscribe\",\"topics\":[\"events\",\"nonsense\"]}")
+  run serveAll(&mut session, &mut protocol, &mut tree, &mut app)
+  let subscribed = run take(&mut client)
+  run Testing.expect(int(&subscribed, "id") == 2, "subscribe answers")
+  run Testing.expect(
+    session.topics == TOPIC_HIGHLIGHT | TOPIC_EVENTS,
+    "an unknown topic is ignored",
+  )
+  run put(&mut client, "{\"cmd\":\"click\",\"node\":10}")
+  run serveAll(&mut session, &mut protocol, &mut tree, &mut app)
+  run tree.frame(FrameInput { width: 360.0, height: 440.0, scale: 2.0, time: 0.2 })
+  run protocol.afterFrame(&tree)
+  run publishTo(&mut session, &mut protocol, &tree, &mut app)
+  let events = run take(&mut client)
+  run Testing.expect(text(&events, "event") == "events" && int(&events, "next") > 1, "events")
+
+  // unsubscribe: nothing more is pushed.
+  run put(&mut client, "{\"id\":3,\"cmd\":\"unsubscribe\"}")
+  run put(&mut client, "{\"cmd\":\"highlight\",\"nodes\":[10]}")
+  run serveAll(&mut session, &mut protocol, &mut tree, &mut app)
+  let unsubscribed = run take(&mut client)
+  run Testing.expect(int(&unsubscribed, "id") == 3 && session.topics == 0, "unsubscribed")
+  run tree.frame(FrameInput { width: 360.0, height: 440.0, scale: 2.0, time: 0.3 })
+  run protocol.afterFrame(&tree)
+  run publishTo(&mut session, &mut protocol, &tree, &mut app)
+  let none4 = run take(&mut client)
+  run Testing.expect(has(&none4, "none"), "nothing is pushed")
+
+  // A session whose first line is not a protocol 3 hello is one request, answered even
+  // without an id, then over.
+  let mut single = Session.make()
+  run put(&mut client, "{\"cmd\":\"stats\"}")
+  run serveAll(&mut single, &mut protocol, &mut tree, &mut app)
+  let answered = run take(&mut client)
+  run Testing.expect(ok(&answered), "a one-shot request is answered")
+  run Testing.expect(single.ended, "and the session is over")
+
+  // Closing one end closes the channel for the other, after what was sent.
+  run put(&mut client, "{\"id\":4,\"cmd\":\"stats\"}")
+  client.close()
+  run Testing.expect(app.open(), "a line still waits")
+  run serveAll(&mut session, &mut protocol, &mut tree, &mut app)
+  run Testing.expect(!app.open(), "then the channel is closed")
+}
+
+test effect fn sessionsOverAMemoryChannel() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run memoryBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
 // The MCP bridge: tool calls become protocol requests, run here with `Protocol.handle`.

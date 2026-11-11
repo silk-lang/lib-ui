@@ -93,8 +93,9 @@ field; to try a fix, `ui_set_style` and a screenshot; before finishing, `ui_audi
 `ui_inspect_server.mcp.Bridge` is the protocol work, with no I/O: a JSON-RPC message in, and
 either a response to write or an inspector request to send. `ui-inspect-mcp` is the loop around
 it: it reads standard input line by line, sends requests with `ui_inspect_server.client`, and
-asks a pending `wait` again every 50 ms until its timeout (the inspector serves one request per
-connection, so it cannot hold a request open across frames).
+asks a pending `wait` again every 50 ms until its timeout. Each request goes on a fresh
+connection, which the inspector answers once (protocol 2 style); a `wait` is answered `pending`
+rather than held open across frames.
 
 It implements MCP revision 2025-06-18 (and answers 2024-11-05, 2025-03-26 and 2025-11-25 clients
 with their own revision): `initialize`, `ping`, `tools/list`, `tools/call`. Notifications are

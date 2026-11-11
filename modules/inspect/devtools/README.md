@@ -9,14 +9,19 @@ colors, and Pick selects whatever is clicked in the app's window.
 It is built with the Silk framework itself ([ui-app](../../app)) and talks to the app only
 through the inspector protocol ([ui-inspect-server](../server)), the same requests
 ui-inspect-cli and ui-inspect-mcp send. So anything it shows, a script or an agent can read
-too, and the devtools window is itself an app the inspector can drive.
+too, and the devtools window is itself an app the inspector can drive. It keeps one protocol 3
+session open with the app, subscribes to its topics, and reads again only what the app says
+changed.
 
 Packages:
 
 - `modules/inspect/devtools` (`ui-inspect-devtools`): the app (`devtools.silk`), what it reads out of
-  the protocol's replies (`data.silk`) and the `Link` service it sends requests through
-  (`link.silk`).
-- `modules/inspect/devtools/app` (`ui-devtools`): the window, with a `Link` over the inspector socket.
+  the protocol's replies (`data.silk`) and the `Link` service it talks through (`link.silk`):
+  requests numbered by `Requests` over the client end of a `Channel`, notifications, and what
+  the app pushed.
+- `modules/inspect/devtools/app` (`ui-devtools`): the window, with a `Link` over a
+  `SocketChannel` session. The pump thread rings a bell that wakes the window, which sends the
+  devtools `Message.Pull`.
 - `modules/inspect/devtools/tests`: the devtools inspecting the todo example in the same process,
   and golden scenes.
 
@@ -36,12 +41,14 @@ silk task native devtools run --connect 1   # 1, tcp:<port> or a socket path
 
 `ui-devtools [--connect ADDRESS]` takes the address in the syntax of `SILK_UI_INSPECT` (default
 `1`, the socket `silk-ui-inspect.sock` in the working directory). The app may start later or
-restart: the status line says when it cannot be reached, and the next refresh picks it up.
+restart: the status line says when it cannot be reached, and the devtools try again every
+second until it answers.
 
 - **Elements**: one row per node in tree order, labelled the way devtools does (the role or the
   kind, the accessible name in quotes, the test id in brackets) with the id and the size. `-`
-  folds a node's children, `+` unfolds them. Click a row to select it; ArrowDown and ArrowUp
-  move the selection, Escape clears it (and the highlight). The field above filters by role,
+  folds a node's children, `+` unfolds them. Hovering a row highlights its node in the app (and
+  leaving it gives the selection its highlight back); click a row to select it; ArrowDown and
+  ArrowUp move the selection, Escape clears it (and the highlight). The field above filters by role,
   name or test id; selecting a node the filter or a fold hides shows it again and scrolls to it.
 - **Pick**: the next click in the app's own window selects the node under the pointer instead
   of reaching the app; the app highlights what the pointer is over meanwhile.
@@ -67,12 +74,19 @@ restart: the status line says when it cannot be reached, and the next refresh pi
 - **Stats**: the last frame's `FrameStats` (layout passes and cache hits, replayed and
   repainted subtrees, glyphs, primitives).
 
-While **Live** is on (the default) everything refreshes twice a second; Refresh (or F5) reads it
-once.
+While **Live** is on (the default) the devtools subscribe to the app's `tree`, `roots`,
+`events` and `pick` topics, and to `frame` while the Stats, Frames or Program tab is open. A
+notification makes them read again only what it says changed: the element tree and the selected
+node after `tree`, the event log after `events`, the open tab's numbers after `frame`, the
+picker after `pick`. The status line comes with the notification itself. With Live off they
+keep only `pick`. Refresh (or F5) reads everything once.
 
 ## The protocol it uses
 
-Besides `hello`, `inspect`, `highlight` and `stats`, these commands came with the devtools.
+A protocol 3 session (see [the server's protocol](../server/README.md#protocol)): `hello` with
+`"protocol": 3` when it connects, `subscribe` and `unsubscribe` as notifications whenever Live
+or the tab changes, and `highlight` as a notification on hover. Every other request carries an
+`id`. Besides `hello`, `inspect`, `highlight` and `stats`, these commands came with the devtools.
 Protocol 2 added `program`, `messages`, `model`, `frames`, `styles`, `setStyle`, `resetStyles`,
 `pickMode` and `audit` (see the [protocol table](../server/README.md#protocol)); against an
 older app those panels stay empty and the rest works.
@@ -96,12 +110,15 @@ build/llvm/x86_64-unknown-linux-gnu/debug/ui-inspect-devtools-tests modules/insp
 silk task native devtools check
 ```
 
-- The devtools run headless against the todo example through `Protocol.handle`: the first
-  refresh lists every node; clicking the Add button's row selects it, highlights it in the
-  app and shows its styles and box model (padding 10, border 1); a click sent to the app shows
-  in the event log once; ArrowDown moves the selection and the highlight; Escape clears both;
-  folding the root hides the rest; Live off stops refreshes; an app that cannot be reached
-  shows in the status line and the next good refresh clears it. Then the reported program:
+- The devtools run headless against the todo example over a `MemoryChannel` session, served
+  by the same `Session` as the socket: the first refresh lists every node; clicking the Add
+  button's row selects it, highlights it in the app and shows its styles and box model
+  (padding 10, border 1); hovering another row highlights that node, and leaving the rows gives
+  the selection its highlight back; a click sent to the app is pushed, and one pull reads the
+  event log and the tree again, each record once; ArrowDown moves the selection and the
+  highlight; Escape clears both; folding the root hides the rest; with Live off nothing is
+  pushed or read; an app that cannot be reached shows in the status line and the next good
+  refresh clears it. Then the reported program:
   three steps, the model diff of one, the frame bars, an audit, a style typed in and applied
   (and a bad one refused, and Reset), the filter, and a pick ending in a selection.
 - Goldens (`describe` text and PNG, tolerance 2 per channel): the styles panel, the box model
@@ -116,8 +133,9 @@ silk task native devtools check
 
 ## Limits
 
-- One request per connection (the server's limit for now), so a refresh is six to eight round trips;
-  fine locally, and it moves to one persistent connection when the server gets them.
+- A full refresh (start, Refresh, a new tab, Live on, after the app was away) is still six to
+  eight requests, on the one session. The Program tab's messages are read with `tree` and
+  `frame` notifications while it is open; a program topic comes with silk-ui's extension.
 - A style edit lasts until the app next sets that node's style; it is for trying a value, not
   for keeping it.
 - Models are read, not restored: no time travel yet.

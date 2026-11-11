@@ -1,14 +1,107 @@
-//! How the devtools reach the app they inspect: one request line out, one reply line back. The
-//! window provides a link over the inspector socket; tests provide one that runs the protocol
-//! against a tree in the same process.
+//! How the devtools reach the app they inspect: one protocol 3 session. Requests go out with an
+//! `id` and wait for the reply with that `id`; notifications go out with none; what the app
+//! pushes (`{"event": ...}`) waits until the devtools take it. The window provides a link over
+//! the inspector socket; tests provide one over a memory channel to a tree in the same process.
+//! Both are the client end of a [`Channel`], numbered by [`Requests`].
+import ui_inspect_server.channel { Channel }
+import ui_inspect_server.reply { has }
+import ui_tree.inspect { writeInt }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.json.scanner { JsonError }
+import silk.json.value { Json, Value }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.text.string { String }
 
 /// The connection to the inspected app.
 pub service Link {
-  /// Sends `line` (one JSON request, without the newline) and writes the reply line to `reply`.
-  /// Returns false, with a reason in `reply`, when the app could not be reached.
+  /// Sends `line` (one JSON request without an `id`, without the newline), which the link
+  /// numbers, and writes the reply line to `reply`. Returns false, with a reason in `reply`,
+  /// when the app could not be reached.
   effect fn request(line: string, reply: &mut String) -> bool
     ! OutOfMemoryError
     ? &mut Link | &mut Allocator
+
+  /// Sends `line` as a notification: the app answers nothing. False when it could not be
+  /// reached.
+  effect fn notify(line: string) -> bool ! OutOfMemoryError ? &mut Link | &mut Allocator
+
+  /// Moves the notification lines the app pushed since the last call into `out`, oldest first.
+  /// False when the session is over: the app went away.
+  effect fn take(out: &mut List<String>) -> bool ! OutOfMemoryError ? &mut Link | &mut Allocator
+}
+
+/// The client end of a session over a [`Channel`]: numbers requests, matches replies by `id`
+/// and keeps the notifications that come in meanwhile.
+pub struct Requests {
+  next: u64,
+  /// Notification lines that came in and were not taken yet, oldest first.
+  pub notes: List<String>,
+}
+
+impl Requests {
+  pub fn make() -> Requests {
+    return Requests { next: 1, notes: List<String>.make() }
+  }
+
+  /// Sends `line` (an object without an `id`) with the next `id`, which it returns; 0 when the
+  /// other end is gone.
+  pub effect fn send(self: &mut Self, line: string) -> u64
+    ! OutOfMemoryError
+    ? &mut Channel | &mut Allocator {
+    let id = self.next
+    self.next = self.next + 1
+    let mut numbered = run String.copy("{\"id\":")
+    run writeInt(&mut numbered, id)
+    let rest = String.slice(line, 1, String.byteLength(line) - 1)
+    if String.trim(rest) != "}" {
+      run numbered.append(",")
+    }
+    run numbered.append(rest)
+    if !run Channel.send(String.view(&numbered)) {
+      return 0
+    }
+    return id
+  }
+
+  /// Takes what came in: notifications into `notes`, and the reply to `id` into `reply`. True
+  /// when that reply came. Replies to other ids (requests given up on) are dropped.
+  pub effect fn collect(self: &mut Self, id: u64, reply: &mut String) -> bool
+    ! OutOfMemoryError
+    ? &mut Channel | &mut Allocator {
+    let mut line = String.make()
+    while run Channel.receive(&mut line) {
+      let parsed = run Effect.result(Json.parse(line.ownedUtf8Bytes()))
+      match move parsed {
+        Result<Value, JsonError | OutOfMemoryError>.Success { value } => {
+          let answers = match Json.asU64(Json.field(&value, "id")) {
+            Option<u64>.Some { value: n } => n
+            Option<u64>.None => 0
+          }
+          if has(&value, "event") {
+            run self.notes.append(run String.copy(String.view(&line)))
+          } else if answers == id && id != 0 {
+            reply.clear()
+            run reply.append(String.view(&line))
+            return true
+          }
+        }
+        Result<Value, JsonError | OutOfMemoryError>.Failure { error } => {
+          drop error
+        }
+      }
+    }
+    return false
+  }
+
+  /// Moves the notifications kept so far into `out`.
+  pub effect fn takeNotes(self: &mut Self, out: &mut List<String>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    while self.notes.length() != 0 {
+      run out.append(self.notes.remove(0))
+    }
+  }
 }

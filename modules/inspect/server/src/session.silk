@@ -1,0 +1,199 @@
+//! A session: one client's conversation with the inspector, over a [`Channel`] and nothing else,
+//! so the same code serves a socket client and one in the same process.
+//!
+//! Lines are JSON objects. A request with an `id` gets a reply with that `id`; a line without
+//! one is a notification and gets none. A session the client opened with `hello` naming
+//! `"protocol": 3` stays open, and the client may `subscribe` to topics (see `topics.silk`):
+//! the app then sends `{"event": <topic>, ...}` lines when they change. Any other first line is
+//! a one-shot request as in protocol 2: it is answered (with or without an `id`), and the
+//! session ends.
+import channel { Channel }
+import protocol { Protocol, Outcome }
+import reply { begin, finish, putKey, malformed, notYet, has, textField, stringsField, writeString }
+import topics { TOPIC_COUNT, TOPIC_NAMES, topicNamed, allTopics }
+import ui_tree.engine { UiTree }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.json.scanner { JsonError }
+import silk.json.value { Json, Value }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.text.string { String }
+
+/// The protocol a client names in `hello` to keep the session open.
+pub const SESSION_PROTOCOL: u64 = 3
+
+/// One client's session.
+pub struct Session {
+  /// The topics the client subscribed to, as `TOPIC_*` bits.
+  pub topics: u32,
+  /// Whether the session stays open after a reply.
+  pub persistent: bool,
+  /// Whether a line came yet: the first one decides whether the session stays open.
+  started: bool,
+  /// The session is over (a one-shot request was answered): close its channel.
+  pub ended: bool,
+  /// Lines served.
+  pub served: u64,
+  line: String,
+  reply: String,
+}
+
+impl Session {
+  /// A session whose first line decides whether it stays open, as over a socket, where a
+  /// protocol 2 client sends one request and reads one reply.
+  pub fn make() -> Session {
+    return Session {
+      topics: 0,
+      persistent: false,
+      started: false,
+      ended: false,
+      served: 0,
+      line: String.make(),
+      reply: String.make(),
+    }
+  }
+
+  /// A session that is open from the start, for a client in the same process.
+  pub fn open() -> Session {
+    let mut session = Session.make()
+    session.persistent = true
+    session.started = true
+    return move session
+  }
+
+  /// Serves the next line waiting on the channel: runs it against `tree` and sends the reply,
+  /// unless it is a notification. Returns false when no line waited.
+  pub effect fn serveNext(self: &mut Self, protocol: &mut Protocol, tree: &mut UiTree<'_>) -> bool
+    ! OutOfMemoryError
+    ? &mut Channel | &mut Allocator {
+    if self.ended || !run Channel.receive(&mut self.line) {
+      return false
+    }
+    self.served = self.served + 1
+    let parsed = run Effect.result(Json.parse(self.line.ownedUtf8Bytes()))
+    let request = match move parsed {
+      Result<Value, JsonError | OutOfMemoryError>.Success { value } => move value
+      Result<Value, JsonError | OutOfMemoryError>.Failure { error } => {
+        drop error
+        run malformed(&mut self.reply, "the request is not valid JSON")
+        run self.answer(true)
+        return true
+      }
+    }
+    let cmd = textField(&request, "cmd")
+    if !self.started {
+      self.started = true
+      if cmd == "hello" {
+        match Json.asU64(Json.field(&request, "protocol")) {
+          Option<u64>.Some { value } => {
+            self.persistent = value >= SESSION_PROTOCOL
+          }
+          Option<u64>.None => {}
+        }
+      }
+    }
+
+    // Protocol 2 answered every request; in a session, a line without an id is a notification.
+    let answered = !self.persistent || has(&request, "id")
+    if cmd == "subscribe" || cmd == "unsubscribe" {
+      run self.subscribe(&request, cmd == "subscribe")
+    } else {
+      if cmd == "hello" && has(&request, "wants") {
+        run self.subscribeTo(&request, "wants", true)
+      }
+      let outcome = run protocol.handle(&mut tree, &request, 0, &mut self.reply)
+      if outcome == Outcome.Pending {
+        // A frame cannot come while this line is served: the client asks again.
+        run notYet(&mut self.reply, &request)
+      }
+    }
+    run self.answer(answered)
+    return true
+  }
+
+  /// Sends the reply if `answered`, and ends a one-shot session.
+  effect fn answer(self: &mut Self, answered: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Channel | &mut Allocator {
+    if answered {
+      drop run Channel.send(String.view(&self.reply))
+    }
+    if !self.persistent {
+      self.ended = true
+    }
+  }
+
+  /// subscribe and unsubscribe: `topics` names topics (all of them when left out); unknown
+  /// names are ignored. The reply lists the topics subscribed to now.
+  effect fn subscribe(self: &mut Self, request: &Value, on: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if has(request, "topics") {
+      run self.subscribeTo(request, "topics", on)
+    } else if on {
+      self.topics = allTopics()
+    } else {
+      self.topics = 0
+    }
+    run begin(&mut self.reply, request)
+    run putKey(&mut self.reply, "topics")
+    run self.reply.append("[")
+    let mut first = true
+    let mut i: usize = 0
+    while i < TOPIC_COUNT {
+      if u32.bitAnd(self.topics, u32.shiftLeft(1, usize.toU32(i))) != 0 {
+        if !first {
+          run self.reply.append(",")
+        }
+        first = false
+        run writeString(&mut self.reply, TOPIC_NAMES[i])
+      }
+      i = i + 1
+    }
+    run self.reply.append("]")
+    run finish(&mut self.reply)
+  }
+
+  effect fn subscribeTo(self: &mut Self, request: &Value, key: string, on: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut names = List<string>.make()
+    run stringsField(request, key, &mut names)
+    let list = names.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      let bit = topicNamed(list[i])
+      if on {
+        self.topics = self.topics | bit
+      } else {
+        self.topics = u32.bitAnd(self.topics, u32.bitXor(bit, 0xFFFFFFFF))
+      }
+      i = i + 1
+    }
+  }
+
+  /// Sends a notification for each of `topics` (`TOPIC_*` bits, from `Protocol.takeChanges`)
+  /// this session subscribed to.
+  pub effect fn publish(self: &mut Self, protocol: &Protocol, tree: &UiTree<'_>, topics: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Channel | &mut Allocator {
+    let wanted = u32.bitAnd(self.topics, topics)
+    if wanted == 0 || self.ended {
+      return ()
+    }
+    let mut i: usize = 0
+    while i < TOPIC_COUNT {
+      let bit = u32.shiftLeft(1, usize.toU32(i))
+      if u32.bitAnd(wanted, bit) != 0 {
+        run protocol.notification(tree, bit, &mut self.reply)
+        drop run Channel.send(String.view(&self.reply))
+      }
+      i = i + 1
+    }
+  }
+}
