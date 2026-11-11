@@ -463,6 +463,19 @@ silk task native demo modules/tree/demo -- check
   scroll placement through the input/hit-testing path.
   On SwiftShader both trees stay under a mean of 0.07; the largest difference (75) is on the
   edge of the form's link underline.
+- `silk task browser parity` compares behaviour with Chromium, case by case. `tools/parity`
+  builds each case with the `Tree` API, feeds it inputs and prints the page a browser should
+  build for it (a box is a `div`, the root is the `body`, styles go inline as written), the
+  inputs, and what the tree saw: the handlers that ran, in order, as `type:target>current`;
+  the border box of every node with a test id; the scroll offsets; the focused node.
+  The task replays the inputs in Chromium through the DevTools protocol and
+  `tests/chrome/parity.js` lists every difference. `--only NAME` runs one case and `--within`
+  sets the box tolerance (0.5px). It is a development aid and is not part of `check` or CI.
+  To add a case, write a function in `tools/parity/src/cases.silk` and add it to `all`.
+
+  One known difference: after a press on one box, the tree sends the release to the pressed
+  box (its implicit capture), where a mouse in Chromium sends it to the box under the pointer
+  (`release-elsewhere`).
 
 Fixtures use examples/graphics-demo's embedded Noto Sans subsets, icons and photo, so the native tests and
 the wasm build draw the same bytes.

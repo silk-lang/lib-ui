@@ -49,7 +49,7 @@ import ui_protocol.mutation {
 }
 import ui_protocol.record { Event, EventKind }
 pub import ui_protocol.event { DefaultAction }
-import ui_protocol.event { preventFlags }
+import ui_protocol.event { preventFlags, bubbles, EventRecord, Propagation, Step, Phase }
 import silk.collections.hash { Hash, Word }
 import silk.collections.hash_map { HashMap }
 import silk.collections.list { List }
@@ -501,21 +501,6 @@ pub fn listenerFlag(kind: EventKind) -> u32 {
   }
 }
 
-/// Whether records of `kind` go to the handlers of the target's ancestors too. The tree queues
-/// enter, leave, focus, blur and scroll records only for a target that listens itself, so
-/// those reach the target's handlers only.
-pub fn bubbles(kind: EventKind) -> bool {
-  return match kind {
-    EventKind.PointerEnter => false
-    EventKind.PointerLeave => false
-    EventKind.Focus => false
-    EventKind.Blur => false
-    EventKind.Layout => false
-    EventKind.Scroll => false
-    _ => true
-  }
-}
-
 fn mix(value: u64) -> u64 {
   let mut z = u64.wrappingAdd(value, 0x9E3779B97F4A7C15)
   z = u64.wrappingMultiply(u64.bitXor(z, u64.shiftRight(z, 30)), 0xBF58476D1CE4E5B9)
@@ -712,49 +697,60 @@ impl<M> Ui<M> {
     ? &mut Allocator {
     self.dispatching = false
     self.searching = false
-    let mut depth = usize.toU32(self.path.length())
-    let mut stopped = false
-    while !stopped {
-      // Handlers of the same node answer in the order they were declared.
-      let mut i: usize = 0
-      while i < self.answers.length() && !stopped {
-        if self.answers.asSlice()[i].depth == depth {
-          let answer = self.answers.remove(i)
-          match move answer.reply {
-            Reply<M>.Emit { message } => {
-              run out.append(move message)
-            }
-            Reply<M>.EmitAndStop { message } => {
-              run out.append(move message)
-              stopped = true
-            }
-            Reply<M>.Stop => {
-              stopped = true
-            }
-            Reply<M>.Pass => {}
-            Reply<M>.Prevent => {
-              self.prevented = true
-            }
-            Reply<M>.Custom { message, stopPropagation, preventDefault } => {
-              if let Option<M>.Some { value } = move message {
-                run out.append(move value)
+    // The shared walk decides the order (the target, then its ancestors for kinds that
+    // bubble) and what stopping means, so this client agrees with every other one.
+    let record = run EventRecord.lift(&self.event)
+    let mut walk = Propagation.over(&record)
+    let mut step = walk.next()
+    while let Option<Step>.Some { value: at } = step {
+      if at.phase != Phase.Capture {
+        let depth = usize.toU32(at.depth)
+        // Handlers of the same node answer in the order they were declared; one that stops
+        // the event also keeps the node's later handlers from answering.
+        let mut stopped = false
+        let mut i: usize = 0
+        while i < self.answers.length() && !stopped {
+          if self.answers.asSlice()[i].depth == depth {
+            let answer = self.answers.remove(i)
+            match move answer.reply {
+              Reply<M>.Emit { message } => {
+                run out.append(move message)
               }
-              if preventDefault {
-                self.prevented = true
-              }
-              if stopPropagation {
+              Reply<M>.EmitAndStop { message } => {
+                run out.append(move message)
                 stopped = true
               }
+              Reply<M>.Stop => {
+                stopped = true
+              }
+              Reply<M>.Pass => {}
+              Reply<M>.Prevent => {
+                walk.preventDefault()
+              }
+              Reply<M>.Custom { message, stopPropagation, preventDefault } => {
+                if let Option<M>.Some { value } = move message {
+                  run out.append(move value)
+                }
+                if preventDefault {
+                  walk.preventDefault()
+                }
+                if stopPropagation {
+                  stopped = true
+                }
+              }
             }
+          } else {
+            i = i + 1
           }
-        } else {
-          i = i + 1
+        }
+        if stopped {
+          walk.stopPropagation()
         }
       }
-      if depth == 0 {
-        break
-      }
-      depth = depth - 1
+      step = walk.next()
+    }
+    if walk.defaultPrevented() {
+      self.prevented = true
     }
     self.answers.clear()
   }

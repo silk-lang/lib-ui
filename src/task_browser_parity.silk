@@ -1,0 +1,246 @@
+// Compares how the tree and Chromium handle the same pages and inputs. ui-tree-parity runs
+// each case in the tree and prints the page, the inputs and what the tree saw; this replays
+// them in Chromium, which runs as a managed subprocess; Windows lacks those (silk#3034).
+static if Intrinsic.targetOperatingSystem() == "darwin" || Intrinsic.targetOperatingSystem() == "linux" {
+import silk.cli.task { TaskError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.io.writer { Writer, WriterError }
+import silk.io.writer_native { StdoutWriter }
+import silk.json.value { Json, JsonEntry, JsonNumber, Value }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f64
+import silk.num.u8
+import silk.num.usize
+import silk.system.child_process { ChildProcess, ProcessError }
+import silk.system.filesystem { FileError, FileSystem }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.text.format { Format }
+import silk.text.string { String }
+import task_browser_cdp { Browser, open, page, send, evaluate, close, findChrome, parse, stringify, utf8, sleep }
+import task_browser_text_process { executeText }
+import task_support { build, rootPath, require }
+
+pub struct ParityOptions<'a> {
+  /// The Chromium executable; empty looks for one.
+  pub chrome: string<'a>,
+  /// Runs the one case with this name; empty runs them all.
+  pub only: string<'a>,
+  /// How far a box edge or scroll offset may be from the tree's, in CSS pixels.
+  pub within: f64,
+}
+
+/// A page in standards mode: `about:blank` alone is in quirks mode, where the body fills the
+/// viewport.
+const BLANK: string = "document.open(); document.write('<!doctype html><html><head></head><body></body></html>'); document.close(); document.compatMode"
+
+fn object() -> Value { return Value.Object { entries: List<JsonEntry>.make() } }
+fn float(value: f64) -> Value { return Value.Number { value: JsonNumber.Float { value: value } } }
+fn integer(value: usize) -> Value { return Value.Number { value: JsonNumber.Unsigned { value: usize.toU64(value) } } }
+effect fn text(value: string) -> Value ! OutOfMemoryError ? &mut Allocator { return Value.String { text: run String.copy(value) } }
+effect fn put(target: &mut Value, key: string, value: Value) -> () ! OutOfMemoryError ? &mut Allocator {
+  match &mut target.* {
+    Value.Object { entries } => run List.append(&mut entries, JsonEntry { key: run String.copy(key), value: move value })
+    _ => Intrinsic.trap("parity task expected a JSON object")
+  }
+}
+effect fn member<'a>(value: &'a Value, key: string) -> &'a Value ! TaskError | OutOfMemoryError ? &mut Allocator {
+  return match Json.field(value, key) {
+    Option.Some { value: found } => found
+    Option.None => {
+      let mut message = run String.copy("missing parity field: ")
+      run String.append(&mut message, key)
+      fail TaskError { message: move message, status: 1 }
+    }
+  }
+}
+effect fn items<'a>(value: &'a Value) -> &'a [Value] ! TaskError | OutOfMemoryError ? &mut Allocator {
+  return match &value.* {
+    Value.Array { values } => List.asSlice(&values)
+    _ => { fail TaskError { message: run String.copy("expected a parity array"), status: 1 } }
+  }
+}
+effect fn word<'a>(value: &'a Value) -> string<'a> ! TaskError | OutOfMemoryError ? &mut Allocator {
+  return match Json.asString(Option<&Value>.some(value)) {
+    Option.Some { value: found } => found
+    Option.None => { fail TaskError { message: run String.copy("expected a parity string"), status: 1 } }
+  }
+}
+effect fn amount(value: &Value) -> f64 ! TaskError | OutOfMemoryError ? &mut Allocator {
+  return match Json.asF64(Option<&Value>.some(value)) {
+    Option.Some { value: found } => found
+    Option.None => { fail TaskError { message: run String.copy("expected a parity number"), status: 1 } }
+  }
+}
+
+/// The Windows virtual key code Chromium wants for the key named `key`, or 0.
+fn virtualKey(key: string) -> usize {
+  if key == "Tab" { return 9 }
+  if key == "Enter" { return 13 }
+  if key == "Escape" { return 27 }
+  if key == " " { return 32 }
+  if key == "End" { return 35 }
+  if key == "Home" { return 36 }
+  if key == "ArrowLeft" { return 37 }
+  if key == "ArrowUp" { return 38 }
+  if key == "ArrowRight" { return 39 }
+  if key == "ArrowDown" { return 40 }
+  if key == "Backspace" { return 8 }
+  if key == "Delete" { return 46 }
+  let bytes = String.utf8Bytes(key)
+  if bytes.length == 1 {
+    let byte = bytes[0]
+    if byte >= 97 && byte <= 122 { return u8.toUsize(byte) - 32 }
+    if (byte >= 65 && byte <= 90) || (byte >= 48 && byte <= 57) { return u8.toUsize(byte) }
+  }
+  return 0
+}
+
+effect fn mouse(browser: &mut Browser, session: string, kind: string, input: &Value, pressed: bool) -> ()
+  ! TaskError | OutOfMemoryError | WriterError ? &mut Allocator {
+  let mut parameters = object()
+  run put(&mut parameters, "type", run text(kind))
+  run put(&mut parameters, "x", float(run amount(run member(input, "x"))))
+  run put(&mut parameters, "y", float(run amount(run member(input, "y"))))
+  let button = if kind == "mousePressed" || kind == "mouseReleased" { "left" } else { "none" }
+  run put(&mut parameters, "button", run text(button))
+  run put(&mut parameters, "buttons", integer(if pressed { 1 } else { 0 }))
+  if kind == "mousePressed" || kind == "mouseReleased" {
+    run put(&mut parameters, "clickCount", integer(1))
+  }
+  if kind == "mouseWheel" {
+    run put(&mut parameters, "deltaX", float(run amount(run member(input, "deltaX"))))
+    run put(&mut parameters, "deltaY", float(run amount(run member(input, "deltaY"))))
+  }
+  drop run send(&mut browser, "Input.dispatchMouseEvent", &parameters, session)
+}
+
+effect fn keyboard(browser: &mut Browser, session: string, kind: string, key: string) -> ()
+  ! TaskError | OutOfMemoryError | WriterError ? &mut Allocator {
+  let mut parameters = object()
+  run put(&mut parameters, "type", run text(kind))
+  run put(&mut parameters, "key", run text(key))
+  run put(&mut parameters, "windowsVirtualKeyCode", integer(virtualKey(key)))
+  if kind == "keyDown" && String.utf8Bytes(key).length == 1 {
+    run put(&mut parameters, "text", run text(key))
+  }
+  drop run send(&mut browser, "Input.dispatchKeyEvent", &parameters, session)
+}
+
+/// Replays the inputs of `test` the way a person's mouse and keyboard would send them.
+effect fn replay(browser: &mut Browser, session: string, test: &Value) -> ()
+  ! TaskError | OutOfMemoryError | WriterError ? &mut Allocator {
+  let inputs = run items(run member(test, "inputs"))
+  let mut pressed = false
+  let mut i: usize = 0
+  while i < inputs.length {
+    let input = &inputs[i]
+    i = i + 1
+    let kind = run word(run member(input, "type"))
+    if kind == "move" {
+      run mouse(&mut browser, session, "mouseMoved", input, pressed)
+    } else if kind == "down" {
+      pressed = true
+      run mouse(&mut browser, session, "mousePressed", input, pressed)
+    } else if kind == "up" {
+      pressed = false
+      run mouse(&mut browser, session, "mouseReleased", input, pressed)
+    } else if kind == "wheel" {
+      run mouse(&mut browser, session, "mouseWheel", input, pressed)
+      // Chromium scrolls on its compositor: give the page a moment to hear about it.
+      run sleep(100)
+    } else if kind == "key" {
+      let key = run word(run member(input, "key"))
+      run keyboard(&mut browser, session, "keyDown", key)
+      run keyboard(&mut browser, session, "keyUp", key)
+    } else {
+      fail TaskError { message: run String.copy("unknown parity input"), status: 1 }
+    }
+  }
+}
+
+effect fn compare(browser: &mut Browser, cases: &Value, runtime: string, options: &ParityOptions<'_>) -> usize
+  ! TaskError | OutOfMemoryError | WriterError ? &mut Allocator {
+  let mut stdout = StdoutWriter.make()
+  let tests = run items(cases)
+  let mut failed: usize = 0
+  let mut ran: usize = 0
+  let mut i: usize = 0
+  while i < tests.length {
+    let test = &tests[i]
+    i = i + 1
+    let name = run word(run member(test, "name"))
+    if options.only != "" && options.only != name { continue }
+    ran = ran + 1
+    // A page of its own for each case, so no hover, press or focus is left over from the last.
+    let session = run page(&mut browser)
+    let mut metrics = object()
+    run put(&mut metrics, "width", float(run amount(run member(test, "width"))))
+    run put(&mut metrics, "height", float(run amount(run member(test, "height"))))
+    run put(&mut metrics, "deviceScaleFactor", integer(1))
+    run put(&mut metrics, "mobile", Value.Bool { value: false })
+    drop run send(&mut browser, "Emulation.setDeviceMetricsOverride", &metrics, String.view(&session))
+    let mode = run evaluate(&mut browser, BLANK, String.view(&session))
+    run require((run word(&mode)) == "CSS1Compat", "the parity page is not in standards mode")
+    let testJson = run stringify(test)
+    let mut setup = run String.copy("window.parity = ")
+    run String.append(&mut setup, runtime)
+    run String.append(&mut setup, "; window.parity.setup(")
+    run String.append(&mut setup, String.view(&testJson))
+    run String.append(&mut setup, ")")
+    drop run evaluate(&mut browser, String.view(&setup), String.view(&session))
+    run replay(&mut browser, String.view(&session), test)
+    let mut finish = run String.copy("window.parity.finish(")
+    run String.append(&mut finish, String.view(&testJson))
+    run String.append(&mut finish, ",")
+    let tolerance = run stringify(&float(options.within))
+    run String.append(&mut finish, String.view(&tolerance))
+    run String.append(&mut finish, ")")
+    let result = run evaluate(&mut browser, String.view(&finish), String.view(&session))
+    let differences = run items(run member(&result, "differences"))
+    if differences.length == 0 {
+      run Format.format("{}: ok\n", &.(name)) |> Effect.provideMut<Writer>(&mut stdout)
+      continue
+    }
+    failed = failed + 1
+    run Format.format("{}: DIFFERENT\n", &.(name)) |> Effect.provideMut<Writer>(&mut stdout)
+    let mut d: usize = 0
+    while d < differences.length {
+      let line = run stringify(&differences[d])
+      run Format.format("  {}\n", &.(String.view(&line))) |> Effect.provideMut<Writer>(&mut stdout)
+      d = d + 1
+    }
+  }
+  run require(ran > 0, "no parity case has that name")
+  run Format.format("{} of {} cases match Chromium\n", &.(ran - failed, ran)) |> Effect.provideMut<Writer>(&mut stdout)
+  return failed
+}
+
+pub effect fn runParity(options: &ParityOptions<'_>) -> ()
+  ! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+  ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  let built = run build("modules/tree/tools/parity", false, false)
+  let cli = run rootPath(String.view(&built))
+  let root = run rootPath(".")
+  let printed = run executeText(&cli, &root, b"")
+  run require(printed.status == 0, "ui-tree-parity failed to run its cases")
+  let cases = run parse(Bytes.asSlice(&printed.output))
+  let runtimePath = run rootPath("modules/tree/tests/chrome/parity.js")
+  let runtimeBytes = run FileSystem.readFile(&runtimePath)
+  let runtime = run utf8(Bytes.asSlice(&runtimeBytes))
+  let executable = run findChrome(options.chrome)
+  let mut browser = run open(String.view(&executable), true,
+    &["--disable-background-networking", "--disable-component-update", "--disable-extensions",
+      "--force-device-scale-factor=1", "--hide-scrollbars"])
+  let completed = run Effect.result(compare(&mut browser, &cases, runtime, options))
+  run close(&mut browser)
+  let failed = match move completed {
+    Result<usize, TaskError | OutOfMemoryError | WriterError>.Success { value } => value
+    Result<usize, TaskError | OutOfMemoryError | WriterError>.Failure { error } => { fail move error }
+  }
+  run require(failed == 0, "the tree and Chromium differ")
+}
+}

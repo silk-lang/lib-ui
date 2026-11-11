@@ -1,0 +1,492 @@
+//! One parity case: a tree, the inputs fed to it, and what it reported.
+import ui_tree.css { writeDeclaration }
+import ui_tree.lib {
+  Tree,
+  TreeError,
+  Viewport,
+  NodeId,
+  NodeKind,
+  StyleState,
+  Input,
+  EventKind,
+  Propagation,
+  Phase,
+  Step,
+  NOT_FOCUSABLE
+}
+import silk.collections.bytes { Bytes }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.i32
+import silk.num.u8
+import silk.num.u64
+import silk.num.usize
+import silk.text.string { String }
+
+pub const WIDTH: f32 = 400.0
+
+pub const HEIGHT: f32 = 300.0
+
+/// The kinds a case can listen for, with their DOM names.
+const KINDS: [EventKind; 13] = [
+  EventKind.PointerDown,
+  EventKind.PointerUp,
+  EventKind.Click,
+  EventKind.PointerMove,
+  EventKind.PointerEnter,
+  EventKind.PointerLeave,
+  EventKind.Wheel,
+  EventKind.KeyDown,
+  EventKind.KeyUp,
+  EventKind.Focus,
+  EventKind.Blur,
+  EventKind.Scroll,
+  EventKind.Input,
+]
+
+pub fn domName(kind: EventKind) -> string<'static> {
+  return match kind {
+    EventKind.PointerDown => "pointerdown"
+    EventKind.PointerUp => "pointerup"
+    EventKind.Click => "click"
+    EventKind.PointerMove => "pointermove"
+    EventKind.PointerEnter => "pointerenter"
+    EventKind.PointerLeave => "pointerleave"
+    EventKind.Wheel => "wheel"
+    EventKind.KeyDown => "keydown"
+    EventKind.KeyUp => "keyup"
+    EventKind.Focus => "focus"
+    EventKind.Blur => "blur"
+    EventKind.Scroll => "scroll"
+    EventKind.Input => "input"
+    EventKind.PointerCancel => "pointercancel"
+    EventKind.GotPointerCapture => "gotpointercapture"
+    EventKind.LostPointerCapture => "lostpointercapture"
+    EventKind.Layout => "layout"
+  }
+}
+
+pub fn viewport() -> Viewport {
+  return Viewport { width: WIDTH, height: HEIGHT, scale: 1.0 }
+}
+
+/// What one case fed its tree and what came back, as the bodies of JSON arrays.
+pub struct Scenario {
+  pub name: string<'static>,
+  inputs: String,
+  events: String,
+  time: f64,
+}
+
+impl Scenario {
+  pub fn make(name: string<'static>) -> Scenario {
+    return Scenario { name: name, inputs: String.make(), events: String.make(), time: 0.0 }
+  }
+
+  /// Lays the tree out, so the inputs that follow hit what a browser has on screen.
+  pub effect fn settle(self: &mut Self, tree: &mut Tree<'_>) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    self.time = self.time + 16.0
+    drop run tree.frame(viewport(), self.time)
+    run self.collect(&mut tree)
+  }
+
+  pub effect fn moveTo(self: &mut Self, tree: &mut Tree<'_>, x: f32, y: f32) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    run self.pointer("move", x, y)
+    run tree.dispatch(Input.moveTo(x, y))
+    run self.settle(&mut tree)
+  }
+
+  pub effect fn press(self: &mut Self, tree: &mut Tree<'_>, x: f32, y: f32) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    run self.pointer("down", x, y)
+    run tree.dispatch(Input.press(x, y))
+    run self.settle(&mut tree)
+  }
+
+  pub effect fn release(self: &mut Self, tree: &mut Tree<'_>, x: f32, y: f32) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    run self.pointer("up", x, y)
+    run tree.dispatch(Input.release(x, y))
+    run self.settle(&mut tree)
+  }
+
+  /// Moves to (`x`, `y`), then presses and releases there.
+  pub effect fn click(self: &mut Self, tree: &mut Tree<'_>, x: f32, y: f32) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    run self.moveTo(&mut tree, x, y)
+    run self.press(&mut tree, x, y)
+    run self.release(&mut tree, x, y)
+  }
+
+  pub effect fn wheel(self: &mut Self, tree: &mut Tree<'_>, x: f32, y: f32, deltaX: f32, deltaY: f32) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    run self.separator()
+    run self.inputs.append("{\"type\":\"wheel\",\"x\":")
+    run number(&mut self.inputs, x)
+    run self.inputs.append(",\"y\":")
+    run number(&mut self.inputs, y)
+    run self.inputs.append(",\"deltaX\":")
+    run number(&mut self.inputs, deltaX)
+    run self.inputs.append(",\"deltaY\":")
+    run number(&mut self.inputs, deltaY)
+    run self.inputs.append("}")
+    run tree.dispatch(Input.wheel(x, y, deltaX, deltaY))
+    run self.settle(&mut tree)
+  }
+
+  /// Presses and releases the key named `key` (its UI Events `key` value).
+  pub effect fn key(self: &mut Self, tree: &mut Tree<'_>, key: string) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    run self.separator()
+    run self.inputs.append("{\"type\":\"key\",\"key\":")
+    run quoted(&mut self.inputs, key)
+    run self.inputs.append("}")
+    run tree.dispatch(run Input.key(key))
+    run self.settle(&mut tree)
+  }
+
+  effect fn separator(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if String.byteLength(self.inputs.view()) > 0 {
+      run self.inputs.append(",")
+    }
+  }
+
+  effect fn pointer(self: &mut Self, kind: string, x: f32, y: f32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.separator()
+    run self.inputs.append("{\"type\":")
+    run quoted(&mut self.inputs, kind)
+    run self.inputs.append(",\"x\":")
+    run number(&mut self.inputs, x)
+    run self.inputs.append(",\"y\":")
+    run number(&mut self.inputs, y)
+    run self.inputs.append("}")
+  }
+
+  /// Walks the records the tree queued the way a client runs handlers, and notes each node
+  /// that listens as `type:target>current`, which is what a DOM listener there would log.
+  effect fn collect(self: &mut Self, tree: &mut Tree<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let records = run tree.events()
+    let list = records.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      let record = &list[i]
+      i = i + 1
+      let kind = record.event.kind()
+      if kind == EventKind.Layout {
+        continue
+      }
+      let mut walk = Propagation.over(record)
+      let mut step = walk.next()
+      while let Option<Step>.Some { value: at } = step {
+        if at.phase != Phase.Capture {
+          if let Option.Some { value: view } = tree.view(at.node) {
+            if view.listens(kind) {
+              if String.byteLength(self.events.view()) > 0 {
+                run self.events.append(",")
+              }
+              run self.events.append("\"")
+              run self.events.append(domName(kind))
+              run self.events.append(":")
+              run self.events.append(run name(&tree.*, record.target))
+              run self.events.append(">")
+              run self.events.append(view.testId())
+              run self.events.append("\"")
+            }
+          }
+        }
+        step = walk.next()
+      }
+    }
+  }
+
+  /// The case as one JSON object.
+  pub effect fn report(self: &mut Self, tree: &mut Tree<'_>) -> String
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    run self.settle(&mut tree)
+    let mut out = String.make()
+    run out.append("{\"name\":")
+    run quoted(&mut out, self.name)
+    run out.append(",\"width\":")
+    run number(&mut out, WIDTH)
+    run out.append(",\"height\":")
+    run number(&mut out, HEIGHT)
+    run out.append(",\"html\":")
+    let mut html = String.make()
+    if let Option.Some { value: root } = tree.root() {
+      run element(&tree.*, root, &mut html)
+    }
+    run quoted(&mut out, html.view())
+    run out.append(",\"inputs\":[")
+    run out.append(self.inputs.view())
+    run out.append("],\"events\":[")
+    run out.append(self.events.view())
+    run out.append("],\"rects\":{")
+    let mut first = true
+    if let Option.Some { value: root } = tree.root() {
+      run rects(&tree.*, root, &mut out, &mut first)
+    }
+    run out.append("},\"scroll\":{")
+    first = true
+    if let Option.Some { value: root } = tree.root() {
+      run scrolls(&tree.*, root, &mut out, &mut first)
+    }
+    run out.append("},\"focus\":")
+    match tree.focused() {
+      Option.Some { value } => run quoted(&mut out, run name(&tree.*, value))
+      Option.None => run out.append("\"\"")
+    }
+    run out.append("}")
+    return move out
+  }
+}
+
+/// The test id of `node`, which is its `id` in the page.
+effect fn name<'t>(tree: &'t Tree<'_>, node: NodeId) -> string<'t>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match tree.view(node) {
+    Option.Some { value } => value.testId()
+    Option.None => ""
+  }
+}
+
+effect fn rects(tree: &Tree<'_>, node: NodeId, out: &mut String, first: &mut bool) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let id = run name(tree, node)
+  if String.byteLength(id) > 0 {
+    if let Option.Some { value: box } = run tree.bounds(node) {
+      if !first.* {
+        run out.append(",")
+      }
+      first.* = false
+      run quoted(&mut out, id)
+      run out.append(":[")
+      run number(&mut out, box.xMin)
+      run out.append(",")
+      run number(&mut out, box.yMin)
+      run out.append(",")
+      run number(&mut out, box.width())
+      run out.append(",")
+      run number(&mut out, box.height())
+      run out.append("]")
+    }
+  }
+  let children = run tree.children(node)
+  let list = children.asSlice()
+  let mut i: usize = 0
+  while i < list.length {
+    run rects(tree, list[i], &mut out, &mut first)
+    i = i + 1
+  }
+}
+
+effect fn scrolls(tree: &Tree<'_>, node: NodeId, out: &mut String, first: &mut bool) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let id = run name(tree, node)
+  if String.byteLength(id) > 0 {
+    if let Option.Some { value: offset } = tree.scrollOffset(node) {
+      if !first.* {
+        run out.append(",")
+      }
+      first.* = false
+      run quoted(&mut out, id)
+      run out.append(":[")
+      run number(&mut out, offset.x)
+      run out.append(",")
+      run number(&mut out, offset.y)
+      run out.append("]")
+    }
+  }
+  let children = run tree.children(node)
+  let list = children.asSlice()
+  let mut i: usize = 0
+  while i < list.length {
+    run scrolls(tree, list[i], &mut out, &mut first)
+    i = i + 1
+  }
+}
+
+/// Writes `node` and its subtree as the HTML a browser should build: a box is a `div`, an
+/// input an `input`, text a text node. Styles go inline, as written; listeners and tab order
+/// go in attributes the page's script reads.
+effect fn element(tree: &Tree<'_>, node: NodeId, out: &mut String) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let view = match tree.view(node) {
+    Option.Some { value } => move value
+    Option.None => {
+      return ()
+    }
+  }
+  let kind = view.kind()
+  if kind == NodeKind.Text {
+    run escaped(&mut out, view.text())
+    return ()
+  }
+  let tag = if kind == NodeKind.Input { "input" } else { "div" }
+  run out.append("<")
+  run out.append(tag)
+  if String.byteLength(view.testId()) > 0 {
+    run out.append(" id=\"")
+    run escaped(&mut out, view.testId())
+    run out.append("\"")
+  }
+  let declarations = view.style(StyleState.Base)
+  if declarations.length > 0 {
+    run out.append(" style=\"")
+    let mut d: usize = 0
+    while d < declarations.length {
+      let mut text = Bytes.make()
+      run writeDeclaration(&mut text, &declarations[d])
+      run escaped(&mut out, unsafe String.fromUtf8Unchecked(text.asSlice()))
+      run out.append(";")
+      d = d + 1
+    }
+    run out.append("\"")
+  }
+  let mut listens = String.make()
+  let mut k: usize = 0
+  while k < KINDS.length {
+    if view.listens(KINDS[k]) {
+      if String.byteLength(listens.view()) > 0 {
+        run listens.append(" ")
+      }
+      run listens.append(domName(KINDS[k]))
+    }
+    k = k + 1
+  }
+  if String.byteLength(listens.view()) > 0 {
+    run out.append(" data-listen=\"")
+    run out.append(listens.view())
+    run out.append("\"")
+  }
+  if kind != NodeKind.Input && view.tabIndex() != NOT_FOCUSABLE {
+    run out.append(" tabindex=\"")
+    run number(&mut out, i32.toF32(view.tabIndex()))
+    run out.append("\"")
+  }
+  if kind == NodeKind.Input {
+    run out.append(" value=\"")
+    run escaped(&mut out, view.text())
+    run out.append("\">")
+    return ()
+  }
+  run out.append(">")
+  let children = run tree.children(node)
+  let list = children.asSlice()
+  let mut i: usize = 0
+  while i < list.length {
+    run element(tree, list[i], &mut out)
+    i = i + 1
+  }
+  run out.append("</div>")
+}
+
+effect fn escaped(out: &mut String, text: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let bytes = String.utf8Bytes(text)
+  let mut start: usize = 0
+  let mut i: usize = 0
+  while i < bytes.length {
+    let replacement = if bytes[i] == 38 {
+      "&amp;"
+    } else if bytes[i] == 60 {
+      "&lt;"
+    } else if bytes[i] == 62 {
+      "&gt;"
+    } else if bytes[i] == 34 {
+      "&quot;"
+    } else {
+      ""
+    }
+    if String.byteLength(replacement) > 0 {
+      run out.append(unsafe String.fromUtf8Unchecked(Slice.view(bytes, start, i - start)))
+      run out.append(replacement)
+      start = i + 1
+    }
+    i = i + 1
+  }
+  run out.append(unsafe String.fromUtf8Unchecked(Slice.view(bytes, start, bytes.length - start)))
+}
+
+/// `text` as a JSON string.
+pub effect fn quoted(out: &mut String, text: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.append("\"")
+  let bytes = String.utf8Bytes(text)
+  let mut start: usize = 0
+  let mut i: usize = 0
+  while i < bytes.length {
+    let replacement = if bytes[i] == 34 {
+      "\\\""
+    } else if bytes[i] == 92 {
+      "\\\\"
+    } else if bytes[i] == 10 {
+      "\\n"
+    } else {
+      ""
+    }
+    if String.byteLength(replacement) > 0 {
+      run out.append(unsafe String.fromUtf8Unchecked(Slice.view(bytes, start, i - start)))
+      run out.append(replacement)
+      start = i + 1
+    }
+    i = i + 1
+  }
+  run out.append(unsafe String.fromUtf8Unchecked(Slice.view(bytes, start, bytes.length - start)))
+  run out.append("\"")
+}
+
+/// `value` to two decimals, as JSON.
+pub effect fn number(out: &mut String, value: f32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut scaled = f32.round(value * 100.0)
+  if scaled < 0.0 {
+    run out.append("-")
+    scaled = 0.0 - scaled
+  }
+  let whole = f32.toU64(scaled)
+  run digits(&mut out, whole / 100, 1)
+  let fraction = whole % 100
+  if fraction != 0 {
+    run out.append(".")
+    run digits(&mut out, fraction, 2)
+  }
+}
+
+effect fn digits(out: &mut String, value: u64, width: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut buffer: [u8; 20] = [48; 20]
+  let mut number = value
+  let mut start: usize = 20
+  while number > 0 || 20 - start < width {
+    start = start - 1
+    buffer[start] = u64.toU8(number % 10) + 48
+    number = number / 10
+  }
+  run out.append(unsafe String.fromUtf8Unchecked(Slice.view<u8>(&buffer, start, 20 - start)))
+}
