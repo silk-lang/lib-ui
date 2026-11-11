@@ -24,8 +24,10 @@ import ui_inspect_server.lib {
   roleNamed,
   Bridge,
   Action,
-  writeValue
+  writeValue,
+  ProgramStep
 }
+import ui_tree.input { Input }
 import ui_inspect.lib { InspectOptions, inspectNode }
 import ui_tree.legacy {
   UiTree,
@@ -195,7 +197,7 @@ effect fn readOnlyBody() -> ()
 
   let hello = run ask(&mut protocol, &mut tree, "{\"id\":7,\"cmd\":\"hello\"}")
   run Testing.expect(ok(&hello) && int(&hello, "id") == 7, "hello echoes the id")
-  run Testing.expect(int(&hello, "protocol") == 1, "protocol version 1")
+  run Testing.expect(int(&hello, "protocol") == 2, "protocol version 2")
   run Testing.expect(int(&hello, "root") == 1, "the inbox panel is the root")
 
   let snap = run ask(&mut protocol, &mut tree, "{\"cmd\":\"snapshot\"}")
@@ -523,7 +525,7 @@ effect fn socketBody() -> ()
   let mut a = run send("{\"id\":1,\"cmd\":\"hello\"}\n")
   run Testing.expect(!run inspector.poll(&mut tree), "hello changes nothing")
   let hello = run receive(&mut a)
-  run Testing.expect(ok(&hello) && int(&hello, "protocol") == 1, "hello over the socket")
+  run Testing.expect(ok(&hello) && int(&hello, "protocol") == 2, "hello over the socket")
 
   // A click, then a query sent before the app drew a frame: the query waits for the frame.
   let mut b = run send("{\"id\":2,\"cmd\":\"click\",\"node\":10}\n")
@@ -738,7 +740,7 @@ effect fn mcpBody() -> ()
     &mut tree,
     "{\"jsonrpc\":\"2.0\",\"id\":\"t\",\"method\":\"tools/list\"}",
   )
-  run Testing.expect(toolCount(&tools) == 18, "eighteen tools")
+  run Testing.expect(toolCount(&tools) == 27, "twenty-seven tools")
   run Testing.expect(same(text(&tools, "id"), "t"), "string ids are echoed")
 
   // Snapshot is describe; inspect is the node view.
@@ -1195,4 +1197,138 @@ test effect fn inspectorInputMatchesNativeWindowAdapter() -> ()
   ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   run equivalentInputBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn step(seq: u64, cause: string, message: string, model: string) -> ProgramStep
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return ProgramStep {
+    seq: seq,
+    time: 0.5,
+    cause: run String.copy(cause),
+    message: run String.copy(message),
+    commands: List<String>.make(),
+    model: run String.copy(model),
+  }
+}
+
+effect fn devtoolsBody() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | FileError | HostInputError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run inbox(&collection)
+  let mut protocol = Protocol.make()
+  let viewport = FrameInput { width: 360.0, height: 440.0, scale: 2.0, time: 0.0 }
+
+  // Without a program the program commands say so.
+  let bare = run ask(&mut protocol, &mut tree, "{\"cmd\":\"program\"}")
+  run Testing.expect(ok(&bare) && int(&bare, "steps") == 0, "no program, no steps")
+  let none = run ask(&mut protocol, &mut tree, "{\"cmd\":\"model\"}")
+  run Testing.expect(same(text(&none, "error"), "no program is attached"), "and no model")
+
+  // A host reports the program as text.
+  protocol.program.attached = true
+  run protocol.program.add(run step(1, "start", "init", "Counter\n  count: 0\n  name: \"a\""))
+  run protocol.program.add(
+    run step(2, "click #20", "Incremented", "Counter\n  count: 1\n  name: \"a\""),
+  )
+  run protocol.program.add(run step(3, "timer", "Ticked", "Counter\n  count: 1\n  name: \"a\""))
+  let messages = run raw(&mut protocol, &mut tree, "{\"cmd\":\"messages\",\"since\":1}")
+  let listed = String.view(&messages)
+  run Testing.expect(occurrences(listed, "\"seq\":") == 2, "the steps after the first")
+  run Testing.expect(
+    String.contains(listed, "\"cause\":\"click #20\",\"message\":\"Incremented\""),
+    "each with its cause and message",
+  )
+  run Testing.expect(String.contains(listed, "\"changed\":true"), "a step that changed the model")
+  run Testing.expect(String.contains(listed, "\"changed\":false"), "and one that did not")
+  run Testing.expect(String.contains(listed, "\"next\":4"), "and where to go on from")
+  let model = run raw(&mut protocol, &mut tree, "{\"cmd\":\"model\",\"seq\":2}")
+  let diff = String.view(&model)
+  run Testing.expect(
+    String.contains(
+      diff,
+      "{\"op\":\" \",\"line\":\"Counter\"},{\"op\":\"-\",\"line\":\"  count: 0\"},{\"op\":\"+\",\"line\":\"  count: 1\"}",
+    ),
+    "a model is compared with the one before, line by line",
+  )
+  run Testing.expect(String.contains(diff, "\"changed\":2"), "and the changes counted")
+  let missing = run ask(&mut protocol, &mut tree, "{\"cmd\":\"model\",\"seq\":9}")
+  run Testing.expect(same(text(&missing, "error"), "no such step"), "an unknown step")
+
+  // Frames are recorded as they are drawn.
+  run protocol.afterFrame(&tree)
+  protocol.timeline.timed(1.5, 0.25)
+  run tree.frame(FrameInput { width: 360.0, height: 440.0, scale: 2.0, time: 1.0 })
+  run protocol.afterFrame(&tree)
+  run protocol.afterFrame(&tree)
+  let frames = run raw(&mut protocol, &mut tree, "{\"cmd\":\"frames\"}")
+  run Testing.expect(String.contains(String.view(&frames), "\"count\":2"), "one record per frame")
+  run Testing.expect(
+    String.contains(String.view(&frames), "\"layoutMs\":1.5,\"paintMs\":0.25"),
+    "with the host's timing",
+  )
+
+  // Styles are edited while the app runs, and put back.
+  let before = run raw(&mut protocol, &mut tree, "{\"cmd\":\"inspect\",\"node\":20}")
+  run Testing.expect(String.contains(String.view(&before), "\"width\":76.64"), "Archive as built")
+  let set = run ask(
+    &mut protocol,
+    &mut tree,
+    "{\"cmd\":\"setStyle\",\"node\":20,\"style\":\"width: 200px; color: #ffffff; background-color: #fefefe\"}",
+  )
+  run Testing.expect(ok(&set) && int(&set, "edited") == 1, "a style is set")
+  run Testing.expect(protocol.repaint, "and a frame asked for")
+  run tree.frame(viewport)
+  let wide = run raw(&mut protocol, &mut tree, "{\"cmd\":\"inspect\",\"node\":20}")
+  run Testing.expect(!String.contains(String.view(&wide), "\"width\":76.64"), "layout follows")
+  let listing = run raw(&mut protocol, &mut tree, "{\"cmd\":\"styles\",\"node\":20}")
+  run Testing.expect(
+    String.contains(String.view(&listing), "\"width: 200px\""),
+    "styles lists the declarations as text",
+  )
+  let audited = run raw(&mut protocol, &mut tree, "{\"cmd\":\"audit\"}")
+  run Testing.expect(
+    String.contains(String.view(&audited), "\"rule\":\"contrast\""),
+    "the audit finds white text on white",
+  )
+  let bad = run ask(
+    &mut protocol,
+    &mut tree,
+    "{\"cmd\":\"setStyle\",\"node\":20,\"state\":\"wobbling\",\"style\":\"width: 1px\"}",
+  )
+  run Testing.expect(same(text(&bad, "error"), "unknown state"), "states are named")
+  let reset = run ask(&mut protocol, &mut tree, "{\"cmd\":\"resetStyles\"}")
+  run Testing.expect(int(&reset, "restored") == 1, "the edit is taken back")
+  run tree.frame(viewport)
+  let after = run raw(&mut protocol, &mut tree, "{\"cmd\":\"inspect\",\"node\":20}")
+  run Testing.expect(String.contains(String.view(&after), "\"width\":76.64"), "as it was")
+
+  // The picker takes the window's pointer.
+  let on = run ask(&mut protocol, &mut tree, "{\"cmd\":\"pickMode\",\"on\":true}")
+  run Testing.expect(ok(&on) && protocol.intercepts(), "picking is on")
+  let moved = Input.PointerMove { x: 100.0, y: 28.0, modifiers: 0 }
+  run Testing.expect(run protocol.pickInput(&tree, &moved), "a move is the picker's")
+  run Testing.expect(protocol.highlight.nodes.length() == 1, "and highlights what it is over")
+  let down = Input.PointerDown { x: 100.0, y: 28.0, button: 0, modifiers: 0, clickCount: 1 }
+  run Testing.expect(run protocol.pickInput(&tree, &down), "a press picks")
+  let up = Input.PointerUp { x: 100.0, y: 28.0, button: 0, modifiers: 0 }
+  run Testing.expect(run protocol.pickInput(&tree, &up), "its release is not the app's either")
+  run Testing.expect(!run protocol.pickInput(&tree, &moved), "and then input is the app's again")
+  let picked = run raw(&mut protocol, &mut tree, "{\"cmd\":\"pickMode\"}")
+  run Testing.expect(
+    String.contains(String.view(&picked), "\"on\":false,\"picked\":{\"id\":"),
+    "the pick is kept for whoever asked",
+  )
+}
+
+test effect fn devtoolsCommands() -> ()
+  ! AssertionError<'static>
+    | TreeError
+    | JsonError
+    | FileError
+    | HostInputError
+    | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run devtoolsBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }

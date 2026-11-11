@@ -46,7 +46,7 @@ const KNOWN_VERSIONS: [string<'static>; 4] = [
   "2025-11-25",
 ]
 
-const INSTRUCTIONS: string = r"""Inspects and drives a running Silk UI (ui-tree) app through its inspector socket. The app must be a debug build started with SILK_UI_INSPECT set (1 means silk-ui-inspect.sock in its working directory). Start with ui_snapshot to see the tree as text (kind, #id, role, label, text, rect), then target nodes by node id, role, name, label, text or testId. Text matches are trimmed, case-insensitive substrings and the first match in tree order wins. Input tools (ui_click, ui_type, ui_press, ui_scroll, ui_hover) wait for the app to draw its answer before the next call, so a snapshot right after a click shows the result; use ui_wait for slower changes. ui_screenshot returns a PNG."""
+const INSTRUCTIONS: string = r"""Inspects and drives a running Silk UI (ui-tree) app through its inspector socket. The app must be a debug build started with SILK_UI_INSPECT set (1 means silk-ui-inspect.sock in its working directory). Start with ui_snapshot to see the tree as text (kind, #id, role, label, text, rect), then target nodes by node id, role, name, label, text or testId. Text matches are trimmed, case-insensitive substrings and the first match in tree order wins. Input tools (ui_click, ui_type, ui_press, ui_scroll, ui_hover) wait for the app to draw its answer before the next call, so a snapshot right after a click shows the result; use ui_wait for slower changes. ui_screenshot returns a PNG. When the app is a silk-ui program, ui_messages lists every message it handled with what caused it and the commands it returned, and ui_model shows the model after any of them with a line diff against the one before: read these to see why the UI is in the state it is in. ui_frames times the frames, ui_set_style tries a style on a live node (ui_reset_styles takes it back) and ui_audit lists accessibility problems."""
 
 /// The target members every node-picking tool takes.
 const TARGET: string = r"""
@@ -412,7 +412,7 @@ pub fn commandOf(name: string) -> string<'static> {
   return ""
 }
 
-const TOOLS: [string<'static>; 18] = [
+const TOOLS: [string<'static>; 27] = [
   "ui_status",
   "ui_snapshot",
   "ui_query",
@@ -431,9 +431,18 @@ const TOOLS: [string<'static>; 18] = [
   "ui_pointer",
   "ui_key",
   "ui_capture",
+  "ui_program",
+  "ui_messages",
+  "ui_model",
+  "ui_frames",
+  "ui_styles",
+  "ui_set_style",
+  "ui_reset_styles",
+  "ui_pick_mode",
+  "ui_audit",
 ]
 
-const COMMANDS: [string<'static>; 18] = [
+const COMMANDS: [string<'static>; 27] = [
   "hello",
   "snapshot",
   "query",
@@ -452,6 +461,15 @@ const COMMANDS: [string<'static>; 18] = [
   "pointer",
   "key",
   "capture",
+  "program",
+  "messages",
+  "model",
+  "frames",
+  "styles",
+  "setStyle",
+  "resetStyles",
+  "pickMode",
+  "audit",
 ]
 
 fn has(value: Option<&Value>, key: string) -> bool {
@@ -962,6 +980,126 @@ effect fn toolList(out: &mut String) -> ()
     "Timed capture mosaic",
     "Captures a sequence of the app's last composed frames and returns one PNG mosaic. Defaults to 10 samples at 100 ms intervals, 5 columns. Captions show actual elapsed milliseconds and source frame numbers. Sampling is in the client; the app keeps handling input. Slow captures may exceed the requested interval. CPU reference rendering; not an FPS benchmark.",
     &capture,
+    "",
+    true,
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_program",
+    "The program",
+    "The program behind the UI, when the host reports one (silk-ui apps do): its model now as indented text, the subscriptions the model asks for, and counters (renders, messages, commands, mutations of the last render, nodes and how many it reused). attached is false for an app without a program.",
+    &none,
+    "",
+    true,
+  )
+  let messages = run props(
+    &[
+      r""" "since":{"type":"integer","description":"Only steps after this seq (the reply's next minus one reads on from the last call)."}""",
+      r""" "limit":{"type":"integer","description":"At most this many of the newest steps."}""",
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_messages",
+    "Message log",
+    "Every message the program handled, oldest first: seq, the program's time, cause (what sent it: 'click #12', 'key binding', 'timer', 'port menu', 'command <the command>', 'task'), the message itself, the commands update returned, and whether the model changed. The last 200 are kept.",
+    &messages,
+    "",
+    true,
+  )
+  let model = run props(
+    &[
+      r""" "seq":{"type":"integer","description":"The step whose model to show; the last one without it."}""",
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_model",
+    "Model at a step",
+    "The model after a step as indented text, and diff: its lines against the model before, each marked kept (' '), added ('+') or removed ('-'). changed counts the added and removed lines.",
+    &model,
+    "",
+    true,
+  )
+  let frames = run props(
+    &[
+      r""" "since":{"type":"integer","description":"Only frames after this frame number."}""",
+      r""" "limit":{"type":"integer","description":"At most this many of the newest frames."}""",
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_frames",
+    "Frame timeline",
+    "The last 240 frames: layout and paint time in milliseconds (zero when the host does not time them), whether layout was skipped, layout passes, repainted and replayed subtrees, fragments, primitives and glyphs; then the slowest and the average.",
+    &frames,
+    "",
+    true,
+  )
+  let styles = run props(&[TARGET])
+  run tool(
+    &mut out,
+    false,
+    "ui_styles",
+    "A node's declarations",
+    "The declarations the first matching node has in each state (base, hover, active, focus, focus-visible), each as CSS text.",
+    &styles,
+    "",
+    true,
+  )
+  let setStyle = run props(
+    &[
+      TARGET,
+      r""" "style":{"type":"string","description":"CSS declarations, such as 'width: 200px; color: red'."}""",
+      r""" "state":{"type":"string","enum":["base","hover","active","focus","focus-visible"],"description":"The state the declarations apply in; base without it."}""",
+      r""" "replace":{"type":"boolean","description":"Replace the state's declarations instead of adding to them."}""",
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_set_style",
+    "Edit a node's style",
+    "Sets CSS declarations on the first matching node while the app runs, and draws. The edit lasts until the app sets the same properties again or ui_reset_styles takes it back. Returns the node's declarations in that state.",
+    &setStyle,
+    "\"style\"",
+    false,
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_reset_styles",
+    "Take style edits back",
+    "Restores the declarations every edited node had before ui_set_style.",
+    &none,
+    "",
+    false,
+  )
+  let pickMode = run props(
+    &[r""" "on":{"type":"boolean","description":"Turn picking on or off; leave out to ask."}"""],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_pick_mode",
+    "Pick with the pointer",
+    "While on, the pointer in the app's window highlights the node under it and a press picks that node instead of reaching the app (Escape cancels). Ask again without 'on' for the picked node.",
+    &pickMode,
+    "",
+    false,
+  )
+  let audit = run props(&[TARGET])
+  run tool(
+    &mut out,
+    false,
+    "ui_audit",
+    "Accessibility audit",
+    "Checks the visible tree (or the target's subtree) and lists issues, each with its rule, a message and the node: unnamed (a control or image without an accessible name), no-role (listens for clicks without a role), not-focusable (clickable but unreachable by keyboard), small-target (under 24 by 24), contrast (text under 4.5:1, or 3:1 for large text).",
+    &audit,
     "",
     true,
   )

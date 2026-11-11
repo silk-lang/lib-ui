@@ -1,0 +1,125 @@
+//! The notes example in a native window: a whole native app in one file of host code.
+//!
+//!   ui-app-notes
+//!
+//! The menu bar, the dialogs, the clipboard and the title all go through the `Shell` the
+//! window provides; the files go through the `Disk` below. A worker thread says hello through
+//! a `Poster`. In a debug build with `SILK_UI_INSPECT` set the window serves the inspector.
+import ui_app_examples.notes { Notes, Message, Command, Disk, PORT_WORKER }
+import ui_app_examples.look { SANS }
+import ui_app.lib { Shell }
+import ui_app_window.background { Background }
+import ui_app_window.program { Launched, Window, launch, show, systemFonts, failed }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.system.filesystem_machine { MachineFileSystem }
+import silk.text.string { String, InvalidUtf8 }
+
+/// The machine's files.
+struct Files {
+  system: MachineFileSystem,
+}
+
+effect fn unread(error: FileError) -> String {
+  drop error
+  return String.make()
+}
+
+effect fn unwritten(error: FileError) -> bool {
+  drop error
+  return false
+}
+
+impl Files {
+  effect fn load(self: &mut Self, path: string) -> String
+    ! FileError | OutOfMemoryError
+    ? &mut Allocator {
+    let place = run Path.make(path)
+    let bytes = run FileSystem.readFile(&place) |> Effect.provideMut<FileSystem>(&mut self.system)
+    return match String.fromBytes(move bytes) {
+      Result<String, InvalidUtf8>.Success { value } => move value
+      Result<String, InvalidUtf8>.Failure { error } => {
+        drop error
+        String.make()
+      }
+    }
+  }
+
+  effect fn store(self: &mut Self, path: string, text: string) -> bool
+    ! FileError | OutOfMemoryError
+    ? &mut Allocator {
+    let place = run Path.make(path)
+    run FileSystem.writeFile(&place, String.utf8Bytes(text))
+      |> Effect.provideMut<FileSystem>(&mut self.system)
+    return true
+  }
+}
+
+impl Disk for Files {
+  effect fn read(self: &mut Self, path: string) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run Effect.catch<FileError>(self.load(path), unread)
+  }
+
+  effect fn write(self: &mut Self, path: string, text: string) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run Effect.catch<FileError>(self.store(path, text), unwritten)
+  }
+}
+
+effect fn notes(platform: Option<Launched>) -> i32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut window = run Window.make("Notes", 760.0, 520.0)
+  run window.font(SANS, "system-ui, sans-serif")
+  let mut shell = window.shell()
+  let mut files = Files { system: run MachineFileSystem.make() }
+  let fonts = run systemFonts()
+
+  // Work off the UI thread reaches the program through its ports.
+  let poster = window.poster()
+  let worker = run Effect.catchAll(
+    Background<()>.start(
+      fn() -> () {
+        let poster = move poster
+        poster.post(PORT_WORKER, "A worker thread says hello")
+      },
+    ),
+    unstarted,
+  )
+  let code = run show<Notes, Message, Command, &mut Shell | &mut Disk | &mut Allocator>(
+    move window,
+    &fonts,
+    move platform,
+  )
+    |> Effect.provideMut<Shell>(&mut shell)
+    |> Effect.provideMut<Disk>(&mut files)
+  drop worker
+  return code
+}
+
+effect fn unstarted<E>(error: E) -> Option<Background<()>> {
+  drop error
+  return Option<Background<()>>.None
+}
+
+/// The app, on the UI thread `launch` made.
+fn app(platform: Option<Launched>) -> i32 {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(notes(move platform), failed)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+pub fn main() -> i32 {
+  // The main thread keeps the OS event loop; the app runs on its own thread.
+  return launch(
+    fn(platform: Option<Launched>) -> i32 {
+      return app(move platform)
+    },
+  )
+}

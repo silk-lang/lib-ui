@@ -1,0 +1,459 @@
+//! What devtools do beyond looking: edit a node's styles while the app runs, and audit the
+//! tree for what a person using it would trip over.
+import nodes { nodeMembers }
+import reply { begin, finish, putKey, putText, putInt, failure, writeString }
+import ui_inspect.query { accessibleName, visible }
+import ui_inspect.view { writeDeclaration }
+import ui_tree.css { Declaration, cloneDeclaration }
+import ui_tree.engine { UiTree, TreeError }
+import ui_tree.inspect { info, NodeInfo, writeNumber }
+import ui_tree.mutation { Mutation, NodeKind, Role, StyleState, LISTEN_CLICK, NOT_FOCUSABLE }
+import ui_tree.node { NONE, Node }
+import ui_tree.style { Fill }
+import css_style.tokens { CssError }
+import css_style.written as written
+import silk.collections.list { List }
+import silk.color.rgba { Rgba }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.json.value { Value }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.u32
+import silk.num.usize
+import silk.text.string { String }
+
+/// The smallest side of something to click, as WCAG 2.2 asks (2.5.8).
+pub const TARGET_SIZE: f32 = 24.0
+
+/// The least contrast of text against what is behind it (WCAG 1.4.3), and of large text.
+pub const CONTRAST: f32 = 4.5
+
+pub const CONTRAST_LARGE: f32 = 3.0
+
+/// Text from this size on is large.
+pub const LARGE_TEXT: f32 = 24.0
+
+/// The most issues an audit reports.
+pub const ISSUE_LIMIT: usize = 200
+
+pub fn stateNamed(name: string) -> Option<StyleState> {
+  if name == "" || name == "base" {
+    return Option<StyleState>.Some { value: StyleState.Base }
+  }
+  if name == "hover" {
+    return Option<StyleState>.Some { value: StyleState.Hover }
+  }
+  if name == "active" {
+    return Option<StyleState>.Some { value: StyleState.Active }
+  }
+  if name == "focus" {
+    return Option<StyleState>.Some { value: StyleState.Focus }
+  }
+  if name == "focus-visible" {
+    return Option<StyleState>.Some { value: StyleState.FocusVisible }
+  }
+  return Option<StyleState>.None
+}
+
+pub fn stateName(state: StyleState) -> string<'static> {
+  return match state {
+    StyleState.Base => "base"
+    StyleState.Hover => "hover"
+    StyleState.Active => "active"
+    StyleState.Focus => "focus"
+    StyleState.FocusVisible => "focus-visible"
+  }
+}
+
+fn patchOf(node: &Node, state: StyleState) -> &List<Declaration> {
+  return match state {
+    StyleState.Base => &node.base
+    StyleState.Hover => &node.hover
+    StyleState.Active => &node.active
+    StyleState.Focus => &node.focus
+    StyleState.FocusVisible => &node.focusVisible
+  }
+}
+
+effect fn copied(list: &List<Declaration>) -> List<Declaration>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = List<Declaration>.make()
+  let items = list.asSlice()
+  let mut i: usize = 0
+  while i < items.length {
+    run out.append(run cloneDeclaration(&items[i]))
+    i = i + 1
+  }
+  return move out
+}
+
+/// The declarations a node had in one state before the inspector first edited them.
+struct Original {
+  id: u32,
+  state: StyleState,
+  declarations: List<Declaration>,
+}
+
+/// The style edits made through the inspector, so they can be taken back.
+pub struct StyleEdits {
+  originals: List<Original>,
+}
+
+impl StyleEdits {
+  pub fn make() -> StyleEdits {
+    return StyleEdits { originals: List<Original>.make() }
+  }
+
+  /// How many (node, state) pairs are edited.
+  pub fn count(self: &Self) -> usize {
+    return self.originals.length()
+  }
+
+  effect fn remember(self: &mut Self, tree: &UiTree<'_>, id: u32, state: StyleState) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let known = self.originals.asSlice()
+    let mut i: usize = 0
+    while i < known.length {
+      if known[i].id == id && known[i].state == state {
+        return ()
+      }
+      i = i + 1
+    }
+    let node = tree.node(tree.slotOf(id))
+    run self.originals.append(
+      Original { id: id, state: state, declarations: run copied(patchOf(node, state)) },
+    )
+  }
+
+  /// setStyle: parses `css` (`"width: 10px; color: red"`) and sets it on node `id` for
+  /// `state`, over what the node has, or instead of it with `replace`. Writes the reply.
+  pub effect fn apply(
+    self: &mut Self,
+    tree: &mut UiTree<'_>,
+    request: &Value,
+    id: u32,
+    state: StyleState,
+    css: string,
+    replace: bool,
+    out: &mut String,
+  ) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let parsed = run Effect.result(written.declarations(String.utf8Bytes(css)))
+    let declarations = match move parsed {
+      Result<List<Declaration>, CssError | OutOfMemoryError>.Success { value } => move value
+      Result<List<Declaration>, CssError | OutOfMemoryError>.Failure { error } => {
+        drop error
+        run failure(&mut out, request, "the style does not parse")
+        return false
+      }
+    }
+    if declarations.length() == 0 && !replace && String.byteLength(css) != 0 {
+      run failure(&mut out, request, "the style has no declaration the tree knows")
+      return false
+    }
+    run self.remember(&tree.*, id, state)
+    let mut batch = List<Mutation>.make()
+    if replace {
+      run batch.append(Mutation.ClearStyle { id: id, state: state })
+    }
+    run batch.append(Mutation.SetStyle { id: id, state: state, declarations: move declarations })
+    if !run applied(&mut tree, move batch) {
+      run failure(&mut out, request, "the tree refused the style")
+      return false
+    }
+    run begin(&mut out, request)
+    run putInt(&mut out, "node", u32.toU64(id))
+    run putText(&mut out, "state", stateName(state))
+    run putKey(&mut out, "style")
+    run declarationTexts(patchOf(tree.node(tree.slotOf(id)), state), &mut out)
+    run putInt(&mut out, "edited", usize.toU64(self.originals.length()))
+    run finish(&mut out)
+    return true
+  }
+
+  /// resetStyles: puts back what every edited node had. Nodes that are gone are skipped.
+  /// Returns how many (node, state) pairs it restored.
+  pub effect fn reset(self: &mut Self, tree: &mut UiTree<'_>) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut restored: usize = 0
+    while true {
+      let original = match self.originals.pop() {
+        Option<Original>.Some { value } => move value
+        Option<Original>.None => {
+          break
+        }
+      }
+      let Original { id, state, declarations } = move original
+      if !tree.contains(id) {
+        continue
+      }
+      let mut batch = List<Mutation>.make()
+      run batch.append(Mutation.ClearStyle { id: id, state: state })
+      run batch.append(Mutation.SetStyle { id: id, state: state, declarations: move declarations })
+      if run applied(&mut tree, move batch) {
+        restored = restored + 1
+      }
+    }
+    return restored
+  }
+}
+
+effect fn applied(tree: &mut UiTree<'_>, batch: List<Mutation>) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match run Effect.result(tree.apply(move batch)) {
+    Result<(), TreeError | OutOfMemoryError>.Success { value: _ } => true
+    Result<(), TreeError | OutOfMemoryError>.Failure { error } => {
+      drop error
+      false
+    }
+  }
+}
+
+effect fn declarationTexts(list: &List<Declaration>, out: &mut String) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.append("[")
+  let items = list.asSlice()
+  let mut text = String.make()
+  let mut i: usize = 0
+  while i < items.length {
+    if i > 0 {
+      run out.append(",")
+    }
+    text.clear()
+    run writeDeclaration(&mut text, &items[i])
+    run writeString(&mut out, String.view(&text))
+    i = i + 1
+  }
+  run out.append("]")
+}
+
+/// styles: the declarations node `id` has in each state, as text, for an editor to show.
+pub effect fn styles(tree: &UiTree<'_>, request: &Value, id: u32, out: &mut String) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let node = tree.node(tree.slotOf(id))
+  run begin(&mut out, request)
+  run putInt(&mut out, "node", u32.toU64(id))
+  run putKey(&mut out, "base")
+  run declarationTexts(&node.base, &mut out)
+  run putKey(&mut out, "hover")
+  run declarationTexts(&node.hover, &mut out)
+  run putKey(&mut out, "active")
+  run declarationTexts(&node.active, &mut out)
+  run putKey(&mut out, "focus")
+  run declarationTexts(&node.focus, &mut out)
+  run putKey(&mut out, "focus-visible")
+  run declarationTexts(&node.focusVisible, &mut out)
+  run finish(&mut out)
+}
+
+// The audit.
+
+fn interactive(value: Role) -> bool {
+  return value == Role.Button || value == Role.Link || value == Role.Checkbox || value == Role.Radio
+    || value == Role.TextBox
+    || value == Role.Tab
+    || value == Role.MenuItem
+    || value == Role.Slider
+    || value == Role.Switch
+    || value == Role.Option
+}
+
+fn channel(value: f32) -> f32 {
+  if value <= 0.04045 {
+    return value / 12.92
+  }
+  return f32.pow((value + 0.055) / 1.055, 2.4)
+}
+
+fn luminance(color: Rgba<f32>) -> f32 {
+  return 0.2126 * channel(color.r) + 0.7152 * channel(color.g) + 0.0722 * channel(color.b)
+}
+
+/// The WCAG contrast ratio of two opaque colors, from 1 to 21.
+pub fn contrast(a: Rgba<f32>, b: Rgba<f32>) -> f32 {
+  let la = luminance(a)
+  let lb = luminance(b)
+  if la > lb {
+    return (la + 0.05) / (lb + 0.05)
+  }
+  return (lb + 0.05) / (la + 0.05)
+}
+
+/// The opaque color behind node `slot`: the nearest solid background at or above it. None
+/// when a gradient, a translucent color or nothing is there, where no ratio can be told.
+fn backdrop(tree: &UiTree<'_>, slot: u32) -> Option<Rgba<f32>> {
+  let mut at = slot
+  while at != NONE {
+    let node = tree.node(at)
+    match node.computed.paint.background {
+      Fill.Solid { color } => {
+        if color.a >= 0.999 {
+          return Option<Rgba<f32>>.Some { value: color }
+        }
+        if color.a > 0.0 {
+          return Option<Rgba<f32>>.None
+        }
+      }
+      Fill.Gradient { .. } => {
+        return Option<Rgba<f32>>.None
+      }
+      Fill.None => {}
+    }
+    if node.computed.paint.opacity < 0.999 {
+      return Option<Rgba<f32>>.None
+    }
+    at = node.parent
+  }
+  return Option<Rgba<f32>>.None
+}
+
+struct Report<'a> {
+  out: &'a mut String,
+  name: String,
+  count: usize,
+}
+
+impl<'a> Report<'a> {
+  effect fn issue(self: &mut Self, tree: &UiTree<'_>, id: u32, rule: string, message: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.count = self.count + 1
+    if self.count > ISSUE_LIMIT {
+      return ()
+    }
+    if self.count > 1 {
+      run self.out.append(",")
+    }
+    run self.out.append("{\"rule\":")
+    run writeString(&mut self.out, rule)
+    run self.out.append(",\"message\":")
+    run writeString(&mut self.out, message)
+    run self.out.append(",\"node\":")
+    run nodeMembers(tree, id, &mut self.name, &mut self.out)
+    run self.out.append("}}")
+  }
+}
+
+/// audit: walks the tree under `top` for what trips people up. Each issue names its rule,
+/// says what is wrong in words and carries the node:
+///
+/// - `unnamed`: a control or image without an accessible name.
+/// - `no-role`: a node that listens for clicks and has no role.
+/// - `not-focusable`: a node that listens for clicks and the keyboard cannot reach.
+/// - `small-target`: something to click smaller than 24 by 24.
+/// - `contrast`: text whose contrast against its background is under 4.5 (3 for large text).
+pub effect fn audit(tree: &UiTree<'_>, request: &Value, top: u32, out: &mut String) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run begin(&mut out, request)
+  run putKey(&mut out, "issues")
+  run out.append("[")
+  let mut report = Report { out: &mut out, name: String.make(), count: 0 }
+  let mut stack = List<u32>.make()
+  let mut kids = List<u32>.make()
+  let mut message = String.make()
+  let mut name = String.make()
+  let mut checked: usize = 0
+  if top != NONE && tree.contains(top) {
+    run stack.append(tree.slotOf(top))
+  }
+  while true {
+    let slot = match stack.pop() {
+      Option<u32>.Some { value } => value
+      Option<u32>.None => {
+        break
+      }
+    }
+    let node = tree.node(slot)
+    run tree.childSlots(slot, &mut kids)
+    let mut k = kids.length()
+    while k > 0 {
+      k = k - 1
+      run stack.append(kids.get(k))
+    }
+    if !run visible(tree, slot) {
+      continue
+    }
+    checked = checked + 1
+    let id = node.id
+    let clicks = u32.bitAnd(node.listeners, LISTEN_CLICK) != 0
+    let control = interactive(node.accessRole)
+    if control || node.accessRole == Role.Image || node.kind == NodeKind.Image {
+      run accessibleName(tree, id, &mut name)
+      if name.ownedByteLength() == 0 {
+        run report.issue(tree, id, "unnamed", "has no accessible name: give it a label or text")
+      }
+    }
+    if clicks && (node.accessRole == Role.None || node.accessRole == Role.Generic) {
+      run report.issue(
+        tree,
+        id,
+        "no-role",
+        "listens for clicks without a role: assistive technology cannot tell it is a control",
+      )
+    }
+    if clicks && !node.disabled && node.tabIndex == NOT_FOCUSABLE {
+      run report.issue(
+        tree,
+        id,
+        "not-focusable",
+        "listens for clicks and cannot be focused: the keyboard cannot reach it",
+      )
+    }
+    if (clicks || control) && !node.disabled {
+      match run info(tree, id) {
+        Option<NodeInfo>.Some { value } => {
+          let w = value.bounds.xMax - value.bounds.xMin
+          let h = value.bounds.yMax - value.bounds.yMin
+          if value.laidOut && (w < TARGET_SIZE || h < TARGET_SIZE) {
+            message.clear()
+            run message.append("is ")
+            run writeNumber(&mut message, w)
+            run message.append(" by ")
+            run writeNumber(&mut message, h)
+            run message.append(": a target should be at least 24 by 24")
+            run report.issue(tree, id, "small-target", String.view(&message))
+          }
+        }
+        Option<NodeInfo>.None => {}
+      }
+    }
+    if node.kind == NodeKind.Text && node.text.ownedByteLength() != 0
+      && node.computed.text.color.a >= 0.999 {
+      match backdrop(tree, slot) {
+        Option<Rgba<f32>>.Some { value } => {
+          let ratio = contrast(node.computed.text.color, value)
+          let needed = if node.computed.text.size >= LARGE_TEXT {
+            CONTRAST_LARGE
+          } else {
+            CONTRAST
+          }
+          if ratio < needed {
+            message.clear()
+            run message.append("contrast is ")
+            run writeNumber(&mut message, f32.round(ratio * 100.0) / 100.0)
+            run message.append(", under ")
+            run writeNumber(&mut message, needed)
+            run report.issue(tree, id, "contrast", String.view(&message))
+          }
+        }
+        Option<Rgba<f32>>.None => {}
+      }
+    }
+  }
+  let count = report.count
+  drop report
+  run out.append("]")
+  run putInt(&mut out, "count", usize.toU64(count))
+  run putInt(&mut out, "checked", usize.toU64(checked))
+  run finish(&mut out)
+}

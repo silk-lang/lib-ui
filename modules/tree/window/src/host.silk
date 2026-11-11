@@ -119,6 +119,11 @@ pub interface WindowClient<S, E, ? R> {
     return Option<f64>.None
   }
 
+  /// Whether the client asked to close the window: the loop ends without asking `closing`.
+  fn quitting(self: &Self, state: &S) -> bool {
+    return false
+  }
+
   /// Prepares optional custom scene content after tree layout and before upload.
   effect fn frame(
     self: &mut Self,
@@ -134,6 +139,12 @@ pub interface WindowClient<S, E, ? R> {
   fn scene<'s>(self: &'s Self, state: &'s S, tree: &'s UiTree<'_>) -> &'s Scene {
     return tree.scene()
   }
+
+  /// Tells a served inspector what the tree cannot: the program behind it. The host calls it
+  /// before `start` and then on every turn of its loop, only while the inspector is on.
+  effect fn report(self: &mut Self, state: &mut S, inspector: &mut Inspector) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {}
 
   /// Initializes client nodes after the host applies resource definitions.
   effect fn start(self: &mut Self, state: &mut S, tree: &mut UiTree<'_>) -> ()
@@ -310,6 +321,9 @@ pub effect fn runWindow<H: WindowClient<S, E, R>, S, E, ? R>(
   let mut tree = run UiTree.make(collection)
   run content.setup(&mut state, &mut tree)
   run tree.apply(move resources)
+  if inspector.enabled() {
+    run content.report(&mut state, &mut inspector)
+  }
   run content.start(&mut state, &mut tree)
   let mut snapshot = CpuSnapshot.make()
 
@@ -325,6 +339,11 @@ pub effect fn runWindow<H: WindowClient<S, E, R>, S, E, ? R>(
   let window = run platform.openWindow(&windowOptions)
   let owner = window
   run content.opened(&mut state, &mut platform, owner)
+
+  // What `start` asked of the window before there was one.
+  if !check && run content.update(&mut state, &mut tree, &mut platform, owner) {
+    platform.requestFrame(owner)
+  }
   let mut host = HostState.of(&platform)
   let raw = platform.rawSurface(window)
 
@@ -357,6 +376,9 @@ pub effect fn runWindow<H: WindowClient<S, E, R>, S, E, ? R>(
     let backgroundChanged = run content.poll(&mut state, &mut tree, now)
     if backgroundChanged {
       platform.requestFrame(owner)
+    }
+    if !check && content.quitting(&state.*) {
+      break
     }
     let wait = if check {
       Wait.Seconds { seconds: 0.016 }
@@ -429,6 +451,9 @@ pub effect fn runWindow<H: WindowClient<S, E, R>, S, E, ? R>(
       run content.tick(&mut state, &mut tree, time, false)
       redraw = content.needsFrame(&state.*, &tree)
     }
+    if inspector.enabled() {
+      run content.report(&mut state, &mut inspector)
+    }
     if run inspector.poll(&mut tree) {
       while true {
         // Input from the inspector is answered like window input: the client decides
@@ -476,6 +501,10 @@ pub effect fn runWindow<H: WindowClient<S, E, R>, S, E, ? R>(
               let layoutEnd = run seconds(&mut clock)
               run content.frame(&mut state, &mut tree, viewport, &inspector)
               let canvasEnd = run seconds(&mut clock)
+              inspector.timed(
+                f64.toF32((layoutEnd - frameStart) * 1000.0),
+                f64.toF32((canvasEnd - layoutEnd) * 1000.0),
+              )
               run serve(&mut platform, owner, &mut tree, &mut host)
               run inspector.afterFrameScene(&tree, content.scene(&state.*, &tree))
               run snapshot.copyUploads(&tree)
@@ -553,16 +582,18 @@ pub effect fn runWindow<H: WindowClient<S, E, R>, S, E, ? R>(
             resized = true
           }
           Event.CloseRequested { .. } => {
-            if !check && !run content.closing(&mut state) {
-              continue
+            if check || run content.closing(&mut state) {
+              break
             }
-            break
+
+            // The client keeps the window: what it queued while deciding is handled next.
+            redraw = true
           }
           Event.QuitRequested => {
-            if !check && !run content.closing(&mut state) {
-              continue
+            if check || run content.closing(&mut state) {
+              break
             }
-            break
+            redraw = true
           }
           _ => {
             let fed = if check {
@@ -571,16 +602,21 @@ pub effect fn runWindow<H: WindowClient<S, E, R>, S, E, ? R>(
               run toInput(&value)
             }
             if let Option<Input>.Some { value: input } = move fed {
-              // As a browser does: the handlers of the input see it first, and the default
-              // action runs unless one of them prevented it.
-              run tree.begin(&input)
-              let prevented = run content.decide(&mut state, &mut tree)
-              run tree.finish(move input, prevented)
-              run serve(&mut platform, owner, &mut tree, &mut host)
-              run inspector.observe(&tree)
-              run content.pump(&mut state, &mut tree)
-              platform.setCursor(owner, windowCursor(tree.cursor()))
-              redraw = content.needsFrame(&state.*, &tree)
+              // The inspector's picker takes the pointer before the app sees it.
+              if inspector.picking() && run inspector.pickInput(&tree, &input) {
+                redraw = true
+              } else {
+                // As a browser does: the handlers of the input see it first, and the default
+                // action runs unless one of them prevented it.
+                run tree.begin(&input)
+                let prevented = run content.decide(&mut state, &mut tree)
+                run tree.finish(move input, prevented)
+                run serve(&mut platform, owner, &mut tree, &mut host)
+                run inspector.observe(&tree)
+                run content.pump(&mut state, &mut tree)
+                platform.setCursor(owner, windowCursor(tree.cursor()))
+                redraw = content.needsFrame(&state.*, &tree)
+              }
             }
           }
         }

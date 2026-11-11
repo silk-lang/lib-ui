@@ -1,0 +1,149 @@
+//! [`show`] and [`showTree`]: values written down by reflection.
+import ui_app.show { show, showTree }
+import ui_app.app { NoCommand }
+import ui_app.harness { click, press }
+import ui_app.program as program
+import ui_app.runtime { drain, tick }
+import ui_app_examples.counter { Counter, Message as CounterMessage }
+import ui_app_examples.look { SANS }
+import ui_fixtures.fixtures as fixtures
+import ui_tree.legacy { UiTree, TreeError, Batch, FrameInput }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+enum Filter {
+  All,
+  Open,
+}
+
+union Message {
+  Typed { pub value: String },
+  Moved { pub x: f64, pub y: i32 },
+  Done,
+}
+
+struct Todo {
+  pub title: String,
+  pub done: bool,
+}
+
+struct Model {
+  pub text: String,
+  pub count: u32,
+  pub last: Option<u32>,
+  pub filter: Filter,
+  pub todos: List<Todo>,
+  pub messages: List<Message>,
+  hidden: u32,
+}
+
+effect fn same(got: &String, wanted: string<'static>) -> ()
+  ! AssertionError<'static> {
+  run Testing.expect(String.view(got) == wanted, wanted)
+}
+
+effect fn showBody() -> ()
+  ! AssertionError<'static> | OutOfMemoryError
+  ? &mut Allocator {
+  let typed = Message.Typed { value: run String.copy("a \"b\"\n") }
+  let typedLine = run show(&typed)
+  run same(&typedLine, "Typed { value: \"a \\\"b\\\"\\n\" }")
+  let moved = Message.Moved { x: -1.25, y: -7 }
+  let movedLine = run show(&moved)
+  run same(&movedLine, "Moved { x: -1.25, y: -7 }")
+  let doneLine = run show(&Message.Done)
+  run same(&doneLine, "Done")
+
+  let mut todos = List<Todo>.make()
+  run todos.append(Todo { title: run String.copy("milk"), done: true })
+  let mut messages = List<Message>.make()
+  run messages.append(Message.Done)
+  let model = Model {
+    text: run String.copy("hi"),
+    count: 3,
+    last: Option<u32>.some(9),
+    filter: Filter.Open,
+    todos: move todos,
+    messages: move messages,
+    hidden: 1,
+  }
+  let modelLine = run show(&model)
+  run same(
+    &modelLine,
+    "Model { text: \"hi\", count: 3, last: Some { value: 9 }, filter: <Filter>, todos: [Todo { title: \"milk\", done: true }], messages: [Done] }",
+  )
+  let tree = run showTree(&model)
+  run same(
+    &tree,
+    "Model\n  text: \"hi\"\n  count: 3\n  last: Some\n    value: 9\n  filter: <Filter>\n  todos: [1]\n    0: Todo\n      title: \"milk\"\n      done: true\n  messages: [1]\n    0: Done",
+  )
+}
+
+test effect fn valuesShowThemselves() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run showBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn journalBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  let mut batch = Batch.make()
+  run batch.fontFamily(SANS, "Noto Sans, sans-serif")
+  run tree.apply(run batch.take())
+  let viewport = FrameInput { width: 360.0, height: 360.0, scale: 1.0, time: 0.0 }
+  let mut app = run program.make<Counter, CounterMessage, NoCommand>()
+  run Testing.expect(app.journal.steps.length() == 0, "no journal unless asked")
+  run app.record()
+  run app.start(&mut tree, 0.0)
+  drop run click(&mut app, &mut tree, viewport, "+")
+  run press(&mut app, &mut tree, viewport, "ArrowUp", 0)
+  app.send(CounterMessage.Reset)
+  run drain(&mut app, &mut tree)
+  drop run click(&mut app, &mut tree, viewport, "Auto")
+  run tick(&mut app, &mut tree, 1.0, false)
+
+  let steps = app.journal.steps.asSlice()
+  run Testing.expect(steps.length == 6, "one step per message, after the first")
+  run same(&steps[0].message, "init")
+  run same(&steps[0].model, "Counter\n  count: 0\n  running: false\n  ticks: 0")
+  run same(&steps[1].message, "Increment")
+  run Testing.expect(
+    String.startsWith(String.view(&steps[1].cause), "click #"),
+    "a click caused it",
+  )
+  run same(&steps[1].model, "Counter\n  count: 1\n  running: false\n  ticks: 0")
+  run same(&steps[2].cause, "key binding")
+  run same(&steps[3].message, "Reset")
+  run same(&steps[3].cause, "task")
+  run same(&steps[4].message, "ToggleTimer")
+  run same(&steps[5].message, "Tick { time: 1 }")
+  run same(&steps[5].cause, "timer")
+  run Testing.expect(steps[5].seq == 6, "steps count from 1")
+
+  let lines = run app.subscriptionLines()
+  let mut timer = false
+  let mut reset = false
+  let list = lines.asSlice()
+  let mut i: usize = 0
+  while i < list.length {
+    timer = timer || String.view(&list[i]) == "every 1s"
+    reset = reset || String.view(&list[i]) == "keyBinding Control+r"
+    i = i + 1
+  }
+  run Testing.expect(timer && reset, "the subscriptions say what they are")
+  drop app.journal.take()
+  run Testing.expect(app.journal.steps.length() == 0, "taking empties the journal")
+}
+
+test effect fn theJournalWritesEveryStep() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run journalBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}

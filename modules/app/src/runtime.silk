@@ -12,6 +12,8 @@ import ui_protocol.css
 import ui_protocol.css { percent, Keyword, Declaration }
 import app { App, Perform, Context, Subscriptions, SubscriptionKind, Delivery }
 import diff { DiffState, diff }
+import journal { Journal, MODEL_LIMIT, eventName }
+import show { Printer, show, showTree }
 import ui { Ui, Identity, AnchorRect, NO_ENTRY, ROOT_ID }
 import ui_protocol.mutation {
   Mutation,
@@ -23,7 +25,7 @@ import ui_protocol.mutation {
 }
 import ui_protocol.record { Event, EventKind }
 import ui_tree.node { FrameInput }
-import ui_protocol.input { Input, MOD_ALT, MOD_CONTROL, MOD_META }
+import ui_protocol.input { Input, MOD_ALT, MOD_CONTROL, MOD_META, MOD_SHIFT }
 import ui_protocol.options { VirtualItem }
 import ui_tree.virtual_list { VirtualRange }
 import ui_tree.engine { UiTree, TreeError }
@@ -92,6 +94,8 @@ pub struct Runtime<A, M, C> {
   started: bool,
   deferring: bool,
   held: List<C>,
+  /// What the program did, once a host asks (`record`).
+  pub journal: Journal,
 }
 
 impl<A: App<M, C>, M, C> Runtime<A, M, C> {
@@ -128,7 +132,124 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
       started: false,
       deferring: false,
       held: List<C>.make(),
+      journal: Journal.make(),
     }
+  }
+
+  /// From now on, every message is written down in `journal` with the model it led to. The
+  /// first step is the model as it is now. For a host that serves an inspector.
+  pub effect fn record(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.journal.on {
+      return ()
+    }
+    self.journal.on = true
+    let model = run self.shownModel()
+    let mut waiting = List<String>.make()
+    let commands = self.context.commands.asSlice()
+    let mut i: usize = 0
+    while i < commands.length {
+      run waiting.append(run show(&commands[i]))
+      i = i + 1
+    }
+    run self.journal.add(
+      self.time,
+      run String.copy("start"),
+      run String.copy("init"),
+      move waiting,
+      move model,
+    )
+  }
+
+  effect fn shownModel(self: &Self) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let text = run showTree(&self.model)
+    if String.byteLength(String.view(&text)) <= MODEL_LIMIT {
+      return move text
+    }
+    let bytes = String.utf8Bytes(String.view(&text))
+    let mut end = MODEL_LIMIT
+    while end > 0 && (bytes[end] & 0xC0) == 0x80 {
+      end = end - 1
+    }
+    let mut cut = run String.copy(String.slice(String.view(&text), 0, end))
+    run cut.append("\n…")
+    return move cut
+  }
+
+  /// Says where the messages queued from `from` on came from. The ones before it that nobody
+  /// spoke for were sent by a task (`send`).
+  effect fn caused(self: &mut Self, from: usize, cause: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.journal.on {
+      return ()
+    }
+    while self.journal.causes.length() < from {
+      run self.journal.causes.append(run String.copy("task"))
+    }
+    while self.journal.causes.length() < self.queue.length() {
+      run self.journal.causes.append(run String.copy(cause))
+    }
+  }
+
+  /// The subscriptions the model asks for now, one line each: `every 1s`, `port menu`.
+  pub effect fn subscriptionLines(self: &mut Self) -> List<String>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.subscriptions.beginCollect()
+    App<M, C>.subscriptions(&self.model, &mut self.subscriptions)
+    let mut lines = List<String>.make()
+    let list = self.subscriptions.list()
+    let mut i: usize = 0
+    while i < list.length {
+      let record = list[i]
+      let mut line = String.make()
+      if record.kind == SubscriptionKind.Every {
+        run line.append("every ")
+        let mut to = Printer.make(false)
+        run to.real(record.interval)
+        run line.append(String.view(&to.out))
+        run line.append("s")
+      } else if record.kind == SubscriptionKind.AnimationFrame {
+        run line.append("animationFrame")
+      } else if record.kind == SubscriptionKind.KeyBinding {
+        run line.append("keyBinding ")
+        if (record.modifiers & MOD_CONTROL) != 0 {
+          run line.append("Control+")
+        }
+        if (record.modifiers & MOD_ALT) != 0 {
+          run line.append("Alt+")
+        }
+        if (record.modifiers & MOD_SHIFT) != 0 {
+          run line.append("Shift+")
+        }
+        if (record.modifiers & MOD_META) != 0 {
+          run line.append("Meta+")
+        }
+        if let Result<string, InvalidUtf8>.Success { value: name } = String.fromUtf8(
+          self.subscriptions.keyName(record),
+        ) {
+          run line.append(name)
+        }
+      } else if record.kind == SubscriptionKind.Resize {
+        run line.append("resize")
+      } else if record.kind == SubscriptionKind.Location {
+        run line.append("location")
+      } else {
+        run line.append("port ")
+        if let Result<string, InvalidUtf8>.Success { value: name } = String.fromUtf8(
+          self.subscriptions.keyName(record),
+        ) {
+          run line.append(name)
+        }
+      }
+      run lines.append(move line)
+      i = i + 1
+    }
+    return move lines
   }
 
   /// From now on, `drain` keeps the commands `update` returns instead of performing them, for
@@ -420,8 +541,28 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
     self.subscriptions.beginDelivery(delivery)
     App<M, C>.subscriptions(&self.model, &mut self.subscriptions)
     self.subscriptions.beginCollect()
+    let first = self.queue.length()
     while self.subscriptions.messages.length() != 0 {
       run self.queue.append(self.subscriptions.messages.remove(0))
+    }
+    if self.journal.on {
+      let mut cause = String.make()
+      if delivery.kind == SubscriptionKind.Every {
+        run cause.append("timer")
+      } else if delivery.kind == SubscriptionKind.AnimationFrame {
+        run cause.append("frame")
+      } else if delivery.kind == SubscriptionKind.KeyBinding {
+        run cause.append("key binding")
+      } else if delivery.kind == SubscriptionKind.Resize {
+        run cause.append("resize")
+      } else if delivery.kind == SubscriptionKind.Location {
+        run cause.append("location ")
+        run cause.append(String.view(&self.subscriptions.current))
+      } else {
+        run cause.append("port ")
+        run cause.append(String.view(&self.journal.port))
+      }
+      run self.caused(first, String.view(&cause))
     }
   }
 
@@ -471,6 +612,9 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
     ! OutOfMemoryError
     ? &mut Allocator {
     self.subscriptions.posted = run String.copy(text)
+    if self.journal.on {
+      self.journal.port = run String.copy(name)
+    }
     self.subscriptions.beginCollect()
     App<M, C>.subscriptions(&self.model, &mut self.subscriptions)
     let wanted = String.utf8Bytes(name)
@@ -505,6 +649,31 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
       k = k + 1
     }
     self.subscriptions.posted = String.make()
+  }
+
+  /// Whether the model subscribes to the port `name` now.
+  pub fn listens(self: &mut Self, name: string) -> bool {
+    self.subscriptions.beginCollect()
+    App<M, C>.subscriptions(&self.model, &mut self.subscriptions)
+    let wanted = String.utf8Bytes(name)
+    let list = self.subscriptions.list()
+    let mut j: usize = 0
+    while j < list.length {
+      if list[j].kind == SubscriptionKind.Port {
+        let named = self.subscriptions.keyName(list[j])
+        let mut same = named.length == wanted.length
+        let mut i: usize = 0
+        while same && i < named.length {
+          same = named[i] == wanted[i]
+          i = i + 1
+        }
+        if same {
+          return true
+        }
+      }
+      j = j + 1
+    }
+    return false
   }
 
   /// The viewport is `width` by `height` CSS pixels: tells the resize subscriptions, whose
@@ -597,10 +766,19 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
     if isKey && self.keyBindings {
       run name.appendSlice(String.utf8Bytes(String.view(&record.key)))
     }
+    let kind = record.kind
+    let target = record.target
     run self.ui.beginDispatch(move record, self.path.asSlice())
     App<M, C>.view(&self.model, &mut self.ui)
     let before = self.queue.length()
     run self.ui.endDispatch(&mut self.queue)
+    if self.journal.on && self.queue.length() != before {
+      let mut to = Printer.make(false)
+      run to.out.append(eventName(kind))
+      run to.out.append(" #")
+      run to.unsigned(u32.toU64(target))
+      run self.caused(before, String.view(&to.out))
+    }
     let prevented = self.ui.takePrevented()
     if prevented {
       self.prevented = true
@@ -699,6 +877,14 @@ pub effect fn settle<A: App<M, C>, M, C: Perform<M, E, R>, E, ? R>(
       runtime.stats.commands = runtime.stats.commands + 1
       if runtime.deferring {
         run runtime.held.append(move command)
+      } else if runtime.journal.on {
+        let mut cause = run String.copy("command ")
+        let shown = run show(&command)
+        run cause.append(String.view(&shown))
+        let result = run Perform<M, E, R>.perform(move command)
+        let first = runtime.queue.length()
+        run runtime.queue.append(move result)
+        run runtime.caused(first, String.view(&cause))
       } else {
         let result = run Perform<M, E, R>.perform(move command)
         run runtime.queue.append(move result)
@@ -709,7 +895,27 @@ pub effect fn settle<A: App<M, C>, M, C: Perform<M, E, R>, E, ? R>(
     }
     let message = runtime.queue.remove(runtime.head)
     runtime.stats.messages = runtime.stats.messages + 1
-    App<M, C>.update(&mut runtime.model, move message, &mut runtime.context)
+    if runtime.journal.on {
+      let shown = run show(&message)
+      let cause = if runtime.head < runtime.journal.causes.length() {
+        runtime.journal.causes.remove(runtime.head)
+      } else {
+        run String.copy("task")
+      }
+      let before = runtime.context.commands.length()
+      App<M, C>.update(&mut runtime.model, move message, &mut runtime.context)
+      let mut asked = List<String>.make()
+      let commands = runtime.context.commands.asSlice()
+      let mut i = before
+      while i < commands.length {
+        run asked.append(run show(&commands[i]))
+        i = i + 1
+      }
+      let model = run runtime.shownModel()
+      run runtime.journal.add(runtime.time, move cause, move shown, move asked, move model)
+    } else {
+      App<M, C>.update(&mut runtime.model, move message, &mut runtime.context)
+    }
     if let Option<String>.Some { value: path } = Intrinsic.replace(
       runtime.context.destination,
       Option<String>.none(),
@@ -719,6 +925,7 @@ pub effect fn settle<A: App<M, C>, M, C: Perform<M, E, R>, E, ? R>(
     }
   }
   runtime.queue.clear()
+  runtime.journal.causes.clear()
   runtime.head = 0
   return true
 }

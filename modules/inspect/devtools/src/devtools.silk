@@ -1,11 +1,13 @@
 //! The devtools window as a ui-app app: the inspected app's element tree on the left, and on
-//! the right the selected node's styles, its box model, the event log and the frame stats. It
-//! talks to the app only through the inspector protocol (the same requests ui-inspect-cli and
-//! ui-inspect-mcp send), over a [`Link`] the host provides.
+//! the right the selected node's styles (which can be edited), its box model, the program's
+//! messages with the model after each, the event log, the frame timeline, an accessibility
+//! audit and the frame stats. It talks to the app only through the inspector protocol (the
+//! same requests ui-inspect-cli and ui-inspect-mcp send), over a [`Link`] the host provides.
 //!
-//! Selecting a row inspects that node and highlights it in the app's window. While live (the
-//! default), the window refreshes every [`LIVE_INTERVAL`] seconds. Keys: ArrowDown and ArrowUp
-//! move the selection, Escape clears it, F5 refreshes.
+//! Selecting a row inspects that node and highlights it in the app's window; Pick selects the
+//! node pressed in the app's window instead. While live (the default), the window refreshes
+//! every [`LIVE_INTERVAL`] seconds. Keys: ArrowDown and ArrowUp move the selection, Escape
+//! clears it, F5 refreshes.
 import ui_tree.css
 import ui_tree.css { px, percent, none, Property }
 import data {
@@ -22,22 +24,28 @@ import data {
   parseEvents,
   parseStats,
   parseStatus,
-  writeSize
+  parseSteps,
+  parseProgram,
+  parseModel,
+  parseFrames,
+  parseIssues,
+  matches,
+  writeSize,
+  StepRow,
+  ModelView,
+  ProgramView,
+  FrameView,
+  Issue,
+  ADDED,
+  REMOVED,
+  FRAME_BUDGET
 }
 import link { Link }
 import ui_app.app { App, Perform, Context, Subscriptions }
 import ui_app.ui { Ui, Reply }
-import ui_inspect_server.reply { textField }
+import ui_inspect_server.reply { textField, flagField, idField, writeString }
 import ui_tree.inspect { writeInt }
-import ui_tree.mutation {
-  Align,
-  Role,
-  Cursor,
-  BorderStyle,
-  Overflow,
-  WhiteSpace,
-  TextAlign
-}
+import ui_tree.mutation { Align, Role, Cursor, BorderStyle, Overflow, WhiteSpace, TextAlign }
 import ui_tree.node { EventKind }
 import silk.collections.list { List }
 import silk.color.rgba { Rgba }
@@ -66,9 +74,20 @@ pub const FONT: u32 = 1
 pub enum Panel {
   Styles,
   BoxModel,
+  /// The program's messages and the model after each.
+  Program,
   Events,
+  /// The frame timeline.
+  Frames,
+  Audit,
   Stats,
 }
+
+/// How many frames the timeline shows.
+pub const MAX_FRAMES: u64 = 120
+
+/// The height of the timeline's bars, in pixels.
+const BAR_HEIGHT: f32 = 96.0
 
 pub union Message {
   /// Read everything again.
@@ -85,18 +104,48 @@ pub union Message {
   SelectPrevious,
   ClearSelection,
   ClearEvents,
+  /// The filter over the elements changed.
+  Search { pub value: String },
+  /// Start or stop picking in the app's window.
+  TogglePick,
+  Picking { pub on: bool },
+  /// The declarations being typed for the selected node.
+  StyleDraft { pub value: String },
+  /// Set the typed declarations on the selected node.
+  ApplyStyle,
+  /// Take every style edit back.
+  ResetStyles,
+  /// The app took the edit; `detail` is the node after it.
+  Styled { pub detail: Detail },
+  StyleRefused { pub error: String },
+  /// Open the model after message `seq`, or close it when it is open.
+  OpenStep { pub seq: u64 },
+  Stepped { pub view: ModelView },
+  ClearSteps,
+  RunAudit,
+  Audited { pub issues: List<Issue>, pub line: String },
   Synced { pub snapshot: Snapshot },
   Inspected { pub detail: Detail },
   Failed { pub error: String },
 }
 
 pub union Command {
-  /// Status, tree, stats, the events after `since`, and node `selected` again.
-  Sync { pub since: u64, pub selected: u32 },
+  /// Status, tree, stats, the events after `since`, the messages after `step`, what `panel`
+  /// shows besides, and node `selected` again.
+  Sync { pub since: u64, pub step: u64, pub selected: u32, pub panel: Panel },
   /// Highlight node `node` and inspect it.
   Inspect { pub node: u32 },
   /// Clear the highlight.
   Unhighlight,
+  /// Turn picking in the app's window on or off.
+  Pick { pub on: bool },
+  /// Set declarations `css` on node `node`.
+  SetStyle { pub node: u32, pub css: String },
+  /// Take every style edit back, and inspect `selected` again.
+  ResetStyles { pub selected: u32 },
+  /// The model after message `seq`.
+  Step { pub seq: u64 },
+  Audit,
 }
 
 /// The devtools model.
@@ -121,6 +170,25 @@ pub struct Devtools {
   pub error: String,
   /// Refreshes that reached the app.
   pub syncs: u64,
+  /// The filter over the elements; rows whose label does not contain it are hidden.
+  pub search: String,
+  /// Whether the app's window is waiting for a pick.
+  pub picking: bool,
+  /// The declarations being typed for the selected node.
+  pub draft: String,
+  /// Why the app refused the last style edit, or empty.
+  pub styleError: String,
+  pub program: ProgramView,
+  /// The newest [`MAX_LOG`] messages the program handled, oldest first.
+  pub steps: List<StepRow>,
+  /// The `seq` of the last message read.
+  pub sinceStep: u64,
+  /// The model of the open step.
+  pub opened: ModelView,
+  pub frames: FrameView,
+  pub issues: List<Issue>,
+  /// The audit's summary, or empty before the first one.
+  pub auditLine: String,
 }
 
 impl Devtools {
@@ -142,6 +210,21 @@ impl Devtools {
       status: run String.copy("connecting"),
       error: String.make(),
       syncs: 0,
+      search: String.make(),
+      picking: false,
+      draft: String.make(),
+      styleError: String.make(),
+      program: ProgramView {
+        attached: false,
+        line: String.make(),
+        subscriptions: List<String>.make(),
+      },
+      steps: List<StepRow>.make(),
+      sinceStep: 0,
+      opened: ModelView.none(),
+      frames: FrameView.none(),
+      issues: List<Issue>.make(),
+      auditLine: String.make(),
     }
   }
 
@@ -157,11 +240,20 @@ impl Devtools {
     return false
   }
 
-  /// Marks the rows under folded nodes hidden.
+  /// Marks the rows under folded nodes hidden; with a filter, the rows that do not match it.
   fn updateVisibility(self: &mut Self) -> () {
     let mut hideBelow: u32 = 4294967295
     let n = self.rows.length()
     let mut i: usize = 0
+    if self.search.ownedByteLength() != 0 {
+      while i < n {
+        let shown = matches(String.view(&self.rows.asSlice()[i].label), String.view(&self.search))
+        let rows = self.rows.asMutSlice()
+        rows[i].visible = shown
+        i = i + 1
+      }
+      return ()
+    }
     while i < n {
       let depth = self.rows.asSlice()[i].depth
       let id = self.rows.asSlice()[i].id
@@ -241,7 +333,43 @@ impl Devtools {
   }
 
   fn sync(self: &Self, cx: &mut Context<Command>) -> () {
-    cx.command(Command.Sync { since: self.since, selected: self.selected })
+    cx.command(
+      Command.Sync {
+        since: self.since,
+        step: self.sinceStep,
+        selected: self.selected,
+        panel: self.panel,
+      },
+    )
+  }
+
+  /// Unfolds what hides node `id` and drops a filter that does.
+  fn expose(self: &mut Self, id: u32) -> () {
+    let mut at = id
+    while at != NO_PARENT {
+      let rows = self.rows.asSlice()
+      let mut parent = NO_PARENT
+      let mut i: usize = 0
+      while i < rows.length {
+        if rows[i].id == at {
+          parent = rows[i].parent
+        }
+        i = i + 1
+      }
+      let mut j: usize = 0
+      while j < self.collapsed.length() {
+        if self.collapsed.asSlice()[j] == parent {
+          drop self.collapsed.remove(j)
+        } else {
+          j = j + 1
+        }
+      }
+      at = parent
+    }
+    if self.search.ownedByteLength() != 0 && !matches(self.labelOf(id), String.view(&self.search)) {
+      self.search.clear()
+    }
+    self.updateVisibility()
   }
 
   fn select(self: &mut Self, id: u32, cx: &mut Context<Command>) -> () {
@@ -321,7 +449,7 @@ effect fn inspectNode(node: u32) -> Option<Detail>
   }
 }
 
-effect fn syncAll(since: u64, selected: u32) -> Message
+effect fn syncAll(since: u64, step: u64, selected: u32, panel: Panel) -> Message
   ! OutOfMemoryError
   ? &mut Link | &mut Allocator {
   let mut error = String.make()
@@ -330,8 +458,14 @@ effect fn syncAll(since: u64, selected: u32) -> Message
     rows: List<Row>.make(),
     stats: List<Stat>.make(),
     events: List<LogRow>.make(),
-    next: since,
+    next: since + 1,
     detail: Option<Detail>.None,
+    steps: List<StepRow>.make(),
+    stepNext: step + 1,
+    program: Option<ProgramView>.None,
+    frames: Option<FrameView>.None,
+    picking: false,
+    picked: NO_PARENT,
   }
   match run ask("{\"cmd\":\"hello\"}", &mut error) {
     Option<Value>.Some { value } => {
@@ -369,7 +503,123 @@ effect fn syncAll(since: u64, selected: u32) -> Message
   if selected != NO_PARENT {
     snapshot.detail = run inspectNode(selected)
   }
+
+  // What came with protocol 2: an older app answers "unknown cmd" and the panels stay empty.
+  let mut quiet = String.make()
+  let messages = run requestLine("messages", "since", step)
+  match run ask(String.view(&messages), &mut quiet) {
+    Option<Value>.Some { value } => {
+      snapshot.stepNext = run parseSteps(&value, &mut snapshot.steps)
+    }
+    Option<Value>.None => {}
+  }
+  if panel == Panel.Program {
+    match run ask("{\"cmd\":\"program\"}", &mut quiet) {
+      Option<Value>.Some { value } => {
+        snapshot.program = Option<ProgramView>.Some { value: run parseProgram(&value) }
+      }
+      Option<Value>.None => {}
+    }
+  }
+  if panel == Panel.Frames {
+    let frames = run requestLine("frames", "limit", MAX_FRAMES)
+    match run ask(String.view(&frames), &mut quiet) {
+      Option<Value>.Some { value } => {
+        snapshot.frames = Option<FrameView>.Some { value: run parseFrames(&value) }
+      }
+      Option<Value>.None => {}
+    }
+  }
+  match run ask("{\"cmd\":\"pickMode\"}", &mut quiet) {
+    Option<Value>.Some { value } => {
+      snapshot.picking = flagField(&value, "on", false)
+      snapshot.picked = pickedOf(&value)
+    }
+    Option<Value>.None => {}
+  }
   return Message.Synced { snapshot: move snapshot }
+}
+
+fn pickedOf(reply: &Value) -> u32 {
+  return match Json.field(reply, "picked") {
+    Option<&Value>.Some { value: node } => match idField(node, "id") {
+      Option<u32>.Some { value: id } => id
+      Option<u32>.None => NO_PARENT
+    }
+    Option<&Value>.None => NO_PARENT
+  }
+}
+
+effect fn pick(on: bool) -> Message
+  ! OutOfMemoryError
+  ? &mut Link | &mut Allocator {
+  let mut error = String.make()
+  let line = if on {
+    "{\"cmd\":\"pickMode\",\"on\":true}"
+  } else {
+    "{\"cmd\":\"pickMode\",\"on\":false}"
+  }
+  return match run ask(line, &mut error) {
+    Option<Value>.Some { value } => Message.Picking { on: flagField(&value, "on", false) }
+    Option<Value>.None => Message.Failed { error: move error }
+  }
+}
+
+/// What the styles panel shows after an edit: the node again, or why the app refused.
+effect fn afterEdit(line: string, node: u32) -> Message
+  ! OutOfMemoryError
+  ? &mut Link | &mut Allocator {
+  let mut error = String.make()
+  match run ask(line, &mut error) {
+    Option<Value>.Some { value: _ } => {}
+    Option<Value>.None => {
+      return Message.StyleRefused { error: move error }
+    }
+  }
+  if node == NO_PARENT {
+    return Message.Styled { detail: Detail.none() }
+  }
+  return match run inspectNode(node) {
+    Option<Detail>.Some { value } => Message.Styled { detail: move value }
+    Option<Detail>.None => Message.Styled { detail: Detail.none() }
+  }
+}
+
+effect fn setStyle(node: u32, declarations: string) -> Message
+  ! OutOfMemoryError
+  ? &mut Link | &mut Allocator {
+  let mut line = run String.copy("{\"cmd\":\"setStyle\",\"node\":")
+  run writeInt(&mut line, u32.toU64(node))
+  run line.append(",\"style\":")
+  run writeString(&mut line, declarations)
+  run line.append("}")
+  return run afterEdit(String.view(&line), node)
+}
+
+effect fn openStep(seq: u64) -> Message
+  ! OutOfMemoryError
+  ? &mut Link | &mut Allocator {
+  let mut error = String.make()
+  let line = run requestLine("model", "seq", seq)
+  return match run ask(String.view(&line), &mut error) {
+    Option<Value>.Some { value } => Message.Stepped { view: run parseModel(&value) }
+    Option<Value>.None => Message.Failed { error: move error }
+  }
+}
+
+effect fn runAudit() -> Message
+  ! OutOfMemoryError
+  ? &mut Link | &mut Allocator {
+  let mut error = String.make()
+  return match run ask("{\"cmd\":\"audit\"}", &mut error) {
+    Option<Value>.Some { value } => {
+      let mut issues = List<Issue>.make()
+      let mut line = String.make()
+      run parseIssues(&value, &mut issues, &mut line)
+      Message.Audited { issues: move issues, line: move line }
+    }
+    Option<Value>.None => Message.Failed { error: move error }
+  }
 }
 
 effect fn highlightAndInspect(node: u32) -> Message
@@ -406,9 +656,14 @@ impl Perform<Message, OutOfMemoryError ? &mut Link | &mut Allocator> for Command
     ! OutOfMemoryError
     ? &mut Link | &mut Allocator {
     return match &self {
-      Command.Sync { since, selected } => run syncAll(since, selected)
+      Command.Sync { since, step, selected, panel } => run syncAll(since, step, selected, panel)
       Command.Inspect { node } => run highlightAndInspect(node)
       Command.Unhighlight => run unhighlight()
+      Command.Pick { on } => run pick(on)
+      Command.SetStyle { node, css: declarations } => run setStyle(node, String.view(&declarations))
+      Command.ResetStyles { selected } => run afterEdit("{\"cmd\":\"resetStyles\"}", selected)
+      Command.Step { seq } => run openStep(seq)
+      Command.Audit => run runAudit()
     }
   }
 }
@@ -450,13 +705,80 @@ const PADDING: u32 = 0xC3D08B
 
 const CONTENT: u32 = 0x8CB6C0
 
+const ADDED_LINE: u32 = 0xDCFCE7
+
+const REMOVED_LINE: u32 = 0xFEE2E2
+
+const LAYOUT_BAR: u32 = 0xF59E0B
+
+const WARNING: u32 = 0xB45309
+
+/// A one-line text field in the look of the toolbar.
+fn field(
+  ui: &mut Ui<Message>,
+  testId: string,
+  label: string,
+  hint: string,
+  value: string,
+  onChange: fn(String) -> Message,
+) -> () {
+  ui.input(
+    value,
+    |ui| {
+      ui.testId(testId)
+      ui.label(label)
+      ui.placeholder(hint)
+      ui.style(
+        &[
+          css.flexGrow(1.0),
+          css.flexShrink(1.0),
+          css.flexBasis(px(0.0)),
+          css.minWidth(px(0.0)),
+          css.height(px(22.0)),
+          css.paddingLeft(px(6.0)),
+          css.paddingRight(px(6.0)),
+          css.borderTopWidth(px(1.0)),
+          css.borderRightWidth(px(1.0)),
+          css.borderBottomWidth(px(1.0)),
+          css.borderLeftWidth(px(1.0)),
+          css.borderStyle(BorderStyle.Solid),
+          css.borderColor(rgb(LINE)),
+          css.backgroundColor(rgb(0xFFFFFF)),
+        ],
+      )
+      ui.focused(&[css.borderColor(rgb(ACCENT))])
+      ui.onInput(onChange)
+    },
+  )
+}
+
+/// A swatch and what it stands for, in the timeline's legend.
+fn legend(ui: &mut Ui<Message>, hex: u32, text: string) -> () {
+  ui.row(
+    |ui| {
+      ui.style(&[css.alignItems(Align.Center)])
+      ui.gap(4.0)
+      ui.box(
+        |ui| {
+          ui.background(rgb(hex))
+          ui.style(&[css.width(px(8.0)), css.height(px(8.0))])
+        },
+      )
+      muted(&mut ui, text)
+    },
+  )
+}
+
+fn ruleColor(rule: string) -> u32 {
+  if rule == "contrast" || rule == "small-target" {
+    return WARNING
+  }
+  return ERROR
+}
+
 fn border(ui: &mut Ui<Message>, side: Property, hex: u32) -> () {
   ui.style(
-    &[
-      css.declare(side, px(1.0)),
-      css.borderStyle(BorderStyle.Solid),
-      css.borderColor(rgb(hex)),
-    ],
+    &[css.declare(side, px(1.0)), css.borderStyle(BorderStyle.Solid), css.borderColor(rgb(hex))],
   )
 }
 
@@ -481,7 +803,13 @@ fn barButton(ui: &mut Ui<Message>, label: string, selected: bool, onPress: fn() 
         &[
           css.borderBottomWidth(px(2.0)),
           css.borderStyle(BorderStyle.Solid),
-          css.borderColor(if selected { rgb(ACCENT) } else { Rgba<f32> { r: 0.0, g: 0.0, b: 0.0, a: 0.0 } }),
+          css.borderColor(
+            if selected {
+              rgb(ACCENT)
+            } else {
+              Rgba<f32> { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }
+            },
+          ),
         ],
       )
       if selected {
@@ -600,7 +928,13 @@ fn layer(
           css.borderRightWidth(px(1.0)),
           css.borderBottomWidth(px(1.0)),
           css.borderLeftWidth(px(1.0)),
-          css.borderStyle(if dashed { BorderStyle.Dashed } else { BorderStyle.Solid }),
+          css.borderStyle(
+            if dashed {
+              BorderStyle.Dashed
+            } else {
+              BorderStyle.Solid
+            },
+          ),
           css.borderColor(rgb(0x808080)),
           css.alignItems(Align.Stretch),
         ],
@@ -669,6 +1003,21 @@ fn layer(
   )
 }
 
+/// The height of a bar for `value` when `scale` fills the timeline, at least `least` pixels.
+fn barHeight(value: f32, scale: f32, least: f32) -> f32 {
+  let mut height: f32 = 0.0
+  if scale > 0.0 {
+    height = value / scale * BAR_HEIGHT
+  }
+  if height < least {
+    return least
+  }
+  if height > BAR_HEIGHT {
+    return BAR_HEIGHT
+  }
+  return height
+}
+
 impl Devtools {
   fn toolbar(self: &Self, ui: &mut Ui<Message>) -> () {
     ui.row(
@@ -702,6 +1051,7 @@ impl Devtools {
             }
           },
         )
+        barButton(&mut ui, "Pick", self.picking, || Message.TogglePick)
         barButton(&mut ui, "Refresh", false, || Message.Refresh)
         barButton(&mut ui, "Live", self.live, || Message.ToggleLive)
       },
@@ -711,36 +1061,54 @@ impl Devtools {
   fn elements(self: &Self, ui: &mut Ui<Message>) -> () {
     ui.column(
       |ui| {
-        ui.testId("elements")
-        ui.accessRole(Role.List)
-        ui.label("Elements")
         ui.style(
           &[
             css.flexBasis(percent(45.0)),
             css.flexShrink(0.0),
             css.minHeight(px(0.0)),
-            css.overflowY(Overflow.Scroll),
-            css.overflowX(Overflow.Hidden),
-            css.whiteSpace(WhiteSpace.NoWrap),
+            css.minWidth(px(0.0)),
           ],
         )
         border(&mut ui, Property.BorderRightWidth, LINE)
-        paddings(&mut ui, 4.0, 0.0)
-        if self.rows.length() == 0 {
-          ui.box(
-            |ui| {
-              paddings(&mut ui, 4.0, 8.0)
-              muted(&mut ui, "No elements yet.")
-            },
-          )
-        }
-        ui.each(
-          self.rows.asSlice(),
-          |row| u32.toU64(row.id),
-          |ui, row| {
-            if row.visible {
-              self.elementRow(&mut ui, row)
+        ui.row(
+          |ui| {
+            paddings(&mut ui, 4.0, 6.0)
+            border(&mut ui, Property.BorderBottomWidth, BAR)
+            field(
+              &mut ui,
+              "search",
+              "Filter elements",
+              "Filter by role, name or test id",
+              String.view(&self.search),
+              |value| Message.Search { value: move value },
+            )
+          },
+        )
+        ui.column(
+          |ui| {
+            ui.testId("elements")
+            ui.accessRole(Role.List)
+            ui.label("Elements")
+            scrolling(&mut ui)
+            ui.style(&[css.whiteSpace(WhiteSpace.NoWrap)])
+            paddings(&mut ui, 4.0, 0.0)
+            if self.rows.length() == 0 {
+              ui.box(
+                |ui| {
+                  paddings(&mut ui, 4.0, 8.0)
+                  muted(&mut ui, "No elements yet.")
+                },
+              )
             }
+            ui.each(
+              self.rows.asSlice(),
+              |row| u32.toU64(row.id),
+              |ui, row| {
+                if row.visible {
+                  self.elementRow(&mut ui, row)
+                }
+              },
+            )
           },
         )
       },
@@ -770,14 +1138,13 @@ impl Devtools {
         )
         if selected {
           ui.background(rgb(SELECTED))
+          ui.reveal()
         } else {
           ui.hover(&[css.backgroundColor(rgb(HOVER))])
         }
         ui.box(
           |ui| {
-            ui.style(
-              &[css.width(px(10.0)), css.flexShrink(0.0)],
-            )
+            ui.style(&[css.width(px(10.0)), css.flexShrink(0.0)])
             ui.color(rgb(MUTED))
             if row.children > 0 {
               ui.on(
@@ -814,13 +1181,7 @@ impl Devtools {
     ui.column(
       |ui| {
         ui.grow(1.0)
-        ui.style(
-          &[
-            css.flexBasis(px(0.0)),
-            css.minWidth(px(0.0)),
-            css.minHeight(px(0.0)),
-          ],
-        )
+        ui.style(&[css.flexBasis(px(0.0)), css.minWidth(px(0.0)), css.minHeight(px(0.0))])
         ui.row(
           |ui| {
             ui.accessRole(Role.TabList)
@@ -840,9 +1201,27 @@ impl Devtools {
             )
             barButton(
               &mut ui,
+              "Program",
+              self.panel == Panel.Program,
+              || Message.Show { panel: Panel.Program },
+            )
+            barButton(
+              &mut ui,
               "Events",
               self.panel == Panel.Events,
               || Message.Show { panel: Panel.Events },
+            )
+            barButton(
+              &mut ui,
+              "Frames",
+              self.panel == Panel.Frames,
+              || Message.Show { panel: Panel.Frames },
+            )
+            barButton(
+              &mut ui,
+              "Audit",
+              self.panel == Panel.Audit,
+              || Message.Show { panel: Panel.Audit },
             )
             barButton(
               &mut ui,
@@ -861,7 +1240,10 @@ impl Devtools {
             match self.panel {
               Panel.Styles => self.styles(&mut ui)
               Panel.BoxModel => self.boxModel(&mut ui)
+              Panel.Program => self.programPanel(&mut ui)
               Panel.Events => self.eventLog(&mut ui)
+              Panel.Frames => self.framesPanel(&mut ui)
+              Panel.Audit => self.auditPanel(&mut ui)
               Panel.Stats => self.statsPanel(&mut ui)
             }
           },
@@ -890,6 +1272,32 @@ impl Devtools {
         ui.text(String.view(&self.detail.title))
       },
     )
+    ui.row(
+      |ui| {
+        ui.style(&[css.alignItems(Align.Center), css.marginTop(px(4.0)), css.marginBottom(px(4.0))])
+        ui.gap(4.0)
+        ui.onEnter(|| Message.ApplyStyle)
+        field(
+          &mut ui,
+          "style-draft",
+          "Declarations to set",
+          "Try a style: width: 200px; color: red",
+          String.view(&self.draft),
+          |value| Message.StyleDraft { value: move value },
+        )
+        barButton(&mut ui, "Apply", false, || Message.ApplyStyle)
+        barButton(&mut ui, "Reset", false, || Message.ResetStyles)
+      },
+    )
+    if self.styleError.ownedByteLength() != 0 {
+      ui.box(
+        |ui| {
+          ui.testId("style-error")
+          ui.color(rgb(ERROR))
+          ui.text(String.view(&self.styleError))
+        },
+      )
+    }
     ui.enumerate(
       self.detail.lines.asSlice(),
       |line| 0,
@@ -900,12 +1308,7 @@ impl Devtools {
           |ui| {
             ui.style(&[css.whiteSpace(WhiteSpace.Pre)])
             if String.startsWith(text, "style ") {
-              ui.style(
-                &[
-                  css.fontWeight(700.0),
-                  css.marginTop(px(6.0)),
-                ],
-              )
+              ui.style(&[css.fontWeight(700.0), css.marginTop(px(6.0))])
               ui.text(text)
             } else if String.startsWith(text, "  ") {
               match String.find(text, ": ") {
@@ -1071,6 +1474,386 @@ impl Devtools {
     )
   }
 
+  fn programPanel(self: &Self, ui: &mut Ui<Message>) -> () {
+    if !self.program.attached && self.steps.length() == 0 {
+      muted(
+        &mut ui,
+        "This app reports no program. A silk-ui program in a window does: every message it handles shows here with what caused it, the commands it returned and the model after it.",
+      )
+      return ()
+    }
+    ui.box(
+      |ui| {
+        ui.testId("program-line")
+        ui.color(rgb(MUTED))
+        ui.text(String.view(&self.program.line))
+      },
+    )
+    ui.row(
+      |ui| {
+        ui.testId("subscriptions")
+        ui.style(&[css.alignItems(Align.Center), css.marginTop(px(2.0)), css.marginBottom(px(4.0))])
+        ui.gap(6.0)
+        ui.box(
+          |ui| {
+            ui.grow(1.0)
+            ui.color(rgb(MUTED))
+            if self.program.subscriptions.length() == 0 {
+              ui.text("No subscriptions")
+            } else {
+              ui.text("Subscribed to ")
+              ui.enumerate(
+                self.program.subscriptions.asSlice(),
+                |line| 0,
+                |ui, index, line| {
+                  if index > 0 {
+                    ui.text(", ")
+                  }
+                  ui.text(String.view(&line))
+                },
+              )
+            }
+          },
+        )
+        barButton(&mut ui, "Clear", false, || Message.ClearSteps)
+      },
+    )
+    if self.steps.length() == 0 {
+      muted(&mut ui, "No messages yet. Use the app, then look here.")
+      return ()
+    }
+    ui.column(
+      |ui| {
+        ui.testId("messages")
+        ui.accessRole(Role.List)
+        let rows = self.steps.asSlice()
+        let mut i = rows.length
+        while i > 0 {
+          i = i - 1
+          let step = &rows[i]
+          let open = self.opened.seq == step.seq
+          ui.key(step.seq)
+          ui.column(
+            |ui| {
+              ui.accessRole(Role.ListItem)
+              border(&mut ui, Property.BorderBottomWidth, BAR)
+              ui.row(
+                |ui| {
+                  ui.accessRole(Role.Button)
+                  ui.tabIndex(0)
+                  ui.cursor(Cursor.Pointer)
+                  ui.onClick(|| Message.OpenStep { seq: step.seq })
+                  ui.onEnter(|| Message.OpenStep { seq: step.seq })
+                  ui.gap(8.0)
+                  paddings(&mut ui, 2.0, 0.0)
+                  if open {
+                    ui.background(rgb(SELECTED))
+                  } else {
+                    ui.hover(&[css.backgroundColor(rgb(HOVER))])
+                  }
+                  ui.focusVisible(&[css.backgroundColor(rgb(SELECTED))])
+                  ui.box(
+                    |ui| {
+                      ui.style(&[css.width(px(36.0)), css.flexShrink(0.0)])
+                      ui.color(rgb(MUTED))
+                      let seq = ui.alloc(seqText(step.seq))
+                      ui.text(String.view(&seq))
+                    },
+                  )
+                  ui.box(
+                    |ui| {
+                      ui.label(
+                        if step.changed {
+                          "changed the model"
+                        } else {
+                          ""
+                        },
+                      )
+                      ui.style(
+                        &[
+                          css.width(px(6.0)),
+                          css.height(px(6.0)),
+                          css.marginTop(px(5.0)),
+                          css.flexShrink(0.0),
+                        ],
+                      )
+                      if step.changed {
+                        ui.background(rgb(ACCENT))
+                      }
+                    },
+                  )
+                  ui.column(
+                    |ui| {
+                      ui.grow(1.0)
+                      ui.style(&[css.flexBasis(px(0.0)), css.minWidth(px(0.0))])
+                      ui.box(
+                        |ui| {
+                          ui.color(rgb(TAG))
+                          ui.text(String.view(&step.message))
+                        },
+                      )
+                      ui.box(
+                        |ui| {
+                          ui.color(rgb(MUTED))
+                          ui.text("from ")
+                          ui.text(String.view(&step.cause))
+                        },
+                      )
+                      if step.commands.ownedByteLength() != 0 {
+                        ui.box(
+                          |ui| {
+                            ui.color(rgb(ACCENT))
+                            ui.text("returned ")
+                            ui.text(String.view(&step.commands))
+                          },
+                        )
+                      }
+                    },
+                  )
+                },
+              )
+              if open {
+                self.modelDiff(&mut ui)
+              }
+            },
+          )
+        }
+      },
+    )
+  }
+
+  /// The open step's model, the lines the step changed marked.
+  fn modelDiff(self: &Self, ui: &mut Ui<Message>) -> () {
+    ui.column(
+      |ui| {
+        ui.testId("model")
+        ui.background(rgb(0xF9FAFB))
+        ui.style(
+          &[
+            css.whiteSpace(WhiteSpace.Pre),
+            css.marginBottom(px(4.0)),
+            css.overflowX(Overflow.Hidden),
+          ],
+        )
+        paddings(&mut ui, 4.0, 0.0)
+        if self.opened.changed == 0 {
+          ui.box(
+            |ui| {
+              paddings(&mut ui, 0.0, 8.0)
+              muted(&mut ui, "The model did not change.")
+            },
+          )
+        }
+        ui.enumerate(
+          self.opened.lines.asSlice(),
+          |line| 0,
+          |ui, index, line| {
+            ui.key(usize.toU64(index))
+            ui.row(
+              |ui| {
+                paddings(&mut ui, 0.0, 8.0)
+                if line.op == ADDED {
+                  ui.background(rgb(ADDED_LINE))
+                  ui.text("+ ")
+                } else if line.op == REMOVED {
+                  ui.background(rgb(REMOVED_LINE))
+                  ui.text("- ")
+                } else {
+                  ui.color(rgb(MUTED))
+                  ui.text("  ")
+                }
+                ui.text(String.view(&line.text))
+              },
+            )
+          },
+        )
+      },
+    )
+  }
+
+  fn framesPanel(self: &Self, ui: &mut Ui<Message>) -> () {
+    if self.frames.bars.length() == 0 {
+      muted(&mut ui, "No frames yet.")
+      return ()
+    }
+    let timed = self.frames.timed
+    let scale = self.frames.scale
+    ui.row(
+      |ui| {
+        ui.testId("frame-bars")
+        ui.label("Frames, oldest first")
+        ui.background(rgb(0xF9FAFB))
+        border(&mut ui, Property.BorderBottomWidth, LINE)
+        ui.style(
+          &[
+            css.height(px(BAR_HEIGHT)),
+            css.flexShrink(0.0),
+            css.alignItems(Align.FlexEnd),
+            css.columnGap(px(1.0)),
+            css.overflowX(Overflow.Hidden),
+            css.overflowY(Overflow.Hidden),
+          ],
+        )
+        ui.each(
+          self.frames.bars.asSlice(),
+          |bar| bar.frame,
+          |ui, bar| {
+            ui.column(
+              |ui| {
+                ui.style(&[css.width(px(3.0)), css.flexShrink(0.0)])
+                if timed {
+                  let over = bar.layout + bar.paint > FRAME_BUDGET
+                  ui.box(
+                    |ui| {
+                      ui.background(
+                        rgb(
+                          if over {
+                            ERROR
+                          } else {
+                            LAYOUT_BAR
+                          },
+                        ),
+                      )
+                      ui.style(&[css.height(px(barHeight(bar.layout, scale, 0.0)))])
+                    },
+                  )
+                  ui.box(
+                    |ui| {
+                      ui.background(
+                        rgb(
+                          if over {
+                            ERROR
+                          } else {
+                            ACCENT
+                          },
+                        ),
+                      )
+                      ui.style(&[css.height(px(barHeight(bar.paint, scale, 1.0)))])
+                    },
+                  )
+                } else {
+                  ui.box(
+                    |ui| {
+                      ui.background(
+                        rgb(
+                          if bar.skipped {
+                            CONTENT
+                          } else {
+                            ACCENT
+                          },
+                        ),
+                      )
+                      ui.style(&[css.height(px(barHeight(bar.fragments, scale, 1.0)))])
+                    },
+                  )
+                }
+              },
+            )
+          },
+        )
+      },
+    )
+    ui.row(
+      |ui| {
+        ui.style(&[css.marginTop(px(6.0))])
+        ui.gap(12.0)
+        if timed {
+          legend(&mut ui, LAYOUT_BAR, "layout")
+          legend(&mut ui, ACCENT, "paint")
+          legend(&mut ui, ERROR, "over 16.7 ms")
+        } else {
+          legend(&mut ui, ACCENT, "laid out and painted")
+          legend(&mut ui, CONTENT, "layout skipped")
+        }
+      },
+    )
+    ui.box(
+      |ui| {
+        ui.testId("frame-line")
+        ui.style(&[css.marginTop(px(4.0))])
+        ui.color(rgb(MUTED))
+        ui.text(String.view(&self.frames.line))
+      },
+    )
+  }
+
+  fn auditPanel(self: &Self, ui: &mut Ui<Message>) -> () {
+    ui.row(
+      |ui| {
+        ui.style(&[css.alignItems(Align.Center)])
+        ui.box(
+          |ui| {
+            ui.testId("audit-line")
+            ui.grow(1.0)
+            ui.color(rgb(MUTED))
+            if self.auditLine.ownedByteLength() == 0 {
+              ui.text("Checks names, roles, keyboard reach, target sizes and text contrast.")
+            } else {
+              ui.text(String.view(&self.auditLine))
+            }
+          },
+        )
+        barButton(&mut ui, "Run audit", false, || Message.RunAudit)
+      },
+    )
+    ui.column(
+      |ui| {
+        ui.testId("issues")
+        ui.accessRole(Role.List)
+        ui.enumerate(
+          self.issues.asSlice(),
+          |issue| 0,
+          |ui, index, issue| {
+            ui.key(usize.toU64(index))
+            ui.row(
+              |ui| {
+                ui.accessRole(Role.Button)
+                ui.tabIndex(0)
+                ui.cursor(Cursor.Pointer)
+                ui.onClick(|| Message.Select { id: issue.node })
+                ui.onEnter(|| Message.Select { id: issue.node })
+                ui.gap(8.0)
+                border(&mut ui, Property.BorderBottomWidth, BAR)
+                paddings(&mut ui, 2.0, 0.0)
+                if issue.node == self.selected {
+                  ui.background(rgb(SELECTED))
+                } else {
+                  ui.hover(&[css.backgroundColor(rgb(HOVER))])
+                }
+                ui.focusVisible(&[css.backgroundColor(rgb(SELECTED))])
+                ui.box(
+                  |ui| {
+                    ui.style(&[css.width(px(88.0)), css.flexShrink(0.0)])
+                    ui.color(rgb(ruleColor(String.view(&issue.rule))))
+                    ui.text(String.view(&issue.rule))
+                  },
+                )
+                ui.column(
+                  |ui| {
+                    ui.grow(1.0)
+                    ui.style(&[css.flexBasis(px(0.0)), css.minWidth(px(0.0))])
+                    ui.box(
+                      |ui| {
+                        ui.color(rgb(TAG))
+                        ui.text(String.view(&issue.label))
+                      },
+                    )
+                    ui.box(
+                      |ui| {
+                        ui.color(rgb(MUTED))
+                        ui.text(String.view(&issue.message))
+                      },
+                    )
+                  },
+                )
+              },
+            )
+          },
+        )
+      },
+    )
+  }
+
   fn statsPanel(self: &Self, ui: &mut Ui<Message>) -> () {
     if self.stats.length() == 0 {
       muted(&mut ui, "No frame stats yet.")
@@ -1132,7 +1915,7 @@ impl App<Message, Command> for Devtools {
         self.sync(&mut cx)
       }
       Message.Tick { time: _ } => {
-        if self.live {
+        if self.live || self.picking {
           self.sync(&mut cx)
         }
       }
@@ -1160,6 +1943,61 @@ impl App<Message, Command> for Devtools {
       }
       Message.Show { panel } => {
         self.panel = panel
+        self.sync(&mut cx)
+      }
+      Message.Search { value } => {
+        self.search = move value
+        self.updateVisibility()
+      }
+      Message.TogglePick => {
+        self.picking = !self.picking
+        cx.command(Command.Pick { on: self.picking })
+      }
+      Message.Picking { on } => {
+        self.picking = on
+      }
+      Message.StyleDraft { value } => {
+        self.draft = move value
+      }
+      Message.ApplyStyle => {
+        if self.selected != NO_PARENT && self.draft.ownedByteLength() != 0 {
+          let declarations = cx.alloc(String.copy(String.view(&self.draft)))
+          cx.command(Command.SetStyle { node: self.selected, css: move declarations })
+        }
+      }
+      Message.ResetStyles => {
+        cx.command(Command.ResetStyles { selected: self.selected })
+      }
+      Message.Styled { detail } => {
+        self.styleError.clear()
+        self.draft.clear()
+        if detail.id != NO_PARENT {
+          self.detail = move detail
+        }
+      }
+      Message.StyleRefused { error } => {
+        self.styleError = move error
+      }
+      Message.OpenStep { seq } => {
+        if self.opened.seq == seq {
+          self.opened = ModelView.none()
+        } else {
+          cx.command(Command.Step { seq: seq })
+        }
+      }
+      Message.Stepped { view } => {
+        self.opened = move view
+      }
+      Message.ClearSteps => {
+        self.steps.clear()
+        self.opened = ModelView.none()
+      }
+      Message.RunAudit => {
+        cx.command(Command.Audit)
+      }
+      Message.Audited { issues, line } => {
+        self.issues = move issues
+        self.auditLine = move line
       }
       Message.SelectNext => {
         let id = self.step(true)
@@ -1185,9 +2023,13 @@ impl App<Message, Command> for Devtools {
         self.rows = Intrinsic.replace(s.rows, List<Row>.make())
         self.updateVisibility()
         self.stats = Intrinsic.replace(s.stats, List<Stat>.make())
+
+        // Two syncs may be out at once and answer with the same records.
         while s.events.length() != 0 {
           let e = s.events.remove(0)
-          cx.alloc(self.events.append(move e))
+          if e.seq > self.since {
+            cx.alloc(self.events.append(move e))
+          }
         }
         while self.events.length() > MAX_LOG {
           drop self.events.remove(0)
@@ -1198,6 +2040,53 @@ impl App<Message, Command> for Devtools {
           s.next - 1
         } else {
           0
+        }
+
+        // A program that started again counts from one: what was read is another run's.
+        if s.stepNext <= self.sinceStep {
+          self.steps.clear()
+          self.opened = ModelView.none()
+        }
+        let mut held: u64 = 0
+        if self.steps.length() != 0 {
+          held = self.steps.asSlice()[self.steps.length() - 1].seq
+        }
+        while s.steps.length() != 0 {
+          let step = s.steps.remove(0)
+          if step.seq > held {
+            held = step.seq
+            cx.alloc(self.steps.append(move step))
+          }
+        }
+        while self.steps.length() > MAX_LOG {
+          drop self.steps.remove(0)
+        }
+        self.sinceStep = if s.stepNext > 0 {
+          s.stepNext - 1
+        } else {
+          0
+        }
+        match Intrinsic.replace(s.program, Option<ProgramView>.None) {
+          Option<ProgramView>.Some { value } => {
+            self.program = move value
+          }
+          Option<ProgramView>.None => {}
+        }
+        match Intrinsic.replace(s.frames, Option<FrameView>.None) {
+          Option<FrameView>.Some { value } => {
+            self.frames = move value
+          }
+          Option<FrameView>.None => {}
+        }
+
+        // The press in the app's window ends the pick: select what it chose.
+        if self.picking && !s.picking {
+          self.picking = false
+          if s.picked != NO_PARENT {
+            self.expose(s.picked)
+            self.select(s.picked, &mut cx)
+            return ()
+          }
         }
         if self.selected != NO_PARENT {
           match Intrinsic.replace(s.detail, Option<Detail>.None) {
@@ -1225,7 +2114,7 @@ impl App<Message, Command> for Devtools {
   }
 
   fn subscriptions(self: &Self, subs: &mut Subscriptions<Message>) -> () {
-    if self.live {
+    if self.live || self.picking {
       subs.every(1, LIVE_INTERVAL, |time| Message.Tick { time: time })
     }
     subs.keyBinding(2, "ArrowDown", 0, || Message.SelectNext)

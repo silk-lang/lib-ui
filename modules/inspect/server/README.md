@@ -88,7 +88,7 @@ Node objects in replies are `{"id", "kind", "role", "name", "testId", "x", "y", 
 
 | cmd | members | reply |
 | --- | --- | --- |
-| `hello` | | `protocol` (1), `commands`, `width`, `height`, `scale`, `frame`, `root`, `nodes`, `highlight` |
+| `hello` | | `protocol` (2), `commands`, `width`, `height`, `scale`, `frame`, `root`, `nodes`, `highlight` |
 | `snapshot` | target (optional, a subtree), `styles` | `text`: `describe` output, `frame` |
 | `query` | target, `limit` | `count`, `nodes` (node objects, tree order) |
 | `inspect` | target, `patches`, `computed` | `node`, `text`: the devtools-style node view; `box`: the `margin`, `border`, `padding` and `content` rects of the first fragment and the `fragments` count (left out when the node has no box) |
@@ -106,6 +106,21 @@ Node objects in replies are `{"id", "kind", "role", "name", "testId", "x", "y", 
 | `stats` | | the last frame's `FrameStats`: nodes, fragments, layout counters, replayed and repainted subtrees, glyphs, primitives |
 | `tree` | target (optional, a subtree) | `nodes`: node objects in tree order, each with `parent` (left out at the top), `depth` and `children` (the count); `width`, `height`, `scale`, `frame` |
 | `events` | `since` (a `seq`, default 0), `limit` (the newest N) | `events`: the logged records after `since`, oldest first, each `{"seq", "frame", "kind", "target", "path"}` plus `x`, `y` (pointer, wheel and scroll records), `modifiers`, `key` and `value` (input records) where they apply; `next`: the `seq` the next record gets |
+| `program` | | `attached`; `steps` held with the `first` and `last` seq; the `model` now, as text; `subscriptions`; `stats`: `renders`, `dispatches`, `messages`, `commands`, `mutations`, `nodes`, `reused` |
+| `messages` | `since` (a `seq`), `limit` | `messages`: the steps after `since`, oldest first, each `{"seq", "time", "cause", "message", "commands", "changed"}`; `next` |
+| `model` | `seq` (default: the last step) | `model`: the model after that step, one line per field; `diff`: `{"op": " "\|"+"\|"-", "line"}` against the step before; `changed` (lines) |
+| `frames` | `since` (a frame number), `limit` | `frames`: one per frame drawn, `{"frame", "layoutMs", "paintMs", "layoutSkipped", "layoutPasses", "repainted", "replayed", "fragments", "primitives", "glyphs", "nodes"}`; `count`, `slowestMs`, `averageMs` (times are 0 when the host does not time frames) |
+| `styles` | target | `node`, and its style patches as declarations: `base`, `hover`, `active`, `focus`, `focus-visible` |
+| `setStyle` | target, `style` (`"width: 200px; color: red"`), `state` (default `base`), `replace` | `node`, `state`, `style` as set, `edited` (node and state pairs edited so far); a declaration that does not parse is an error and changes nothing |
+| `resetStyles` | | `restored`: every edit undone |
+| `pickMode` | `on` (left out: just asks) | `on`; `picked`: the node the last pick chose. While on, the app's own pointer highlights what it is over and the next click selects it instead of reaching the app |
+| `audit` | target (optional, a subtree) | `issues`: `{"rule", "message", "node"}` for `unnamed`, `no-role`, `not-focusable`, `small-target` (under 24 by 24) and `contrast` (under 4.5, or 3 for large text); `count`, `checked` |
+
+The program commands answer for what the host reported: `Inspector.report` takes a
+`ProgramLog` (ui-app's window host fills it from the program's journal after every step) and
+`inspector.timed(layout, paint)` gives the frame about to be recorded its times. A host that
+reports nothing answers `"attached": false` and frames without times. Style edits live in the tree
+like any patch; the app's next render of that node's style wins over them.
 
 `key` down/up tracks held Shift/Control/Alt/Meta for subsequent commands that omit `modifiers`. Explicit `modifiers` overrides the event snapshot.
 
@@ -159,6 +174,9 @@ silk task native inspect      # the CLI drives the demo in a window
 - One request per connection (see above); `wait` is answered `pending` and the client asks
   again (ui-inspect-cli does, every 50 ms).
 - `type` sends `TextInput` records (Enter and Tab for newlines and tabs); IME preedit is not driven.
+- The program log keeps the last 200 steps and the timeline the last 240 frames. A model is
+  text (what `show` prints), so `model` diffs lines, not values, and there is no time travel:
+  an old model can be read, not put back.
 - The event log keeps the last 500 records the app took (`Inspector.observe`); input the
   tree did not queue a record for (no node listens) is not in it. No session recording over
   the wire yet; sessions are still in memory

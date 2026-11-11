@@ -8,8 +8,10 @@ import silk.collections.list { List }
 import silk.collections.slice { Slice }
 import silk.core.effect { Effect }
 import silk.core.ownership { Copy }
+import silk.core.result { Result }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.u32
+import silk.num.u8
 import silk.num.u64
 import silk.num.usize
 import silk.text.string { String }
@@ -335,6 +337,40 @@ impl<M> Subscriptions<M> {
     }
   }
 
+  // What the shell says (see `shell.silk`). Each is a port with a reserved name.
+
+  /// `handler(action)` when an item of the menu a `Shell.setMenu` installed is chosen.
+  pub fn menuAction(self: &mut Self, key: u64, handler: fn(u32) -> M) -> () {
+    self.port(key, PORT_MENU, |text| handler(leadingNumber(String.view(&text))))
+  }
+
+  /// `handler(request, paths)` when a dialog `Shell.openFile` or `Shell.saveFile` opened
+  /// closes: the request it was opened with and the paths chosen, none when cancelled.
+  pub fn files(self: &mut Self, key: u64, handler: fn(u32, List<String>) -> M) -> () {
+    self.port(
+      key,
+      PORT_FILES,
+      |text| handler(leadingNumber(String.view(&text)), linesAfterFirst(String.view(&text))),
+    )
+  }
+
+  /// `handler(dark)` when the system's appearance changes.
+  pub fn appearance(self: &mut Self, key: u64, handler: fn(bool) -> M) -> () {
+    self.port(key, PORT_APPEARANCE, |text| handler(String.view(&text) == "dark"))
+  }
+
+  /// `handler(focused)` when the window becomes the one the user works in, or stops being it.
+  pub fn windowFocus(self: &mut Self, key: u64, handler: fn(bool) -> M) -> () {
+    self.port(key, PORT_FOCUS, |text| handler(String.view(&text) == "1"))
+  }
+
+  /// `handler()` when the user asks to close the window or quit. A program that subscribes
+  /// decides: the window stays until a command calls `Shell.quit`. Without the subscription
+  /// the window closes at once.
+  pub fn closeRequested(self: &mut Self, key: u64, handler: fn() -> M) -> () {
+    self.port(key, PORT_CLOSE, |text| handler())
+  }
+
   /// The subscriptions `body` asks for, as this builder's: each message goes through `wrap`.
   /// `scope` keeps the keys in `body` apart from the ones around it, so two children may use
   /// the same keys under different scopes.
@@ -394,6 +430,59 @@ impl<M> Subscriptions<M> {
       wrap,
     )
   }
+}
+
+/// The port a host posts a chosen menu item to: the action, in decimal.
+pub const PORT_MENU: string = "shell:menu"
+
+/// The port a host posts a closed file dialog to: the request in decimal, then one line per
+/// path.
+pub const PORT_FILES: string = "shell:files"
+
+/// The port a host posts the system's appearance to: `"dark"` or `"light"`.
+pub const PORT_APPEARANCE: string = "shell:appearance"
+
+/// The port a host posts the window's focus to: `"1"` or `"0"`.
+pub const PORT_FOCUS: string = "shell:focus"
+
+/// The port a host posts a request to close the window to.
+pub const PORT_CLOSE: string = "shell:close"
+
+/// The decimal number `text` starts with; zero when it starts with none.
+fn leadingNumber(text: string) -> u32 {
+  let bytes = String.utf8Bytes(text)
+  let mut value: u32 = 0
+  let mut i: usize = 0
+  while i < bytes.length && bytes[i] >= 48 && bytes[i] <= 57 {
+    value = value * 10 + (u8.toU32(bytes[i]) - 48)
+    i = i + 1
+  }
+  return value
+}
+
+/// The lines of `text` after its first, without the empty ones.
+fn linesAfterFirst(text: string) -> List<String> {
+  let mut heap = Heap.make()
+  let mut lines = List<String>.make()
+  let bytes = String.utf8Bytes(text)
+  let mut i: usize = 0
+  while i < bytes.length && bytes[i] != 10 {
+    i = i + 1
+  }
+  while i < bytes.length {
+    let start = i + 1
+    i = start
+    while i < bytes.length && bytes[i] != 10 {
+      i = i + 1
+    }
+    if i > start {
+      if let Result.Success { value } = String.fromUtf8(Slice.view<u8>(bytes, start, i - start)) {
+        let line = heap.alloc(String.copy(value))
+        heap.alloc(lines.append(move line))
+      }
+    }
+  }
+  return move lines
 }
 
 /// `key` as seen from outside the scope `scope`.
