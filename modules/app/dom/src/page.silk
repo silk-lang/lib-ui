@@ -1,0 +1,183 @@
+//! [`Page`]: a program and the document it runs in, and [`call`], the one entry the host
+//! (`js/silk-ui-dom.js`) drives it through.
+//!
+//! An app exports two functions and gives its commands what they require there:
+//!
+//! ```silk
+//! export "C" fn open() -> ?*mut u8 as "silk_ui_open" {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   return run Effect.catchAll(page.open<Site, Message, NoCommand>(), page.unopened)
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//! }
+//!
+//! export "C" fn call(token: ?*mut u8, op: u32, a: f64, b: f64, c: f64) -> f64 as "silk_ui_call" {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   return run Effect.catchAll(page.call<Site, Message, NoCommand>(token, op, a, b, c), page.failed)
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//! }
+//! ```
+import dom { Dom }
+import ui_app.backend { TreeError }
+import ui_app.program { Program, CommandSet, Hosted, Run, make }
+import ui_app.runtime { Runtime, drain, settle, navigate, post, pump, tick, resize }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.box { Box }
+import silk.mem.pointer { Pointer }
+import silk.num.f64
+import silk.num.usize
+import silk.text.string { String }
+
+/// Renders the first view. `a`, `b`: the viewport, in CSS pixels. `c`: the clock, in seconds.
+/// A `CALL_LOCATION` before it says where the app starts.
+pub const CALL_START: u32 = 0
+
+/// Returns where to write an event record of `a` bytes.
+pub const CALL_SCRATCH: u32 = 1
+
+/// Handles the record in the first `a` bytes of the scratch, at `b` seconds. Returns 1 when a handler
+/// prevented the default action.
+pub const CALL_EVENT: u32 = 2
+
+/// Moves the clock to `a` seconds; `b` is 1 on an animation frame.
+pub const CALL_TICK: u32 = 3
+
+/// The viewport is now `a` by `b` CSS pixels.
+pub const CALL_RESIZE: u32 = 4
+
+/// Returns when the next timer is due, in seconds, or -1.
+pub const CALL_DEADLINE: u32 = 5
+
+/// Returns 1 when the program wants animation frames.
+pub const CALL_FRAMES: u32 = 6
+
+/// The location is now the path in the first `a` bytes of the scratch: where the document
+/// opened, or where its history went.
+pub const CALL_LOCATION: u32 = 7
+
+/// The host posts to a port: the scratch holds the port's name in its first `a` bytes and
+/// the text in the `b` after them.
+pub const CALL_POST: u32 = 8
+
+struct Unrooted {}
+
+struct Root<P, M, C> {
+  storage: Box<Page<P, M, C>>,
+}
+
+/// Program `P` and its document.
+pub struct Page<P, M, C> {
+  pub host: Runtime<Hosted<P>, M, Run<C>>,
+  pub dom: Dom,
+  root: Unrooted | Root<P, M, C>,
+}
+
+/// Makes the first model of program `P` and returns the token the host passes to [`call`].
+/// The page lives as long as the document.
+pub effect fn open<P: Program<M, C>, M, C>() -> ?*mut u8
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let host = run make<P, M, C>()
+  let mut storage = run Box<Page<P, M, C>>.make(
+    Page<P, M, C> { host: move host, dom: Dom.make(), root: Unrooted {} },
+  )
+  let pinned = Pointer.fromMutRef(&mut storage.getMut()[0])
+  let mut anchor = ()
+
+  // The page roots itself: the host owns the token and never frees it.
+  let fresh = unsafe Pointer.borrowMut(&mut anchor, pinned)
+  fresh.root = Root<P, M, C> { storage: move storage }
+  return unsafe Intrinsic.pointerReinterpret<*mut Page<P, M, C>, *mut u8>(pinned)
+}
+
+/// What [`open`] returns when it fails.
+pub effect fn unopened<E>(error: E) -> ?*mut u8 {
+  drop error
+  return Pointer.null<u8>()
+}
+
+/// What [`call`] returns when it fails.
+pub effect fn failed<E>(error: E) -> f64 {
+  drop error
+  return -2.0
+}
+
+/// One call from the host: `op` is a `CALL_*` code.
+pub effect fn call<P: Program<M, C>, M, C: CommandSet<M, R>, ? R>(
+  token: ?*mut u8,
+  op: u32,
+  a: f64,
+  b: f64,
+  c: f64,
+) -> f64
+  ! TreeError | OutOfMemoryError
+  ? R | &mut Allocator {
+  if Pointer.isNull(token) {
+    return -2.0
+  }
+  let pointer = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(token)
+  let pinned = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Page<P, M, C>>(pointer)
+  let mut anchor = ()
+  let page = unsafe Pointer.borrowMut(&mut anchor, pinned)
+  if op == CALL_START {
+    // The first render is already where the app starts: past the commands `init` gave, at
+    // the location and in the viewport. A server render does the same, so the two agree.
+    page.dom.setViewport(f64.toF32(a), f64.toF32(b))
+    page.host.time = c
+    run page.host.sized(f64.toF32(a), f64.toF32(b))
+    drop run settle<Hosted<P>, M, Run<C>, OutOfMemoryError, R>(&mut page.host)
+    drop page.host.takeWent()
+    run page.host.start(&mut page.dom, c)
+    run drain<Hosted<P>, M, Run<C>, OutOfMemoryError, Dom, R>(&mut page.host, &mut page.dom)
+  } else if op == CALL_LOCATION {
+    let path = run String.copy(page.dom.written(f64.toUsize(a)))
+    if page.host.running() {
+      run navigate<Hosted<P>, M, Run<C>, OutOfMemoryError, Dom, R>(
+        &mut page.host,
+        &mut page.dom,
+        String.view(&path),
+      )
+    } else {
+      run page.host.locate(String.view(&path))
+    }
+  } else if op == CALL_POST {
+    let name = run String.copy(page.dom.written(f64.toUsize(a)))
+    let text = run String.copy(page.dom.writtenAt(f64.toUsize(a), f64.toUsize(b)))
+    run post<Hosted<P>, M, Run<C>, OutOfMemoryError, Dom, R>(
+      &mut page.host,
+      &mut page.dom,
+      String.view(&name),
+      String.view(&text),
+    )
+  } else if op == CALL_SCRATCH {
+    return usize.toF64(run page.dom.reserve(f64.toUsize(a)))
+  } else if op == CALL_EVENT {
+    page.host.time = b
+    run page.dom.receive(f64.toUsize(a))
+    drop run pump<Hosted<P>, M, Run<C>, OutOfMemoryError, Dom, R>(&mut page.host, &mut page.dom)
+    if page.host.takePrevented() {
+      return 1.0
+    }
+  } else if op == CALL_TICK {
+    run tick<Hosted<P>, M, Run<C>, OutOfMemoryError, Dom, R>(
+      &mut page.host,
+      &mut page.dom,
+      a,
+      b != 0.0,
+    )
+  } else if op == CALL_RESIZE {
+    page.dom.setViewport(f64.toF32(a), f64.toF32(b))
+    run resize<Hosted<P>, M, Run<C>, OutOfMemoryError, Dom, R>(
+      &mut page.host,
+      &mut page.dom,
+      f64.toF32(a),
+      f64.toF32(b),
+    )
+  } else if op == CALL_DEADLINE {
+    return page.host.nextDeadline().unwrapOr(-1.0)
+  } else if op == CALL_FRAMES {
+    if page.host.wantsFrames() {
+      return 1.0
+    }
+  }
+  return 0.0
+}

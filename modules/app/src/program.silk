@@ -1,0 +1,268 @@
+//! The program contract: [`Program`] on the model, [`CommandSet`] on the command type, and
+//! [`Update`], what `update` returns. [`Submodel`], [`Receives`], [`fold`] and [`lift`] are for
+//! a parent that embeds a child by hand.
+//!
+//! A program runs on the same [`Runtime`] as an [`App`]: [`make`] wraps it.
+import app { App, Context, NoCommand, Perform, Subscriptions }
+import document { Document, Node, render }
+import runtime { Runtime }
+import ui { Ui }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.text.string { String }
+
+/// A program, implemented by its model. `M` is its message type and `C` its command type.
+pub interface Program<M, C> {
+  /// The first model, and the commands to start with.
+  effect fn init() -> Update<Self, C, NoOutput> ! OutOfMemoryError ? &mut Allocator
+
+  /// The model after `message`, and the commands to run.
+  effect fn update(model: Self, message: M) -> Update<Self, C, NoOutput>
+    ! OutOfMemoryError
+    ? &mut Allocator
+
+  /// Describes the UI for the model.
+  fn view(model: &Self, h: &Document<M>) -> Node
+
+  /// The subscriptions the model wants now. The runtime asks after every update, starts the
+  /// new ones and stops the ones that are gone, by key. None by default.
+  fn subscriptions(model: &Self, subs: &mut Subscriptions<M>) -> () {
+    return ()
+  }
+}
+
+/// A child a parent embeds. `O` is what it reports to its parent.
+pub interface Submodel<M, C, O> {
+  /// The commands a new child starts with. The parent must run them.
+  effect fn start(model: &Self) -> List<C> ! OutOfMemoryError ? &mut Allocator
+
+  effect fn update(model: Self, message: M) -> Update<Self, C, O>
+    ! OutOfMemoryError
+    ? &mut Allocator
+
+  fn view(model: &Self, h: &Document<M>) -> Node
+
+  fn subscriptions(model: &Self, subs: &mut Subscriptions<M>) -> () {
+    return ()
+  }
+}
+
+/// A child that takes requests of type `I` from its parent.
+pub interface Receives<I, C, O> {
+  effect fn receive(model: Self, input: I) -> Update<Self, C, O> ! OutOfMemoryError ? &mut Allocator
+}
+
+/// A command type: the work each command does, and the message it ends with. `R` is what that
+/// work requires (storage, network, clocks), provided once where the program starts, and
+/// swappable in tests. A command that can fail says so in its message.
+pub interface CommandSet<M, ? R> {
+  effect fn execute(self: Self) -> M ! OutOfMemoryError ? R
+}
+
+impl<M> CommandSet<M ? never> for NoCommand {
+  effect fn execute(self: Self) -> M
+    ! OutOfMemoryError {
+    return Intrinsic.trap("ui-app: NoCommand is never executed")
+  }
+}
+
+/// What a program, or a child that reports nothing, reports.
+pub struct NoOutput {}
+
+/// What `update` returns: the next model, the commands to run, and a report for the parent.
+pub struct Update<Model, C, O> {
+  pub model: Model,
+  pub commands: List<C>,
+  pub out: Option<O>,
+  /// Where the update moves the location to, if anywhere (see `navigating`).
+  pub destination: Option<String>,
+}
+
+impl<Model, C, O> Update<Model, C, O> {
+  /// The next model, no commands, nothing to report.
+  pub fn of(model: Model) -> Update<Model, C, O> {
+    return Update<Model, C, O> {
+      model: move model,
+      commands: List<C>.make(),
+      out: Option<O>.none(),
+      destination: Option<String>.none(),
+    }
+  }
+
+  /// The next model and one command.
+  pub effect fn with(model: Model, command: C) -> Update<Model, C, O>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut commands = List<C>.make()
+    run commands.append(move command)
+    return Update<Model, C, O> {
+      model: move model,
+      commands: move commands,
+      out: Option<O>.none(),
+      destination: Option<String>.none(),
+    }
+  }
+
+  /// The next model and a list of commands.
+  pub fn batch(model: Model, commands: List<C>) -> Update<Model, C, O> {
+    return Update<Model, C, O> {
+      model: move model,
+      commands: move commands,
+      out: Option<O>.none(),
+      destination: Option<String>.none(),
+    }
+  }
+
+  /// The same update, with a report for the parent.
+  pub fn reporting(self: Self, out: O) -> Update<Model, C, O> {
+    return Update<Model, C, O> {
+      model: move self.model,
+      commands: move self.commands,
+      out: Option<O>.some(move out),
+      destination: move self.destination,
+    }
+  }
+
+  /// The same update, moving the location to `path`, as a click on a link to it does: the
+  /// location subscriptions hear of it next. A parent passes a child's on with `heading`.
+  pub effect fn navigating(self: Self, path: string) -> Update<Model, C, O>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return Update<Model, C, O> {
+      model: move self.model,
+      commands: move self.commands,
+      out: move self.out,
+      destination: Option<String>.some(run String.copy(path)),
+    }
+  }
+
+  /// The same update, moving the location where a child's update asked (`Folded.destination`).
+  pub fn heading(self: Self, destination: Option<String>) -> Update<Model, C, O> {
+    if destination.isNone() {
+      return move self
+    }
+    return Update<Model, C, O> {
+      model: move self.model,
+      commands: move self.commands,
+      out: move self.out,
+      destination: move destination,
+    }
+  }
+}
+
+/// What a child's update left for its parent to deal with.
+pub struct Folded<C, O> {
+  pub commands: List<C>,
+  pub out: Option<O>,
+  pub destination: Option<String>,
+}
+
+/// Runs a child's `update` on the child where it lies, in its parent's model.
+pub effect fn fold<Child: Submodel<M, C, O>, M, C, O>(child: &mut Child, message: M) -> Folded<C, O>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let place = Pointer.fromMutRef(&mut child.*)
+
+  // The child is moved out, updated, and put back before anything else can see the hole.
+  let before = unsafe Pointer.take(place)
+  let next = run Submodel.update(move before, move message)
+  unsafe Pointer.put(place, move next.model)
+  return Folded<C, O> {
+    commands: move next.commands,
+    out: move next.out,
+    destination: move next.destination,
+  }
+}
+
+/// Hands a child a request from its parent, where the child lies.
+pub effect fn foldInput<Child: Receives<I, C, O>, I, C, O>(child: &mut Child, input: I) -> Folded<
+  C,
+  O
+>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let place = Pointer.fromMutRef(&mut child.*)
+  let before = unsafe Pointer.take(place)
+  let next = run Receives.receive(move before, move input)
+  unsafe Pointer.put(place, move next.model)
+  return Folded<C, O> {
+    commands: move next.commands,
+    out: move next.out,
+    destination: move next.destination,
+  }
+}
+
+/// Wraps a child's commands as the parent's and adds them to `into`.
+pub effect fn lift<A, B>(into: &mut List<B>, from: List<A>, wrap: fn(A) -> B) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut rest = move from
+  while rest.length() > 0 {
+    run into.append(wrap(rest.remove(0)))
+  }
+}
+
+// Running a program on the runtime.
+
+/// A program's model, as the [`App`] the runtime runs.
+pub struct Hosted<P> {
+  pub value: P,
+}
+
+/// A program's command, as the runtime performs it.
+pub struct Run<C> {
+  pub command: C,
+}
+
+impl<M, C: CommandSet<M, R>, ? R> Perform<M, OutOfMemoryError ? R> for Run<C> {
+  effect fn perform(self: Self) -> M
+    ! OutOfMemoryError
+    ? R {
+    return run CommandSet.execute(move self.command)
+  }
+}
+
+impl<P: Program<M, C>, M, C> App<M, Run<C>> for Hosted<P> {
+  fn view(self: &Self, ui: &mut Ui<M>) -> () {
+    render<M>(&mut ui, |h| Program.view(&self.value, h))
+  }
+
+  fn update(self: &mut Self, message: M, cx: &mut Context<Run<C>>) -> () {
+    let place = Pointer.fromMutRef(&mut self.value)
+
+    // The model is moved out, updated, and put back before anything else can see the hole.
+    let before = unsafe Pointer.take(place)
+    let next: Update<P, C, NoOutput> = cx.alloc(Program.update(move before, move message))
+    unsafe Pointer.put(place, move next.model)
+    if let Option<String>.Some { value: path } = move next.destination {
+      cx.navigate(String.view(&path))
+    }
+    let mut commands = move next.commands
+    while commands.length() > 0 {
+      cx.command(Run<C> { command: commands.remove(0) })
+    }
+  }
+
+  fn subscriptions(self: &Self, subs: &mut Subscriptions<M>) -> () {
+    Program.subscriptions(&self.value, &mut subs)
+  }
+}
+
+/// The runtime of program `P`.
+pub type Host<P, M, C> = Runtime<Hosted<P>, M, Run<C>>
+
+/// Makes the first model of program `P` and a runtime for it. The commands `init` starts with
+/// are performed by the first `drain`.
+pub effect fn make<P: Program<M, C>, M, C>() -> Runtime<Hosted<P>, M, Run<C>>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let first: Update<P, C, NoOutput> = run Program.init()
+  let mut runtime = Runtime<Hosted<P>, M, Run<C>>.make(Hosted<P> { value: move first.model })
+  let mut commands = move first.commands
+  while commands.length() > 0 {
+    run runtime.context.commands.append(Run<C> { command: commands.remove(0) })
+  }
+  return move runtime
+}

@@ -1,0 +1,150 @@
+//! Locations, links, ports and a server render: a program of two pages, run without a tree
+//! and rendered to markup by the document backend.
+import ui_app.lib {
+  Document,
+  drain,
+  navigate,
+  NoCommand,
+  Node,
+  NoOutput,
+  post,
+  Program,
+  Subscriptions,
+  TreeError,
+  Update
+}
+import ui_app.program as program
+import ui_app_dom.html { Html, render }
+import ui_app_dom.grid_css { writeGrid }
+import ui_protocol.grid { Grid }
+import silk.collections.bytes { Bytes }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+struct Pages {
+  about: bool,
+  heard: String,
+}
+
+union Message {
+  Went { about: bool },
+  ClickedHome,
+  Heard { text: String },
+}
+
+type Next = Update<Pages, NoCommand, NoOutput>
+
+fn isAbout(path: string) -> bool {
+  let bytes = String.utf8Bytes(path)
+  return bytes.length >= 6 && bytes[1] == 97 && bytes[5] == 116
+}
+
+impl Program<Message, NoCommand> for Pages {
+  effect fn init() -> Next
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return Next.of(Pages { about: false, heard: String.make() })
+  }
+
+  effect fn update(pages: Pages, message: Message) -> Next
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut model = move pages
+    match move message {
+      Message.Went { about } => {
+        model.about = about
+      }
+      Message.ClickedHome => {
+        return run Next.of(move model).navigating("/")
+      }
+      Message.Heard { text } => {
+        model.heard = move text
+      }
+    }
+    return Next.of(move model)
+  }
+
+  fn view(pages: &Pages, h: &Document<Message>) -> Node {
+    return h.column(
+      &[],
+      &[
+        h.link("/about", &[], &[h.text("About")]),
+        h.button(&[h.onClick(Message.ClickedHome)], &[h.text("Home")]),
+        if pages.about {
+          h.text("the about page <&>")
+        } else {
+          h.text("the home page")
+        },
+        h.text(String.view(&pages.heard)),
+      ],
+    )
+  }
+
+  fn subscriptions(pages: &Pages, subs: &mut Subscriptions<Message>) -> () {
+    subs.location(1, |path| Message.Went { about: isAbout(path) })
+    subs.port(2, "news", |text| Message.Heard { text: move text })
+  }
+}
+
+fn contains(text: &[u8], wanted: string) -> bool {
+  let token = String.utf8Bytes(wanted)
+  let mut at: usize = 0
+  while at + token.length <= text.length {
+    let mut i: usize = 0
+    while i < token.length && text[at + i] == token[i] {
+      i = i + 1
+    }
+    if i == token.length {
+      return true
+    }
+    at = at + 1
+  }
+  return false
+}
+
+effect fn routingBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  // A server render of a page that is not the first.
+  let mut html = Html.make()
+  run html.setBase("/docs")
+  let markup = run render<Pages, Message, NoCommand>(&mut html, "/about")
+  let text = Bytes.asSlice(&markup)
+  run Testing.expect(contains(text, "<style data-silk-ssr>"), "the markup carries its styles")
+  run Testing.expect(contains(text, "href=\"/docs/about\""), "a link is an a, under the base")
+  run Testing.expect(contains(text, "the about page &lt;&amp;&gt;"), "at the page asked for")
+  run Testing.expect(!contains(text, "the home page"), "and not the first page")
+
+  // The same program, moved about by its host.
+  let mut page = Html.make()
+  let mut app = run program.make<Pages, Message, NoCommand>()
+  run app.start(&mut page, 0.0)
+  run drain(&mut app, &mut page)
+  run Testing.expect(!app.model.value.about, "starts at home")
+  run navigate(&mut app, &mut page, "/about")
+  run Testing.expect(app.model.value.about, "the location subscription hears a move")
+  app.send(Message.ClickedHome)
+  run drain(&mut app, &mut page)
+  run Testing.expect(!app.model.value.about, "an update may move the location")
+  run Testing.expect(String.byteLength(app.location()) == 1, "to the path it names")
+
+  run post(&mut app, &mut page, "other", "no")
+  run Testing.expect(app.model.value.heard.ownedByteLength() == 0, "a port hears only its name")
+  run post(&mut app, &mut page, "news", "rain")
+  run Testing.expect(app.model.value.heard.ownedByteLength() == 4, "and gets the text posted")
+  run Testing.expect(contains(Bytes.asSlice(&run page.markup()), "rain"), "which the view shows")
+
+  // A grid template as CSS.
+  let grid = run Grid.columns(3)
+  let mut css = Bytes.make()
+  run writeGrid(&mut css, &grid)
+  run Testing.expect(contains(Bytes.asSlice(&css), "1fr 1fr 1fr"), "three equal columns")
+}
+
+test effect fn locationsPortsAndMarkup() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run routingBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}

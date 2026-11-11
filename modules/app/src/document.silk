@@ -1,0 +1,977 @@
+//! [`Document`]: the builder the view of a [`Program`] writes with.
+//!
+//! A view returns nodes: `h.row(&[h.testId("bar")], &[h.text("a"), h.text("b")])`. The builder is
+//! borrowed shared, so calls nest, and children are built before the node that holds them. What
+//! it builds is a description that lives for one pass; [`render`] then plays it into the
+//! [`Ui`], which matches it against the last render as it always did.
+//!
+//! Handlers do not store closures. A handler that takes a message (`h.onClick(message)`) keeps
+//! the value. A handler that takes a lambda (`h.onInput(|text| ...)`) is called while the view
+//! runs to dispatch a record of its kind, and its answer is kept; while rendering it is not
+//! called at all.
+import heap { Heap }
+import program { Submodel }
+import ui { Ui, Span }
+// What a view names next to the builder.
+pub import ui { Reply, DefaultAction }
+pub import ui_protocol.grid { Grid }
+pub import ui_protocol.mutation { Role, Cursor, CanvasCommand }
+pub import ui_protocol.options { AnchorOptions }
+pub import ui_protocol.record { Event, EventKind }
+import ui_protocol.css
+import ui_protocol.css { Declaration, Keyword }
+import ui_protocol.event { preventFlags }
+import ui_protocol.mutation { NodeKind, StyleState, FlexDirection }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.geometry.rect { Rect }
+import silk.mem.pointer { Pointer }
+import silk.num.i64
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.text.string { String }
+
+/// A node a view built: a handle into the builder, good for the pass that made it.
+pub struct Node {
+  index: u32,
+}
+
+impl Copy for Node {}
+
+/// An attribute a view built: a handle into the builder, good for the pass that made it.
+pub struct Attr {
+  index: u32,
+}
+
+impl Copy for Attr {}
+
+/// The handle of an attribute that sets nothing.
+const NO_ATTR: u32 = 4294967295
+
+enum Shape {
+  Box,
+  Text,
+  Input,
+  Image,
+  Icon,
+  /// Its `text` is a span of the tree's `canvas`.
+  Canvas,
+  /// Its children go in the overlay layer, in the overlay `key` names.
+  Overlay,
+  /// Its children become children of the node that holds it.
+  Fragment,
+}
+
+struct Record {
+  shape: Shape,
+  kidStart: u32,
+  kidCount: u32,
+  attrStart: u32,
+  attrCount: u32,
+  /// The text of a text node, the value of an input.
+  text: Span,
+  keyed: bool,
+  key: u64,
+}
+
+impl Copy for Record {}
+
+union Op {
+  Style { state: StyleState, start: u32, count: u32 },
+  AccessRole { value: Role },
+  Label { text: Span },
+  TestId { text: Span },
+  Placeholder { text: Span },
+  TabIndex { value: i32 },
+  Pointer { value: Cursor },
+  Disabled { value: bool },
+  Checked { value: bool },
+  Selected { value: bool },
+  Expanded { value: bool },
+  Href { text: Span },
+  Transition { text: Span },
+  FocusTrap { value: bool },
+  TakeFocus,
+  Reveal,
+  Prevent { flags: u32 },
+  Multiline { value: bool },
+  ReadOnly { value: bool },
+  ValueRange { min: f32, max: f32, value: f32 },
+  Anchor { key: u64 },
+  Anchored { key: u64, options: AnchorOptions },
+  /// The template at `index` of the tree's `grids`.
+  Template { index: u32 },
+  Source { resource: u32 },
+  /// The node listens for `kind`, and has nothing to answer in this pass.
+  Listen { kind: EventKind },
+  /// The node answers the record of this pass with the reply in `slot`.
+  Answer { kind: EventKind, slot: u32 },
+  /// The attributes at `start..start + count` of the tree's `attrs`.
+  Group { start: u32, count: u32 },
+}
+
+impl Copy for Op {}
+
+/// The nodes of one pass. It has no message type, so a parent and its submodels share it.
+struct Tree {
+  heap: Heap,
+  records: List<Record>,
+  kids: List<u32>,
+  ops: List<Op>,
+  attrs: List<u32>,
+  styles: List<Declaration>,
+  grids: List<Grid>,
+  canvas: List<CanvasCommand>,
+  bytes: List<u8>,
+  /// How many replies this pass kept.
+  replies: u32,
+  dispatching: bool,
+  /// The kind of the record this pass dispatches.
+  kind: EventKind,
+}
+
+impl Tree {
+  fn make(dispatching: bool, kind: EventKind) -> Tree {
+    return Tree {
+      heap: Heap.make(),
+      records: List<Record>.make(),
+      kids: List<u32>.make(),
+      ops: List<Op>.make(),
+      attrs: List<u32>.make(),
+      styles: List<Declaration>.make(),
+      grids: List<Grid>.make(),
+      canvas: List<CanvasCommand>.make(),
+      bytes: List<u8>.make(),
+      replies: 0,
+      dispatching: dispatching,
+      kind: kind,
+    }
+  }
+
+  fn op(self: &mut Self, op: Op) -> Attr {
+    let index = usize.toU32(self.ops.length())
+    self.heap.alloc(self.ops.append(op))
+    return Attr { index: index }
+  }
+
+  fn store(self: &mut Self, bytes: &[u8]) -> Span {
+    let start = usize.toU32(self.bytes.length())
+    self.heap.alloc(self.bytes.appendSlice(bytes))
+    return Span { start: start, length: usize.toU32(bytes.length) }
+  }
+
+  fn text(self: &Self, span: Span) -> string {
+    let bytes = Slice.view(self.bytes.asSlice(), u32.toUsize(span.start), u32.toUsize(span.length))
+    return match String.fromUtf8(bytes) {
+      Result.Success { value } => value
+      Result.Failure { error: _ } => ""
+    }
+  }
+
+  fn group(self: &mut Self, attributes: &[Attr]) -> Span {
+    let start = usize.toU32(self.attrs.length())
+    let mut i: usize = 0
+    while i < attributes.length {
+      if attributes[i].index != NO_ATTR {
+        self.heap.alloc(self.attrs.append(attributes[i].index))
+      }
+      i = i + 1
+    }
+    return Span { start: start, length: usize.toU32(self.attrs.length()) - start }
+  }
+
+  /// A node with the attributes `lead` and then `attributes`.
+  fn add(
+    self: &mut Self,
+    shape: Shape,
+    text: Span,
+    lead: &[Attr],
+    attributes: &[Attr],
+    children: &[Node],
+  ) -> Node {
+    let attrStart = usize.toU32(self.attrs.length())
+    drop self.group(lead)
+    drop self.group(attributes)
+    let kidStart = usize.toU32(self.kids.length())
+    let mut i: usize = 0
+    while i < children.length {
+      let child = self.records.get(u32.toUsize(children[i].index))
+      if child.shape == Shape.Fragment {
+        let mut k: u32 = 0
+        while k < child.kidCount {
+          let kid = self.kids.get(u32.toUsize(child.kidStart + k))
+          self.heap.alloc(self.kids.append(kid))
+          k = k + 1
+        }
+      } else {
+        self.heap.alloc(self.kids.append(children[i].index))
+      }
+      i = i + 1
+    }
+    let index = usize.toU32(self.records.length())
+    self.heap.alloc(
+      self.records.append(
+        Record {
+          shape: shape,
+          kidStart: kidStart,
+          kidCount: usize.toU32(self.kids.length()) - kidStart,
+          attrStart: attrStart,
+          attrCount: usize.toU32(self.attrs.length()) - attrStart,
+          text: text,
+          keyed: false,
+          key: 0,
+        },
+      ),
+    )
+    return Node { index: index }
+  }
+}
+
+/// A reply a handler gave in this pass, with its number.
+struct Slot<M> {
+  slot: u32,
+  reply: Reply<M>,
+}
+
+struct Slots<M> {
+  heap: Heap,
+  list: List<Slot<M>>,
+}
+
+impl<M> Slots<M> {
+  fn make() -> Slots<M> {
+    return Slots<M> { heap: Heap.make(), list: List<Slot<M>>.make() }
+  }
+
+  /// Takes reply `slot` out of this pass.
+  fn take(self: &mut Self, slot: u32) -> Reply<M> {
+    let mut i: usize = 0
+    while i < self.list.length() {
+      if self.list.asSlice()[i].slot == slot {
+        let found = self.list.remove(i)
+        return move found.reply
+      }
+      i = i + 1
+    }
+    return Reply<M>.Pass
+  }
+}
+
+/// The view builder. See the module documentation.
+///
+/// It points at a tree and a list of replies that [`render`] owns for the length of the view
+/// call. Every method writes through the pointers, which is why they are `unsafe` inside and
+/// plain to call.
+pub struct Document<M> {
+  tree: *mut Tree,
+  slots: *mut Slots<M>,
+  event: *const Event,
+}
+
+fn mapReply<A, B>(reply: Reply<A>, wrap: fn(A) -> B) -> Reply<B> {
+  return match move reply {
+    Reply<A>.Emit { message } => Reply<B>.Emit { message: wrap(move message) }
+    Reply<A>.EmitAndStop { message } => Reply<B>.EmitAndStop { message: wrap(move message) }
+    Reply<A>.Stop => Reply<B>.Stop
+    Reply<A>.Pass => Reply<B>.Pass
+    Reply<A>.Prevent => Reply<B>.Prevent
+    Reply<A>.Custom { message, stopPropagation, preventDefault } => Reply<B>.Custom {
+      message: match move message {
+        Option<A>.Some { value } => Option<B>.Some { value: wrap(move value) }
+        Option<A>.None => Option<B>.None
+      },
+      stopPropagation: stopPropagation,
+      preventDefault: preventDefault,
+    }
+  }
+}
+
+impl<M> Document<M> {
+  fn op(self: &Self, op: Op) -> Attr {
+    let mut anchor: u8 = 0
+    let tree = unsafe Pointer.borrowMut(&mut anchor, self.tree)
+    return tree.op(op)
+  }
+
+  fn store(self: &Self, value: string) -> Span {
+    let mut anchor: u8 = 0
+    let tree = unsafe Pointer.borrowMut(&mut anchor, self.tree)
+    return tree.store(String.utf8Bytes(value))
+  }
+
+  fn node(
+    self: &Self,
+    shape: Shape,
+    lead: &[Attr],
+    attributes: &[Attr],
+    children: &[Node],
+  ) -> Node {
+    let mut anchor: u8 = 0
+    let tree = unsafe Pointer.borrowMut(&mut anchor, self.tree)
+    return tree.add(shape, Span.empty(), lead, attributes, children)
+  }
+
+  // Nodes.
+
+  /// A box (`display: block`).
+  pub fn box(self: &Self, attributes: &[Attr], children: &[Node]) -> Node {
+    return self.node(Shape.Box, &[], attributes, children)
+  }
+
+  /// A flex row.
+  pub fn row(self: &Self, attributes: &[Attr], children: &[Node]) -> Node {
+    let flex = self.style(&[css.display(Keyword.Flex), css.flexDirection(FlexDirection.Row)])
+    return self.node(Shape.Box, &[flex], attributes, children)
+  }
+
+  /// A flex column.
+  pub fn column(self: &Self, attributes: &[Attr], children: &[Node]) -> Node {
+    let flex = self.style(&[css.display(Keyword.Flex), css.flexDirection(FlexDirection.Column)])
+    return self.node(Shape.Box, &[flex], attributes, children)
+  }
+
+  /// A focusable box with role button. Give it `h.onClick(message)`: a click, Enter and Space
+  /// all send it.
+  pub fn button(self: &Self, attributes: &[Attr], children: &[Node]) -> Node {
+    let lead: [Attr; 3] = [
+      self.accessRole(Role.Button),
+      self.tabIndex(0),
+      self.cursor(Cursor.Pointer),
+    ]
+    return self.node(Shape.Box, &lead, attributes, children)
+  }
+
+  /// An inline box: a run of styled text inside a paragraph.
+  pub fn span(self: &Self, attributes: &[Attr], children: &[Node]) -> Node {
+    let inline = self.style(&[css.display(Keyword.Inline)])
+    return self.node(Shape.Box, &[inline], attributes, children)
+  }
+
+  /// A grid container. `template` has the tracks, names and areas.
+  pub fn grid(self: &Self, template: &Grid, attributes: &[Attr], children: &[Node]) -> Node {
+    let lead: [Attr; 2] = [self.style(&[css.display(Keyword.Grid)]), self.gridTemplate(template)]
+    return self.node(Shape.Box, &lead, attributes, children)
+  }
+
+  /// A link to `path`, a path of the app such as `"/guide"`. A click moves the location there
+  /// without loading a page (see `Subscriptions.location`); a document backend makes it an `a`,
+  /// so it opens in a new tab and shows its address as any link does.
+  pub fn link(self: &Self, path: string, attributes: &[Attr], children: &[Node]) -> Node {
+    let lead: [Attr; 4] = [
+      self.href(path),
+      self.accessRole(Role.Link),
+      self.tabIndex(0),
+      self.cursor(Cursor.Pointer),
+    ]
+    return self.node(Shape.Box, &lead, attributes, children)
+  }
+
+  /// An image showing a registered resource. Size it with `h.style`.
+  pub fn image(self: &Self, resource: u32, attributes: &[Attr]) -> Node {
+    let lead: [Attr; 2] = [self.op(Op.Source { resource: resource }), self.accessRole(Role.Image)]
+    return self.node(Shape.Image, &lead, attributes, &[])
+  }
+
+  /// An icon: a registered SVG, drawn in the text color.
+  pub fn icon(self: &Self, resource: u32, attributes: &[Attr]) -> Node {
+    return self.node(Shape.Icon, &[self.op(Op.Source { resource: resource })], attributes, &[])
+  }
+
+  /// A canvas drawing `commands`, in CSS pixels from its top left.
+  pub fn canvas(self: &Self, commands: &[CanvasCommand], attributes: &[Attr]) -> Node {
+    let mut anchor: u8 = 0
+    let tree = unsafe Pointer.borrowMut(&mut anchor, self.tree)
+    let mut span = Span.empty()
+    if !tree.dispatching {
+      span = Span { start: usize.toU32(tree.canvas.length()), length: usize.toU32(commands.length) }
+      tree.heap.alloc(tree.canvas.appendSlice(commands))
+    }
+    return tree.add(Shape.Canvas, span, &[], attributes, &[])
+  }
+
+  /// `children`, in the overlay layer: above the rest of the view, whatever node holds the
+  /// result (menus, popovers, dialogs). `key` names this overlay among the others. Place the
+  /// children with `h.anchored`, or `position: fixed`.
+  pub fn overlay(self: &Self, key: u64, children: &[Node]) -> Node {
+    let mut anchor: u8 = 0
+    let tree = unsafe Pointer.borrowMut(&mut anchor, self.tree)
+    let node = tree.add(Shape.Overlay, Span.empty(), &[], &[], children)
+    let at = u32.toUsize(node.index)
+    let mut record = tree.records.get(at)
+    record.key = key
+    tree.records.set(at, record)
+    return node
+  }
+
+  /// A text node: a run of text styled by its parent.
+  pub fn text(self: &Self, value: string) -> Node {
+    let mut anchor: u8 = 0
+    let tree = unsafe Pointer.borrowMut(&mut anchor, self.tree)
+    let span = tree.store(String.utf8Bytes(value))
+    return tree.add(Shape.Text, span, &[], &[], &[])
+  }
+
+  /// A text node showing `value` in decimal.
+  pub fn number(self: &Self, value: i64) -> Node {
+    let mut magnitude: u64 = if value < 0 {
+      i64.toU64(0 - (value + 1)) + 1
+    } else {
+      i64.toU64(value)
+    }
+    let mut digits: [u8; 20] = [0; 20]
+    let mut at: usize = 20
+    while true {
+      at = at - 1
+      digits[at] = u64.toU8(magnitude % 10) + 48
+      magnitude = magnitude / 10
+      if magnitude == 0 {
+        break
+      }
+    }
+    let mut anchor: u8 = 0
+    let tree = unsafe Pointer.borrowMut(&mut anchor, self.tree)
+    let start = usize.toU32(tree.bytes.length())
+    if value < 0 {
+      tree.heap.alloc(tree.bytes.append(45))
+    }
+    while at < 20 {
+      tree.heap.alloc(tree.bytes.append(digits[at]))
+      at = at + 1
+    }
+    let span = Span { start: start, length: usize.toU32(tree.bytes.length()) - start }
+    return tree.add(Shape.Text, span, &[], &[], &[])
+  }
+
+  /// An input node with value `value`. The view controls the value.
+  pub fn input(self: &Self, value: string, attributes: &[Attr]) -> Node {
+    let mut anchor: u8 = 0
+    let tree = unsafe Pointer.borrowMut(&mut anchor, self.tree)
+    let span = tree.store(String.utf8Bytes(value))
+    return tree.add(Shape.Input, span, &[], attributes, &[])
+  }
+
+  /// Nothing: for the branch of a condition that shows no node.
+  pub fn empty(self: &Self) -> Node {
+    return self.node(Shape.Fragment, &[], &[], &[])
+  }
+
+  /// `children`, as children of the node that holds the result.
+  pub fn fragment(self: &Self, children: &[Node]) -> Node {
+    return self.node(Shape.Fragment, &[], &[], children)
+  }
+
+  /// Gives `node` the key `key`, so it keeps its identity (and its tree state: focus, scroll,
+  /// hover) when its siblings come and go or move.
+  pub fn keyed(self: &Self, key: u64, node: Node) -> Node {
+    let mut anchor: u8 = 0
+    let tree = unsafe Pointer.borrowMut(&mut anchor, self.tree)
+    let at = u32.toUsize(node.index)
+    let mut record = tree.records.get(at)
+    record.keyed = true
+    record.key = key
+    tree.records.set(at, record)
+    return node
+  }
+
+  /// One node per item, as children of the node that holds the result.
+  pub fn each<T>(self: &Self, items: &[T], view: fn(&T) -> Node) -> Node {
+    let mut heap = Heap.make()
+    let mut nodes = List<Node>.make()
+    let mut i: usize = 0
+    while i < items.length {
+      heap.alloc(nodes.append(view(&items[i])))
+      i = i + 1
+    }
+    return self.node(Shape.Fragment, &[], &[], nodes.asSlice())
+  }
+
+  /// A view written for messages of type `CM`, with each message wrapped as one of this
+  /// builder's, as Elm's `Document.map`. `wrap` is called before `map` returns and is not stored.
+  pub fn map<CM>(self: &Self, view: fn(&Document<CM>) -> Node, wrap: fn(CM) -> M) -> Node {
+    // The inner view builds into the same tree, and keeps its replies in a list of its own
+    // message type.
+    let mut inner = Slots<CM>.make()
+    let builder = Document<CM> {
+      tree: self.tree,
+      slots: Pointer.fromMutRef(&mut inner),
+      event: self.event,
+    }
+    let node = view(&builder)
+    let mut anchor: u8 = 0
+    let slots = unsafe Pointer.borrowMut(&mut anchor, self.slots)
+    while true {
+      match move inner.list.pop() {
+        Option.Some { value: found } => {
+          let slot = found.slot
+          let reply = mapReply<CM, M>(move found.reply, wrap)
+          slots.heap.alloc(slots.list.append(Slot<M> { slot: slot, reply: move reply }))
+        }
+        Option.None => {
+          break
+        }
+      }
+    }
+    return node
+  }
+
+  /// Embeds a child's view. `wrap` turns each of the child's messages into one of this
+  /// builder's.
+  pub fn submodel<Child: Submodel<CM, CC, CO>, CM, CC, CO>(
+    self: &Self,
+    child: &Child,
+    wrap: fn(CM) -> M,
+  ) -> Node {
+    return self.map(|inner: &Document<CM>| Submodel.view(child, inner), wrap)
+  }
+
+  // Style.
+
+  fn styleFor(self: &Self, state: StyleState, properties: &[Declaration]) -> Attr {
+    let mut anchor: u8 = 0
+    let tree = unsafe Pointer.borrowMut(&mut anchor, self.tree)
+    if tree.dispatching {
+      // A dispatch pass reads handlers only.
+      return Attr { index: NO_ATTR }
+    }
+    let start = usize.toU32(tree.styles.length())
+    let mut i: usize = 0
+    while i < properties.length {
+      let copy = tree.heap.alloc(css.cloneDeclaration(&properties[i]))
+      tree.heap.alloc(tree.styles.append(move copy))
+      i = i + 1
+    }
+    return tree.op(Op.Style { state: state, start: start, count: usize.toU32(properties.length) })
+  }
+
+  /// The node's base style; later properties replace earlier ones.
+  pub fn style(self: &Self, properties: &[Declaration]) -> Attr {
+    return self.styleFor(StyleState.Base, properties)
+  }
+
+  /// The look while hovered.
+  pub fn hover(self: &Self, properties: &[Declaration]) -> Attr {
+    return self.styleFor(StyleState.Hover, properties)
+  }
+
+  /// The look while pressed.
+  pub fn active(self: &Self, properties: &[Declaration]) -> Attr {
+    return self.styleFor(StyleState.Active, properties)
+  }
+
+  /// The look while focused.
+  pub fn focused(self: &Self, properties: &[Declaration]) -> Attr {
+    return self.styleFor(StyleState.Focus, properties)
+  }
+
+  /// The look while focused from the keyboard (focus rings).
+  pub fn focusVisible(self: &Self, properties: &[Declaration]) -> Attr {
+    return self.styleFor(StyleState.FocusVisible, properties)
+  }
+
+  // Attributes.
+
+  /// Several attributes as one, in order: what a helper that styles a node returns.
+  pub fn attrs(self: &Self, attributes: &[Attr]) -> Attr {
+    let mut anchor: u8 = 0
+    let tree = unsafe Pointer.borrowMut(&mut anchor, self.tree)
+    let span = tree.group(attributes)
+    return tree.op(Op.Group { start: span.start, count: span.length })
+  }
+
+  /// An attribute that sets nothing: for the branch of a condition that adds none.
+  pub fn none(self: &Self) -> Attr {
+    return Attr { index: NO_ATTR }
+  }
+
+  pub fn accessRole(self: &Self, value: Role) -> Attr {
+    return self.op(Op.AccessRole { value: value })
+  }
+
+  /// The accessible name.
+  pub fn label(self: &Self, value: string) -> Attr {
+    return self.op(Op.Label { text: self.store(value) })
+  }
+
+  /// A stable name for tests and inspectors.
+  pub fn testId(self: &Self, value: string) -> Attr {
+    return self.op(Op.TestId { text: self.store(value) })
+  }
+
+  /// The text an empty input shows.
+  pub fn placeholder(self: &Self, value: string) -> Attr {
+    return self.op(Op.Placeholder { text: self.store(value) })
+  }
+
+  pub fn tabIndex(self: &Self, value: i32) -> Attr {
+    return self.op(Op.TabIndex { value: value })
+  }
+
+  pub fn cursor(self: &Self, value: Cursor) -> Attr {
+    return self.op(Op.Pointer { value: value })
+  }
+
+  pub fn disabled(self: &Self, value: bool) -> Attr {
+    return self.op(Op.Disabled { value: value })
+  }
+
+  /// Whether a checkbox, radio button or switch is checked (`aria-checked`).
+  pub fn checked(self: &Self, value: bool) -> Attr {
+    return self.op(Op.Checked { value: value })
+  }
+
+  /// Whether a tab, option or list item is the selected one (`aria-selected`).
+  pub fn selected(self: &Self, value: bool) -> Attr {
+    return self.op(Op.Selected { value: value })
+  }
+
+  /// Whether what this node controls is open (`aria-expanded`).
+  pub fn expanded(self: &Self, value: bool) -> Attr {
+    return self.op(Op.Expanded { value: value })
+  }
+
+  /// Makes the node a link to `path` (see `link`).
+  pub fn href(self: &Self, path: string) -> Attr {
+    return self.op(Op.Href { text: self.store(path) })
+  }
+
+  /// How the node's style changes ease, as CSS `transition` text
+  /// (`"background-color 150ms ease"`). A document backend applies it; the tree renderer
+  /// changes styles at once.
+  pub fn transition(self: &Self, value: string) -> Attr {
+    return self.op(Op.Transition { text: self.store(value) })
+  }
+
+  /// The grid template of a node with `display: grid`, or its placement in its parent's.
+  pub fn gridTemplate(self: &Self, template: &Grid) -> Attr {
+    let mut anchor: u8 = 0
+    let tree = unsafe Pointer.borrowMut(&mut anchor, self.tree)
+    if tree.dispatching {
+      return Attr { index: NO_ATTR }
+    }
+    let index = usize.toU32(tree.grids.length())
+    let copy = tree.heap.alloc(template.copy())
+    tree.heap.alloc(tree.grids.append(move copy))
+    return tree.op(Op.Template { index: index })
+  }
+
+  /// Keeps Tab inside the node: a dialog.
+  pub fn focusTrap(self: &Self, value: bool) -> Attr {
+    return self.op(Op.FocusTrap { value: value })
+  }
+
+  /// Moves focus to the node when a render asks and the last one did not, or the node is new.
+  /// `h.none()` is the branch that does not ask.
+  pub fn takeFocus(self: &Self) -> Attr {
+    return self.op(Op.TakeFocus)
+  }
+
+  /// Scrolls the node into view when a render asks and the last one did not, or the node is
+  /// new.
+  pub fn reveal(self: &Self) -> Attr {
+    return self.op(Op.Reveal)
+  }
+
+  /// Turns default actions off for input aimed at the node or below it: what a handler that
+  /// always prevents would do. The handlers still run.
+  pub fn prevent(self: &Self, actions: &[DefaultAction]) -> Attr {
+    return self.op(Op.Prevent { flags: preventFlags(actions) })
+  }
+
+  /// Makes an input take several lines.
+  pub fn multiline(self: &Self, value: bool) -> Attr {
+    return self.op(Op.Multiline { value: value })
+  }
+
+  pub fn readOnly(self: &Self, value: bool) -> Attr {
+    return self.op(Op.ReadOnly { value: value })
+  }
+
+  /// The range and value of a slider or progress bar (`aria-valuemin`, `-max`, `-now`).
+  pub fn valueRange(self: &Self, min: f32, max: f32, value: f32) -> Attr {
+    return self.op(Op.ValueRange { min: min, max: max, value: value })
+  }
+
+  /// Names the node `key`, for `anchored`.
+  pub fn anchor(self: &Self, key: u64) -> Attr {
+    return self.op(Op.Anchor { key: key })
+  }
+
+  /// Places the node, a popup, next to the node named `anchor(key)`, and keeps it there as the
+  /// page scrolls and lays out.
+  pub fn anchored(self: &Self, key: u64, options: AnchorOptions) -> Attr {
+    return self.op(Op.Anchored { key: key, options: options })
+  }
+
+  // Handlers.
+
+  /// Whether this pass dispatches a record of `kind`.
+  fn hears(self: &Self, kind: EventKind) -> bool {
+    let mut anchor: u8 = 0
+    let tree = unsafe Pointer.borrowMut(&mut anchor, self.tree)
+    return tree.dispatching && tree.kind == kind
+  }
+
+  fn listen(self: &Self, kind: EventKind) -> Attr {
+    return self.op(Op.Listen { kind: kind })
+  }
+
+  fn answer(self: &Self, kind: EventKind, reply: Reply<M>) -> Attr {
+    let mut anchor: u8 = 0
+    let tree = unsafe Pointer.borrowMut(&mut anchor, self.tree)
+    tree.replies = tree.replies + 1
+    let slot = tree.replies
+    let mut other: u8 = 0
+    let slots = unsafe Pointer.borrowMut(&mut other, self.slots)
+    slots.heap.alloc(slots.list.append(Slot<M> { slot: slot, reply: move reply }))
+    return tree.op(Op.Answer { kind: kind, slot: slot })
+  }
+
+  fn send(self: &Self, kind: EventKind, message: M) -> Attr {
+    if !self.hears(kind) {
+      return self.listen(kind)
+    }
+    return self.answer(kind, Reply<M>.Emit { message: move message })
+  }
+
+  /// Handles records of `kind` at the node: `handler` answers when the record targets the node
+  /// or, for bubbling kinds, a node below it.
+  pub fn on(self: &Self, kind: EventKind, handler: fn(&Event) -> Reply<M>) -> Attr {
+    if !self.hears(kind) {
+      return self.listen(kind)
+    }
+    let anchor: u8 = 0
+    let event = unsafe Pointer.borrow(&anchor, self.event)
+    return self.answer(kind, handler(event))
+  }
+
+  /// Sends `message` when the node is clicked (or pressed with Enter or Space when it is a
+  /// focused button).
+  pub fn onClick(self: &Self, message: M) -> Attr {
+    return self.send(EventKind.Click, move message)
+  }
+
+  pub fn onFocus(self: &Self, message: M) -> Attr {
+    return self.send(EventKind.Focus, move message)
+  }
+
+  pub fn onBlur(self: &Self, message: M) -> Attr {
+    return self.send(EventKind.Blur, move message)
+  }
+
+  /// Answers a key going down in the node or below it.
+  pub fn onKeyDown(self: &Self, handler: fn(&Event) -> Reply<M>) -> Attr {
+    return self.on(EventKind.KeyDown, handler)
+  }
+
+  /// Answers a pointer going down on the node or below it.
+  pub fn onPointerDown(self: &Self, handler: fn(&Event) -> Reply<M>) -> Attr {
+    return self.on(EventKind.PointerDown, handler)
+  }
+
+  /// Sends `handler(box)` when the node's border box, in CSS pixels of the viewport, changes.
+  pub fn onLayout(self: &Self, handler: fn(Rect<f32>) -> M) -> Attr {
+    return self.on(EventKind.Layout, |event| Reply<M>.Emit { message: handler(event.bounds) })
+  }
+
+  /// Sends `handler(value)` when the input's value changes; `value` is the input's new value,
+  /// a copy the message can keep.
+  pub fn onInput(self: &Self, handler: fn(String) -> M) -> Attr {
+    if !self.hears(EventKind.Input) {
+      return self.listen(EventKind.Input)
+    }
+    let anchor: u8 = 0
+    let event = unsafe Pointer.borrow(&anchor, self.event)
+    let mut heap = Heap.make()
+    let value = heap.alloc(String.copy(String.view(&event.value)))
+    return self.answer(EventKind.Input, Reply<M>.Emit { message: handler(move value) })
+  }
+
+  /// Sends `message` when Enter goes down with no modifier in the node or below it (an input's
+  /// submit), and stops the key there.
+  pub fn onEnter(self: &Self, message: M) -> Attr {
+    if !self.hears(EventKind.KeyDown) {
+      return self.listen(EventKind.KeyDown)
+    }
+    let anchor: u8 = 0
+    let event = unsafe Pointer.borrow(&anchor, self.event)
+    if String.view(&event.key) == "Enter" && event.modifiers == 0 {
+      return self.answer(EventKind.KeyDown, Reply<M>.EmitAndStop { message: move message })
+    }
+    return self.answer(EventKind.KeyDown, Reply<M>.Pass)
+  }
+}
+
+// Playing the description into the `Ui`.
+
+fn take<M>(slots: *mut Slots<M>, slot: u32) -> Reply<M> {
+  let mut anchor: u8 = 0
+  let all = unsafe Pointer.borrowMut(&mut anchor, slots)
+  return all.take(slot)
+}
+
+/// Sets the attributes at `start..start + count` of `tree.attrs` on the open node.
+fn apply<M>(ui: &mut Ui<M>, tree: &Tree, slots: *mut Slots<M>, start: u32, count: u32) -> () {
+  let mut i: u32 = 0
+  while i < count {
+    let op = tree.ops.get(u32.toUsize(tree.attrs.get(u32.toUsize(start + i))))
+    match op {
+      Op.Style { state, start: first, count: length } => {
+        ui.styleFor(
+          state,
+          Slice.view(tree.styles.asSlice(), u32.toUsize(first), u32.toUsize(length)),
+        )
+      }
+      Op.AccessRole { value } => {
+        ui.accessRole(value)
+      }
+      Op.Label { text } => {
+        ui.label(tree.text(text))
+      }
+      Op.TestId { text } => {
+        ui.testId(tree.text(text))
+      }
+      Op.Placeholder { text } => {
+        ui.placeholder(tree.text(text))
+      }
+      Op.TabIndex { value } => {
+        ui.tabIndex(value)
+      }
+      Op.Pointer { value } => {
+        ui.cursor(value)
+      }
+      Op.Disabled { value } => {
+        ui.disabled(value)
+      }
+      Op.Checked { value } => {
+        ui.checked(value)
+      }
+      Op.Selected { value } => {
+        ui.selected(value)
+      }
+      Op.Expanded { value } => {
+        ui.expanded(value)
+      }
+      Op.Href { text } => {
+        ui.href(tree.text(text))
+      }
+      Op.Transition { text } => {
+        ui.transition(tree.text(text))
+      }
+      Op.FocusTrap { value } => {
+        ui.focusTrap(value)
+      }
+      Op.TakeFocus => {
+        ui.takeFocus()
+      }
+      Op.Reveal => {
+        ui.reveal()
+      }
+      Op.Prevent { flags } => {
+        ui.preventMask(flags)
+      }
+      Op.Multiline { value } => {
+        ui.multiline(value)
+      }
+      Op.ReadOnly { value } => {
+        ui.readOnly(value)
+      }
+      Op.ValueRange { min, max, value } => {
+        ui.valueRange(min, max, value)
+      }
+      Op.Anchor { key } => {
+        ui.anchor(key)
+      }
+      Op.Anchored { key, options } => {
+        ui.anchored(key, options)
+      }
+      Op.Template { index } => {
+        ui.gridTemplate(&tree.grids.asSlice()[u32.toUsize(index)])
+      }
+      Op.Source { resource } => {
+        ui.source(resource)
+      }
+      Op.Listen { kind } => {
+        ui.on(kind, |event| Reply<M>.Pass)
+      }
+      Op.Answer { kind, slot } => {
+        ui.on(kind, |event| take<M>(slots, slot))
+      }
+      Op.Group { start: first, count: length } => {
+        apply<M>(&mut ui, tree, slots, first, length)
+      }
+    }
+    i = i + 1
+  }
+}
+
+/// Sets the attributes of `record` on the open node and adds its children.
+fn fill<M>(ui: &mut Ui<M>, tree: &Tree, slots: *mut Slots<M>, record: Record) -> () {
+  apply<M>(&mut ui, tree, slots, record.attrStart, record.attrCount)
+  let mut k: u32 = 0
+  while k < record.kidCount {
+    place<M>(&mut ui, tree, slots, tree.kids.get(u32.toUsize(record.kidStart + k)))
+    k = k + 1
+  }
+}
+
+/// Adds node `index` under the open node.
+fn place<M>(ui: &mut Ui<M>, tree: &Tree, slots: *mut Slots<M>, index: u32) -> () {
+  let record = tree.records.get(u32.toUsize(index))
+  if record.shape == Shape.Fragment {
+    fill<M>(&mut ui, tree, slots, record)
+    return ()
+  }
+  if record.shape == Shape.Overlay {
+    ui.overlay(record.key, |ui| fill<M>(&mut ui, tree, slots, record))
+    return ()
+  }
+  if record.keyed {
+    ui.key(record.key)
+  }
+  if record.shape == Shape.Image {
+    ui.node(NodeKind.Image, |ui| fill<M>(&mut ui, tree, slots, record))
+  } else if record.shape == Shape.Icon {
+    ui.node(NodeKind.Icon, |ui| fill<M>(&mut ui, tree, slots, record))
+  } else if record.shape == Shape.Canvas {
+    ui.canvas(
+      Slice.view(
+        tree.canvas.asSlice(),
+        u32.toUsize(record.text.start),
+        u32.toUsize(record.text.length),
+      ),
+      |ui| fill<M>(&mut ui, tree, slots, record),
+    )
+  } else if record.shape == Shape.Text {
+    ui.text(tree.text(record.text))
+  } else if record.shape == Shape.Input {
+    ui.input(tree.text(record.text), |ui| fill<M>(&mut ui, tree, slots, record))
+  } else {
+    ui.node(NodeKind.Box, |ui| fill<M>(&mut ui, tree, slots, record))
+  }
+}
+
+/// Runs `view` and plays the node it returns into `ui`, for the pass `ui` is in.
+///
+/// A box at the top of the view is the root itself: its attributes go on the root and its
+/// children are the root's children. Any other node is the root's only child.
+pub fn render<M>(ui: &mut Ui<M>, view: fn(&Document<M>) -> Node) -> () {
+  let mut tree = Tree.make(ui.isDispatching(), ui.dispatched().kind)
+  let mut slots = Slots<M>.make()
+  let builder = Document<M> {
+    tree: Pointer.fromMutRef(&mut tree),
+    slots: Pointer.fromMutRef(&mut slots),
+    event: Pointer.fromRef(ui.dispatched()),
+  }
+  let root = view(&builder)
+  let record = tree.records.get(u32.toUsize(root.index))
+  let replies = Pointer.fromMutRef(&mut slots)
+  if record.shape == Shape.Box && !record.keyed {
+    fill<M>(&mut ui, &tree, replies, record)
+  } else {
+    place<M>(&mut ui, &tree, replies, root.index)
+  }
+}

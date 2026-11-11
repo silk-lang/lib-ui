@@ -1,0 +1,644 @@
+//! The bytes that cross between the program and `js/silk-ui-dom.js`: mutation batches out,
+//! event records in. Integers are little-endian; a string is its length (u32) and its UTF-8.
+//!
+//! Virtual lists are the one thing not written: a document scrolls its own content, and the
+//! tree's virtualization is not part of the core (see the README).
+import grid_css { writeGrid }
+import ui_protocol.css { writeDeclaration }
+import ui_protocol.mutation {
+  Mutation,
+  NodeKind,
+  StyleState,
+  Attribute,
+  Role,
+  Cursor,
+  CanvasCommand,
+  NOT_FOCUSABLE
+}
+import ui_protocol.record { Event, EventKind }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.geometry.rect { Rect }
+import silk.color.rgba { Rgba }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.i32
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+import silk.text.string { String, InvalidUtf8 }
+
+pub const OP_CREATE: u8 = 1
+
+pub const OP_INSERT: u8 = 2
+
+pub const OP_REMOVE: u8 = 3
+
+pub const OP_DESTROY: u8 = 4
+
+pub const OP_STYLE: u8 = 5
+
+pub const OP_CLEAR_STYLE: u8 = 6
+
+pub const OP_TEXT: u8 = 7
+
+pub const OP_SELECTION: u8 = 8
+
+pub const OP_ATTRIBUTE: u8 = 9
+
+pub const OP_LISTENERS: u8 = 10
+
+pub const OP_ROOT: u8 = 11
+
+pub const OP_FOCUS: u8 = 12
+
+pub const OP_BLUR: u8 = 13
+
+pub const OP_CAPTURE: u8 = 14
+
+pub const OP_RELEASE: u8 = 15
+
+pub const OP_SCROLL_TO: u8 = 16
+
+pub const OP_SCROLL_INTO_VIEW: u8 = 17
+
+pub const OP_FONT_FAMILY: u8 = 18
+
+/// A grid template, as the CSS declarations of `grid_css`.
+pub const OP_GRID: u8 = 19
+
+/// The image or icon resource a node shows.
+pub const OP_SOURCE: u8 = 20
+
+pub const OP_CANVAS: u8 = 21
+
+pub const OP_ANCHOR: u8 = 22
+
+pub const OP_CLEAR_ANCHOR: u8 = 23
+
+/// An image resource, as the bytes of its file.
+pub const OP_IMAGE: u8 = 24
+
+/// An icon resource, as SVG.
+pub const OP_ICON: u8 = 25
+
+pub const OP_RELEASE_RESOURCE: u8 = 26
+
+effect fn byte(out: &mut Bytes, value: u8) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.append(&[value])
+}
+
+effect fn word(out: &mut Bytes, value: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.append(
+    &[
+      u32.toU8(u32.bitAnd(value, 255)),
+      u32.toU8(u32.bitAnd(u32.shiftRight(value, 8), 255)),
+      u32.toU8(u32.bitAnd(u32.shiftRight(value, 16), 255)),
+      u32.toU8(u32.shiftRight(value, 24)),
+    ],
+  )
+}
+
+effect fn float(out: &mut Bytes, value: f32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run word(&mut out, f32.toBits(value))
+}
+
+effect fn text(out: &mut Bytes, value: &[u8]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run word(&mut out, usize.toU32(value.length))
+  run out.append(value)
+}
+
+effect fn flag(out: &mut Bytes, value: bool) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run byte(
+    &mut out,
+    if value {
+      1
+    } else {
+      0
+    },
+  )
+}
+
+fn kindCode(kind: NodeKind) -> u8 {
+  return match kind {
+    NodeKind.Box => 0
+    NodeKind.Text => 1
+    NodeKind.Image => 2
+    NodeKind.Icon => 3
+    NodeKind.Input => 4
+    NodeKind.Canvas => 5
+  }
+}
+
+fn stateCode(state: StyleState) -> u8 {
+  return match state {
+    StyleState.Base => 0
+    StyleState.Hover => 1
+    StyleState.Active => 2
+    StyleState.Focus => 3
+    StyleState.FocusVisible => 4
+  }
+}
+
+/// The ARIA role name; empty for no role.
+pub fn roleName(value: Role) -> string<'static> {
+  return match value {
+    Role.None => ""
+    Role.Generic => "generic"
+    Role.Button => "button"
+    Role.Link => "link"
+    Role.Checkbox => "checkbox"
+    Role.Radio => "radio"
+    Role.TextBox => "textbox"
+    Role.Heading => "heading"
+    Role.Paragraph => "paragraph"
+    Role.List => "list"
+    Role.ListItem => "listitem"
+    Role.Image => "img"
+    Role.Dialog => "dialog"
+    Role.Menu => "menu"
+    Role.MenuItem => "menuitem"
+    Role.Tab => "tab"
+    Role.TabList => "tablist"
+    Role.TabPanel => "tabpanel"
+    Role.Toolbar => "toolbar"
+    Role.Navigation => "navigation"
+    Role.Main => "main"
+    Role.Form => "form"
+    Role.Group => "group"
+    Role.Slider => "slider"
+    Role.Switch => "switch"
+    Role.ListBox => "listbox"
+    Role.Option => "option"
+    Role.Tooltip => "tooltip"
+  }
+}
+
+/// The CSS `cursor` value.
+pub fn cursorName(value: Cursor) -> string<'static> {
+  return match value {
+    Cursor.Default => "default"
+    Cursor.Pointer => "pointer"
+    Cursor.Text => "text"
+    Cursor.Move => "move"
+    Cursor.Grab => "grab"
+    Cursor.Grabbing => "grabbing"
+    Cursor.NotAllowed => "not-allowed"
+    Cursor.ResizeHorizontal => "ew-resize"
+    Cursor.ResizeVertical => "ns-resize"
+    Cursor.ResizeNorthWestSouthEast => "nwse-resize"
+    Cursor.ResizeNorthEastSouthWest => "nesw-resize"
+    Cursor.Crosshair => "crosshair"
+  }
+}
+
+// Attribute codes, as `js/silk-ui-dom.js` reads them.
+const ATTR_VALUE_RANGE: u8 = 0
+
+const ATTR_CLEAR_VALUE_RANGE: u8 = 1
+
+const ATTR_ROLE: u8 = 2
+
+const ATTR_LABEL: u8 = 3
+
+const ATTR_TEST_ID: u8 = 4
+
+const ATTR_TAB_INDEX: u8 = 5
+
+const ATTR_CURSOR: u8 = 6
+
+const ATTR_DISABLED: u8 = 7
+
+const ATTR_FOCUS_TRAP: u8 = 8
+
+const ATTR_MULTILINE: u8 = 9
+
+const ATTR_READ_ONLY: u8 = 10
+
+const ATTR_PLACEHOLDER: u8 = 11
+
+const ATTR_CHECKED: u8 = 12
+
+const ATTR_SELECTED: u8 = 13
+
+const ATTR_EXPANDED: u8 = 14
+
+const ATTR_PREVENT: u8 = 15
+
+const ATTR_HREF: u8 = 16
+
+const ATTR_TRANSITION: u8 = 17
+
+effect fn color(out: &mut Bytes, value: Rgba<f32>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run float(&mut out, value.r)
+  run float(&mut out, value.g)
+  run float(&mut out, value.b)
+  run float(&mut out, value.a)
+}
+
+effect fn writeCanvas(out: &mut Bytes, command: CanvasCommand) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match command {
+    CanvasCommand.FillRect { x, y, width, height, radius, color: fill } => {
+      run byte(&mut out, 0)
+      run float(&mut out, x)
+      run float(&mut out, y)
+      run float(&mut out, width)
+      run float(&mut out, height)
+      run float(&mut out, radius)
+      run color(&mut out, fill)
+    }
+    CanvasCommand.MoveTo { x, y } => {
+      run byte(&mut out, 1)
+      run float(&mut out, x)
+      run float(&mut out, y)
+    }
+    CanvasCommand.LineTo { x, y } => {
+      run byte(&mut out, 2)
+      run float(&mut out, x)
+      run float(&mut out, y)
+    }
+    CanvasCommand.QuadTo { x1, y1, x, y } => {
+      run byte(&mut out, 3)
+      run float(&mut out, x1)
+      run float(&mut out, y1)
+      run float(&mut out, x)
+      run float(&mut out, y)
+    }
+    CanvasCommand.CubicTo { x1, y1, x2, y2, x, y } => {
+      run byte(&mut out, 4)
+      run float(&mut out, x1)
+      run float(&mut out, y1)
+      run float(&mut out, x2)
+      run float(&mut out, y2)
+      run float(&mut out, x)
+      run float(&mut out, y)
+    }
+    CanvasCommand.Close => {
+      run byte(&mut out, 5)
+    }
+    CanvasCommand.Fill { color: fill } => {
+      run byte(&mut out, 6)
+      run color(&mut out, fill)
+    }
+    CanvasCommand.Stroke { color: line, width } => {
+      run byte(&mut out, 7)
+      run color(&mut out, line)
+      run float(&mut out, width)
+    }
+  }
+}
+
+effect fn writeAttribute(out: &mut Bytes, entry: &Attribute) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match &entry.* {
+    Attribute.ValueRange { min, max, value } => {
+      run byte(&mut out, ATTR_VALUE_RANGE)
+      run float(&mut out, min)
+      run float(&mut out, max)
+      run float(&mut out, value)
+    }
+    Attribute.ClearValueRange => {
+      run byte(&mut out, ATTR_CLEAR_VALUE_RANGE)
+    }
+    Attribute.Role { value } => {
+      run byte(&mut out, ATTR_ROLE)
+      run text(&mut out, String.utf8Bytes(roleName(value)))
+    }
+    Attribute.Label { value } => {
+      run byte(&mut out, ATTR_LABEL)
+      run text(&mut out, value.ownedUtf8Bytes())
+    }
+    Attribute.TestId { value } => {
+      run byte(&mut out, ATTR_TEST_ID)
+      run text(&mut out, value.ownedUtf8Bytes())
+    }
+    Attribute.TabIndex { value } => {
+      run byte(&mut out, ATTR_TAB_INDEX)
+
+      // 0: not focusable. 1: in the tab order, at the index that follows. 2: focusable, not
+      // in the tab order.
+      if value == NOT_FOCUSABLE {
+        run byte(&mut out, 0)
+      } else if value < 0 {
+        run byte(&mut out, 2)
+      } else {
+        run byte(&mut out, 1)
+        run word(&mut out, i32.toU32(value))
+      }
+    }
+    Attribute.Cursor { value } => {
+      run byte(&mut out, ATTR_CURSOR)
+      run text(&mut out, String.utf8Bytes(cursorName(value)))
+    }
+    Attribute.Disabled { value } => {
+      run byte(&mut out, ATTR_DISABLED)
+      run flag(&mut out, value)
+    }
+    Attribute.FocusTrap { value } => {
+      run byte(&mut out, ATTR_FOCUS_TRAP)
+      run flag(&mut out, value)
+    }
+    Attribute.Multiline { value } => {
+      run byte(&mut out, ATTR_MULTILINE)
+      run flag(&mut out, value)
+    }
+    Attribute.ReadOnly { value } => {
+      run byte(&mut out, ATTR_READ_ONLY)
+      run flag(&mut out, value)
+    }
+    Attribute.Placeholder { value } => {
+      run byte(&mut out, ATTR_PLACEHOLDER)
+      run text(&mut out, value.ownedUtf8Bytes())
+    }
+    Attribute.Checked { value } => {
+      run byte(&mut out, ATTR_CHECKED)
+      run flag(&mut out, value)
+    }
+    Attribute.Selected { value } => {
+      run byte(&mut out, ATTR_SELECTED)
+      run flag(&mut out, value)
+    }
+    Attribute.Expanded { value } => {
+      run byte(&mut out, ATTR_EXPANDED)
+      run flag(&mut out, value)
+    }
+    Attribute.Prevent { actions } => {
+      run byte(&mut out, ATTR_PREVENT)
+      run word(&mut out, actions)
+    }
+    Attribute.Href { value } => {
+      run byte(&mut out, ATTR_HREF)
+      run text(&mut out, value.ownedUtf8Bytes())
+    }
+    Attribute.Transition { value } => {
+      run byte(&mut out, ATTR_TRANSITION)
+      run text(&mut out, value.ownedUtf8Bytes())
+    }
+  }
+}
+
+/// Appends `mutation` to `out`. Returns false, and writes nothing, for a mutation the document
+/// backend does not carry.
+pub effect fn writeMutation(out: &mut Bytes, mutation: &Mutation) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match &mutation.* {
+    Mutation.Create { id, kind } => {
+      run byte(&mut out, OP_CREATE)
+      run word(&mut out, id)
+      run byte(&mut out, kindCode(kind))
+    }
+    Mutation.InsertBefore { parent, child, before } => {
+      run byte(&mut out, OP_INSERT)
+      run word(&mut out, parent)
+      run word(&mut out, child)
+      run word(&mut out, before.unwrapOr(0))
+    }
+    Mutation.Remove { id } => {
+      run byte(&mut out, OP_REMOVE)
+      run word(&mut out, id)
+    }
+    Mutation.Destroy { id } => {
+      run byte(&mut out, OP_DESTROY)
+      run word(&mut out, id)
+    }
+    Mutation.SetStyle { id, state, declarations } => {
+      run byte(&mut out, OP_STYLE)
+      run word(&mut out, id)
+      run byte(&mut out, stateCode(state))
+      let list = declarations.asSlice()
+      run word(&mut out, usize.toU32(list.length))
+      let mut line = Bytes.make()
+      let mut i: usize = 0
+      while i < list.length {
+        line.clear()
+        run writeDeclaration(&mut line, &list[i])
+        run text(&mut out, line.asSlice())
+        i = i + 1
+      }
+    }
+    Mutation.ClearStyle { id, state } => {
+      run byte(&mut out, OP_CLEAR_STYLE)
+      run word(&mut out, id)
+      run byte(&mut out, stateCode(state))
+    }
+    Mutation.SetText { id, value } => {
+      run byte(&mut out, OP_TEXT)
+      run word(&mut out, id)
+      run text(&mut out, value.ownedUtf8Bytes())
+    }
+    Mutation.SetSelection { id, anchor, focus } => {
+      run byte(&mut out, OP_SELECTION)
+      run word(&mut out, id)
+      run word(&mut out, usize.toU32(anchor))
+      run word(&mut out, usize.toU32(focus))
+    }
+    Mutation.SetAttribute { id, attribute } => {
+      run byte(&mut out, OP_ATTRIBUTE)
+      run word(&mut out, id)
+      run writeAttribute(&mut out, &attribute)
+    }
+    Mutation.SetListeners { id, flags } => {
+      run byte(&mut out, OP_LISTENERS)
+      run word(&mut out, id)
+      run word(&mut out, flags)
+    }
+    Mutation.SetRoot { id } => {
+      run byte(&mut out, OP_ROOT)
+      run word(&mut out, id)
+    }
+    Mutation.Focus { id } => {
+      run byte(&mut out, OP_FOCUS)
+      run word(&mut out, id)
+    }
+    Mutation.Blur => {
+      run byte(&mut out, OP_BLUR)
+    }
+    Mutation.SetPointerCapture { id } => {
+      run byte(&mut out, OP_CAPTURE)
+      run word(&mut out, id)
+    }
+    Mutation.ReleasePointerCapture => {
+      run byte(&mut out, OP_RELEASE)
+    }
+    Mutation.ScrollTo { id, x, y } => {
+      run byte(&mut out, OP_SCROLL_TO)
+      run word(&mut out, id)
+      run float(&mut out, x)
+      run float(&mut out, y)
+    }
+    Mutation.ScrollIntoView { id } => {
+      run byte(&mut out, OP_SCROLL_INTO_VIEW)
+      run word(&mut out, id)
+    }
+    Mutation.DefineFontFamily { family, names } => {
+      run byte(&mut out, OP_FONT_FAMILY)
+      run word(&mut out, family)
+      run text(&mut out, names.ownedUtf8Bytes())
+    }
+    Mutation.SetGrid { id, value } => {
+      run byte(&mut out, OP_GRID)
+      run word(&mut out, id)
+      let mut css = Bytes.make()
+      run writeGrid(&mut css, &value)
+      run text(&mut out, css.asSlice())
+    }
+    Mutation.SetSource { id, resource } => {
+      run byte(&mut out, OP_SOURCE)
+      run word(&mut out, id)
+      run word(&mut out, resource)
+    }
+    Mutation.SetCanvas { id, commands } => {
+      run byte(&mut out, OP_CANVAS)
+      run word(&mut out, id)
+      let list = commands.asSlice()
+      run word(&mut out, usize.toU32(list.length))
+      let mut i: usize = 0
+      while i < list.length {
+        run writeCanvas(&mut out, list[i])
+        i = i + 1
+      }
+    }
+    Mutation.SetAnchor { id, target, options } => {
+      run byte(&mut out, OP_ANCHOR)
+      run word(&mut out, id)
+      run word(&mut out, target)
+      run float(&mut out, options.gap)
+      run float(&mut out, options.preferredHeight)
+      run flag(&mut out, options.alignEnd)
+      run flag(&mut out, options.matchWidth)
+    }
+    Mutation.ClearAnchor { id } => {
+      run byte(&mut out, OP_CLEAR_ANCHOR)
+      run word(&mut out, id)
+    }
+    Mutation.DefineImage { resource, data } => {
+      run byte(&mut out, OP_IMAGE)
+      run word(&mut out, resource)
+      run text(&mut out, data.asSlice())
+    }
+    Mutation.DefineIcon { resource, data } => {
+      run byte(&mut out, OP_ICON)
+      run word(&mut out, resource)
+      run text(&mut out, data.asSlice())
+    }
+    Mutation.ReleaseResource { resource } => {
+      run byte(&mut out, OP_RELEASE_RESOURCE)
+      run word(&mut out, resource)
+    }
+    _ => {
+      return false
+    }
+  }
+  return true
+}
+
+// Reading an event record.
+
+pub fn readByte(bytes: &[u8], at: &mut usize) -> u8 {
+  let value = bytes[at.*]
+  at.* = at.* + 1
+  return value
+}
+
+pub fn readWord(bytes: &[u8], at: &mut usize) -> u32 {
+  let i = at.*
+  at.* = i + 4
+  return u32.bitOr(
+    u32.bitOr(u8.toU32(bytes[i]), u32.shiftLeft(u8.toU32(bytes[i + 1]), 8)),
+    u32.bitOr(u32.shiftLeft(u8.toU32(bytes[i + 2]), 16), u32.shiftLeft(u8.toU32(bytes[i + 3]), 24)),
+  )
+}
+
+pub fn readFloat(bytes: &[u8], at: &mut usize) -> f32 {
+  return f32.fromBits(readWord(bytes, &mut at))
+}
+
+effect fn readText(bytes: &[u8], at: &mut usize) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let length = u32.toUsize(readWord(bytes, &mut at))
+  let start = at.*
+  at.* = start + length
+  return match run String.copyUtf8(Slice.view<u8>(bytes, start, length)) {
+    Result<String, InvalidUtf8>.Success { value } => move value
+    Result<String, InvalidUtf8>.Failure { .. } => String.make()
+  }
+}
+
+fn eventKind(code: u8) -> EventKind {
+  return match code {
+    0 => EventKind.PointerDown
+    1 => EventKind.PointerUp
+    2 => EventKind.Click
+    3 => EventKind.PointerMove
+    4 => EventKind.PointerEnter
+    5 => EventKind.PointerLeave
+    6 => EventKind.Wheel
+    7 => EventKind.KeyDown
+    8 => EventKind.KeyUp
+    9 => EventKind.Focus
+    10 => EventKind.Blur
+    11 => EventKind.Input
+    12 => EventKind.Scroll
+    13 => EventKind.Layout
+    14 => EventKind.PointerCancel
+    15 => EventKind.GotPointerCapture
+    _ => EventKind.LostPointerCapture
+  }
+}
+
+/// Reads the event record `js/silk-ui-dom.js` wrote into `bytes`.
+pub effect fn readEvent(bytes: &[u8]) -> Event
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut at: usize = 0
+  let kind = eventKind(readByte(bytes, &mut at))
+  let target = readWord(bytes, &mut at)
+  let count = readWord(bytes, &mut at)
+  let mut path = List<u32>.make()
+  let mut i: u32 = 0
+  while i < count {
+    run path.append(readWord(bytes, &mut at))
+    i = i + 1
+  }
+  let mut event = Event.make(kind, target, move path)
+  let left = readFloat(bytes, &mut at)
+  let top = readFloat(bytes, &mut at)
+  let width = readFloat(bytes, &mut at)
+  let height = readFloat(bytes, &mut at)
+  event.bounds = Rect<f32>.new(left, top, width, height)
+  event.x = readFloat(bytes, &mut at)
+  event.y = readFloat(bytes, &mut at)
+  event.modifiers = readWord(bytes, &mut at)
+  event.button = readWord(bytes, &mut at)
+  event.detail = readWord(bytes, &mut at)
+  event.deltaX = readFloat(bytes, &mut at)
+  event.deltaY = readFloat(bytes, &mut at)
+  event.repeat = readByte(bytes, &mut at) != 0
+  event.selectionStart = u32.toUsize(readWord(bytes, &mut at))
+  event.selectionEnd = u32.toUsize(readWord(bytes, &mut at))
+  event.key = run readText(bytes, &mut at)
+  event.code = run readText(bytes, &mut at)
+  event.value = run readText(bytes, &mut at)
+  event.inputType = run readText(bytes, &mut at)
+  return move event
+}
