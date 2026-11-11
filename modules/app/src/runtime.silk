@@ -10,7 +10,6 @@
 //! (`apply`), `Event` records out (`takeEvents`).
 import ui_protocol.css
 import ui_protocol.css { percent, Keyword, Declaration }
-import silk.geometry.rect { Rect }
 import app { App, Perform, Context, Subscriptions, SubscriptionKind, Delivery }
 import diff { DiffState, diff }
 import ui { Ui, Identity, AnchorRect, NO_ENTRY, ROOT_ID }
@@ -24,11 +23,11 @@ import ui_protocol.mutation {
 }
 import ui_protocol.record { Event, EventKind }
 import ui_tree.node { FrameInput }
-import ui_protocol.input { Input }
+import ui_protocol.input { Input, MOD_ALT, MOD_CONTROL, MOD_META }
 import ui_protocol.options { VirtualItem }
 import ui_tree.virtual_list { VirtualRange }
-import ui_tree.inspect { NodeInfo, info }
 import ui_tree.engine { UiTree, TreeError }
+import backend { Backend, Measured }
 import silk.collections.list { List }
 import silk.collections.hash_map { HashMap }
 import silk.collections.hash { Hash }
@@ -146,7 +145,7 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
 
   /// Creates the root box, renders the first view into `tree` and collects the first
   /// subscriptions. `time` is the clock the timers count from, in seconds.
-  pub effect fn start(self: &mut Self, tree: &mut UiTree<'_>, time: f64) -> ()
+  pub effect fn start<B: Backend>(self: &mut Self, tree: &mut B, time: f64) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
     self.time = time
@@ -162,7 +161,7 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
       Mutation.SetStyle { id: ROOT_ID, state: StyleState.Base, declarations: move style },
     )
     run batch.append(Mutation.SetRoot { id: ROOT_ID })
-    run tree.apply(move batch)
+    run Backend.mutate(&mut tree, move batch)
     self.started = true
     run self.render(&mut tree)
   }
@@ -178,11 +177,11 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
   }
 
   /// Renders the view into `tree`: the diff against the last render goes in as one batch.
-  pub effect fn render(self: &mut Self, tree: &mut UiTree<'_>) -> ()
+  pub effect fn render<B: Backend>(self: &mut Self, tree: &mut B) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
     run self.collectSubscriptions()
-    run self.readAnchors(&tree)
+    run self.readAnchors(&mut tree)
     run self.ui.beginRender()
     App<M, C>.view(&self.model, &mut self.ui)
     self.ui.endRender()
@@ -253,18 +252,19 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
     // Transfer the batch in constant time. Removing its first mutation repeatedly
     // shifts the remaining array and makes mounting a large view quadratic.
     let batch = Intrinsic.replace(self.batch, List<Mutation>.make())
-    run tree.apply(move batch)
+    run Backend.mutate(&mut tree, move batch)
   }
 
   /// Reconciles backend range requests with the virtual view. The tree owns geometry.
-  pub effect fn syncVirtual(self: &mut Self, tree: &mut UiTree<'_>) -> bool
+  pub effect fn syncVirtual<B: Backend>(self: &mut Self, tree: &mut B) -> bool
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
     let mut changed = false
     let mut v: usize = 0
     while v < self.ui.virtualLists.length() {
       let list = &mut self.ui.virtualLists.asMutSlice()[v]
-      if let Option<VirtualRange>.Some { value } = tree.virtualRange(
+      if let Option<VirtualRange>.Some { value } = Backend.range(
+        &tree,
         self.ui.arena.entry(list.port).id,
       ) {
         if value.first != list.first || value.end != list.end || value.pinned != list.pinned {
@@ -288,27 +288,25 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
 
   /// Reads the layout boxes of the last render's anchored nodes (`ui.anchor`) from `tree`, for
   /// `ui.anchorRect` in the next pass.
-  pub effect fn readAnchors(self: &mut Self, tree: &UiTree<'_>) -> ()
+  pub effect fn readAnchors<B: Backend>(self: &mut Self, tree: &mut B) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
-    self.ui.viewportBounds = Rect<f32>.new(0.0, 0.0, tree.input.width, tree.input.height)
+    self.ui.viewportBounds = Backend.viewport(&tree)
     self.ui.anchors.clear()
     let count = self.ui.arena.length()
     let mut i: u32 = 0
     while i < count {
       let entry = self.ui.arena.entry(i)
       if entry.hasAnchor && entry.id != 0 {
-        if let Option<NodeInfo>.Some { value: node } = run info(tree, entry.id) {
-          if node.laidOut {
-            let anchor = AnchorRect {
-              key: entry.anchor,
-              rect: node.bounds,
-              pressed: node.pressed,
-              hovered: node.hovered,
-              focused: node.focused,
-            }
-            run self.ui.anchors.append(anchor)
+        if let Option<Measured>.Some { value: node } = run Backend.measure(&tree, entry.id) {
+          let anchor = AnchorRect {
+            key: entry.anchor,
+            rect: node.bounds,
+            pressed: node.pressed,
+            hovered: node.hovered,
+            focused: node.focused,
           }
+          run self.ui.anchors.append(anchor)
         }
       }
       i = i + 1
@@ -437,6 +435,9 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
     if ids.length == 0 || ids[0] != ROOT_ID {
       return ()
     }
+
+    // Whether the record's target is a text input: the keys it types are not key bindings.
+    let mut typing = false
     let mut i: usize = 1
     while i < ids.length {
       let entry = self.diffState.entryOf(ids[i])
@@ -444,6 +445,7 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
         return ()
       }
       run self.path.append(self.ui.arena.entry(entry).identity)
+      typing = isTextInput(self.ui.arena.entry(entry).kind)
       i = i + 1
     }
     let isKey = record.kind == EventKind.KeyDown
@@ -468,6 +470,7 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
       while j < list.length {
         let binding = list[j]
         if binding.kind == SubscriptionKind.KeyBinding && binding.modifiers == modifiers
+          && (!typing || bindsWhileTyping(modifiers, name.asSlice()))
           && same(self.subscriptions.keyName(binding), name.asSlice()) {
           run matched.append(binding.key)
         }
@@ -489,11 +492,31 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
   }
 }
 
+fn isTextInput(kind: NodeKind) -> bool {
+  match kind {
+    NodeKind.Input => {
+      return true
+    }
+    _ => {
+      return false
+    }
+  }
+}
+
+/// Whether a key binding fires while a text input has focus: only a chord with Control, Alt
+/// or Meta, or Escape. Every other key belongs to the input.
+fn bindsWhileTyping(modifiers: u32, name: &[u8]) -> bool {
+  if u32.bitAnd(modifiers, MOD_CONTROL + MOD_ALT + MOD_META) != 0 {
+    return true
+  }
+  return same(name, b"Escape")
+}
+
 /// Handles every queued message: update, then each command's message in turn. Renders once
 /// the queue is empty, if anything was handled.
-pub effect fn drain<A: App<M, C>, M, C: Perform<M, E, R>, E, ? R>(
+pub effect fn drain<A: App<M, C>, M, C: Perform<M, E, R>, E, B: Backend, ? R>(
   runtime: &mut Runtime<A, M, C>,
-  tree: &mut UiTree<'_>,
+  tree: &mut B,
 ) -> ()
   ! E | TreeError | OutOfMemoryError
   ? R | &mut Allocator {
@@ -545,18 +568,18 @@ pub effect fn feed<A: App<M, C>, M, C: Perform<M, E, R>, E, ? R>(
 
 /// Takes the tree's event records and handles them one at a time: dispatch, update, render.
 /// Returns whether any record was handled.
-pub effect fn pump<A: App<M, C>, M, C: Perform<M, E, R>, E, ? R>(
+pub effect fn pump<A: App<M, C>, M, C: Perform<M, E, R>, E, B: Backend, ? R>(
   runtime: &mut Runtime<A, M, C>,
-  tree: &mut UiTree<'_>,
+  tree: &mut B,
 ) -> bool
   ! E | TreeError | OutOfMemoryError
   ? R | &mut Allocator {
   runtime.records.clear()
-  run tree.takeEvents(&mut runtime.records)
+  run Backend.events(&mut tree, &mut runtime.records)
   let handled = runtime.records.length() != 0
   while runtime.records.length() != 0 {
     let record = runtime.records.remove(0)
-    run runtime.readAnchors(&tree)
+    run runtime.readAnchors(&mut tree)
     run runtime.dispatch(move record)
     run drain(&mut runtime, &mut tree)
   }
@@ -566,9 +589,9 @@ pub effect fn pump<A: App<M, C>, M, C: Perform<M, E, R>, E, ? R>(
 
 /// Moves the clock to `now` (seconds): fires the timers that are due and, when `frame` is
 /// true, the animation frame subscriptions, then handles their messages.
-pub effect fn tick<A: App<M, C>, M, C: Perform<M, E, R>, E, ? R>(
+pub effect fn tick<A: App<M, C>, M, C: Perform<M, E, R>, E, B: Backend, ? R>(
   runtime: &mut Runtime<A, M, C>,
-  tree: &mut UiTree<'_>,
+  tree: &mut B,
   now: f64,
   frame: bool,
 ) -> ()
@@ -628,9 +651,9 @@ pub effect fn tick<A: App<M, C>, M, C: Perform<M, E, R>, E, ? R>(
 }
 
 /// Tells resize subscriptions the viewport is now `width` by `height` CSS pixels.
-pub effect fn resize<A: App<M, C>, M, C: Perform<M, E, R>, E, ? R>(
+pub effect fn resize<A: App<M, C>, M, C: Perform<M, E, R>, E, B: Backend, ? R>(
   runtime: &mut Runtime<A, M, C>,
-  tree: &mut UiTree<'_>,
+  tree: &mut B,
   width: f32,
   height: f32,
 ) -> ()

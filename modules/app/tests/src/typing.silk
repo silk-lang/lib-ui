@@ -1,0 +1,98 @@
+//! Key bindings and a focused text input: the keys the input types are not bindings.
+import ui_app.lib { Document, NoCommand, NoOutput, Node, Program, Subscriptions, Update }
+import ui_app.program as program
+import ui_app.harness { click, press }
+import ui_tree.legacy { UiTree, TreeError, FrameInput, MOD_CONTROL }
+import ui_fixtures.fixtures as fixtures
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+struct Search {
+  draft: String,
+  hits: i64,
+  closed: bool,
+}
+
+union SearchMessage {
+  Changed { value: String },
+  Hit,
+  Closed,
+}
+
+type Next = Update<Search, NoCommand, NoOutput>
+
+impl Program<SearchMessage, NoCommand> for Search {
+  effect fn init() -> Next
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return Next.of(Search { draft: String.make(), hits: 0, closed: false })
+  }
+
+  effect fn update(mut model: Search, message: SearchMessage) -> Next
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match move message {
+      SearchMessage.Changed { value } => {
+        model.draft = move value
+      }
+      SearchMessage.Hit => {
+        model.hits = model.hits + 1
+      }
+      SearchMessage.Closed => {
+        model.closed = true
+      }
+    }
+    return Next.of(move model)
+  }
+
+  fn view(model: &Search, h: &Document<SearchMessage>) -> Node {
+    return h.column(
+      &[],
+      &[
+        h.input(
+          String.view(&model.draft),
+          &[h.label("Search"), h.onInput(|value| SearchMessage.Changed { value: move value })],
+        ),
+        h.number(model.hits),
+      ],
+    )
+  }
+
+  fn subscriptions(model: &Search, subs: &mut Subscriptions<SearchMessage>) -> () {
+    subs.keyBinding(1, "k", 0, || SearchMessage.Hit)
+    subs.keyBinding(2, "k", MOD_CONTROL, || SearchMessage.Hit)
+    subs.keyBinding(3, "Escape", 0, || SearchMessage.Closed)
+  }
+}
+
+fn viewport() -> FrameInput {
+  return FrameInput { width: 360.0, height: 360.0, scale: 1.0, time: 0.0 }
+}
+
+effect fn typingBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  let mut app = run program.make<Search, SearchMessage, NoCommand>()
+  run app.start(&mut tree, 0.0)
+
+  run press(&mut app, &mut tree, viewport(), "k", 0)
+  run Testing.expect(app.model.value.hits == 1, "a plain key is a binding with no input focused")
+
+  run Testing.expect(run click(&mut app, &mut tree, viewport(), "Search"), "the input is there")
+  run press(&mut app, &mut tree, viewport(), "k", 0)
+  run Testing.expect(app.model.value.hits == 1, "a plain key in a focused input is the input's")
+  run press(&mut app, &mut tree, viewport(), "k", MOD_CONTROL)
+  run Testing.expect(app.model.value.hits == 2, "a chord still fires")
+  run press(&mut app, &mut tree, viewport(), "Escape", 0)
+  run Testing.expect(app.model.value.closed, "and so does Escape")
+}
+
+test effect fn keyBindingsWaitWhileTyping() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run typingBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
