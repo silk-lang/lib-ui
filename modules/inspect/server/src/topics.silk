@@ -7,7 +7,8 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.u32
 import silk.num.usize
 
-/// The tree changed: nodes, their text, styles or geometry (the tree's `semanticRevision`).
+/// The tree changed: nodes, their text, styles or geometry (the revisions of the roots shown,
+/// see [`shownRevision`]).
 pub const TOPIC_TREE: u32 = 1
 
 /// A frame was drawn.
@@ -60,7 +61,7 @@ const NEVER: u64 = 18446744073709551615
 /// What was last published for each topic, and the flags the protocol sets for the changes the
 /// tree does not count itself.
 pub struct Changes {
-  /// The tree's `semanticRevision` last published.
+  /// The shown roots' revision last published (see [`shownRevision`]).
   revision: u64,
   /// The frame last published.
   frame: u64,
@@ -93,13 +94,21 @@ impl Changes {
   }
 
   /// The topics among `wanted` that changed since they were last published and were not
-  /// published in this frame yet, marked published now. `nextSeq` is the event log's.
-  pub effect fn take(self: &mut Self, tree: &UiTree<'_>, nextSeq: u64, wanted: u32) -> u32
+  /// published in this frame yet, marked published now. `nextSeq` is the event log's; the
+  /// roots in `hidden` are not the inspector's to show, so their changes are not news.
+  pub effect fn take(
+    self: &mut Self,
+    tree: &UiTree<'_>,
+    hidden: &[u32],
+    nextSeq: u64,
+    wanted: u32,
+  ) -> u32
     ! OutOfMemoryError
     ? &mut Allocator {
     let frame = tree.stats.frame
+    let revision = run shownRevision(tree, hidden)
     let mut changed: u32 = 0
-    if tree.semanticRevision != self.revision {
+    if revision != self.revision {
       changed = changed | TOPIC_TREE
     }
     if frame != self.frame {
@@ -116,7 +125,7 @@ impl Changes {
     }
     let mut roots = List<u32>.make()
     if u32.bitAnd(wanted, TOPIC_ROOTS) != 0 {
-      run rootPairs(tree, &mut roots)
+      run rootPairs(tree, hidden, &mut roots)
       if !same(roots.asSlice(), self.roots.asSlice()) {
         changed = changed | TOPIC_ROOTS
       }
@@ -135,7 +144,7 @@ impl Changes {
       i = i + 1
     }
     if u32.bitAnd(changed, TOPIC_TREE) != 0 {
-      self.revision = tree.semanticRevision
+      self.revision = revision
     }
     if u32.bitAnd(changed, TOPIC_FRAME) != 0 {
       self.frame = frame
@@ -156,8 +165,9 @@ impl Changes {
   }
 }
 
-/// The open roots of `tree` as (root, node) pairs, the current one first.
-pub effect fn rootPairs(tree: &UiTree<'_>, out: &mut List<u32>) -> ()
+/// The open roots of `tree` but those in `hidden`, as (root, node) pairs, the current one
+/// first.
+pub effect fn rootPairs(tree: &UiTree<'_>, hidden: &[u32], out: &mut List<u32>) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   let mut roots = List<u32>.make()
@@ -166,10 +176,44 @@ pub effect fn rootPairs(tree: &UiTree<'_>, out: &mut List<u32>) -> ()
   let list = roots.asSlice()
   let mut i: usize = 0
   while i < list.length {
-    run out.append(list[i])
-    run out.append(tree.rootNode(list[i]))
+    if !contains(hidden, list[i]) {
+      run out.append(list[i])
+      run out.append(tree.rootNode(list[i]))
+    }
     i = i + 1
   }
+}
+
+/// The revision of what the inspector shows of `tree`: the sum of the revisions of its open
+/// roots but those in `hidden` (`UiTree.revisionOf`). A change to a hidden root, such as
+/// devtools drawing in the app's own tree, leaves it as it was.
+pub effect fn shownRevision(tree: &UiTree<'_>, hidden: &[u32]) -> u64
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut roots = List<u32>.make()
+  run tree.openRoots(&mut roots)
+  let list = roots.asSlice()
+  let mut sum: u64 = 0
+  let mut i: usize = 0
+  while i < list.length {
+    if !contains(hidden, list[i]) {
+      sum = sum + tree.revisionOf(list[i])
+    }
+    i = i + 1
+  }
+  return sum
+}
+
+/// Whether `values` holds `value`.
+pub fn contains(values: &[u32], value: u32) -> bool {
+  let mut i: usize = 0
+  while i < values.length {
+    if values[i] == value {
+      return true
+    }
+    i = i + 1
+  }
+  return false
 }
 
 fn same(a: &[u32], b: &[u32]) -> bool {
