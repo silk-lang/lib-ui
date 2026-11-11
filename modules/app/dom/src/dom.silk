@@ -2,8 +2,9 @@
 //! `js/silk-ui-dom.js` as one buffer; the events it hears come back one record at a time.
 import wire { writeMutation, readEvent, readByte, readFloat }
 import ui_app.backend { Backend, Measured, TreeError }
-import ui_protocol.mutation { Mutation }
+import ui_protocol.mutation { Mutation, FIRST_ROOT }
 import ui_protocol.record { Event }
+import ui_protocol.root { RootEvent, RootEventKind, RootSupport }
 import silk.collections.bytes { Bytes }
 import silk.collections.list { List }
 import silk.collections.slice { Slice }
@@ -60,6 +61,7 @@ pub struct Dom {
   width: f32,
   height: f32,
   waiting: List<Event>,
+  rootsWaiting: List<RootEvent>,
 }
 
 impl Dom {
@@ -71,6 +73,7 @@ impl Dom {
       width: 0.0,
       height: 0.0,
       waiting: List<Event>.make(),
+      rootsWaiting: List<RootEvent>.make(),
     }
   }
 
@@ -126,7 +129,22 @@ impl Backend for Dom {
     let list = batch.asSlice()
     let mut i: usize = 0
     while i < list.length {
-      if !run writeMutation(&mut self.out, &list[i]) {
+      // The document shows the mounted element only: another root fails, and there is
+      // nothing to close for it.
+      let mut other = false
+      match &list[i] {
+        Mutation.OpenRoot { root, .. } => {
+          if root != FIRST_ROOT {
+            other = true
+            run self.rootsWaiting.append(RootEvent { root: root, kind: RootEventKind.Failed })
+          }
+        }
+        Mutation.CloseRoot { root } => {
+          other = root != FIRST_ROOT
+        }
+        _ => {}
+      }
+      if !other && !run writeMutation(&mut self.out, &list[i]) {
         self.dropped = self.dropped + 1
       }
       i = i + 1
@@ -145,8 +163,22 @@ impl Backend for Dom {
     }
   }
 
-  fn viewport(self: &Self) -> Rect<f32> {
+  effect fn rootEvents(self: &mut Self, out: &mut List<RootEvent>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run out.appendSlice(self.rootsWaiting.asSlice())
+    self.rootsWaiting.clear()
+  }
+
+  fn viewport(self: &Self, root: u32) -> Rect<f32> {
+    if root != FIRST_ROOT {
+      return Rect<f32>.new(0.0, 0.0, 0.0, 0.0)
+    }
     return Rect<f32>.new(0.0, 0.0, self.width, self.height)
+  }
+
+  fn roots(self: &Self) -> RootSupport {
+    return RootSupport.single()
   }
 
   fn navigate(self: &mut Self, path: string) -> () {

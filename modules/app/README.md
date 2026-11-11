@@ -239,6 +239,17 @@ Views, the diff and the element model (`ui`, `diff`, `equal`, `virtual_list`) im
 `runtime` and `harness` hold a `ui-tree`, so another host that speaks the protocol needs its
 own runtime and nothing else.
 
+## Backends
+
+The runtime drives a `Backend` (`backend.silk`): `mutate` takes a render's batch, `events` gives
+element records back, and `measure`, `range` and `navigate` answer the view and the shell. A
+backend says what roots it shows with `roots()` (a `RootSupport`: how many, and what a root past
+the first becomes), gives each root's viewport with `viewport(root)`, and hands out root events
+with `rootEvents`. `UiTree` shows any number of roots, one under the native window host; `Dom`
+and `Html` show the first only and answer an `OpenRoot` for another with a `Failed` root event.
+A program renders into the first root: `Runtime.start` opens it with the runtime's root box,
+records whose path starts elsewhere are dropped, and root events are taken and dropped.
+
 ## Limits
 
 - `runWindow` performs commands synchronously. For native workers, use deferred commands and

@@ -446,7 +446,11 @@ class Page {
           break;
         }
         case 11: {
-          this.rootId = r.u32();
+          // Only the first root is sent: the program answers any other itself.
+          const root = r.u32();
+          const id = r.u32();
+          if (root !== 0) break;
+          this.rootId = id;
           const node = this.nodes.get(this.rootId);
           if (node.parentNode === this.root) {
             for (const other of [...this.root.childNodes]) if (other !== node) other.remove();
@@ -549,6 +553,13 @@ class Page {
             if (this.made.has(key)) URL.revokeObjectURL(this.made.get(key));
             this.made.delete(key);
           }
+          break;
+        }
+        case 27: {
+          // The first root closes: the mounted element shows nothing.
+          if (r.u32() !== 0) break;
+          this.nodes.get(this.rootId)?.remove();
+          this.rootId = 0;
           break;
         }
         default:

@@ -43,8 +43,9 @@ let records = run tree.events()
   and `CanvasNode`. The kind is in the type, so appending to a text node or setting the text of
   a box does not compile. Every handle has an `id()`, a `NodeId`, which is what events and
   queries name nodes by; `BoxNode.of(id)` and the others turn an id back into a handle.
-- **Structure**: `setRoot`, `append`, `insertBefore`, `remove` (detach, can be appended again)
-  and `destroy` (free the subtree). A child already in the tree moves, as in the DOM.
+- **Structure**: `setRoot` (opens the first root, see [Roots](#roots)), `append`,
+  `insertBefore`, `remove` (detach, can be appended again) and `destroy` (free the subtree). A
+  child already in the tree moves, as in the DOM.
 - **Style** is a list of CSS declarations built with `ui_tree.css` (`css.width(px(120.0))`,
   `css.display(Keyword.Flex)`), values as written: `setStyle` for the base look, `setStyleFor`
   with a `StyleState` for hover, active, focus and focus-visible, and `clearStyle`. Text
@@ -94,11 +95,40 @@ run tree.apply(run batch.take())
   the `TreeError`; the mutations before it stay applied.
 - `Mutation` (`mutation.silk`) has one variant for each thing a direct call does: `Create`,
   `InsertBefore`, `Remove`, `Destroy`, `SetStyle`, `ClearStyle`, `SetText`, `SetAttribute`,
-  `SetSelection`, `SetListeners`, `SetRoot`, `Focus`, `Blur`, `ScrollTo`, `ScrollIntoView`,
-  `SetSource`, `SetCanvas`, `SetGrid`, the virtual list and anchor mutations, and the resource
-  definitions.
+  `SetSelection`, `SetListeners`, `OpenRoot`, `UpdateRoot`, `CloseRoot`, `Focus`, `Blur`,
+  `ScrollTo`, `ScrollIntoView`, `SetSource`, `SetCanvas`, `SetGrid`, the virtual list and anchor
+  mutations, and the resource definitions.
 - Direct calls and protocol ids can share one tree: `NodeId.of(7)` names the client's node 7,
   and a node made with `tree.box` takes a number that is not in use.
+
+## Roots
+
+A tree holds several roots: top-level trees with ids the client chooses, in one node id space
+and with one glyph atlas and font set. `Mutation.OpenRoot { root, node, options }` opens one
+(`Batch.root(id)` and `tree.setRoot(node)` open the first, `FIRST_ROOT`, with default options),
+`UpdateRoot` replaces its `RootOptions` (title, requested size and position, resizable, parent
+root, kind) and `CloseRoot` detaches its node. Options are requests; the tree keeps them for the
+host. The tree never closes a root by itself.
+
+In the engine (`UiTree`) one root at a time is current: `frame`, `scene`, `hitTest`, the
+geometry queries and pointer input are about it, and the other open roots are parked with their
+own layout, scenes, focus, hover, press and viewport. `useRoot(root)` makes a root current,
+`frameRoot(root, input)` frames one in its own viewport, and `dispatchTo(root, input)` and
+`beginAt(root, input)` aim pointer input at one. Key and text input go to `keyRoot`, the first
+root until a host reports another `Focused`. `Focus` and the other mutations about one node
+switch to that node's root first; `Blur` blurs the key root. `openRoots`, `rootOpen`,
+`rootNode` and `rootViewport` answer for any root. Changing the current root lays out and
+paints the new one in full at its next frame; with one root nothing changes.
+
+Element events need no root: the first id of their path is the root's node. What happens to a
+root itself comes as a `RootEvent` (`ui_protocol.root`): `CloseRequested`, `Resized`, `Focused`,
+`Blurred`, `ScaleChanged`, `AppearanceChanged` and `Failed`. A host reports them with
+`reportRoot(root, kind)` and the client drains them with `takeRootEvents`; a waiting event is
+replaced by a later one of the same kind for the same root, so the queue stays short when
+nobody drains it. `rootSupport` says how many roots the tree shows (any number of headless
+surfaces by default); a root past it fails with `Failed` and stays closed. The native window
+host shows the first root only, sets `RootSupport.single()`, and reports its window's resize,
+scale, focus, appearance and close requests as root 0.
 
 ## Moving from the old API
 
