@@ -1,13 +1,14 @@
-//! What devtools do beyond looking: edit a node's styles while the app runs, and audit the
-//! tree for what a person using it would trip over.
+//! What devtools do beyond looking: edit a node's styles while the app runs (through the
+//! tree's override layer, `UiTree.setOverride`), and audit the tree for what a person using it
+//! would trip over.
 import nodes { nodeMembers }
-import reply { begin, finish, putKey, putText, putInt, failure, writeString }
+import reply { begin, finish, putKey, putInt, failure, writeString }
 import ui_inspect.query { accessibleName, visible }
 import ui_inspect.view { writeDeclaration }
-import ui_tree.css { Declaration, cloneDeclaration }
-import ui_tree.engine { UiTree, TreeError }
+import ui_tree.css { Declaration, cloneDeclaration, set }
+import ui_tree.engine { UiTree, StyleOverride }
 import ui_tree.inspect { info, NodeInfo, writeNumber }
-import ui_tree.mutation { Mutation, NodeKind, Role, StyleState, LISTEN_CLICK, NOT_FOCUSABLE }
+import ui_tree.mutation { NodeKind, Role, StyleState, LISTEN_CLICK, NOT_FOCUSABLE }
 import ui_tree.node { NONE, Node }
 import ui_tree.style { Fill }
 import css_style.tokens { CssError }
@@ -21,6 +22,7 @@ import silk.json.value { Value }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.f32
 import silk.num.u32
+import silk.num.u64
 import silk.num.usize
 import silk.text.string { String }
 
@@ -67,7 +69,8 @@ pub fn stateName(state: StyleState) -> string<'static> {
   }
 }
 
-fn patchOf(node: &Node, state: StyleState) -> &List<Declaration> {
+/// The declarations the client set on `node` for `state`.
+pub fn patchOf(node: &Node, state: StyleState) -> &List<Declaration> {
   return match state {
     StyleState.Base => &node.base
     StyleState.Hover => &node.hover
@@ -76,6 +79,15 @@ fn patchOf(node: &Node, state: StyleState) -> &List<Declaration> {
     StyleState.FocusVisible => &node.focusVisible
   }
 }
+
+/// Every state, in the order replies list them.
+pub const STATES: [StyleState; 5] = [
+  StyleState.Base,
+  StyleState.Hover,
+  StyleState.Active,
+  StyleState.Focus,
+  StyleState.FocusVisible,
+]
 
 effect fn copied(list: &List<Declaration>) -> List<Declaration>
   ! OutOfMemoryError
@@ -90,133 +102,212 @@ effect fn copied(list: &List<Declaration>) -> List<Declaration>
   return move out
 }
 
-/// The declarations a node had in one state before the inspector first edited them.
-struct Original {
-  id: u32,
-  state: StyleState,
-  declarations: List<Declaration>,
-}
-
-/// The style edits made through the inspector, so they can be taken back.
-pub struct StyleEdits {
-  originals: List<Original>,
-}
-
-impl StyleEdits {
-  pub fn make() -> StyleEdits {
-    return StyleEdits { originals: List<Original>.make() }
-  }
-
-  /// How many (node, state) pairs are edited.
-  pub fn count(self: &Self) -> usize {
-    return self.originals.length()
-  }
-
-  effect fn remember(self: &mut Self, tree: &UiTree<'_>, id: u32, state: StyleState) -> ()
-    ! OutOfMemoryError
-    ? &mut Allocator {
-    let known = self.originals.asSlice()
-    let mut i: usize = 0
-    while i < known.length {
-      if known[i].id == id && known[i].state == state {
-        return ()
-      }
-      i = i + 1
-    }
-    let node = tree.node(tree.slotOf(id))
-    run self.originals.append(
-      Original { id: id, state: state, declarations: run copied(patchOf(node, state)) },
-    )
-  }
-
-  /// setStyle: parses `css` (`"width: 10px; color: red"`) and sets it on node `id` for
-  /// `state`, over what the node has, or instead of it with `replace`. Writes the reply.
-  pub effect fn apply(
-    self: &mut Self,
-    tree: &mut UiTree<'_>,
-    request: &Value,
-    id: u32,
-    state: StyleState,
-    css: string,
-    replace: bool,
-    out: &mut String,
-  ) -> bool
-    ! OutOfMemoryError
-    ? &mut Allocator {
-    let parsed = run Effect.result(written.declarations(String.utf8Bytes(css)))
-    let declarations = match move parsed {
-      Result<List<Declaration>, CssError | OutOfMemoryError>.Success { value } => move value
-      Result<List<Declaration>, CssError | OutOfMemoryError>.Failure { error } => {
-        drop error
-        run failure(&mut out, request, "the style does not parse")
-        return false
-      }
-    }
-    if declarations.length() == 0 && !replace && String.byteLength(css) != 0 {
-      run failure(&mut out, request, "the style has no declaration the tree knows")
-      return false
-    }
-    run self.remember(&tree.*, id, state)
-    let mut batch = List<Mutation>.make()
-    if replace {
-      run batch.append(Mutation.ClearStyle { id: id, state: state })
-    }
-    run batch.append(Mutation.SetStyle { id: id, state: state, declarations: move declarations })
-    if !run applied(&mut tree, move batch) {
-      run failure(&mut out, request, "the tree refused the style")
-      return false
-    }
-    run begin(&mut out, request)
-    run putInt(&mut out, "node", u32.toU64(id))
-    run putText(&mut out, "state", stateName(state))
-    run putKey(&mut out, "style")
-    run declarationTexts(patchOf(tree.node(tree.slotOf(id)), state), &mut out)
-    run putInt(&mut out, "edited", usize.toU64(self.originals.length()))
-    run finish(&mut out)
-    return true
-  }
-
-  /// resetStyles: puts back what every edited node had. Nodes that are gone are skipped.
-  /// Returns how many (node, state) pairs it restored.
-  pub effect fn reset(self: &mut Self, tree: &mut UiTree<'_>) -> usize
-    ! OutOfMemoryError
-    ? &mut Allocator {
-    let mut restored: usize = 0
-    while true {
-      let original = match self.originals.pop() {
-        Option<Original>.Some { value } => move value
-        Option<Original>.None => {
-          break
-        }
-      }
-      let Original { id, state, declarations } = move original
-      if !tree.contains(id) {
-        continue
-      }
-      let mut batch = List<Mutation>.make()
-      run batch.append(Mutation.ClearStyle { id: id, state: state })
-      run batch.append(Mutation.SetStyle { id: id, state: state, declarations: move declarations })
-      if run applied(&mut tree, move batch) {
-        restored = restored + 1
-      }
-    }
-    return restored
-  }
-}
-
-effect fn applied(tree: &mut UiTree<'_>, batch: List<Mutation>) -> bool
+/// The declarations node `id` shows in `state`: what its client set, with the inspector's
+/// override laid over them as the tree lays it.
+pub effect fn shown(tree: &UiTree<'_>, id: u32, state: StyleState) -> List<Declaration>
   ! OutOfMemoryError
   ? &mut Allocator {
-  return match run Effect.result(tree.apply(move batch)) {
-    Result<(), TreeError | OutOfMemoryError>.Success { value: _ } => true
-    Result<(), TreeError | OutOfMemoryError>.Failure { error } => {
+  let client = patchOf(tree.node(tree.slotOf(id)), state)
+  return match tree.overrideOf(id, state) {
+    Option<&StyleOverride>.Some { value } => {
+      let mut merged = if value.replace {
+        List<Declaration>.make()
+      } else {
+        run copied(client)
+      }
+      let items = value.declarations.asSlice()
+      let mut i: usize = 0
+      while i < items.length {
+        run set(&mut merged, &items[i])
+        i = i + 1
+      }
+      move merged
+    }
+    Option<&StyleOverride>.None => run copied(client)
+  }
+}
+
+/// The declarations of `css` (`"width: 10px; color: red"`), or None with the failure written
+/// to `out`: text that does not parse, or names nothing the tree knows (empty text is none,
+/// which `replace` may set).
+pub effect fn parseStyle(css: string, replace: bool, request: &Value, out: &mut String) -> Option<
+  List<Declaration>
+>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let parsed = run Effect.result(written.declarations(String.utf8Bytes(css)))
+  let declarations = match move parsed {
+    Result<List<Declaration>, CssError | OutOfMemoryError>.Success { value } => move value
+    Result<List<Declaration>, CssError | OutOfMemoryError>.Failure { error } => {
       drop error
-      false
+      run failure(&mut out, request, "the style does not parse")
+      return Option<List<Declaration>>.None
+    }
+  }
+  if declarations.length() == 0 && !replace {
+    run failure(
+      &mut out,
+      request,
+      if String.byteLength(css) == 0 {
+        "the style is empty"
+      } else {
+        "the style has no declaration the tree knows"
+      },
+    )
+    return Option<List<Declaration>>.None
+  }
+  return Option<List<Declaration>>.some(move declarations)
+}
+
+/// Lays `declarations` over node `id` in `state` through the tree's override layer: each set
+/// into the node's override there as `css.set` would, or the override made of them alone and
+/// replacing the client's declarations, with `replace`. The client's own declarations stay as
+/// it set them underneath. Returns false when there is no such node.
+pub effect fn layOver(
+  tree: &mut UiTree<'_>,
+  id: u32,
+  state: StyleState,
+  declarations: &List<Declaration>,
+  replace: bool,
+) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut list = List<Declaration>.make()
+  let mut replacing = replace
+  if !replace {
+    if let Option<&StyleOverride>.Some { value } = tree.overrideOf(id, state) {
+      list = run copied(&value.declarations)
+      replacing = value.replace
+    }
+  }
+  let items = declarations.asSlice()
+  let mut i: usize = 0
+  while i < items.length {
+    run set(&mut list, &items[i])
+    i = i + 1
+  }
+  return run tree.setOverride(id, state, move list, replacing)
+}
+
+/// Takes the declaration of `property` (a property name, as `parts` writes it) out of node
+/// `id`'s override in `state`, so the client's own shows again there. Returns whether the
+/// override had it.
+pub effect fn dropProperty(
+  tree: &mut UiTree<'_>,
+  id: u32,
+  state: StyleState,
+  property: string,
+) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut kept = List<Declaration>.make()
+  let mut replacing = false
+  let mut found = false
+  match tree.overrideOf(id, state) {
+    Option<&StyleOverride>.Some { value } => {
+      replacing = value.replace
+      let items = value.declarations.asSlice()
+      let mut name = String.make()
+      let mut text = String.make()
+      let mut i: usize = 0
+      while i < items.length {
+        run parts(&items[i], &mut name, &mut text)
+        if String.view(&name) == property {
+          found = true
+        } else {
+          run kept.append(run cloneDeclaration(&items[i]))
+        }
+        i = i + 1
+      }
+    }
+    Option<&StyleOverride>.None => {
+      return false
+    }
+  }
+  if found {
+    drop run tree.setOverride(id, state, move kept, replacing)
+  }
+  return found
+}
+
+/// Takes the overrides of node `id` away, in `state` alone when one is given. Returns how many
+/// (node, state) pairs show the client's declarations again.
+pub fn resetNode(tree: &mut UiTree<'_>, id: u32, state: Option<StyleState>) -> usize {
+  let mut restored: usize = 0
+  let mut k: usize = 0
+  while k < STATES.length {
+    let wanted = match state {
+      Option<StyleState>.Some { value } => value == STATES[k]
+      Option<StyleState>.None => true
+    }
+    if wanted && tree.clearOverride(id, STATES[k]) {
+      restored = restored + 1
+    }
+    k = k + 1
+  }
+  return restored
+}
+
+/// Takes every override away. Returns how many (node, state) pairs show the client's
+/// declarations again.
+pub effect fn resetAll(tree: &mut UiTree<'_>) -> usize
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut pairs = List<u64>.make()
+  let list = tree.styleOverrides()
+  let mut i: usize = 0
+  while i < list.length {
+    run pairs.append(u64.bitOr(u32.toU64(list[i].id), u64.shiftLeft(stateIndex(list[i].state), 32)))
+    i = i + 1
+  }
+  let mut restored: usize = 0
+  let mut j: usize = 0
+  while j < pairs.length() {
+    let pair = pairs.get(j)
+    let id = u64.toU32(u64.bitAnd(pair, 0xFFFFFFFF))
+    let state = STATES[u64.toUsize(u64.shiftRight(pair, 32))]
+    if tree.clearOverride(id, state) {
+      restored = restored + 1
+    }
+    j = j + 1
+  }
+  return restored
+}
+
+fn stateIndex(state: StyleState) -> u64 {
+  let mut k: usize = 0
+  while k < STATES.length {
+    if STATES[k] == state {
+      return usize.toU64(k)
+    }
+    k = k + 1
+  }
+  return 0
+}
+
+/// The property name and the value text of `declaration`, as CSS writes them (`padding-top`,
+/// `6px`).
+pub effect fn parts(declaration: &Declaration, name: &mut String, value: &mut String) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = String.make()
+  run writeDeclaration(&mut text, declaration)
+  name.clear()
+  value.clear()
+  let whole = String.view(&text)
+  match String.find(whole, ": ") {
+    Option<usize>.Some { value: colon } => {
+      run name.append(String.slice(whole, 0, colon))
+      run value.append(String.slice(whole, colon + 2, String.byteLength(whole) - colon - 2))
+    }
+    Option<usize>.None => {
+      run name.append(whole)
     }
   }
 }
 
-effect fn declarationTexts(list: &List<Declaration>, out: &mut String) -> ()
+/// Appends `list` as a JSON array of CSS texts.
+pub effect fn declarationTexts(list: &List<Declaration>, out: &mut String) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   run out.append("[")
@@ -235,23 +326,76 @@ effect fn declarationTexts(list: &List<Declaration>, out: &mut String) -> ()
   run out.append("]")
 }
 
-/// styles: the declarations node `id` has in each state, as text, for an editor to show.
+/// styles: the declarations node `id` shows in each state, as text, for an editor to show:
+/// what its client set with the inspector's overrides over them. For the states the inspector
+/// overrides, `overrides` has the override's declarations (and `replacing` the states whose
+/// override leaves the client's out) and `client` the client's own underneath.
 pub effect fn styles(tree: &UiTree<'_>, request: &Value, id: u32, out: &mut String) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
-  let node = tree.node(tree.slotOf(id))
   run begin(&mut out, request)
   run putInt(&mut out, "node", u32.toU64(id))
-  run putKey(&mut out, "base")
-  run declarationTexts(&node.base, &mut out)
-  run putKey(&mut out, "hover")
-  run declarationTexts(&node.hover, &mut out)
-  run putKey(&mut out, "active")
-  run declarationTexts(&node.active, &mut out)
-  run putKey(&mut out, "focus")
-  run declarationTexts(&node.focus, &mut out)
-  run putKey(&mut out, "focus-visible")
-  run declarationTexts(&node.focusVisible, &mut out)
+  let mut k: usize = 0
+  while k < STATES.length {
+    run putKey(&mut out, stateName(STATES[k]))
+    run declarationTexts(&run shown(tree, id, STATES[k]), &mut out)
+    k = k + 1
+  }
+  let node = tree.node(tree.slotOf(id))
+  let mut first = true
+  let mut replacing = List<string>.make()
+  k = 0
+  while k < STATES.length {
+    if let Option<&StyleOverride>.Some { value } = tree.overrideOf(id, STATES[k]) {
+      run out.append(
+        if first {
+          ",\"overrides\":{"
+        } else {
+          ","
+        },
+      )
+      first = false
+      run writeString(&mut out, stateName(STATES[k]))
+      run out.append(":")
+      run declarationTexts(&value.declarations, &mut out)
+      if value.replace {
+        run replacing.append(stateName(STATES[k]))
+      }
+    }
+    k = k + 1
+  }
+  if !first {
+    run out.append("},\"client\":{")
+    first = true
+    k = 0
+    while k < STATES.length {
+      if tree.overridden(id, STATES[k]) {
+        if !first {
+          run out.append(",")
+        }
+        first = false
+        run writeString(&mut out, stateName(STATES[k]))
+        run out.append(":")
+        run declarationTexts(patchOf(node, STATES[k]), &mut out)
+      }
+      k = k + 1
+    }
+    run out.append("}")
+    if replacing.length() != 0 {
+      run putKey(&mut out, "replacing")
+      run out.append("[")
+      let names = replacing.asSlice()
+      let mut n: usize = 0
+      while n < names.length {
+        if n > 0 {
+          run out.append(",")
+        }
+        run writeString(&mut out, names[n])
+        n = n + 1
+      }
+      run out.append("]")
+    }
+  }
   run finish(&mut out)
 }
 

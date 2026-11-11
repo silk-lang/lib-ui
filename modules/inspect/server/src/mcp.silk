@@ -53,7 +53,7 @@ const KNOWN_VERSIONS: [string<'static>; 4] = [
   "2025-11-25",
 ]
 
-const INSTRUCTIONS: string = r"""Inspects and drives a running Silk UI (ui-tree) app through its inspector socket. The app must be a debug build started with SILK_UI_INSPECT set (1 means silk-ui-inspect.sock in its working directory). Start with ui_snapshot to see the tree as text (kind, #id, role, label, text, rect), then target nodes by node id, role, name, label, text or testId. Text matches are trimmed, case-insensitive substrings and the first match in tree order wins. Input tools (ui_click, ui_type, ui_press, ui_scroll, ui_hover) wait for the app to draw its answer before the next call, so a snapshot right after a click shows the result; use ui_wait for slower changes. ui_screenshot returns a PNG. ui_frames times the frames, ui_set_style tries a style on a live node (ui_reset_styles takes it back) and ui_audit lists accessibility problems. The app's framework may add tools of its own, listed after these and named after it (<extension>_<command>); ui_status lists the extensions. Read them: they often say why the UI is in the state it is in."""
+const INSTRUCTIONS: string = r"""Inspects and drives a running Silk UI (ui-tree) app through its inspector socket. The app must be a debug build started with SILK_UI_INSPECT set (1 means silk-ui-inspect.sock in its working directory). Start with ui_snapshot to see the tree as text (kind, #id, role, label, text, rect), then target nodes by node id, role, name, label, text or testId. Text matches are trimmed, case-insensitive substrings and the first match in tree order wins. Input tools (ui_click, ui_type, ui_press, ui_scroll, ui_hover) wait for the app to draw its answer before the next call, so a snapshot right after a click shows the result; use ui_wait for slower changes. ui_screenshot returns a PNG. ui_frames times the frames, ui_set_style tries a style on a live node (ui_reset_styles takes it back) and ui_audit lists accessibility problems. Design changes people make in devtools (style edits and comments) wait in ui_edits: read the open ones, change the source so the app does what they ask, then mark them done with ui_resolve. The app's framework may add tools of its own, listed after these and named after it (<extension>_<command>); ui_status lists the extensions. Read them: they often say why the UI is in the state it is in."""
 
 /// The target members every node-picking tool takes.
 const TARGET: string = r"""
@@ -62,6 +62,18 @@ const TARGET: string = r"""
 "name":{"type":"string","description":"Accessible name: the label, or the text inside."},
 "label":{"type":"string","description":"The node's label attribute."},
 "text":{"type":"string","description":"Text content."},
+"testId":{"type":"string","description":"The node's testId attribute."},
+"within":{"type":"integer","description":"Only match inside this node's subtree."},
+"exact":{"type":"boolean","description":"Match whole values, with case, instead of substrings."},
+"hidden":{"type":"boolean","description":"Also match hidden nodes."}"""
+
+/// The target members of a tool whose `text` is its own (`ui_comment`): to match by text, put
+/// the target in `query`.
+const TARGET_BUT_TEXT: string = r"""
+"node":{"type":"integer","description":"The node's client id, the #id in a snapshot."},
+"role":{"type":"string","description":"ARIA role as the snapshot prints it: button, link, listitem, textbox, checkbox, heading, ..."},
+"name":{"type":"string","description":"Accessible name: the label, or the text inside."},
+"label":{"type":"string","description":"The node's label attribute."},
 "testId":{"type":"string","description":"The node's testId attribute."},
 "within":{"type":"integer","description":"Only match inside this node's subtree."},
 "exact":{"type":"boolean","description":"Match whole values, with case, instead of substrings."},
@@ -585,7 +597,7 @@ pub fn commandOf(name: string) -> string<'static> {
   return ""
 }
 
-const TOOLS: [string<'static>; 24] = [
+const TOOLS: [string<'static>; 27] = [
   "ui_status",
   "ui_snapshot",
   "ui_query",
@@ -610,9 +622,12 @@ const TOOLS: [string<'static>; 24] = [
   "ui_reset_styles",
   "ui_pick_mode",
   "ui_audit",
+  "ui_edits",
+  "ui_comment",
+  "ui_resolve",
 ]
 
-const COMMANDS: [string<'static>; 24] = [
+const COMMANDS: [string<'static>; 27] = [
   "hello",
   "snapshot",
   "query",
@@ -637,6 +652,9 @@ const COMMANDS: [string<'static>; 24] = [
   "resetStyles",
   "pickMode",
   "audit",
+  "edits",
+  "comment",
+  "resolve",
 ]
 
 fn has(value: Option<&Value>, key: string) -> bool {
@@ -1223,18 +1241,25 @@ effect fn toolList(out: &mut String, extra: &List<ExtensionTool>) -> ()
     false,
     "ui_set_style",
     "Edit a node's style",
-    "Sets CSS declarations on the first matching node while the app runs, and draws. The edit lasts until the app sets the same properties again or ui_reset_styles takes it back. Returns the node's declarations in that state.",
+    "Sets CSS declarations on the first matching node while the app runs, and draws. The declarations are laid over what the app sets, so they stay when the app updates the node, until ui_reset_styles takes them back or ui_resolve marks them done. Each property becomes an edit in ui_edits. Returns the declarations the node shows in that state and the ids of its open edits.",
     &setStyle,
     "\"style\"",
     false,
+  )
+  let reset = run props(
+    &[
+      TARGET,
+      r""" "state":{"type":"string","enum":["base","hover","active","focus","focus-visible"],"description":"Only the edits in this state (with a target)."}""",
+      r""" "property":{"type":"string","description":"Only the edit of this CSS property, such as padding-left (with a target; state defaults to base)."}""",
+    ],
   )
   run tool(
     &mut out,
     false,
     "ui_reset_styles",
     "Take style edits back",
-    "Restores the declarations every edited node had before ui_set_style.",
-    &none,
+    "Takes style edits back, so nodes show what the app sets again: every edit, or with a target that node's (in one state, or of one property). The open edits taken back leave ui_edits; resolved ones and comments stay. Returns restored (node and state pairs or properties) and removed (edits).",
+    &reset,
     "",
     false,
   )
@@ -1261,6 +1286,58 @@ effect fn toolList(out: &mut String, extra: &List<ExtensionTool>) -> ()
     &audit,
     "",
     true,
+  )
+  let edits = run props(
+    &[
+      r""" "status":{"type":"string","enum":["open","resolved","all"],"description":"open: what is left to do. Both without it."}""",
+      r""" "kind":{"type":"string","enum":["edit","comment"],"description":"Only edits, or only comments."}""",
+      r""" "since":{"type":"integer","description":"Only entries that changed after this seq (the seq of an earlier reply)."}""",
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_edits",
+    "Design changes to make",
+    "The style edits and comments people made on the running app (in devtools, or with ui_set_style and ui_comment), for you to carry into the source code; the app keeps them until it exits. Each edit is one CSS property of one node in one state (base, hover, active, focus, focus-visible): before is the app's value when the edit was made (null: the app sets none), after the value wanted (null: the app's should go). Each comment has text, an author and a thread of replies. Each target says which node: root, node (its id now), path (ids from the root down), element (kind, role, accessible name, testId, rect), named (the nearest node at or above it with a testId, label or accessible name) and keys (the testIds along the path). There is no source location: search the code for the named element's testId, label or text and the property. applied says whether the edit still shows in the app (false once its node is gone). Pass status open for the work left. Then change the code that builds the node so it sets after, and call ui_resolve with the ids.",
+    &edits,
+    "",
+    true,
+  )
+  let comment = run props(
+    &[
+      TARGET_BUT_TEXT,
+      r""" "text":{"type":"string","description":"What to say."}""",
+      r""" "author":{"type":"string","description":"Who says it, such as your name."}""",
+      r""" "reply":{"type":"integer","description":"A comment's id: add text to its thread instead of a new comment."}""",
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_comment",
+    "Comment on a node",
+    "Leaves a comment on the first matching node (on the app as a whole without a target), or with reply adds to a comment's thread, for example to say what you changed or to ask what was meant. Returns the comment.",
+    &comment,
+    "\"text\"",
+    false,
+  )
+  let resolve = run props(
+    &[
+      r""" "entries":{"type":"array","items":{"type":"integer"},"description":"The ids of the edits and comments."}""",
+      r""" "entry":{"type":"integer","description":"One id, instead of entries."}""",
+      r""" "reopen":{"type":"boolean","description":"Open them again instead."}""",
+    ],
+  )
+  run tool(
+    &mut out,
+    false,
+    "ui_resolve",
+    "Mark changes done",
+    "Marks edits and comments from ui_edits resolved, once the source code does what they ask. Resolving an edit takes it off the running app: the node shows what the app's code sets, which is your change once the app is rebuilt and run again (until then, the old value). With reopen, opens them again and lays reopened edits on their nodes again. An unknown id changes nothing. Returns each entry.",
+    &resolve,
+    "",
+    false,
   )
   let list = extra.asSlice()
   let mut i: usize = 0

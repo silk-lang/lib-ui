@@ -1,20 +1,24 @@
 //! What the devtools window shows, read out of the inspector protocol's JSON replies: the
 //! element tree (`tree`), a node's view and box model (`inspect`), the event log (`events`), the
 //! frame stats (`stats`), the status line and the app's extensions (`hello`), the frame timeline
-//! (`frames`), the audit (`audit`) and an extension panel's data (its command's reply).
+//! (`frames`), the audit (`audit`), the edit log (`edits`) and an extension panel's data (its
+//! command's reply).
 //! Display text is made here, once per reply, so the view only lays it out.
 import ui_inspect_server.reply { appendNumber, textField, numberField, idField, flagField, has }
 import ui_tree.inspect { writeInt, writeNumber }
 import silk.collections.list { List }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
+import silk.core.result { Result }
 import silk.json.value { Json, Value }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.f32
 import silk.num.u32
 import silk.num.u64
 import silk.num.usize
-import silk.text.string { String }
+import silk.text.string { String, InvalidUtf8 }
+import silk.num.u8
+import properties.catalog
 
 /// The parent of the top row.
 pub const NO_PARENT: u32 = 4294967295
@@ -72,6 +76,9 @@ pub struct Detail {
   pub title: String,
   /// The devtools node view (`inspect`'s text), one entry per line.
   pub lines: List<String>,
+  /// What each of `lines` is in the node's styles: [`MARK_PLAIN`], [`MARK_EDITED`],
+  /// [`MARK_OVERRIDDEN`] or [`MARK_EDIT_HEAD`].
+  pub marks: List<u8>,
   /// Whether the node has a box (`box` holds its numbers).
   pub hasBox: bool,
   pub box: BoxNumbers,
@@ -141,7 +148,10 @@ pub const PART_DETAIL: u32 = 16
 pub const PART_PICK: u32 = 32
 
 /// Every part: a whole refresh.
-pub const PART_ALL: u32 = 63
+/// The edit log.
+pub const PART_EDITS: u32 = 64
+
+pub const PART_ALL: u32 = 127
 
 /// A panel an extension of the app adds (`hello`'s `extensions`), names in full.
 pub struct PanelInfo {
@@ -209,6 +219,9 @@ pub struct Snapshot {
   pub picking: bool,
   /// The node picked in the app's window, or NO_PARENT.
   pub picked: u32,
+  /// The edit log, with `PART_EDITS`, and how many of its entries are open.
+  pub changes: List<ChangeRow>,
+  pub openChanges: usize,
 }
 
 /// How long a frame may take at 60 frames a second, in milliseconds.
@@ -246,6 +259,7 @@ impl Detail {
       id: NO_PARENT,
       title: String.make(),
       lines: List<String>.make(),
+      marks: List<u8>.make(),
       hasBox: false,
       box: BoxNumbers.zero(),
     }
@@ -402,11 +416,28 @@ pub effect fn parseDetail(reply: &Value) -> Detail
   }
   let text = textField(reply, "text")
   let mut lines = String.split(text, "\n")
+  let mut edited = false
   while true {
     match lines.next() {
       Option<string>.Some { value: line } => {
         if line != "" {
-          run detail.lines.append(run String.copy(line))
+          let mut mark = MARK_PLAIN
+          let mut shown = line
+          if String.startsWith(line, "style ") {
+            edited = String.contains(line, " edited")
+            if edited {
+              mark = MARK_EDIT_HEAD
+            }
+          } else if line == "}" {
+            edited = false
+          } else if edited {
+            mark = MARK_EDITED
+          } else if String.endsWith(line, OVERRIDDEN) {
+            mark = MARK_OVERRIDDEN
+            shown = String.slice(line, 0, String.byteLength(line) - String.byteLength(OVERRIDDEN))
+          }
+          run detail.lines.append(run String.copy(shown))
+          run detail.marks.append(mark)
         }
       }
       Option<string>.None => {
@@ -837,4 +868,324 @@ pub fn matches(text: string, wanted: string) -> bool {
     at = at + 1
   }
   return false
+}
+
+// The node view's style marks, and the edit log.
+
+/// A line of the node view as it is.
+pub const MARK_PLAIN: u8 = 0
+
+/// A declaration of an edit laid over the client's (`style <state> edited { ... }`).
+pub const MARK_EDITED: u8 = 1
+
+/// A declaration of the client's that an edit hides.
+pub const MARK_OVERRIDDEN: u8 = 2
+
+/// The heading of an edit's section.
+pub const MARK_EDIT_HEAD: u8 = 3
+
+/// What the node view writes after a declaration of the client's that an edit hides
+/// (`ui_inspect.view.OVERRIDDEN`).
+const OVERRIDDEN: string = " /* overridden */"
+
+/// One entry of the edit log, as the Changes panel shows it.
+pub struct ChangeRow {
+  pub id: u64,
+  pub comment: bool,
+  pub open: bool,
+  /// An edit's declaration shows in the app now.
+  pub applied: bool,
+  /// The node it is about, or NO_PARENT for the app as a whole.
+  pub node: u32,
+  /// The node as the element rows label it (when the entry was made), or "App".
+  pub label: String,
+  /// An edit's state, property and values (`none` for none).
+  pub state: String,
+  pub property: String,
+  pub before: String,
+  pub after: String,
+  /// A comment's text, its author, and its replies as `text (author)`.
+  pub text: String,
+  pub author: String,
+  pub thread: List<String>,
+}
+
+effect fn valueText(entry: &Value, key: string, out: &mut String) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let value = textField(entry, key)
+  if value == "" {
+    run out.append("none")
+  } else {
+    run out.append(value)
+  }
+}
+
+effect fn changeRow(entry: &Value, comment: bool) -> ChangeRow
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut row = ChangeRow {
+    id: u64Field(entry, "id"),
+    comment: comment,
+    open: textField(entry, "status") == "open",
+    applied: flagField(entry, "applied", false),
+    node: NO_PARENT,
+    label: String.make(),
+    state: run String.copy(textField(entry, "state")),
+    property: run String.copy(textField(entry, "property")),
+    before: String.make(),
+    after: String.make(),
+    text: run String.copy(textField(entry, "text")),
+    author: run String.copy(textField(entry, "author")),
+    thread: List<String>.make(),
+  }
+  match Json.field(entry, "target") {
+    Option<&Value>.Some { value: target } => {
+      row.node = u32Field(target, "node", NO_PARENT)
+      match Json.field(target, "element") {
+        Option<&Value>.Some { value: element } => {
+          run labelOf(element, &mut row.label)
+        }
+        Option<&Value>.None => {
+          run row.label.append("App")
+        }
+      }
+    }
+    Option<&Value>.None => {
+      run row.label.append("App")
+    }
+  }
+  if !comment {
+    run valueText(entry, "before", &mut row.before)
+    run valueText(entry, "after", &mut row.after)
+  }
+  if let Option<&List<Value>>.Some { value: replies } = items(Json.field(entry, "thread")) {
+    let list = replies.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      let mut line = run String.copy(textField(&list[i], "text"))
+      let author = textField(&list[i], "author")
+      if author != "" {
+        run line.append(" (")
+        run line.append(author)
+        run line.append(")")
+      }
+      run row.thread.append(move line)
+      i = i + 1
+    }
+  }
+  return move row
+}
+
+/// The entries of an `edits` reply, edits then comments, into `out`. Returns how many are open.
+pub effect fn parseChanges(reply: &Value, out: &mut List<ChangeRow>) -> usize
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  let mut pass: usize = 0
+  while pass < 2 {
+    let key = if pass == 0 {
+      "edits"
+    } else {
+      "comments"
+    }
+    if let Option<&List<Value>>.Some { value } = items(Json.field(reply, key)) {
+      let list = value.asSlice()
+      let mut i: usize = 0
+      while i < list.length {
+        run out.append(run changeRow(&list[i], pass == 1))
+        i = i + 1
+      }
+    }
+    pass = pass + 1
+  }
+  return match Json.asU64(Json.field(reply, "open")) {
+    Option<u64>.Some { value } => u64.toUsize(value)
+    Option<u64>.None => 0
+  }
+}
+
+// The declaration editor: completion from the css package's tables, and number steps.
+
+/// How many completions the editor offers.
+pub const SUGGESTIONS: usize = 6
+
+/// The declaration being typed: what follows the last `;` of `draft`, without leading spaces.
+fn lastDeclaration(draft: string) -> usize {
+  let bytes = String.utf8Bytes(draft)
+  let mut start: usize = 0
+  let mut i: usize = 0
+  while i < bytes.length {
+    if bytes[i] == 59 {
+      start = i + 1
+    }
+    i = i + 1
+  }
+  while start < bytes.length && bytes[start] == 32 {
+    start = start + 1
+  }
+  return start
+}
+
+/// Where the value of the declaration at `start` begins (after `:` and spaces), or `usize.MAX`
+/// while its property is still being typed.
+fn valueStart(draft: string, start: usize) -> usize {
+  let bytes = String.utf8Bytes(draft)
+  let mut i = start
+  while i < bytes.length {
+    if bytes[i] == 58 {
+      let mut at = i + 1
+      while at < bytes.length && bytes[at] == 32 {
+        at = at + 1
+      }
+      return at
+    }
+    i = i + 1
+  }
+  return usize.MAX
+}
+
+/// The property of the declaration at `start` (before its `:`), trimmed.
+fn propertyOf(draft: string, start: usize) -> string {
+  let bytes = String.utf8Bytes(draft)
+  let mut end = start
+  while end < bytes.length && bytes[end] != 58 && bytes[end] != 32 {
+    end = end + 1
+  }
+  return String.slice(draft, start, end - start)
+}
+
+/// Completions for the last declaration of `draft`: property names from the css package's
+/// catalog while the property is typed, then for the value the property's initial value and
+/// the CSS-wide keywords, all that start with what is typed. At most [`SUGGESTIONS`].
+pub effect fn suggest(draft: string, out: &mut List<String>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  let start = lastDeclaration(draft)
+  let value = valueStart(draft, start)
+  if value == usize.MAX {
+    let typed = String.slice(draft, start, String.byteLength(draft) - start)
+    if typed == "" {
+      return ()
+    }
+    let all = catalog.all()
+    let mut i: usize = 0
+    while i < all.length && out.length() < SUGGESTIONS {
+      if let Result<string, InvalidUtf8>.Success { value: name } = String.fromUtf8(
+        catalog.name(all[i]),
+      ) {
+        if String.startsWith(name, typed) && name != typed && !String.startsWith(name, "-") {
+          run out.append(run String.copy(name))
+        }
+      }
+      i = i + 1
+    }
+    return ()
+  }
+  let typed = String.slice(draft, value, String.byteLength(draft) - value)
+  let mut candidates = List<string>.make()
+  if let Option<catalog.Property>.Some { value: property } = catalog.lookup(
+    String.utf8Bytes(propertyOf(draft, start)),
+  ) {
+    if let Result<string, InvalidUtf8>.Success { value: initial } = String.fromUtf8(
+      catalog.initial(property),
+    ) {
+      run candidates.append(initial)
+    }
+  } else {
+    return ()
+  }
+  run candidates.append("inherit")
+  run candidates.append("initial")
+  run candidates.append("unset")
+  let list = candidates.asSlice()
+  let mut k: usize = 0
+  while k < list.length && out.length() < SUGGESTIONS {
+    if list[k] != "" && String.startsWith(list[k], typed) && list[k] != typed {
+      run out.append(run String.copy(list[k]))
+    }
+    k = k + 1
+  }
+}
+
+/// `draft` with what is being typed in its last declaration replaced by `chosen`, a completion
+/// from [`suggest`]: a property gets its `: `.
+pub effect fn complete(draft: string, chosen: string, out: &mut String) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  let start = lastDeclaration(draft)
+  let value = valueStart(draft, start)
+  if value == usize.MAX {
+    run out.append(String.slice(draft, 0, start))
+    run out.append(chosen)
+    run out.append(": ")
+    return ()
+  }
+  run out.append(String.slice(draft, 0, value))
+  run out.append(chosen)
+}
+
+fn digit(b: u8) -> bool {
+  return b >= 48 && b <= 57
+}
+
+/// `draft` with the last number in the value of its last declaration stepped by `by`, as the
+/// arrow keys step numbers in a style editor (`padding: 4px 8px` steps the 8). False when that
+/// value has no number.
+pub effect fn step(draft: string, by: f32, out: &mut String) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  let start = lastDeclaration(draft)
+  let value = valueStart(draft, start)
+  if value == usize.MAX {
+    return false
+  }
+  let bytes = String.utf8Bytes(draft)
+  let mut end = bytes.length
+  while end > value && !digit(bytes[end - 1]) {
+    end = end - 1
+  }
+  if end == value {
+    return false
+  }
+  let mut begin = end
+  while begin > value && (digit(bytes[begin - 1]) || bytes[begin - 1] == 46) {
+    begin = begin - 1
+  }
+  let negative = begin > value && bytes[begin - 1] == 45
+
+  // The number: digits, perhaps a point and more digits.
+  let mut whole: f32 = 0.0
+  let mut fraction: f32 = 0.0
+  let mut scale: f32 = 1.0
+  let mut point = false
+  let mut i = begin
+  while i < end {
+    if bytes[i] == 46 {
+      point = true
+    } else if point {
+      scale = scale / 10.0
+      fraction = fraction + u8.toF32(bytes[i] - 48) * scale
+    } else {
+      whole = whole * 10.0 + u8.toF32(bytes[i] - 48)
+    }
+    i = i + 1
+  }
+  let mut number = whole + fraction
+  if negative {
+    number = -number
+  }
+  let stepped = f32.round((number + by) * 100.0) / 100.0
+  let from = if negative {
+    begin - 1
+  } else {
+    begin
+  }
+  run out.append(String.slice(draft, 0, from))
+  run writeNumber(&mut out, stepped)
+  run out.append(String.slice(draft, end, bytes.length - end))
+  return true
 }

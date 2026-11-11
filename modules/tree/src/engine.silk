@@ -324,13 +324,17 @@ fn defaultDisplay(kind: NodeKind) -> CssDisplay {
     NodeKind.Text => CssDisplay.Box { outside: DisplayOutside.Inline, inside: DisplayInside.Flow }
     NodeKind.Image => CssDisplay.Box { outside: DisplayOutside.Inline, inside: DisplayInside.Flow }
     NodeKind.Icon => CssDisplay.Box { outside: DisplayOutside.Inline, inside: DisplayInside.Flow }
-    NodeKind.Input => CssDisplay.Box { outside: DisplayOutside.Inline, inside: DisplayInside.FlowRoot }
+    NodeKind.Input => CssDisplay.Box {
+      outside: DisplayOutside.Inline,
+      inside: DisplayInside.FlowRoot,
+    }
     NodeKind.Canvas => CssDisplay.Box { outside: DisplayOutside.Block, inside: DisplayInside.Flow }
   }
 }
 
 fn applyAll(computed: &mut Computed, list: &List<Declaration>) -> () {
   let items = list.asSlice()
+
   // Font size first: `em` lengths in the same patch refer to it.
   let mut i: usize = 0
   while i < items.length {
@@ -346,6 +350,20 @@ fn applyAll(computed: &mut Computed, list: &List<Declaration>) -> () {
     }
     i = i + 1
   }
+}
+
+/// Declarations a second party that shares the tree lays over what its client set for one
+/// node in one state: the inspector's style edits. The tree applies them when it resolves the
+/// node's style, over the client's declarations as `css.set` would (or instead of them, with
+/// `replace`), so a client that restyles the node changes only what lies underneath: its own
+/// declarations stay as it set them, the client is never told of the override, and taking the
+/// override away shows exactly what the client last set. See [`UiTree.setOverride`].
+pub struct StyleOverride {
+  pub id: u32,
+  pub state: StyleState,
+  pub declarations: List<Declaration>,
+  /// The client's declarations in this state are left out.
+  pub replace: bool,
 }
 
 /// The retained tree.
@@ -505,6 +523,9 @@ pub struct UiTree<'a> {
   pub aside: List<u32>,
   /// What `sceneOf` gives for a root that is not open.
   empty: Scene,
+  /// The style overrides (see `setOverride`), a few at most; styles resolve as before while
+  /// there are none.
+  overrides: List<StyleOverride>,
 }
 
 impl<'a> UiTree<'a> {
@@ -610,6 +631,7 @@ impl<'a> UiTree<'a> {
       rootEvents: List<RootEvent>.make(),
       aside: List<u32>.make(),
       empty: Scene.make(),
+      overrides: List<StyleOverride>.make(),
     }
   }
 
@@ -1326,6 +1348,10 @@ impl<'a> UiTree<'a> {
       let nodeCss = node.css
       let inner = node.inner
       drop self.ids.remove(Word { value: u32.toU64(id) })
+      if self.overrides.length() != 0 {
+        // The id may name another node later: its overrides go with this one.
+        self.dropOverrides(id)
+      }
       self.slotOfCss.set(nodeCss, NONE)
       if inner != NO_INDEX {
         self.slotOfCss.set(inner, NONE)
@@ -2529,7 +2555,7 @@ impl<'a> UiTree<'a> {
         computed.layout.overflowY = Overflow.Hidden
       }
     }
-    if node.kind != NodeKind.Text {
+    if node.kind != NodeKind.Text && self.overrides.length() == 0 {
       applyAll(&mut computed, &node.base)
       if node.hovered {
         applyAll(&mut computed, &node.hover)
@@ -2541,6 +2567,25 @@ impl<'a> UiTree<'a> {
         applyAll(&mut computed, &node.focus)
         if self.focusVisible || node.kind == NodeKind.Input {
           applyAll(&mut computed, &node.focusVisible)
+        }
+      }
+    } else if node.kind != NodeKind.Text {
+      run self.applyOverridden(&mut computed, node.id, StyleState.Base, &node.base)
+      if node.hovered {
+        run self.applyOverridden(&mut computed, node.id, StyleState.Hover, &node.hover)
+      }
+      if node.pressed {
+        run self.applyOverridden(&mut computed, node.id, StyleState.Active, &node.active)
+      }
+      if self.focused == slot {
+        run self.applyOverridden(&mut computed, node.id, StyleState.Focus, &node.focus)
+        if self.focusVisible || node.kind == NodeKind.Input {
+          run self.applyOverridden(
+            &mut computed,
+            node.id,
+            StyleState.FocusVisible,
+            &node.focusVisible,
+          )
         }
       }
     }
@@ -2557,10 +2602,169 @@ impl<'a> UiTree<'a> {
     target.paintHash = paintHash
     if kind != NodeKind.Text {
       // css-layout leaves the node clean when the style is the one it already has.
-      run Effect.catchAll(self.layout.setStyle(NodeId { index: css }, computed.layout), layoutFailed)
+      run Effect.catchAll(
+        self.layout.setStyle(NodeId { index: css }, computed.layout),
+        layoutFailed,
+      )
     }
     if kind == NodeKind.Icon && sizeChanged {
       run self.updateNatural(slot)
+    }
+  }
+
+  // Style overrides.
+
+  /// The index of node `id`'s override in `state`, or `usize.MAX`.
+  fn overrideIndex(self: &Self, id: u32, state: StyleState) -> usize {
+    let list = self.overrides.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      if list[i].id == id && list[i].state == state {
+        return i
+      }
+      i = i + 1
+    }
+    return usize.MAX
+  }
+
+  /// Applies `client`, node `id`'s own declarations in `state`, with its override laid over
+  /// them as one list, so `em` lengths see the font size either of them sets.
+  effect fn applyOverridden(
+    self: &Self,
+    computed: &mut Computed,
+    id: u32,
+    state: StyleState,
+    client: &List<Declaration>,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let at = self.overrideIndex(id, state)
+    if at == usize.MAX {
+      applyAll(&mut computed, client)
+      return ()
+    }
+    let laid = &self.overrides.asSlice()[at]
+    let mut merged = List<Declaration>.make()
+    if !laid.replace {
+      let own = client.asSlice()
+      let mut i: usize = 0
+      while i < own.length {
+        run merged.append(run css.cloneDeclaration(&own[i]))
+        i = i + 1
+      }
+    }
+    let over = laid.declarations.asSlice()
+    let mut j: usize = 0
+    while j < over.length {
+      run css.set(&mut merged, &over[j])
+      j = j + 1
+    }
+    applyAll(&mut computed, &merged)
+  }
+
+  /// Whether node `id` has an override in `state`. Costs nothing while there are none.
+  pub fn overridden(self: &Self, id: u32, state: StyleState) -> bool {
+    if self.overrides.length() == 0 {
+      return false
+    }
+    return self.overrideIndex(id, state) != usize.MAX
+  }
+
+  /// Node `id`'s override in `state`, if it has one.
+  pub fn overrideOf(self: &Self, id: u32, state: StyleState) -> Option<&StyleOverride> {
+    let at = self.overrideIndex(id, state)
+    if at == usize.MAX {
+      return Option<&StyleOverride>.None
+    }
+    return Option<&StyleOverride>.some(&self.overrides.asSlice()[at])
+  }
+
+  /// Every override, oldest first.
+  pub fn styleOverrides(self: &Self) -> &[StyleOverride] {
+    return self.overrides.asSlice()
+  }
+
+  /// Lays `declarations` over what the client set for node `id` in `state` (instead of it,
+  /// with `replace`), in place of the override the node had there: for a second party that
+  /// shares the tree, such as the inspector trying a style. The client's own declarations
+  /// are kept underneath and stay its to change (`SetStyle`, `ClearStyle`); the override
+  /// applies over whatever they are, until `clearOverride`, and goes when the node is
+  /// destroyed. No declarations and no `replace` clears the override. The node's root styles
+  /// again at its next frame, as after a mutation of it; no other root does, and no event
+  /// record tells the client. Returns false when there is no node `id`.
+  pub effect fn setOverride(
+    self: &mut Self,
+    id: u32,
+    state: StyleState,
+    declarations: List<Declaration>,
+    replace: bool,
+  ) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let slot = self.slotOf(id)
+    if slot == NONE {
+      return false
+    }
+    let at = self.overrideIndex(id, state)
+    if declarations.length() == 0 && !replace {
+      if at != usize.MAX {
+        drop self.overrides.remove(at)
+        self.restyled(slot)
+      }
+      return true
+    }
+    let laid = StyleOverride {
+      id: id,
+      state: state,
+      declarations: move declarations,
+      replace: replace,
+    }
+    if at == usize.MAX {
+      run self.overrides.append(move laid)
+    } else {
+      self.overrides.set(at, move laid)
+    }
+    self.restyled(slot)
+    return true
+  }
+
+  /// Takes node `id`'s override in `state` away: the node shows what its client set again.
+  /// Returns whether it had one.
+  pub fn clearOverride(self: &mut Self, id: u32, state: StyleState) -> bool {
+    let at = self.overrideIndex(id, state)
+    if at == usize.MAX {
+      return false
+    }
+    drop self.overrides.remove(at)
+    let slot = self.slotOf(id)
+    if slot != NONE {
+      self.restyled(slot)
+    }
+    return true
+  }
+
+  /// Takes every override of node `id` away, for a node being destroyed.
+  fn dropOverrides(self: &mut Self, id: u32) -> () {
+    let mut i: usize = 0
+    while i < self.overrides.length() {
+      if self.overrides.asSlice()[i].id == id {
+        drop self.overrides.remove(i)
+      } else {
+        i = i + 1
+      }
+    }
+  }
+
+  /// An override of the node at `slot` changed: its root styles again at its next frame and
+  /// counts the change in its revision, as a mutation of the node would.
+  fn restyled(self: &mut Self, slot: u32) -> () {
+    self.semanticRevision = self.semanticRevision + 1
+    let holder = self.rootHolding(slot)
+    if holder != NONE {
+      self.touchRoot(holder)
+    } else {
+      // A detached node styles when it is attached again.
+      self.stylesDirty = true
     }
   }
 

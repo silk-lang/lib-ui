@@ -70,8 +70,11 @@ match in tree order wins.
 | `ui_events` | `events` | the event records the app took (click, keydown, input, ...), with `since` and `limit` |
 | `ui_frames` | `frames` | layout and paint time per frame, with the frame's counters |
 | `ui_styles` | `styles` | the target's style patches per state |
-| `ui_set_style` | `setStyle` | sets `style` declarations on the target for `state`; `replace` drops what it had |
-| `ui_reset_styles` | `resetStyles` | undoes every style edit |
+| `ui_set_style` | `setStyle` | lays `style` declarations over the target for `state` (they outlast the app restyling it); `replace` leaves the app's out; each property becomes an edit in `ui_edits` |
+| `ui_reset_styles` | `resetStyles` | takes style edits back: all, or the target's (one `state`, one `property`); their open edits leave the log |
+| `ui_edits` | `edits` | the style edits and comments people made, for the agent to carry into the code: `status` (`open` for the work left), `kind`, `since` |
+| `ui_comment` | `comment` | a comment on the target (or the app), or with `reply` an answer in a comment's thread |
+| `ui_resolve` | `resolve` | marks `entries` (or `entry`) done once the code does what they ask; `reopen` opens them again |
 | `ui_pick_mode` | `pickMode` | lets the person point at a node in the app's window; ask again for `picked` |
 | `ui_audit` | `audit` | accessibility issues: unnamed controls, missing roles, unreachable or small targets, low contrast |
 
@@ -92,6 +95,16 @@ A typical agent session: `ui_snapshot` to read the tree, `ui_click` with `label:
 `role: "button", name: "New"`), `ui_wait` for the change, `ui_screenshot` to look at it. To
 find why the app did something, read what its framework's tools say (for a silk-ui program,
 `silk_ui_messages` and `silk_ui_model`: which message changed which field); to try a fix, `ui_set_style` and a screenshot; before finishing, `ui_audit`.
+
+Design changes made in devtools come to an agent through the edit log. `ui_edits` with
+`status: "open"` lists the style edits (one property of one node in one state: `before`, the
+app's value, and `after`, the value wanted) and comments, each with a `target` that says which
+node: its id path, the element (role, accessible name, test id) and the nearest named element
+with its label and test id, and the test ids along the path. There is no source location yet,
+so the agent searches the code for the named element's test id, label or text and changes the
+code that styles it. Then `ui_resolve` with the ids: a resolved edit stops being laid over the
+app, so the node shows what the app's code sets, which is the agent's change once the app is
+rebuilt and run. `ui_comment` with `reply` answers in a comment's thread.
 
 ## How it works
 
@@ -121,10 +134,15 @@ silk task native mcp       # an MCP client drives the demo in a window
 - `mcpToolsComeFromHello`: an extension of no framework's commands listed as tools after the
   inspector's, named as MCP allows, and called through the extension; a call before any list
   learns them first.
+- `anAgentResolvesEditsOverMcp` (`edits.silk`): the edit tools are listed and described for
+  the workflow; with an edit and a comment made as devtools make them, the agent reads the open
+  ones and the named element, answers the comment, resolves both, and nothing is left open; each
+  bridge request is served by a one-shot session over a memory channel.
 - `demo mcp` (CI job `demo` in ui-inspect.yml), the exit test for agent access: an MCP client
   starts `ui-inspect-mcp` over stdio, reads a snapshot, finds the button labelled New in it,
   clicks it by that label, waits for the new row, inspects and highlights Archive and takes a
-  screenshot.
+  screenshot; then sets a style on Archive, clicks New (the demo restyles Archive), reads the
+  edit still applied with `ui_edits`, resolves it, and finds nothing left open.
 
 ## Limits
 

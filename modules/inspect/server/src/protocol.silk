@@ -10,9 +10,10 @@ import ui_inspect.query { Query, queryAll, queryFirst, hitPath, pick }
 import ui_inspect.overlay { BoxModel, Highlight, boxModels, compose, paintHighlight }
 import ui_inspect.view { InspectOptions, inspectNode }
 import ui_inspect.synth { pointOf, click, press }
-import ui_tree.engine { UiTree }
+import ui_tree.engine { UiTree, StyleOverride }
 import ui_tree.node { NONE, Event, EventKind }
 import ui_tree.mutation { Role, StyleState }
+import ui_tree.css { Declaration }
 import ui_tree.input { Input, MOD_SHIFT, MOD_CONTROL, MOD_ALT, MOD_META, BUTTON_PRIMARY }
 import ui_tree.inspect {
   CpuSnapshot,
@@ -63,10 +64,26 @@ import topics {
   TOPIC_ROOTS,
   TOPIC_HIGHLIGHT,
   TOPIC_PICK,
+  TOPIC_EDITS,
   TOPIC_COUNT,
   TOPIC_NAMES
 }
-import tools { StyleEdits, audit, stateNamed, styles }
+import tools {
+  audit,
+  stateNamed,
+  stateName,
+  styles,
+  shown,
+  parseStyle,
+  layOver,
+  dropProperty,
+  resetAll,
+  resetNode,
+  declarationTexts,
+  patchOf,
+  parts
+}
+import edits { EditLog, EntryKind, Status, Recorded, writeEntry, writeTarget }
 import vector.geometry_error { GeometryError }
 import vector.pixmap { Pixmap }
 import codec.image { ImageError }
@@ -88,7 +105,7 @@ import silk.text.string { String }
 pub const VERSION: u32 = 3
 
 /// The commands `hello` lists. `subscribe` and `unsubscribe` are a session's (see `session.silk`).
-const COMMANDS: string = "[\"hello\",\"subscribe\",\"unsubscribe\",\"tree\",\"events\",\"snapshot\",\"query\",\"inspect\",\"pick\",\"highlight\",\"screenshot\",\"click\",\"hover\",\"scroll\",\"press\",\"pointer\",\"key\",\"type\",\"wait\",\"stats\",\"frames\",\"styles\",\"setStyle\",\"resetStyles\",\"pickMode\",\"audit\",\"viewEvents\"]"
+const COMMANDS: string = "[\"hello\",\"subscribe\",\"unsubscribe\",\"tree\",\"events\",\"snapshot\",\"query\",\"inspect\",\"pick\",\"highlight\",\"screenshot\",\"click\",\"hover\",\"scroll\",\"press\",\"pointer\",\"key\",\"type\",\"wait\",\"stats\",\"frames\",\"styles\",\"setStyle\",\"resetStyles\",\"pickMode\",\"audit\",\"edits\",\"comment\",\"resolve\",\"viewEvents\"]"
 
 /// How long `wait` waits when the request names no `timeout`, in milliseconds.
 pub const DEFAULT_TIMEOUT: u64 = 5000
@@ -149,7 +166,8 @@ pub struct Protocol {
   pub nextSeq: u64,
   /// The frames the tree drew.
   pub timeline: Timeline,
-  edits: StyleEdits,
+  /// The style edits and comments (see `edits.silk`). They outlive every session.
+  pub edits: EditLog,
   /// The window's pointer picks a node instead of reaching the app (the `pickMode` command).
   pub picking: bool,
   /// The node the last pick chose, or NONE.
@@ -181,7 +199,7 @@ impl Protocol {
       log: List<LoggedEvent>.make(),
       nextSeq: 1,
       timeline: Timeline.make(),
-      edits: StyleEdits.make(),
+      edits: EditLog.make(),
       picking: false,
       picked: NONE,
       swallowUp: false,
@@ -392,6 +410,10 @@ impl Protocol {
     run self.snapshot.copyUploads(tree)
     self.extensions.frame = tree.stats.frame
     run self.timeline.record(tree.stats)
+    if self.edits.hasApplied() {
+      // A node destroyed took its overrides along: its edits are no longer applied.
+      self.edits.sweep(tree)
+    }
     if self.highlight.nodes.length() != 0 {
       run self.composeOverlay(tree)
     }
@@ -488,11 +510,13 @@ impl Protocol {
     } else if cmd == "setStyle" {
       run self.setStyle(&mut tree, request, &mut out)
     } else if cmd == "resetStyles" {
-      let restored = run self.edits.reset(&mut tree)
-      self.repaint = true
-      run begin(&mut out, request)
-      run putInt(&mut out, "restored", usize.toU64(restored))
-      run finish(&mut out)
+      run self.resetStyles(&mut tree, request, &mut out)
+    } else if cmd == "edits" {
+      run self.listEdits(&tree.*, request, &mut out)
+    } else if cmd == "comment" {
+      run self.comment(&tree.*, request, &mut out)
+    } else if cmd == "resolve" {
+      run self.resolve(&mut tree, request, &mut out)
     } else if cmd == "pickMode" {
       run self.pickMode(&tree.*, request, &mut out)
     } else if cmd == "audit" {
@@ -570,7 +594,7 @@ impl Protocol {
     ! OutOfMemoryError
     ? &mut Allocator {
     self.extensions.frame = tree.stats.frame
-    return run self.changes.take(tree, self.hidden.asSlice(), self.nextSeq, wanted)
+    return run self.changes.take(tree, self.hidden.asSlice(), self.nextSeq, self.edits.seq, wanted)
   }
 
   /// The tree's node count without the nodes of hidden roots.
@@ -654,6 +678,9 @@ impl Protocol {
       run rootMembers(tree, self.hidden.asSlice(), &mut out)
     } else if topic == TOPIC_HIGHLIGHT {
       run putIds(&mut out, "nodes", &self.highlight.nodes)
+    } else if topic == TOPIC_EDITS {
+      run putInt(&mut out, "seq", self.edits.seq)
+      run putInt(&mut out, "open", usize.toU64(self.edits.openCount()))
     } else if topic == TOPIC_PICK {
       run putFlag(&mut out, "on", self.picking)
       if self.picked != NONE {
@@ -663,9 +690,10 @@ impl Protocol {
     run finish(&mut out)
   }
 
-  /// setStyle: sets the declarations of `style` (CSS text) on the target for `state` (`base`
-  /// without one), over what the node has or, with `replace`, instead of it. The edit lasts
-  /// until the app sets the same properties again or `resetStyles` takes it back.
+  /// setStyle: lays the declarations of `style` (CSS text) over the target for `state` (`base`
+  /// without one), through the tree's override layer: over what the client set or, with
+  /// `replace`, instead of it. The edit outlasts the client restyling the node, until
+  /// `resetStyles` takes it back.
   effect fn setStyle(
     self: &mut Self,
     tree: &mut UiTree<'_>,
@@ -685,17 +713,336 @@ impl Protocol {
         return ()
       }
     }
-    if run self.edits.apply(
-      &mut tree,
-      request,
-      id,
-      state,
+    let replace = flagField(request, "replace", false)
+    let declarations = match run parseStyle(
       textField(request, "style"),
-      flagField(request, "replace", false),
+      replace,
+      request,
       &mut out,
     ) {
-      self.repaint = true
+      Option<List<Declaration>>.Some { value } => move value
+      Option<List<Declaration>>.None => {
+        return ()
+      }
     }
+
+    // What the edit log records: each declared property, and with `replace` the client's (and
+    // earlier edits') properties it leaves out, each with the client's value now.
+    let mut changes = List<Change>.make()
+    run changed(&tree.*, id, state, &declarations, replace, &self.edits, &mut changes)
+    if !run layOver(&mut tree, id, state, &declarations, replace) {
+      run failure(&mut out, request, "the tree refused the style")
+      return ()
+    }
+    let slot = tree.slotOf(id)
+    let root = tree.rootHolding(slot)
+    let mut target = String.make()
+    run writeTarget(&tree.*, root, id, &mut target)
+    let list = changes.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      let c = &list[i]
+      let recorded = run self.edits.record(
+        root,
+        id,
+        state,
+        String.view(&c.property),
+        String.view(&c.before),
+        c.hasBefore,
+        String.view(&c.after),
+        c.hasAfter,
+        &target,
+      )
+      if (recorded == Recorded.Reverted || recorded == Recorded.Unchanged) && c.hasAfter
+        && !replacing(&tree.*, id, state) {
+        // Back to the client's value: the client has the property again. (A replacing edit
+        // keeps it: without it the client's would not show.)
+        drop run dropProperty(&mut tree, id, state, String.view(&c.property))
+      }
+      i = i + 1
+    }
+    self.repaint = true
+    run begin(&mut out, request)
+    run putInt(&mut out, "node", u32.toU64(id))
+    run putText(&mut out, "state", stateName(state))
+    run putKey(&mut out, "style")
+    run declarationTexts(&run shown(&tree.*, id, state), &mut out)
+    run putInt(&mut out, "edited", usize.toU64(tree.styleOverrides().length))
+    run putKey(&mut out, "edits")
+    run out.append("[")
+    let entries = self.edits.entries.asSlice()
+    let mut first = true
+    let mut k: usize = 0
+    while k < entries.length {
+      let e = &entries[k]
+      if e.kind == EntryKind.Edit && e.status == Status.Open && e.applied && e.node == id
+        && e.state == state {
+        if !first {
+          run out.append(",")
+        }
+        first = false
+        run writeInt(&mut out, e.id)
+      }
+      k = k + 1
+    }
+    run out.append("]")
+    run putInt(&mut out, "seq", self.edits.seq)
+    run finish(&mut out)
+  }
+
+  /// resetStyles: takes style edits back. With a target, the target's alone: in `state` alone
+  /// when the request names one, and the declaration of `property` alone when it names one
+  /// (`state` is then `base` without one); otherwise every edit. The open edits taken back
+  /// leave the edit log (resolved ones and comments stay). Answers `restored`, the (node,
+  /// state) pairs or properties that show the client's declarations again, and `removed`, the
+  /// edits that left the log.
+  effect fn resetStyles(
+    self: &mut Self,
+    tree: &mut UiTree<'_>,
+    request: &Value,
+    out: &mut String,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut restored: usize = 0
+    let mut removed: usize = 0
+    if run hasTarget(request) {
+      let id = run targetOf(&tree.*, self.hidden.asSlice(), request, &mut out)
+      if id == NONE {
+        return ()
+      }
+      let state = if has(request, "state") {
+        match stateNamed(textField(request, "state")) {
+          Option<StyleState>.Some { value } => Option<StyleState>.some(value)
+          Option<StyleState>.None => {
+            run failure(&mut out, request, "unknown state")
+            return ()
+          }
+        }
+      } else {
+        Option<StyleState>.None
+      }
+      let property = textField(request, "property")
+      if property != "" {
+        let one = state.unwrapOr(StyleState.Base)
+        if run dropProperty(&mut tree, id, one, property) {
+          restored = 1
+        }
+        removed = self.edits.removeOpen(id, Option<StyleState>.some(one), property)
+      } else {
+        restored = resetNode(&mut tree, id, state)
+        removed = self.edits.removeOpen(id, state, "")
+      }
+    } else {
+      restored = run resetAll(&mut tree)
+      removed = self.edits.removeOpen(NONE, Option<StyleState>.None, "")
+    }
+    self.repaint = true
+    run begin(&mut out, request)
+    run putInt(&mut out, "restored", usize.toU64(restored))
+    run putInt(&mut out, "removed", usize.toU64(removed))
+    run putInt(&mut out, "seq", self.edits.seq)
+    run finish(&mut out)
+  }
+
+  /// edits: the edit log's entries, oldest first: `edits` and `comments`, filtered by `status`
+  /// (`open` or `resolved`; both without it), `kind` (`edit` or `comment`) and `since` (the
+  /// entries that changed after that `seq`). `seq` is the log's now, `open` how many entries
+  /// are open.
+  effect fn listEdits(self: &mut Self, tree: &UiTree<'_>, request: &Value, out: &mut String) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.edits.sweep(tree)
+    let status = textField(request, "status")
+    if status != "" && status != "open" && status != "resolved" && status != "all" {
+      run failure(&mut out, request, "status is open, resolved or all")
+      return ()
+    }
+    let kind = textField(request, "kind")
+    if kind != "" && kind != "edit" && kind != "comment" {
+      run failure(&mut out, request, "kind is edit or comment")
+      return ()
+    }
+    let since = match Json.asU64(Json.field(request, "since")) {
+      Option<u64>.Some { value } => value
+      Option<u64>.None => 0
+    }
+    run begin(&mut out, request)
+    run putInt(&mut out, "seq", self.edits.seq)
+    run putInt(&mut out, "open", usize.toU64(self.edits.openCount()))
+    let mut pass: usize = 0
+    while pass < 2 {
+      let edits = pass == 0
+      run putKey(
+        &mut out,
+        if edits {
+          "edits"
+        } else {
+          "comments"
+        },
+      )
+      run out.append("[")
+      let wanted = kind == "" || (kind == "edit") == edits
+      let entries = self.edits.entries.asSlice()
+      let mut first = true
+      let mut i: usize = 0
+      while i < entries.length && wanted {
+        let e = &entries[i]
+        let shown = (e.kind == EntryKind.Edit) == edits && e.seq > since
+          && (status == "" || status == "all" || (status == "open") == (e.status == Status.Open))
+        if shown {
+          if !first {
+            run out.append(",")
+          }
+          first = false
+          run writeEntry(e, &mut out)
+        }
+        i = i + 1
+      }
+      run out.append("]")
+      pass = pass + 1
+    }
+    run finish(&mut out)
+  }
+
+  /// comment: adds a comment with `text` (and `author`) on the target, or on the app as a
+  /// whole without one; or, with `reply` (a comment's id), adds `text` to its thread. Answers
+  /// `entry`, the comment now.
+  effect fn comment(self: &mut Self, tree: &UiTree<'_>, request: &Value, out: &mut String) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let text = textField(request, "text")
+    if text == "" {
+      run failure(&mut out, request, "a comment needs text")
+      return ()
+    }
+    let author = textField(request, "author")
+    let mut at: usize = usize.MAX
+    if has(request, "reply") {
+      at = match Json.asU64(Json.field(request, "reply")) {
+        Option<u64>.Some { value } => self.edits.find(value)
+        Option<u64>.None => usize.MAX
+      }
+      if at == usize.MAX {
+        run failure(&mut out, request, "no entry has that id")
+        return ()
+      }
+      if self.edits.entries.asSlice()[at].kind != EntryKind.Comment {
+        run failure(&mut out, request, "replies go to comments; that entry is an edit")
+        return ()
+      }
+      run self.edits.reply(at, text, author)
+    } else {
+      let mut node = NONE
+      let mut root = tree.current
+      if run hasTarget(request) {
+        node = run targetOf(tree, self.hidden.asSlice(), request, &mut out)
+        if node == NONE {
+          return ()
+        }
+        root = tree.rootHolding(tree.slotOf(node))
+      }
+      let mut target = String.make()
+      run writeTarget(tree, root, node, &mut target)
+      let id = run self.edits.comment(root, node, move target, text, author)
+      at = self.edits.find(id)
+    }
+    run begin(&mut out, request)
+    run putInt(&mut out, "seq", self.edits.seq)
+    run putKey(&mut out, "entry")
+    run writeEntry(&self.edits.entries.asSlice()[at], &mut out)
+    run finish(&mut out)
+  }
+
+  /// resolve: marks the entries `entry` (an id) or `entries` (ids) resolved, or open again with
+  /// `reopen`. Resolving an edit says the code now does what it tried: its declaration leaves
+  /// the node's override, so the node shows what the client sets (the new code's value, once
+  /// the app runs it). Reopening an edit lays its `after` over its node again, when the node is
+  /// there and no newer edit of the property is open. Nothing changes when an id is unknown.
+  /// Answers `entries`, each entry now.
+  effect fn resolve(self: &mut Self, tree: &mut UiTree<'_>, request: &Value, out: &mut String) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut ids = List<u32>.make()
+    run idsField(request, "entries", &mut ids)
+    if has(request, "entry") {
+      let mut one = List<u32>.make()
+      run idsField(request, "entry", &mut one)
+      run ids.appendSlice(one.asSlice())
+    }
+    if ids.length() == 0 {
+      run failure(&mut out, request, "name the entry (or entries) to resolve")
+      return ()
+    }
+    let reopen = flagField(request, "reopen", false)
+    let list = ids.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      let at = self.edits.find(u32.toU64(list[i]))
+      if at == usize.MAX {
+        run failure(&mut out, request, "no entry has that id")
+        return ()
+      }
+      let e = &self.edits.entries.asSlice()[at]
+      if reopen && e.kind == EntryKind.Edit && e.status == Status.Resolved
+        && self.edits.openEdit(e.node, e.state, String.view(&e.property)) != usize.MAX {
+        run failure(&mut out, request, "a newer edit of that property is open: reset it first")
+        return ()
+      }
+      i = i + 1
+    }
+    let mut j: usize = 0
+    while j < list.length {
+      let at = self.edits.find(u32.toU64(list[j]))
+      let e = &self.edits.entries.asSlice()[at]
+      let wanted = if reopen {
+        Status.Open
+      } else {
+        Status.Resolved
+      }
+      if e.status != wanted {
+        let mut applied = false
+        if e.kind == EntryKind.Edit {
+          let node = e.node
+          let state = e.state
+          let property = run String.copy(String.view(&e.property))
+          if !reopen && e.applied && !replacing(&tree.*, node, state) {
+            drop run dropProperty(&mut tree, node, state, String.view(&property))
+          }
+          if reopen && e.hasAfter && tree.contains(node) {
+            let mut css = run String.copy(String.view(&property))
+            run css.append(": ")
+            run css.append(String.view(&e.after))
+            let mut quiet = String.make()
+            if let Option<List<Declaration>>.Some { value } = run parseStyle(
+              String.view(&css),
+              false,
+              request,
+              &mut quiet,
+            ) {
+              applied = run layOver(&mut tree, node, state, &value, false)
+            }
+          }
+          self.repaint = true
+        }
+        self.edits.mark(at, wanted, applied)
+      }
+      j = j + 1
+    }
+    run begin(&mut out, request)
+    run putInt(&mut out, "seq", self.edits.seq)
+    run putKey(&mut out, "entries")
+    run out.append("[")
+    let mut k: usize = 0
+    while k < list.length {
+      if k > 0 {
+        run out.append(",")
+      }
+      run writeEntry(&self.edits.entries.asSlice()[self.edits.find(u32.toU64(list[k]))], &mut out)
+      k = k + 1
+    }
+    run out.append("]")
+    run finish(&mut out)
   }
 
   /// pickMode: with `on`, turns picking on or off; either way says whether it is on and the
@@ -1611,9 +1958,11 @@ fn targetObject(request: &Value) -> &Value {
   }
 }
 
-/// Whether `text` is a query member: `type` uses a top-level `text` for what it types.
+/// Whether `text` is a query member: `type` and `comment` use a top-level `text` for what
+/// they type or say.
 fn textQueries(request: &Value) -> bool {
-  return nested(request) || textField(request, "cmd") != "type"
+  let cmd = textField(request, "cmd")
+  return nested(request) || cmd != "type" && cmd != "comment"
 }
 
 /// Whether the request names a target node.
@@ -1759,4 +2108,147 @@ effect fn cropPixels(full: &Pixmap, bounds: Rect<f32>, scale: f32) -> Pixmap
     y = y + 1
   }
   return move crop
+}
+
+// The edit log.
+
+/// Whether node `id`'s override in `state` leaves the client's declarations out.
+fn replacing(tree: &UiTree<'_>, id: u32, state: StyleState) -> bool {
+  return match tree.overrideOf(id, state) {
+    Option<&StyleOverride>.Some { value } => value.replace
+    Option<&StyleOverride>.None => false
+  }
+}
+
+/// One property a `setStyle` changes, with the client's value now.
+struct Change {
+  property: String,
+  before: String,
+  hasBefore: bool,
+  after: String,
+  hasAfter: bool,
+}
+
+/// Whether `list` has a change of `property`.
+fn hasChange(list: &List<Change>, property: string) -> bool {
+  let items = list.asSlice()
+  let mut i: usize = 0
+  while i < items.length {
+    if String.view(&items[i].property) == property {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+/// The client's value of `property` on node `id` in `state`, in `value`; false when it sets
+/// none (a shorthand covering the property does not count).
+effect fn clientValue(
+  tree: &UiTree<'_>,
+  id: u32,
+  state: StyleState,
+  property: string,
+  value: &mut String,
+) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let client = patchOf(tree.node(tree.slotOf(id)), state).asSlice()
+  let mut name = String.make()
+  let mut i: usize = 0
+  while i < client.length {
+    run parts(&client[i], &mut name, &mut value)
+    if String.view(&name) == property {
+      return true
+    }
+    i = i + 1
+  }
+  value.clear()
+  return false
+}
+
+/// The changes `declarations` make to node `id` in `state`: each declared property; with
+/// `replace` also the client's properties and those of the node's open edits there that it
+/// leaves out (shown as none).
+effect fn changed(
+  tree: &UiTree<'_>,
+  id: u32,
+  state: StyleState,
+  declarations: &List<Declaration>,
+  replace: bool,
+  log: &EditLog,
+  out: &mut List<Change>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let items = declarations.asSlice()
+  let mut name = String.make()
+  let mut value = String.make()
+  let mut i: usize = 0
+  while i < items.length {
+    run parts(&items[i], &mut name, &mut value)
+    let mut before = String.make()
+    let had = run clientValue(tree, id, state, String.view(&name), &mut before)
+
+    // A later declaration of the same property wins, as in the override.
+    let mut j: usize = 0
+    while j < out.length() {
+      if String.view(&out.asSlice()[j].property) == String.view(&name) {
+        drop out.remove(j)
+      } else {
+        j = j + 1
+      }
+    }
+    run out.append(
+      Change {
+        property: run String.copy(String.view(&name)),
+        before: move before,
+        hasBefore: had,
+        after: run String.copy(String.view(&value)),
+        hasAfter: true,
+      },
+    )
+    i = i + 1
+  }
+  if !replace {
+    return ()
+  }
+  let mut left = List<String>.make()
+  let client = patchOf(tree.node(tree.slotOf(id)), state).asSlice()
+  let mut k: usize = 0
+  while k < client.length {
+    run parts(&client[k], &mut name, &mut value)
+    run left.append(run String.copy(String.view(&name)))
+    k = k + 1
+  }
+  let entries = log.entries.asSlice()
+  let mut e: usize = 0
+  while e < entries.length {
+    let entry = &entries[e]
+    if entry.kind == EntryKind.Edit && entry.status == Status.Open && entry.applied
+      && entry.node == id
+      && entry.state == state {
+      run left.append(run String.copy(String.view(&entry.property)))
+    }
+    e = e + 1
+  }
+  let names = left.asSlice()
+  let mut n: usize = 0
+  while n < names.length {
+    let property = String.view(&names[n])
+    if !hasChange(&out, property) {
+      let mut before = String.make()
+      let had = run clientValue(tree, id, state, property, &mut before)
+      run out.append(
+        Change {
+          property: run String.copy(property),
+          before: move before,
+          hasBefore: had,
+          after: String.make(),
+          hasAfter: false,
+        },
+      )
+    }
+    n = n + 1
+  }
 }
