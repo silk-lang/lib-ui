@@ -1,0 +1,509 @@
+//! Devtools in the app's own tree: the todo example in root 0 and the embedded devtools beside
+//! it, driven as the window host drives them (frames when a root needs one, the companion
+//! pumped after each turn), with an inspector that has no socket. The devtools inspect the app
+//! and never themselves, settle without pushing anything to each other, highlight in the app
+//! the row clicked in their root, and docked, leave the app the rest of the window.
+import ui_devtools.embedded { EmbeddedDevtools, Placement, DEVTOOLS_ROOT, FIRST_ID, dockArea }
+import ui_devtools.lib { Devtools, Message, Command, NO_PARENT }
+import ui_app_examples.todo { Todo, Message as TodoMessage, Command as TodoCommand, Store }
+import ui_app_examples.look { SANS }
+import ui_app.runtime { Runtime, frame, pump }
+import ui_inspect.query { Query, queryFirst }
+import ui_inspect_server.lib { Inspector, Channel, MemoryChannel }
+import ui_tree_window.companion { Dock, dockTarget }
+// Interface methods resolve through this import; silk#2819 reports it as unused.
+import ui_tree_window.companion { Companion as _Companion }
+import ui_fixtures.fixtures as fixtures
+import ui_tree.legacy { UiTree, TreeError, Batch, FrameInput, Role, Input, NONE, BUTTON_PRIMARY }
+import ui_tree.lib { RootSupport, ExtraRoot }
+import ui_tree.mutation { FIRST_ROOT }
+import ui_tree.inspect { NodeInfo, info, writeInt }
+import font_collection.lib { FontCollection }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.json.scanner { JsonError }
+import silk.json.value { Json, Value }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.u64
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+struct Kept {}
+
+impl Store for Kept {
+  effect fn save(self: &mut Self, count: u64) -> u64 {
+    return count
+  }
+}
+
+/// The app, the devtools beside it, and what the host keeps for them.
+struct Host<'f> {
+  tree: UiTree<'f>,
+  app: Runtime<Todo, TodoMessage, TodoCommand>,
+  store: Kept,
+  inspector: Inspector,
+  devtools: EmbeddedDevtools,
+  /// The first window's size, and the frames each root drew.
+  width: f32,
+  height: f32,
+  appFrames: u64,
+  toolFrames: u64,
+}
+
+fn input(width: f32, height: f32) -> FrameInput {
+  return FrameInput { width: width, height: height, scale: 1.0, time: 0.0 }
+}
+
+impl<'f> Host<'f> {
+  effect fn make(collection: &'f FontCollection, placement: Placement) -> Host<'f>
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut tree = run UiTree.make(collection)
+    tree.rootSupport = RootSupport { count: 4294967295, extra: ExtraRoot.Window }
+    let mut batch = Batch.make()
+    run batch.fontFamily(SANS, "Noto Sans, sans-serif")
+    run tree.apply(run batch.take())
+    let mut app = Runtime<Todo, TodoMessage, TodoCommand>.make(run Todo.make())
+    run app.start(&mut tree, 0.0)
+    let mut host = Host<'f> {
+      tree: move tree,
+      app: move app,
+      store: Kept {},
+      inspector: Inspector.off(),
+      devtools: EmbeddedDevtools.make(true, true, Option<Placement>.some(placement)),
+      width: 600.0,
+      height: 500.0,
+      appFrames: 0,
+      toolFrames: 0,
+    }
+    run host.devtools.attach(&mut host.tree, &mut host.inspector)
+    run host.turns(8)
+    return move host
+  }
+
+  /// The app's part of the window: all of it, or what the dock leaves.
+  fn appInput(self: &Self) -> FrameInput {
+    return match self.devtools.dock(self.width, self.height) {
+      Option<Dock>.Some { value } => input(self.width, value.area.yMin)
+      Option<Dock>.None => input(self.width, self.height)
+    }
+  }
+
+  /// One turn of the host's loop: each root framed when it needs it, then the devtools hear
+  /// what was pushed to them.
+  effect fn turn(self: &mut Self) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if self.tree.needsFrameOf(DEVTOOLS_ROOT) {
+      let whole = if self.devtools.dock(self.width, self.height).isSome() {
+        input(self.width, self.height)
+      } else {
+        input(900.0, 560.0)
+      }
+      run self.devtools.layout(&mut self.tree, &mut self.inspector, DEVTOOLS_ROOT, whole)
+      self.toolFrames = self.toolFrames + 1
+    }
+    drop run self.tree.useRoot(FIRST_ROOT)
+    if self.tree.needsFrameOf(FIRST_ROOT) || self.inspector.wantsFrame() || self.appFrames == 0 {
+      let viewport = self.appInput()
+      run frame(&mut self.app, &mut self.tree, viewport)
+        |> Effect.provideMut<Store>(&mut self.store)
+      run self.inspector.afterFrame(&self.tree)
+      self.appFrames = self.appFrames + 1
+    }
+    drop run self.devtools.pump(&mut self.tree, &mut self.inspector, 0.0)
+    drop run self.tree.useRoot(FIRST_ROOT)
+  }
+
+  effect fn turns(self: &mut Self, count: u32) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut i: u32 = 0
+    while i < count {
+      run self.turn()
+      i = i + 1
+    }
+  }
+
+  /// What the devtools show: their rows, whether one is theirs, the selected node, how often
+  /// they read everything, and whether an error shows. Nothing while they are closed.
+  fn rows(self: &Self) -> usize {
+    return match self.devtools.app() {
+      Option<&Runtime<Devtools, Message, Command>>.Some { value } => value.model.rows.length()
+      Option<&Runtime<Devtools, Message, Command>>.None => 0
+    }
+  }
+
+  fn firstRow(self: &Self) -> u32 {
+    return match self.devtools.app() {
+      Option<&Runtime<Devtools, Message, Command>>.Some { value } => if value.model.rows.length()
+        == 0 {
+        NO_PARENT
+      } else {
+        value.model.rows.asSlice()[0].id
+      }
+      Option<&Runtime<Devtools, Message, Command>>.None => NO_PARENT
+    }
+  }
+
+  fn listsOwn(self: &Self) -> bool {
+    if let Option<&Runtime<Devtools, Message, Command>>.Some { value } = self.devtools.app() {
+      let rows = value.model.rows.asSlice()
+      let mut i: usize = 0
+      while i < rows.length {
+        if rows[i].id >= FIRST_ID {
+          return true
+        }
+        i = i + 1
+      }
+    }
+    return false
+  }
+
+  fn selected(self: &Self) -> u32 {
+    return match self.devtools.app() {
+      Option<&Runtime<Devtools, Message, Command>>.Some { value } => value.model.selected
+      Option<&Runtime<Devtools, Message, Command>>.None => NO_PARENT
+    }
+  }
+
+  fn syncs(self: &Self) -> u64 {
+    return match self.devtools.app() {
+      Option<&Runtime<Devtools, Message, Command>>.Some { value } => value.model.syncs
+      Option<&Runtime<Devtools, Message, Command>>.None => 0
+    }
+  }
+
+  fn failing(self: &Self) -> bool {
+    return match self.devtools.app() {
+      Option<&Runtime<Devtools, Message, Command>>.Some {
+        value
+      } => value.model.error.ownedByteLength() != 0
+      Option<&Runtime<Devtools, Message, Command>>.None => true
+    }
+  }
+
+  /// Presses and releases the primary button at (`x`, `y`) in root `root`, as the host feeds
+  /// window input: the devtools decide for their root, the app for its own.
+  effect fn click(self: &mut Self, root: u32, x: f32, y: f32) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    run self.feed(
+      root,
+      Input.PointerDown { x: x, y: y, button: BUTTON_PRIMARY, modifiers: 0, clickCount: 1 },
+    )
+    run self.feed(root, Input.PointerUp { x: x, y: y, button: BUTTON_PRIMARY, modifiers: 0 })
+  }
+
+  effect fn feed(self: &mut Self, root: u32, record: Input) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    run self.tree.beginAt(root, &record)
+    let into = self.tree.current
+    if self.devtools.owns(into) {
+      let prevented = run self.devtools.decide(&mut self.tree, &mut self.inspector)
+      run self.tree.finish(move record, prevented)
+      drop run self.devtools.pump(&mut self.tree, &mut self.inspector, 0.0)
+    } else {
+      run self.tree.finish(move record, false)
+      drop run pump(&mut self.app, &mut self.tree) |> Effect.provideMut<Store>(&mut self.store)
+    }
+    drop run self.tree.useRoot(FIRST_ROOT)
+  }
+
+  /// The middle of the devtools' node with test id `testId`, or None.
+  effect fn toolNode(self: &mut Self, testId: string) -> Option<NodeInfo>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    drop run self.tree.useRoot(DEVTOOLS_ROOT)
+    let mut q = run Query.byTestId(testId)
+    q.within = FIRST_ID
+    let found = run queryFirst(&self.tree, &q)
+    let node = if found == NONE {
+      Option<NodeInfo>.None
+    } else {
+      run info(&self.tree, found)
+    }
+    drop run self.tree.useRoot(FIRST_ROOT)
+    return node
+  }
+}
+
+/// "element-<id>".
+effect fn rowId(id: u32) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = run String.copy("element-")
+  run writeInt(&mut text, u32.toU64(id))
+  return move text
+}
+
+/// Sends `line` from another local client (as the CLI would), serves it, parses the reply.
+effect fn ask(host: &mut Host<'_>, client: &mut MemoryChannel, line: string) -> Value
+  ! JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  drop run Channel.send(line) |> Effect.provideMut<Channel>(&mut client)
+  drop run host.inspector.serveLocal(&mut host.tree)
+  let mut reply = String.make()
+  while run Channel.receive(&mut reply) |> Effect.provideMut<Channel>(&mut client) {
+    if !String.contains(String.view(&reply), "\"event\"") {
+      return run Json.parse(reply.ownedUtf8Bytes())
+    }
+  }
+  return run Json.parse(b"{}")
+}
+
+fn array<'a>(reply: &'a Value, key: string) -> usize {
+  return match Json.field(reply, key) {
+    Option<&Value>.Some { value } => match &value.* {
+      Value.Array { values } => values.length()
+      _ => 0
+    }
+    Option<&Value>.None => 0
+  }
+}
+
+/// Whether some node of a `tree` reply is the devtools'.
+fn listsTools(reply: &Value) -> bool {
+  return match Json.field(reply, "nodes") {
+    Option<&Value>.Some { value } => match &value.* {
+      Value.Array { values } => {
+        let list = values.asSlice()
+        let mut i: usize = 0
+        while i < list.length {
+          match Json.asU64(Json.field(&list[i], "id")) {
+            Option<u64>.Some { value: id } => {
+              if id >= u32.toU64(FIRST_ID) {
+                return true
+              }
+            }
+            Option<u64>.None => {}
+          }
+          i = i + 1
+        }
+        false
+      }
+      _ => false
+    }
+    Option<&Value>.None => false
+  }
+}
+
+effect fn windowBody() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut host = run Host.make(&collection, Placement.Window)
+  run Testing.expect(host.devtools.isOpen(), "the devtools open at start")
+  run Testing.expect(host.inspector.enabled(), "and turn the inspector on, with no socket")
+  run Testing.expect(
+    host.tree.rootOpen(DEVTOOLS_ROOT) && host.tree.rootNode(DEVTOOLS_ROOT) == FIRST_ID,
+    "in a root of their own, with ids at the top of the id space",
+  )
+  run Testing.expect(
+    host.devtools.dock(600.0, 500.0).isNone(),
+    "in a window of their own where the host has windows",
+  )
+
+  // They list the app's nodes and none of their own.
+  run Testing.expect(
+    host.rows() > 20 && host.firstRow() == 1 && !host.listsOwn(),
+    "the devtools list the app's tree, not their own",
+  )
+  run Testing.expect(!host.failing(), "without an error")
+
+  // Another client of the same inspector sees the app alone.
+  let mut cli = run host.inspector.openLocal()
+  let tree = run ask(&mut host, &mut cli, "{\"id\":1,\"cmd\":\"tree\"}")
+  run Testing.expect(!listsTools(&tree), "a tree reply leaves the devtools' nodes out")
+  let row = run ask(&mut host, &mut cli, "{\"id\":2,\"cmd\":\"query\",\"testId\":\"element-1\"}")
+  run Testing.expect(array(&row, "nodes") == 0, "no query finds them")
+  let hello = run ask(&mut host, &mut cli, "{\"id\":3,\"cmd\":\"hello\"}")
+  run Testing.expect(
+    array(&hello, "roots") == 1 && array(&hello, "hidden") == 1,
+    "hello lists the app's root, and the devtools' as hidden",
+  )
+  let picked = run ask(&mut host, &mut cli, "{\"id\":4,\"cmd\":\"pick\",\"x\":40,\"y\":40}")
+  let node = match Json.field(&picked, "node") {
+    Option<&Value>.Some { value } => Json.asU64(Json.field(value, "id")).unwrapOr(0)
+    Option<&Value>.None => 0
+  }
+  run Testing.expect(node != 0 && node < u32.toU64(FIRST_ID), "picking finds the app's nodes")
+  cli.close()
+
+  // Settled, nothing goes round: idle turns draw nothing and push nothing.
+  run host.turns(4)
+  let appFrames = host.appFrames
+  let toolFrames = host.toolFrames
+  let syncs = host.syncs()
+  let served = host.inspector.served
+  run host.turns(10)
+  run Testing.expect(host.appFrames == appFrames, "idle turns draw no app frame")
+  run Testing.expect(host.toolFrames == toolFrames, "nor a devtools frame")
+  run Testing.expect(
+    host.inspector.served == served && host.syncs() == syncs,
+    "and the devtools ask nothing",
+  )
+
+  // A click on the Add button's row highlights the button in the app.
+  let add = run queryFirst(&host.tree, &run Query.byRoleNamed(Role.Button, "Add"))
+  let addRow = run rowId(add)
+  let found = run host.toolNode(String.view(&addRow))
+  run Testing.expect(found.isSome(), "the Add button has a row")
+  if let Option<NodeInfo>.Some { value } = found {
+    let x = (value.bounds.xMin + value.bounds.xMax) * 0.5
+    let y = (value.bounds.yMin + value.bounds.yMax) * 0.5
+    run host.click(DEVTOOLS_ROOT, x, y)
+  }
+  run host.turns(2)
+  let lit = host.inspector.state().highlight.nodes.asSlice()
+  run Testing.expect(host.selected() == add, "the row is selected")
+  run Testing.expect(lit.length == 1 && lit[0] == add, "the app highlights the Add button")
+  run Testing.expect(host.inspector.wantsFrame() == false, "and drew it")
+
+  // A change in the app reaches the devtools once.
+  let before = host.rows()
+  if let Option<NodeInfo>.Some { value } = run info(&host.tree, add) {
+    run host.click(
+      FIRST_ROOT,
+      (value.bounds.xMin + value.bounds.xMax) * 0.5,
+      value.bounds.yMin + 2.0,
+    )
+  }
+  run host.turns(3)
+  run Testing.expect(host.rows() > before, "the new task's rows show in the devtools")
+  let settled = host.inspector.served
+  run host.turns(10)
+  run Testing.expect(host.inspector.served == settled, "then all is quiet again")
+
+  // F12 closes them, and its release is theirs too; the app keeps its root.
+  let closing = Input.KeyDown {
+    key: run String.copy("F12"),
+    code: run String.copy("F12"),
+    modifiers: 0,
+    repeat: false,
+  }
+  run Testing.expect(
+    run host.devtools.key(&mut host.tree, &mut host.inspector, &closing),
+    "F12 is the devtools'",
+  )
+  let release = Input.KeyUp {
+    key: run String.copy("F12"),
+    code: run String.copy("F12"),
+    modifiers: 0,
+  }
+  run Testing.expect(
+    run host.devtools.key(&mut host.tree, &mut host.inspector, &release),
+    "and so is its release",
+  )
+  run Testing.expect(
+    !host.devtools.isOpen() && !host.tree.rootOpen(DEVTOOLS_ROOT) && host.tree.rootOpen(FIRST_ROOT),
+    "they close, the app stays",
+  )
+  run Testing.expect(
+    host.inspector.state().highlight.nodes.length() == 0 && !host.inspector.enabled(),
+    "their highlight goes, and the inspector is off again",
+  )
+  let other = Input.KeyDown {
+    key: run String.copy("a"),
+    code: run String.copy("KeyA"),
+    modifiers: 0,
+    repeat: false,
+  }
+  run Testing.expect(
+    !(run host.devtools.key(&mut host.tree, &mut host.inspector, &other)),
+    "other keys are the app's",
+  )
+  let opening = Input.KeyDown {
+    key: run String.copy("F12"),
+    code: run String.copy("F12"),
+    modifiers: 0,
+    repeat: false,
+  }
+  drop run host.devtools.key(&mut host.tree, &mut host.inspector, &opening)
+  run host.turns(4)
+  run Testing.expect(host.devtools.isOpen() && host.rows() > 20, "F12 opens them again")
+}
+
+test effect fn devtoolsInTheAppsOwnTree() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run windowBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn dockBody() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut host = run Host.make(&collection, Placement.Dock)
+  let area = dockArea(600.0, 500.0)
+  let dock = host.devtools.dock(600.0, 500.0)
+  run Testing.expect(
+    dock.isSome() && area.yMin > 100.0 && area.yMin < 400.0 && area.yMax == 500.0,
+    "docked at the bottom of the window",
+  )
+
+  // The app lays out in the rest, as if that were its window.
+  let viewport = host.tree.rootViewport(FIRST_ROOT)
+  run Testing.expect(
+    viewport.width() == 600.0 && viewport.height() == area.yMin,
+    "the app's viewport is what the dock leaves",
+  )
+  let footer = run queryFirst(&host.tree, &run Query.byTestId("footer"))
+  run Testing.expect(footer != NONE, "the app has a footer")
+
+  // Pointer input goes by where it is; a press keeps its side until the release.
+  let inApp = Input.PointerMove { x: 50.0, y: 20.0, modifiers: 0 }
+  let inDock = Input.PointerMove { x: 50.0, y: area.yMin + 20.0, modifiers: 0 }
+  run Testing.expect(dockTarget(&inApp, &dock, NONE, FIRST_ROOT) == FIRST_ROOT, "the app's part")
+  run Testing.expect(
+    dockTarget(&inDock, &dock, NONE, FIRST_ROOT) == DEVTOOLS_ROOT,
+    "the dock's part",
+  )
+  run Testing.expect(
+    dockTarget(&inDock, &dock, FIRST_ROOT, FIRST_ROOT) == FIRST_ROOT,
+    "a drag that began in the app stays the app's",
+  )
+  run Testing.expect(
+    dockTarget(&Input.PointerLeave, &dock, NONE, DEVTOOLS_ROOT) == DEVTOOLS_ROOT,
+    "the pointer leaves the side it was on",
+  )
+
+  // The app's coordinates keep their origin; the dock's nodes are where the dock is.
+  run Testing.expect(
+    host.tree.hitTest(50.0, 20.0) != NONE && host.tree.hitTest(50.0, 20.0) < FIRST_ID,
+    "the app is hit where it is",
+  )
+  drop run host.tree.useRoot(DEVTOOLS_ROOT)
+  let tool = host.tree.hitTest(50.0, area.yMin + 20.0)
+  let over = host.tree.hitTest(50.0, 20.0)
+  drop run host.tree.useRoot(FIRST_ROOT)
+  run Testing.expect(tool != NONE && tool >= FIRST_ID, "the devtools are hit in the dock")
+  run Testing.expect(over == NONE, "and nowhere else")
+
+  // A click on a row in the dock highlights in the app, which draws again.
+  let add = run queryFirst(&host.tree, &run Query.byRoleNamed(Role.Button, "Add"))
+  let addRow = run rowId(add)
+  let found = run host.toolNode(String.view(&addRow))
+  run Testing.expect(found.isSome(), "the Add button has a row in the dock")
+  if let Option<NodeInfo>.Some { value } = found {
+    run Testing.expect(value.bounds.yMin >= area.yMin, "inside the dock")
+    let frames = host.appFrames
+    run host.click(
+      DEVTOOLS_ROOT,
+      (value.bounds.xMin + value.bounds.xMax) * 0.5,
+      (value.bounds.yMin + value.bounds.yMax) * 0.5,
+    )
+    run host.turns(2)
+    let lit = host.inspector.state().highlight.nodes.asSlice()
+    run Testing.expect(lit.length == 1 && lit[0] == add, "the app highlights the Add button")
+    run Testing.expect(host.appFrames > frames, "and draws its highlight")
+  }
+}
+
+test effect fn devtoolsDockedInTheAppsWindow() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run dockBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
