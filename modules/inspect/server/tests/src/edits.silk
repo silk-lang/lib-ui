@@ -5,7 +5,15 @@
 //! once a frame and not at all while nothing changes, nothing asks for frames once an edit is
 //! drawn, and the log outlives the session that made it.
 import ui_fixtures.fixtures as fixtures
-import ui_inspect_server.lib { Protocol, Session, Channel, MemoryChannel, MemoryPair }
+import ui_inspect_server.lib {
+  Protocol,
+  Session,
+  Channel,
+  MemoryChannel,
+  MemoryPair,
+  Bridge,
+  Action
+}
 import ui_inspect_server.topics { TOPIC_EDITS }
 import ui_tree.legacy { UiTree, TreeError, Batch, FrameInput }
 import ui_tree.mutation { Mutation, StyleState }
@@ -572,4 +580,164 @@ test effect fn editsTopicAndSessions() -> ()
   ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   run topicBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// An agent's round trip over MCP: the bridge's requests go to one-shot sessions over a memory
+// channel, as the MCP server's go to the app's socket.
+
+/// Runs one JSON-RPC message through `bridge`, each request it makes answered by a new one-shot
+/// session over a `MemoryChannel`. Returns the response.
+effect fn mcp(
+  bridge: &mut Bridge,
+  protocol: &mut Protocol,
+  tree: &mut UiTree<'_>,
+  line: string,
+) -> Value
+  ! JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = String.make()
+  let mut action = run bridge.handle(String.utf8Bytes(line), &mut out)
+  while action == Action.Ask {
+    let pair = run MemoryChannel.pair()
+    let MemoryPair { first, second } = move pair
+    let mut app = move first
+    let mut client = move second
+    let mut session = Session.make()
+    run send(&mut client, String.view(&out))
+    run serveAll(&mut session, &mut protocol, &mut tree, &mut app)
+    let mut reply = String.make()
+    drop run Channel.receive(&mut reply) |> Effect.provideMut<Channel>(&mut client)
+    action = run bridge.answer(reply.ownedUtf8Bytes(), true, 0, &mut out)
+  }
+  return run Json.parse(out.ownedUtf8Bytes())
+}
+
+/// The text of a tool result, parsed (the inspector's reply line).
+effect fn resultOf(response: &Value) -> Value
+  ! JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  let items = array(member(response, "result"), "content")
+  if items.length == 0 {
+    return run Json.parse(b"{}")
+  }
+  return run Json.parse(String.utf8Bytes(text(&items[0], "text")))
+}
+
+/// The tool named `name` in a `tools/list` response, or the response itself.
+fn toolNamed<'a>(response: &'a Value, name: string) -> &'a Value {
+  let tools = array(member(response, "result"), "tools")
+  let mut i: usize = 0
+  while i < tools.length {
+    if text(&tools[i], "name") == name {
+      return &tools[i]
+    }
+    i = i + 1
+  }
+  return response
+}
+
+effect fn agentBody() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run inbox(&collection)
+  let mut protocol = Protocol.make()
+  run protocol.afterFrame(&tree)
+  let mut bridge = run Bridge.make("memory")
+
+  let listed = run mcp(
+    &mut bridge,
+    &mut protocol,
+    &mut tree,
+    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}",
+  )
+  let edits = toolNamed(&listed, "ui_edits")
+  let resolve = toolNamed(&listed, "ui_resolve")
+  let comment = toolNamed(&listed, "ui_comment")
+  run Testing.expect(
+    String.contains(text(edits, "description"), "ui_resolve")
+      && String.contains(text(resolve, "description"), "rebuilt")
+      && text(comment, "name") == "ui_comment",
+    "the edit tools are listed, described for the workflow",
+  )
+
+  // A person tries a padding in devtools and leaves a comment.
+  drop run ask(
+    &mut protocol,
+    &mut tree,
+    "{\"cmd\":\"setStyle\",\"node\":20,\"style\":\"padding-left: 20px\"}",
+  )
+  drop run ask(&mut protocol, &mut tree, "{\"cmd\":\"comment\",\"node\":10,\"text\":\"Bolder\"}")
+
+  // The agent reads what is open...
+  let read = run mcp(
+    &mut bridge,
+    &mut protocol,
+    &mut tree,
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"ui_edits\",\"arguments\":{\"status\":\"open\"}}}",
+  )
+  let open = run resultOf(&read)
+  let found = array(&open, "edits")
+  run Testing.expect(
+    found.length == 1 && array(&open, "comments").length == 1 && text(&found[0], "after") == "20px"
+      && text(member(member(&found[0], "target"), "named"), "name") == "Archive",
+    "the agent reads the open edit and comment, with the node to find",
+  )
+  let edit = int(&found[0], "id")
+  let note = int(&array(&open, "comments")[0], "id")
+
+  // ...changes the code (here: the app now sets what the edit asked), replies and resolves.
+  run clientRestyle(&mut tree, &[css.paddingLeft(px(20.0))])
+  let mut replyLine = run String.copy(
+    "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"ui_comment\",\"arguments\":{\"text\":\"Done in toolbar.silk\",\"author\":\"agent\",\"reply\":",
+  )
+  run appendInt(&mut replyLine, note)
+  run replyLine.append("}}}")
+  let replied = run resultOf(
+    &run mcp(&mut bridge, &mut protocol, &mut tree, String.view(&replyLine)),
+  )
+  run Testing.expect(
+    array(member(&replied, "entry"), "thread").length == 1,
+    "the agent answers in the comment's thread",
+  )
+  let mut resolveLine = run String.copy(
+    "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"ui_resolve\",\"arguments\":{\"entries\":[",
+  )
+  run appendInt(&mut resolveLine, edit)
+  run resolveLine.append(",")
+  run appendInt(&mut resolveLine, note)
+  run resolveLine.append("]}}}")
+  let resolved = run resultOf(
+    &run mcp(&mut bridge, &mut protocol, &mut tree, String.view(&resolveLine)),
+  )
+  let entries = array(&resolved, "entries")
+  run Testing.expect(
+    entries.length == 2 && text(&entries[0], "status") == "resolved"
+      && text(&entries[1], "status") == "resolved",
+    "and marks both resolved",
+  )
+  run tree.frame(viewport(0.1))
+  run Testing.expect(
+    !tree.overridden(ARCHIVE, StyleState.Base)
+      && (run paddingLeft(&mut protocol, &mut tree)) == 20.0,
+    "the override is gone and the app's own value is the one asked for",
+  )
+  let after = run resultOf(
+    &run mcp(
+      &mut bridge,
+      &mut protocol,
+      &mut tree,
+      "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"ui_edits\",\"arguments\":{\"status\":\"open\"}}}",
+    ),
+  )
+  run Testing.expect(
+    array(&after, "edits").length == 0 && array(&after, "comments").length == 0,
+    "nothing is left open",
+  )
+}
+
+test effect fn anAgentResolvesEditsOverMcp() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run agentBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }
