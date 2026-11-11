@@ -311,22 +311,23 @@ effect fn coalesceBody() -> ()
       modifiers: none,
     },
   )
-  let mut pending = Option<Event>.None
+  let mut backlog = List<Event>.make()
   let first = match move run platform.nextEvent(Wait.Poll) {
     Option<Event>.Some { value } => move value
     Option<Event>.None => Event.QuitRequested
   }
-  let moved = run coalesce(&mut platform, move first, &mut pending)
+  let moved = run coalesce(&mut platform, move first, &mut backlog)
   let lastMove = match &moved {
     Event.MouseMoved { position, .. } => position.x == 3.0 && position.y == 4.0
     _ => false
   }
   run Testing.expect(lastMove, "three queued moves fold into the last one")
-  let next = match move Intrinsic.replace(pending, Option<Event>.None) {
-    Option<Event>.Some { value } => move value
-    Option<Event>.None => Event.QuitRequested
+  let next = if backlog.length() != 0 {
+    backlog.remove(0)
+  } else {
+    Event.QuitRequested
   }
-  let scrolled = run coalesce(&mut platform, move next, &mut pending)
+  let scrolled = run coalesce(&mut platform, move next, &mut backlog)
   let summed = match &scrolled {
     Event.Scroll { position, delta, .. } => match delta {
       ScrollDelta.Points { delta: d } => d.x == 1.0 && d.y == -25.0 && position.x == 6.0
@@ -335,14 +336,51 @@ effect fn coalesceBody() -> ()
     _ => false
   }
   run Testing.expect(summed, "two scrolls in one phase sum their deltas")
-  let ended = match move pending {
-    Option<Event>.Some { value } => match move value {
-      Event.Scroll { phase, .. } => phase == Phase.Ended
-      _ => false
-    }
-    Option<Event>.None => false
+  let ended = backlog.length() == 1 && match &backlog.asSlice()[0] {
+    Event.Scroll { phase, .. } => phase == Phase.Ended
+    _ => false
   }
   run Testing.expect(ended, "the gesture's end is kept for the next pass")
+  backlog.clear()
+
+  // Moves that queued up between frame requests, as when frames are slower than the pointer:
+  // one move and one request are left, not a move and a frame for each.
+  let mut x: f64 = 10.0
+  while x < 14.0 {
+    run platform.push(Event.MouseMoved { window: window, position: at(x, 1.0), modifiers: none })
+    run platform.push(Event.RequestFrame { window: window, targetTime: x })
+    x = x + 1.0
+  }
+  run platform.push(Event.MouseMoved { window: window, position: at(20.0, 1.0), modifiers: none })
+  run platform.push(Event.MouseDown {
+    window: window,
+    button: MouseButton.Left,
+    position: at(20.0, 1.0),
+    modifiers: none,
+    clickCount: 1,
+  })
+  run platform.push(Event.MouseMoved { window: window, position: at(30.0, 1.0), modifiers: none })
+  let head = match move run platform.nextEvent(Wait.Poll) {
+    Option<Event>.Some { value } => move value
+    Option<Event>.None => Event.QuitRequested
+  }
+  let now = run coalesce(&mut platform, move head, &mut backlog)
+  let frame = match &now {
+    Event.RequestFrame { targetTime, .. } => targetTime == 13.0
+    _ => false
+  }
+  run Testing.expect(frame, "the last frame request stands for the four")
+  let after = match &backlog.asSlice()[0] {
+    Event.MouseMoved { position, .. } => position.x == 20.0
+    _ => false
+  }
+  run Testing.expect(after && backlog.length() == 3, "then the last move before the press")
+  let press = match &backlog.asSlice()[1] {
+    Event.MouseDown { .. } => true
+    _ => false
+  }
+  run Testing.expect(press, "a press is never folded over")
+  drop now
   drop moved
   drop scrolled
 }

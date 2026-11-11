@@ -19,6 +19,7 @@ import ui_tree.mutation { LISTEN_WHEEL, NodeKind }
 import ui_tree.scrollbar { usedOverflow, userScrolls }
 import render_thread { FastScroll, ScrollerAxes }
 import silk.collections.list { List }
+import silk.collections.slice { Slice }
 import silk.geometry.rect { Rect }
 import silk.num.f32
 import silk.core.option { Option }
@@ -359,78 +360,123 @@ fn mergeablePhase(phase: Phase) -> bool {
   }
 }
 
-/// Folds the events already queued behind `first` into it, so a slow frame does not leave a
-/// backlog that runs the client once per event: consecutive pointer moves keep the last
-/// position, and consecutive scrolls of one kind and phase sum their deltas. The first event
-/// that does not fold is left in `pending` for the next pass.
-pub effect fn coalesce<P: Platform>(
-  platform: &mut P,
-  first: Event,
-  pending: &mut Option<Event>,
-) -> Event
-  ! OutOfMemoryError
-  ? &mut Allocator {
-  let mut current = move first
-  while true {
-    let folds = match &current {
-      Event.MouseMoved { .. } => true
-      Event.Scroll { phase, .. } => mergeablePhase(phase)
-      _ => false
+/// How many queued events one pass takes from the platform to fold.
+const BACKLOG_LIMIT: usize = 1024
+
+/// 1 for a pointer move, 2 for a frame request, 0 for the rest: the two kinds of which only
+/// the last one a window has queued matters.
+fn pacedKind(event: &Event) -> u32 {
+  return match &event.* {
+    Event.MouseMoved { .. } => 1
+    Event.RequestFrame { .. } => 2
+    _ => 0
+  }
+}
+
+fn pacedWindow(event: &Event) -> u32 {
+  return match &event.* {
+    Event.MouseMoved { window, .. } => window.value
+    Event.RequestFrame { window, .. } => window.value
+    _ => 0
+  }
+}
+
+/// Whether one of `later` is of `event`'s kind, for its window.
+fn superseded(event: &Event, later: &[Event]) -> bool {
+  let kind = pacedKind(event)
+  let window = pacedWindow(event)
+  let mut i: usize = 0
+  while i < later.length {
+    if pacedKind(&later[i]) == kind && pacedWindow(&later[i]) == window {
+      return true
     }
-    if !folds {
-      return move current
-    }
-    let following = match run platform.nextEvent(Wait.Poll) {
-      Option<Event>.Some { value } => move value
-      Option<Event>.None => {
-        return move current
-      }
-    }
-    let merged = match &current {
-      Event.MouseMoved { window, .. } => match &following {
-        Event.MouseMoved { window: next, position: at, modifiers: keys } => if next.value
-          == window.value {
-          Option<Event>.some(Event.MouseMoved { window: next, position: at, modifiers: keys })
+    i = i + 1
+  }
+  return false
+}
+
+/// `current` and `following` as one scroll, when they are two of one window, phase and unit.
+fn mergedScroll(current: &Event, following: &Event) -> Option<Event> {
+  return match &current.* {
+    Event.Scroll { window, delta, phase, modifiers, .. } => match &following.* {
+      Event.Scroll { window: next, position: at, delta: more, phase: stage, modifiers: keys } => {
+        let sameKeys = keys.bits() == modifiers.bits()
+        if mergeablePhase(phase) && next.value == window.value && stage == phase && sameKeys {
+          match sum(delta, more) {
+            Option<ScrollDelta>.Some { value } => Option<Event>.some(
+              Event.Scroll {
+                window: next,
+                position: at,
+                delta: value,
+                phase: stage,
+                modifiers: keys,
+              },
+            )
+            Option<ScrollDelta>.None => Option<Event>.None
+          }
         } else {
           Option<Event>.None
         }
-        _ => Option<Event>.None
-      }
-      Event.Scroll { window, delta, phase, modifiers, .. } => match &following {
-        Event.Scroll { window: next, position: at, delta: more, phase: stage, modifiers: keys } => {
-          let sameKeys = keys.bits() == modifiers.bits()
-          if next.value == window.value && stage == phase && sameKeys {
-            match sum(delta, more) {
-              Option<ScrollDelta>.Some { value } => Option<Event>.some(
-                Event.Scroll {
-                  window: next,
-                  position: at,
-                  delta: value,
-                  phase: stage,
-                  modifiers: keys,
-                },
-              )
-              Option<ScrollDelta>.None => Option<Event>.None
-            }
-          } else {
-            Option<Event>.None
-          }
-        }
-        _ => Option<Event>.None
       }
       _ => Option<Event>.None
     }
-    match move merged {
-      Option<Event>.Some { value } => {
-        drop current
-        drop following
-        current = move value
-      }
+    _ => Option<Event>.None
+  }
+}
+
+/// Folds the events already queued behind `first`, so a slow frame does not leave a backlog
+/// that runs the client once per event. What the platform has queued moves to `backlog`, for
+/// the next passes to take from its front. Of a run of pointer moves and frame requests, only
+/// the last move and the last request of each window stay: moves that came while frames were
+/// drawn are not replayed one frame each after the pointer stopped. Consecutive scrolls of one
+/// kind and phase sum their deltas. Returns the event to handle now.
+pub effect fn coalesce<P: Platform>(platform: &mut P, first: Event, backlog: &mut List<Event>)
+  -> Event
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  while backlog.length() < BACKLOG_LIMIT {
+    match run platform.nextEvent(Wait.Poll) {
+      Option<Event>.Some { value } => run backlog.append(move value)
       Option<Event>.None => {
-        pending.* = Option<Event>.some(move following)
-        return move current
+        break
       }
     }
+  }
+  let mut current = move first
+  if pacedKind(&current) == 0 {
+    while backlog.length() != 0 {
+      match mergedScroll(&current, &backlog.asSlice()[0]) {
+        Option<Event>.Some { value } => {
+          drop backlog.remove(0)
+          current = move value
+        }
+        Option<Event>.None => {
+          break
+        }
+      }
+    }
+    return move current
+  }
+
+  // The run of moves and frame requests at the front, each kept only if it is its window's
+  // last of its kind.
+  let mut end: usize = 0
+  while end < backlog.length() && pacedKind(&backlog.asSlice()[end]) != 0 {
+    end = end + 1
+  }
+  let mut i: usize = 0
+  while i < end {
+    let queued = backlog.asSlice()
+    if superseded(&queued[i], Slice.view(queued, i + 1, end - i - 1)) {
+      drop backlog.remove(i)
+      end = end - 1
+    } else {
+      i = i + 1
+    }
+  }
+  if superseded(&current, Slice.view(backlog.asSlice(), 0, end)) {
+    drop current
+    return backlog.remove(0)
   }
   return move current
 }
