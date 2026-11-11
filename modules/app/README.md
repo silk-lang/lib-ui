@@ -273,10 +273,13 @@ A program keeps a `Journal`: every message with what sent it (`click #12`, `port
 `command Save`, `timer`), the commands `update` returned and the model afterwards. Nothing is
 written by hand: `show.show` and `show.showTree` print any value by reflection (`pub` fields of
 structs and unions, list items, numbers, strings), and a type reflection cannot open says how
-with `impl Shown`. The window host hands the journal to the inspector, where it is the
-`program`, `messages` and `model` commands and the devtools' Program tab
-([ui-inspect-devtools](../inspect/devtools)). The journal keeps the last 200 steps and is only
-filled while an inspector is attached.
+with `impl Shown`. ui-app knows no inspector: the journal is read by silk-ui's inspector
+extension, `silk-ui`, in [ui-app-inspect](inspect), which the window host registers and serves
+the way any framework would its own. There it is the `silk-ui.program`, `silk-ui.messages` and
+`silk-ui.model` commands, the `silk-ui.message` topic and the Program panel the devtools show
+([ui-inspect-devtools](../inspect/devtools)), a view the app renders with its own `Document`
+builder. The journal keeps the last 200 steps and is only filled while an inspector is
+attached.
 
 A native app also shows those devtools in its own process, in a window or docked in its own
 (`SILK_UI_DEVTOOLS=window|dock|1`, or F12 in a debug build with `SILK_UI_INSPECT` set); see

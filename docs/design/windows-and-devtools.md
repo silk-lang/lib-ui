@@ -1,6 +1,6 @@
 # Windows, inspector transports, custom panels, style edits
 
-Status: steps 1–4 of the [order of work](#order-of-work) are implemented; the rest is a draft
+Status: steps 1–5 of the [order of work](#order-of-work) are implemented; the rest is a draft
 for review.
 Code sketches show shape only, not final names or syntax.
 
@@ -24,17 +24,17 @@ Code sketches show shape only, not final names or syntax.
 |---|---|---|
 | Tree | `ui-protocol`, `ui-tree`, `ui-tree-window` | Nodes, styles, events, roots. Roots are opened imperatively. |
 | Inspector | `ui-inspect`, `ui-inspect-server`, cli, mcp | The tree layer only: tree, roots, styles, events, input, highlight, pick, screenshots, frames, audit, edits. Plus the extension API. |
-| Framework | `ui-app` (silk-ui), or any other | Model, messages, commands. Wraps roots however it likes. Registers its own inspector extension. |
+| Framework | `ui-app` (silk-ui), or any other | Model, messages, commands. Wraps roots however it likes. Registers its own inspector extension (silk-ui's is `ui-app-inspect`, so `ui-app` itself stays free of the inspector). |
 | Devtools UI | `ui-inspect-devtools` | An inspector client. Built with silk-ui, which is an implementation choice and leaks nothing into the protocol. In the app's process it is a window-host companion (`ui-tree-window`), so it also needs that host. |
 
-Two things in the code break this today:
+Two things in the code broke this until step 5:
 
-- `ui-inspect-server` owns the program log: `program`, `messages`, `model`
-  and the model diff live in `modules/inspect/server/src/program.silk`, fed by
-  `Inspector.program`. They move to `ui-app` as an extension.
-- Devtools has a hard-wired Program tab (`Panel` enum,
-  `modules/inspect/devtools/src/devtools.silk:74`). It becomes a panel that
-  silk-ui supplies.
+- `ui-inspect-server` owned the program log: `program`, `messages`, `model`
+  and the model diff lived in `modules/inspect/server/src/program.silk`, fed by
+  `Inspector.program`. They are now the `silk-ui` extension, in
+  `modules/app/inspect` (`ui-app-inspect`).
+- Devtools had a hard-wired Program tab (`Panel` enum). It is now a panel
+  silk-ui supplies as a remote view.
 
 Frame timings stay in the inspector: the window host produces them.
 
@@ -58,7 +58,11 @@ Frame timings stay in the inspector: the window host produces them.
 | Inspector | A session in the same process: `openLocal`, served on the spot by `serveLocal` | `server.silk` |
 | Native | A companion beside the client: input, records and frames of its roots, every key first; its root in a window or docked in the first | `modules/tree/window/src/companion.silk` |
 | Devtools | Run in the app's process as that companion, on a hidden root set aside in the tree | `modules/inspect/devtools/src/embedded.silk` |
-| Inspector | Commands are an if/else chain; the MCP tool list is a fixed array | `protocol.silk:417`, `mcp.silk:404` |
+| Inspector | Built-in commands are an if/else chain; `<id>.<command>` goes to the extension registry. The MCP tool list is the built-in array plus the tools of the extensions `hello` lists | `protocol.silk` (`execute`), `extension.silk`, `mcp.silk` |
+| Inspector | Extensions: registered with `Inspector.extend`, served from the app's loop with `Inspector.serveExtension`; topics by name, views on `<id>.view.<panel>` | `modules/inspect/server/src/extension.silk` |
+| Inspector | Mutation batches and event records as JSON, `mutationFormat` 1 | `modules/inspect/server/src/remote.silk` |
+| Framework | silk-ui's extension: program log, `silk-ui.*` commands, the Program panel as a silk-ui program on a `ViewBackend` | `modules/app/inspect/src/{extension,program,panel}.silk` |
+| Devtools | Tabs past their own come from `hello`; data panels in rows; views replayed by `ViewHost`, their records sent back | `modules/inspect/devtools/src/{devtools,remote}.silk` |
 | Inspector | `highlight` exists; devtools only calls it on click | `protocol.silk:784`, `devtools.silk:1128` |
 | Styles | `setStyle` keeps originals per (node, state); no record of the edit; the app's next render of that style wins | `server/src/tools.silk:94` |
 | Theme | `Theme` is a struct passed by hand in ui-components; no variables in css | `modules/components/src/theme.silk:16` |
@@ -276,6 +280,40 @@ inspector.extend(Extension {
 silk-ui's Program tab, message list and model diff move into this extension
 in `ui-app`. Router, store or user panels register the same way.
 
+### As built (step 5)
+
+Silk has no dynamic dispatch, so the inspector cannot hold the extension
+object. Registration is data and serving is the app's:
+
+```silk
+let mut info = run Extension.make("silk-ui", "0.1.0")
+run info.command("messages")                    // served as silk-ui.messages
+run info.topic("message")                       // pushed as silk-ui.message
+run info.tool("messages", "Message log", "...", schemaJson, true)
+run info.panel("program", "Program", "program", "message", true)  // data, topic, view
+run inspector.extend(move info)
+// on every turn of the app's loop, while the inspector is on:
+run inspector.serveExtension("silk-ui", &mut silkUi)   // silkUi: an ExtensionHandler
+```
+
+- `ExtensionHandler` has `command(name, request, out) -> bool`,
+  `topics(news)` and `view(panel, view)`. A command is queued by the
+  inspector and answered when the app next serves the extension; the reply
+  goes to the session that asked (`Session.deliver`), and `pollInterval` is 0
+  while something waits.
+- Topics are kept by name next to the built-in bitmask; each is pushed at most
+  once a frame, as the built-in ones, and dropped when nobody listens.
+- A panel's view is open while some session subscribes to its view topic
+  `<id>.view.<panel>`. `View.send(batch)` pushes
+  `{"event", "frame", "format", "seq", "reset", "mutations"}`; events come back
+  with the built-in `viewEvents` command and out of `View.takeEvents`.
+- Devtools send extension requests with `Link.ask`, whose reply comes with
+  the notifications: a client in the app's own process cannot wait for the
+  app's next turn. The window content's `intercept` hook takes a replayed
+  view's records before the devtools' program sees them.
+- silk-ui's extension lives in a new package, `ui-app-inspect`, which
+  `ui-app-window` registers and serves; `ui-app` stays inspector-free.
+
 ### Risks
 
 - Remote views tie panels to the `Mutation` format, so that format needs a
@@ -339,7 +377,7 @@ the css package's own property and value tables; arrows step numbers.
 | 2 | Protocol 3 sessions, `Channel` with memory and socket, pushed topics, hover highlight | Snappy devtools; 4, 5, 6 |
 | 3 | Native host with several windows; `windows` in silk-ui | Multi-window apps |
 | 4 | Embedded and same-process windowed devtools (done) | — |
-| 5 | Extension API; move the program log out of the inspector into `ui-app`; panels with data, then remote views | Framework tabs |
+| 5 | Extension API; move the program log out of the inspector into `ui-app`; panels with data, then remote views (done) | Framework tabs |
 | 6 | Override layer, edit log, comments, MCP tools | Agent workflow |
 | 7 | Tokens, TOML file, two-way editing | Theme editing |
 
@@ -416,6 +454,15 @@ until the remote view works.**
      view; the hard-wired tab is deleted.
 - After 3, devtools contains no silk-ui knowledge, which is the test that the
   extension API is sufficient for any framework.
+
+Done as recommended. Deviations: the program log went to a new package beside
+`ui-app` (`ui-app-inspect`) rather than into `ui-app` itself; there is no
+`silk-ui.frames` (frame timings stay the inspector's `frames`, as the window
+host produces them) and no `silk-ui.subscriptions` (they are in
+`silk-ui.program`); the devtools' own tabs (Styles to Stats) stay theirs, and
+only extension panels come from `hello`; MCP tools are named
+`<id>_<command>`, since MCP names allow no dots. A remote view carries no root
+options, resources, canvases, grids, anchors or virtual lists in format 1.
 
 ### 4. Token file format
 

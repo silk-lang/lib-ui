@@ -68,15 +68,20 @@ match in tree order wins.
 | `ui_wait` | `wait` | until the target exists (or, with `gone`, does not); `timeout` in ms, default 5000 |
 | `ui_stats` | `stats` | the last frame's counters |
 | `ui_events` | `events` | the event records the app took (click, keydown, input, ...), with `since` and `limit` |
-| `ui_program` | `program` | the running program: counters, subscriptions and the model now |
-| `ui_messages` | `messages` | the steps the program took: message, what sent it, commands returned; `since`, `limit` |
-| `ui_model` | `model` | the model after step `seq` and its line diff against the step before |
 | `ui_frames` | `frames` | layout and paint time per frame, with the frame's counters |
 | `ui_styles` | `styles` | the target's style patches per state |
 | `ui_set_style` | `setStyle` | sets `style` declarations on the target for `state`; `replace` drops what it had |
 | `ui_reset_styles` | `resetStyles` | undoes every style edit |
 | `ui_pick_mode` | `pickMode` | lets the person point at a node in the app's window; ask again for `picked` |
 | `ui_audit` | `audit` | accessibility issues: unnamed controls, missing roles, unreachable or small targets, low contrast |
+
+After these come the tools of the app's extensions (see
+[Extensions](../server/README.md#extensions)): `tools/list` asks the app for `hello` and lists a
+tool for each command an extension has, named `<id>_<command>` (characters MCP does not allow in
+a name become `_`: `silk-ui.messages` is `silk_ui_messages`), described as the extension
+describes it, or generically when it does not. A call to a tool the bridge has not listed yet
+asks `hello` first. When the app is not running, `tools/list` has the inspector's tools alone.
+A silk-ui app has `silk_ui_program`, `silk_ui_messages` and `silk_ui_model` this way.
 
 Results are text: the snapshot or node view text, otherwise the protocol's reply line. A failed
 command (no node matches, a covered node, a timed out wait) is a tool result with `isError`, so
@@ -85,8 +90,8 @@ answers, so a snapshot right after a click shows the result.
 
 A typical agent session: `ui_snapshot` to read the tree, `ui_click` with `label: "New"` (or
 `role: "button", name: "New"`), `ui_wait` for the change, `ui_screenshot` to look at it. To
-find why the app did something, `ui_messages` and `ui_model` say which message changed which
-field; to try a fix, `ui_set_style` and a screenshot; before finishing, `ui_audit`.
+find why the app did something, read what its framework's tools say (for a silk-ui program,
+`silk_ui_messages` and `silk_ui_model`: which message changed which field); to try a fix, `ui_set_style` and a screenshot; before finishing, `ui_audit`.
 
 ## How it works
 
@@ -113,6 +118,9 @@ silk task native mcp       # an MCP client drives the demo in a window
   `describe`, inspect equals `inspectNode`, the New button found by its label and clicked (the
   app sees the click), a screenshot as a PNG image, wait holding and timing out after retries,
   tool errors, JSON-RPC errors, an unreachable app, and JSON written back by `writeValue`.
+- `mcpToolsComeFromHello`: an extension of no framework's commands listed as tools after the
+  inspector's, named as MCP allows, and called through the extension; a call before any list
+  learns them first.
 - `demo mcp` (CI job `demo` in ui-inspect.yml), the exit test for agent access: an MCP client
   starts `ui-inspect-mcp` over stdio, reads a snapshot, finds the button labelled New in it,
   clicks it by that label, waits for the new row, inspects and highlights Archive and takes a

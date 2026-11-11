@@ -155,5 +155,12 @@ environment): in a debug build, `SILK_UI_DEVTOOLS=window`, `dock` or `1` opens t
 F12 toggles them, with no change to the app. They are inert in release builds and in check
 mode. See [ui-inspect-devtools](../../inspect/devtools/README.md#in-the-apps-own-process).
 
+The host registers silk-ui's inspector extension (`silk-ui`, [ui-app-inspect](../inspect)) with
+the inspector it is given, and serves it on every turn of its loop while the inspector is on:
+the program's journal goes to the extension's log, and the extension answers what waits for it
+and renders its Program panel while a client has it open. `WindowContent.intercept` lets a
+content take the records of nodes it put in the tree itself before the program sees them (the
+devtools window replays an app's panel view that way).
+
 Image loading and native workers are implemented in `ui-tree-window.images` and
 `ui-tree-window.background`. Existing imports from this package remain compatible.
