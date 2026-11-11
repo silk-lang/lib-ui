@@ -104,6 +104,9 @@ pub const MAX_REQUEST: usize = 1048576
 /// nanoseconds.
 const ACCEPT_PAUSE: u64 = 200000000
 
+/// How many highlight requests one poll serves before the app gets its frame.
+const FOLD_LIMIT: usize = 256
+
 /// Where the inspector listens.
 pub union Address {
   Unix { pub path: String },
@@ -589,8 +592,15 @@ impl Inspector {
     let mut changed = false
 
     // One request, then yield to native input and timers even when clients continuously
-    // request screenshots.
-    if run self.serveOne(&mut tree) {
+    // request screenshots. A request that only replaced the highlight costs nothing until the
+    // frame, so what waits behind it is served too: a client that hovers faster than the app
+    // draws leaves no backlog of highlights to play back, one frame each.
+    let mut folded: usize = 0
+    while true {
+      self.protocol.latestWins = false
+      if !run self.serveOne(&mut tree) {
+        break
+      }
       self.served = self.served + 1
       if self.protocol.dispatched || self.protocol.repaint {
         changed = true
@@ -600,7 +610,15 @@ impl Inspector {
           drop run self.protocol.dispatchNext(&mut tree)
         }
         self.awaitingFrame = true
+        break
       }
+      if !self.protocol.latestWins || folded == FOLD_LIMIT {
+        break
+      }
+      folded = folded + 1
+
+      // Subscribers hear of this highlight before the next request's reply.
+      run self.publish(&tree.*)
     }
     self.release()
     run self.publish(&tree.*)
