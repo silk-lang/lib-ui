@@ -405,6 +405,15 @@ For people and agents looking at a running UI (`inspect.silk`):
 - [ui-inspect](../inspect) builds on these: queries by role, name and text, hit paths and an
   element picker, the devtools highlight overlay, a node view, synthetic input, and session
   record and replay.
+- **Style overrides** (`UiTree.setOverride(id, state, declarations, replace)`) let a second
+  party that shares the tree, such as the inspector trying a style, lay declarations over what
+  the client set for a node in one state. The tree merges them at style resolution (as
+  `css.set`, or instead of the client's with `replace`), so they outlast the client's
+  `SetStyle` and `ClearStyle` of the node, which change only the declarations underneath;
+  `clearOverride` shows exactly what the client set last. Overrides go with their node when it
+  is destroyed, change only the revision of the root holding the node, are never reported to
+  the client (`NodeView.style` is the client's), and cost nothing while there are none.
+  `overrideOf`, `overridden` and `styleOverrides` read them.
 
 ## Tests
 
@@ -421,6 +430,11 @@ silk task native demo modules/tree/demo -- check
   background repaints that card and its ancestors and replays the rest, with pixels equal to a
   fresh tree), relayout after text changes, failing mutations and id reuse, inheritance and
   state variants, focus events with paths, and the inspection queries.
+- The override tests (`tests/src/overrides.silk`): an override survives the client restyling
+  and clearing the node, clearing it shows the client's last value, `replace` leaves the
+  client's out, a destroyed node's overrides go (and a new node with its id has none), only the
+  holding root changes and an override drawn once asks for no frame, and a hover override
+  restyles on hover.
 - The interaction tests (`tests/src/interaction.silk`) script the inbox fixture with synthetic
   input and check the records (kinds, targets, paths, payloads), the states and looks, and
   what repaints: hover, press, capture and click, disabled nodes, pointer-events, Tab order

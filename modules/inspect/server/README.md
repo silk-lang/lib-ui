@@ -142,6 +142,7 @@ topic per frame:
 | `roots` | a root opened or closed | `roots`, as `tree` lists them |
 | `highlight` | the highlight changed | `nodes` |
 | `pick` | the picker turned on or off, or picked | `on`, `picked` (an id) |
+| `edits` | the edit log changed (see Style edits and the edit log) | `seq` (the log's), `open` (entries open) |
 
 Nothing is computed for a topic no session subscribed to.
 
@@ -176,17 +177,63 @@ Node objects in replies are `{"id", "kind", "role", "name", "testId", "x", "y", 
 | `tree` | target (optional, a subtree) | `nodes`: node objects in tree order, each with `parent` (left out at the top), `depth` and `children` (the count); `roots`: the open roots, `{"root", "node"}`, the current one first; `width`, `height`, `scale`, `frame` |
 | `events` | `since` (a `seq`, default 0), `limit` (the newest N) | `events`: the logged records after `since`, oldest first, each `{"seq", "frame", "kind", "target", "path"}` plus `x`, `y` (pointer, wheel and scroll records), `modifiers`, `key` and `value` (input records) where they apply; `next`: the `seq` the next record gets |
 | `frames` | `since` (a frame number), `limit` | `frames`: one per frame drawn, `{"frame", "layoutMs", "paintMs", "layoutSkipped", "layoutPasses", "repainted", "replayed", "fragments", "primitives", "glyphs", "nodes"}`; `count`, `slowestMs`, `averageMs` (times are 0 when the host does not time frames) |
-| `styles` | target | `node`, and its style patches as declarations: `base`, `hover`, `active`, `focus`, `focus-visible` |
-| `setStyle` | target, `style` (`"width: 200px; color: red"`), `state` (default `base`), `replace` | `node`, `state`, `style` as set, `edited` (node and state pairs edited so far); a declaration that does not parse is an error and changes nothing |
-| `resetStyles` | | `restored`: every edit undone |
+| `styles` | target | `node`; the declarations it shows per state (`base`, `hover`, `active`, `focus`, `focus-visible`): the client's with the style edits over them; for the states with edits, `overrides` (the edits' declarations), `client` (the client's own underneath) and `replacing` (states whose edit leaves the client's out) |
+| `setStyle` | target, `style` (`"width: 200px; color: red"`), `state` (default `base`), `replace` | `node`, `state`, `style` (what it shows now), `edited` (node and state pairs with edits), `edits` (the ids of the node's open edits in that state), `seq`; a declaration that does not parse is an error and changes nothing |
+| `resetStyles` | target (optional), `state`, `property` (with a target) | `restored` (pairs or properties showing the client's declarations again), `removed` (open edits taken out of the log), `seq` |
+| `edits` | `status` (`open`, `resolved`; both without it), `kind` (`edit`, `comment`), `since` (a `seq`) | `seq`, `open`, `edits`, `comments` (see the edit log) |
+| `comment` | `text`, `author`, and a target (none: the app as a whole) or `reply` (a comment's id) | `entry`: the comment, `seq` |
+| `resolve` | `entry` (an id) or `entries` (ids), `reopen` | `entries`: each entry now, `seq`; an unknown id is an error and changes nothing |
 | `pickMode` | `on` (left out: just asks) | `on`; `picked`: the node the last pick chose. While on, the app's own pointer highlights what it is over and the next click selects it instead of reaching the app |
 | `audit` | target (optional, a subtree) | `issues`: `{"rule", "message", "node"}` for `unnamed`, `no-role`, `not-focusable`, `small-target` (under 24 by 24) and `contrast` (under 4.5, or 3 for large text); `count`, `checked` |
 | `viewEvents` | `topic` (an extension view topic), `events` (records, see `remote.silk`) | `queued`: the records queued for the view (none while nobody has it open) |
 | `<id>.<command>` | the extension's | the extension's, when the app next serves it (see Extensions) |
 
 `inspector.timed(layout, paint)` gives the frame about to be recorded its times; a host that
-does not time its frames records them without. Style edits live in the tree like any patch; the
-app's next render of that node's style wins over them.
+does not time its frames records them without.
+
+### Style edits and the edit log
+
+`setStyle` does not change the client's declarations. It lays the edit over them through the
+tree's override layer (`UiTree.setOverride`, a tree-level hook with no inspector in it): the tree
+keeps an override per node and state, merges it over the client's declarations when it resolves
+the node's style (as `css.set` would, or instead of them with `replace`), and drops it when the
+node is destroyed. So the client restyling the node (`SetStyle`, `ClearStyle`) changes only what
+lies underneath, and the edit stays until it is reset or resolved; a reset shows exactly what the
+client set last, also while it was overridden. Nothing is applied again: no mutation, no record
+and no notification reaches the client, an edit changes only the revision of the root that holds
+its node, and once drawn it asks for no frame. While there are no overrides, styles resolve as
+before; hover and press restyle a node with an override in that state as they do one with a
+client style for it.
+
+Each property an edit sets is an entry of the edit log, which the inspector keeps for the app's
+lifetime (`Protocol.edits`), whatever sessions come and go. An entry is an edit or a comment:
+
+```text
+edit    {"id","seq","kind":"edit","status","target","state","property","before","after","origin","applied"}
+comment {"id","seq","kind":"comment","status","target","text","author","thread":[{"seq","text","author"}]}
+```
+
+- `id` is one sequence for edits and comments; `seq` is the log's change counter when the entry
+  last changed (the log's `seq` grows with every change: `edits` with `since` reads on).
+- `status` is `open` or `resolved`.
+- An edit is one property of one node in one state. `before` is the client's value when it was
+  made (null when the client set none; a shorthand covering the property does not count),
+  `after` the value tried (null when a `replace` leaves the client's out). Setting the property
+  again changes the open edit's `after`; setting it to what the client shows takes the edit out
+  of the log and its declaration out of the override. `applied` is false once the edit's node
+  was destroyed (its override went with it). `origin` is `inline`, or `token` for design tokens
+  (reserved).
+- `target` is the node as it was: `root`, `node`, `path` (ids from the root's node down),
+  `element` (a node object), `named` (the nearest node at or above it with a test id, label or
+  accessible name, with its `label`) and `keys` (`{"id","testId"}` along the path; the test ids
+  are the only keys the tree has). There is no `source` yet: the tree does not know where a node
+  was built.
+
+`resolve` says the code now does what an entry asks. Resolving an edit takes its declaration out
+of the node's override, so the node shows what the client sets (the new code's value once the
+app runs it); reopening lays it over again, when the node is there and no newer edit of the
+property is open. `resetStyles` takes edits back and their open entries out of the log; resolved
+entries and comments stay.
 
 ### Extensions
 
@@ -292,6 +339,16 @@ silk task native inspect      # the CLI drives the demo in a window
   not logged, five changes and frames of it push nothing while a change to the app pushes
   `tree`, and the inspector is off again once the client closes its end.
 - The MCP bridge over the same fixture (see [ui-inspect-mcp](../mcp/README.md#tests)).
+- Style edits and the edit log (`edits.silk`): an edit outlasts the client restyling the node
+  and a reset shows the value the client set meanwhile; edits coalesce, and leave the log when
+  set back; one property is reset alone; comments with threads; resolve and reopen; an unknown id
+  changes nothing; `since`; a destroyed node's edit is no longer applied; `seq` only grows; the
+  `edits` topic goes out once a frame and not while nothing changes, nothing asks for frames
+  once an edit is drawn, and the log outlives the session that made it (a one-shot client reads
+  it too); an agent's round trip over MCP, its requests served by one-shot sessions over a
+  memory channel (tools listed, edits read, a reply in a thread, resolved). In the hidden root
+  test, an edit of the app's node leaves the hidden root's revision alone, and its nodes cannot
+  be edited.
 - Extensions, with a notes extension that belongs to no framework (`extensions.silk`): `hello`
   lists it and names its commands and topics in full; a command waits for the extension and its
   reply reaches the session that asked, a one-shot session too; unknown commands and prefixes;
@@ -320,3 +377,7 @@ silk task native inspect      # the CLI drives the demo in a window
   (ui-inspect's `Session`).
 - Screenshots come from the CPU renderer, not a GPU readback.
 - The highlight has no name tag over the node.
+- The edit log lives as long as the app: it is not saved anywhere, and an app started again
+  starts with none. Edits have no source location.
+- `edits` with `since` lists what changed after a seq, but not the entries that left the log
+  (reverted or reset); read it whole to see those go.

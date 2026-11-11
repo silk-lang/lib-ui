@@ -50,8 +50,11 @@ run inspectNode(&tree, archive, InspectOptions.all(), &mut text)
 `inspectNode(tree, id, options, &mut out)` writes the devtools side panel as text: kind, id,
 role, label, test id, text, parent and children; attributes; listeners; hover, active, focus,
 focus-visible and scroll state; the box model; the style patches the client set for each state
-(base, hover, active, focus, focus-visible); and the computed style (only the inherited text
-properties for text nodes). Properties print as CSS declarations (`writeDeclaration`).
+(base, hover, active, focus, focus-visible), each one a style override hides marked
+`/* overridden */`, then the override as `style <state> edited { ... }` (`edited, replacing`
+when it leaves the client's out; see `UiTree.setOverride`); and the computed style (only the
+inherited text properties for text nodes). Properties print as CSS declarations
+(`writeDeclaration`). A node without overrides prints as before.
 
 ## Synthetic input (`synth.silk`)
 

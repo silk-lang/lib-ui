@@ -1,8 +1,9 @@
 # ui-inspect-devtools
 
 A devtools window for a running Silk UI: the app's element tree on the left, and on the right
-the selected node's styles (editable), its box model, the event log, a frame timeline, an
-accessibility audit and the frame stats, then a tab for each panel the app's extensions add (a
+the selected node's styles (editable), the changes made (style edits and comments, for an agent
+to carry into the code), its box model, the event log, a frame timeline, an accessibility audit
+and the frame stats, then a tab for each panel the app's extensions add (a
 silk-ui program's Program panel among them). Selecting an element highlights it in the app's
 window with the devtools box model colors, and Pick selects whatever is clicked in the app's
 window.
@@ -95,8 +96,24 @@ second until it answers.
 - **Styles**: the node view of `inspect`: attributes, listeners, state, the box model in
   numbers, the style patches the client set for each state (base, hover, active, focus,
   focus-visible) and the computed style. Type declarations (`width: 200px; color: red`) and
-  press Enter or Apply to set them on the node in the running app; one that does not parse is
-  refused with the reason and changes nothing. Reset undoes every edit.
+  press Enter or Apply to lay them over the node in the running app; one that does not parse is
+  refused with the reason and changes nothing. An edit stays over what the app sets, also when
+  the app restyles the node, until it is reset or resolved (see
+  [Style edits and the edit log](../server/README.md#style-edits-and-the-edit-log)): the panel
+  shows it as a `style <state> edited` section, marked down its side, and strikes through the
+  app's declarations it hides. The field completes property names (from the css package's
+  catalog) and values (the property's initial value and the CSS-wide keywords) as you type;
+  click a completion to take it. ArrowUp and ArrowDown step the last number of the last
+  declaration by 1 (Shift 10, Alt 0.1) and set it at once, so a value can be tuned live. Reset
+  takes the selected node's edits back. Below, a comment on the selected node goes to the edit
+  log.
+- **Changes**: the edit log, by node (the app as a whole for comments on no node): each edit's
+  property, the app's value struck through and the value tried, its state when not base, and
+  whether it is no longer applied (its node is gone); each comment with its author and replies.
+  Resolve says the code now does it (an edit stops being laid over the app), Reopen undoes
+  that, Reset takes an edit back and out of the log, Reset all takes every edit back. The tab
+  shows how many entries are open, and the panel follows the app's `edits` topic. Devtools never
+  change source: an agent reads the log (`ui_edits`), changes the code and resolves.
 - **Box model**: margin, border, padding and content as nested boxes with their widths, in
   Chrome's colors, and the position of the border box.
 - **Frames**: one bar per frame, layout over paint, against a 16.7 ms budget; frames over it
@@ -133,11 +150,11 @@ does not follow what was replayed (another view, a box drawn anew) asks the app 
 view again. Closing the tab unsubscribes: the app stops rendering it.
 
 While **Live** is on (the default) the devtools subscribe to the app's `tree`, `roots`,
-`events` and `pick` topics, to `frame` while the Stats or Frames tab is open, and to an
+`events`, `pick` and `edits` topics, to `frame` while the Stats or Frames tab is open, and to an
 extension panel's topic while its tab is open (its view topic, live or not). A
 notification makes them read again only what it says changed: the element tree and the selected
 node after `tree`, the event log after `events`, the open tab's numbers after `frame`, the
-picker after `pick`. The status line comes with the notification itself. With Live off they
+picker after `pick`, the edit log after `edits`. The status line comes with the notification itself. With Live off they
 keep only `pick`. Refresh (or F5) reads everything once.
 
 ## The protocol it uses
@@ -183,12 +200,20 @@ silk task native devtools check
   the model diff, and closing the tab stopping the app's rendering. Then the frame bars, an
   audit, a style typed in and applied (and a bad one refused, and Reset), the filter, and a
   pick ending in a selection.
+- Editing and the Changes panel (`changes.silk`): a property completes from the catalog and a
+  value from the property's tables, ArrowUp steps the number and sets it in the app at once,
+  Shift+ArrowDown by ten without moving the selection, Enter sets it; one edit from the app's
+  10px, marked in the Styles panel with the app's declaration struck; a comment from the selected
+  node; the Changes panel lists both; the edit outlasts the app re-rendering; resolve takes it
+  off the app, reopen lays it on again, Reset takes it out of the log, and a resolved comment
+  stays.
 - A notes extension that belongs to no framework: its panel is a tab, its data shows in rows,
   and is read again when its topic says it changed.
 - Goldens (`describe` text and PNG, tolerance 2 per channel): the styles panel, the box model
   panel, the event log, silk-ui's Program panel (the app's view, replayed, a step opened by a
-  click on it), frames and audit panels, and the todo app with the highlight the devtools asked
-  for.
+  click on it), frames and audit panels, the Changes panel (two edits, one resolved, a comment
+  with a reply and one on the app), the styles of an edited node, and the todo app with the
+  highlight the devtools asked for.
 - The devtools in the todo example's own tree, driven as the window host drives them
   (`embedded.silk`): they list the app's nodes and none of theirs; another local client's
   `tree`, `query` and `hello` leave them out and `pick` finds the app's nodes; once settled,
@@ -224,8 +249,11 @@ silk task native devtools check
   lists (`mutationFormat` 1). In the window, the `Layout` records of a view's nodes made during
   the devtools' own layout passes do not reach the app; pointer, key, focus and input records
   do.
-- A style edit lasts until the app next sets that node's style; it is for trying a value, not
-  for keeping it.
+- Edits are kept in the running app, not saved: they are for trying values and handing them to
+  whoever changes the code. No design sidebar yet: edits are typed as declarations.
+- Completion knows property names and, for values, the initial value and the CSS-wide keywords:
+  the css package has no table of each property's keywords. An edit of a longhand does not
+  strike the app's shorthand it partly hides.
 - Models are read, not restored: no time travel yet.
 - No network or storage panels: a Silk app's effects are its commands, and those are in the
   Program panel.

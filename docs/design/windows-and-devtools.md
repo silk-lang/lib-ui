@@ -1,6 +1,6 @@
 # Windows, inspector transports, custom panels, style edits
 
-Status: steps 1–5 of the [order of work](#order-of-work) are implemented; the rest is a draft
+Status: steps 1–6 of the [order of work](#order-of-work) are implemented; the rest is a draft
 for review.
 Code sketches show shape only, not final names or syntax.
 
@@ -64,7 +64,7 @@ Frame timings stay in the inspector: the window host produces them.
 | Framework | silk-ui's extension: program log, `silk-ui.*` commands, the Program panel as a silk-ui program on a `ViewBackend` | `modules/app/inspect/src/{extension,program,panel}.silk` |
 | Devtools | Tabs past their own come from `hello`; data panels in rows; views replayed by `ViewHost`, their records sent back | `modules/inspect/devtools/src/{devtools,remote}.silk` |
 | Inspector | `highlight` exists; devtools only calls it on click | `protocol.silk:784`, `devtools.silk:1128` |
-| Styles | `setStyle` keeps originals per (node, state); no record of the edit; the app's next render of that style wins | `server/src/tools.silk:94` |
+| Styles | `setStyle` lays an override over the node (`UiTree.setOverride`), kept until reset or resolved; each property is an edit in the app's edit log, with comments | `tree/src/engine.silk` (`StyleOverride`), `server/src/{tools,edits}.silk` |
 | Theme | `Theme` is a struct passed by hand in ui-components; no variables in css | `modules/components/src/theme.silk:16` |
 | std | `silk.toml` exists: parser, scanner with byte spans, comment-preserving formatter | `stdlib/silk/toml/` |
 | std | `accept` returns an owned `Accepted`; the connection is reachable only inside `withAccepted`, which closes it on return | `stdlib/silk/net/socket_native.silk:2736`, `:2823` |
@@ -364,6 +364,95 @@ the css package's own property and value tables; arrows step numbers.
 
 **Tokens.** The one place devtools writes a file. See decision 4.
 
+### As built (step 6)
+
+**The override layer is in the tree**, as a generic hook with no inspector type in it:
+
+```silk
+pub struct StyleOverride { id: u32, state: StyleState, declarations: List<Declaration>, replace: bool }
+run tree.setOverride(id, state, declarations, replace)   // false: no such node
+tree.clearOverride(id, state)                            // the client's declarations show again
+tree.overrideOf(id, state); tree.overridden(id, state); tree.styleOverrides()
+```
+
+- The tree keeps a short list of overrides. When it resolves a node's style in a state that
+  has one, it merges the override over a copy of the client's declarations (`css.set`, so
+  shorthands and `em` lengths behave as in one patch), or uses it alone with `replace`.
+- Nothing is reapplied, so nothing can loop: the client's `SetStyle` and `ClearStyle` change
+  its own declarations underneath, which the tree never touches, and clearing the override
+  shows exactly what the client set last, also while it was overridden. The client is never
+  told (no mutation, no record; `NodeView.style` is the client's).
+- Setting or clearing an override restyles only the root that holds the node
+  (`touchRoot`: its revision moves, it needs a frame); hidden and other roots are untouched.
+  Drawn once, an override costs no frame.
+- `destroy` drops the node's overrides, so a node made later with its id has none.
+- Cost when empty: one length check per resolved node; hover and press check `overridden`
+  only when the list is not empty (a node with a hover override restyles on hover like one
+  with a client hover style).
+- The inspector keeps no copy of the client's declarations: what it needs (`before`) it reads
+  when it records an edit.
+
+**The edit log** (`modules/inspect/server/src/edits.silk`) lives in `Protocol`, so it lasts as
+long as the app, whatever sessions come and go:
+
+```text
+Edit    {"id","seq","kind":"edit","status","target","state","property","before","after","origin","applied"}
+Comment {"id","seq","kind":"comment","status","target","text","author","thread":[{"seq","text","author"}]}
+target  {"root","node","path":[ids],"element":{node},"named":{node,"label"},"keys":[{"id","testId"}]}
+```
+
+- One `id` sequence for both kinds; `seq` is the log's change counter (every add, change,
+  status change or removal moves it) and an entry's `seq` the last one that touched it.
+- Statuses: `open`, `resolved`. An edit is one property of one node in one state; `state` is
+  outside `target`. `before` is the client's value when the edit was made, null when the client
+  set none (a covering shorthand does not count); `after` is the latest value, null when a
+  `replace` leaves the client's out. Editing the property again changes `after`; setting it to
+  what the client shows removes the edit and its declaration from the override. `applied` is
+  false once the node was destroyed. `origin` is `inline`; `token` is defined for step 7 and
+  never produced.
+- `target` is written when the entry is made: the root, the id path from the root's node, the
+  node object, the nearest node at or above it with a test id, label or accessible name (with
+  its label), and the test ids along the path as `keys` (the tree has no other keys). No
+  `source` (decision 5).
+- **Resolve** marks an entry done. For an edit it means "the code now does this": its
+  declaration leaves the node's override, so the node shows what the client sets, the new
+  code's value once the app runs it (until then, the old one). **Reopen** (`resolve` with
+  `reopen`) lays the edit's `after` over its node again, when the node is there and no newer
+  edit of the property is open.
+- **Reset** (`resetStyles`) takes edits back: all, or a target's, in one state, or one
+  property. The open edits it undoes leave the log; resolved entries and comments stay.
+
+**Protocol.** `edits` (`status`, `kind`, `since` → `seq`, `open`, `edits`, `comments`),
+`comment` (target or none, `text`, `author`, or `reply` with a comment's id → `entry`),
+`resolve` (`entry` or `entries`, `reopen` → `entries`); `setStyle` answers the node's open edit
+ids and `seq`, `resetStyles` takes a target, `state` and `property` and answers `removed`,
+`styles` adds `overrides`, `client` and `replacing` for edited states. The `edits` topic
+(`{"event":"edits","frame","seq","open"}`) goes out at most once a frame when `seq` moved. All
+are in `hello`; one-shot clients use them as any command. Ids are `entry`/`entries` because a
+request's `id` is its reply's.
+
+**MCP and CLI.** `ui_edits`, `ui_comment`, `ui_resolve` (and `ui_reset_styles` with a target,
+state and property), described for the workflow: read the open edits and comments, find the
+code by the named element and test ids, change it, resolve. The CLI has `edits` (printed for
+people), `comment TEXT` and `resolve ID...`.
+
+**Devtools.** A Changes tab (with the open count) lists the log by node: each edit's
+property, before struck through and after, its state, whether it is no longer applied; each
+comment with its thread; Resolve, Reopen and Reset per entry, Reset all. The Styles panel
+edits through the layer and shows each edit as a `style <state> edited` section, striking the
+client's declarations it hides; it takes a comment on the selected node. Of the Editor
+paragraph: completion of property names from the css package's catalog and of values (the
+property's initial value and the CSS-wide keywords: the package has no per-property keyword
+table), and ArrowUp and ArrowDown stepping the last number (Shift 10, Alt 0.1), applied at
+once. The design sidebar is left for the visual redesign.
+
+**Deviations.** The layer is in `ui-tree` rather than the inspector, as the cleanest seam: the
+tree resolves styles, and anything that reapplied on restyle would have had to intercept the
+client's mutations. `key` is `keys`, the test ids along the path. Statuses are two; a gone
+node is `applied: false` rather than a status. `edits` with `since` does not report entries
+that left the log. To show an edit outlasting a client restyle in the native checks, the tree
+demo restyles Archive when New adds a row.
+
 ### Risks
 
 - Tokens are a new concept in css and the engine. Largest item in this
@@ -378,7 +467,7 @@ the css package's own property and value tables; arrows step numbers.
 | 3 | Native host with several windows; `windows` in silk-ui | Multi-window apps |
 | 4 | Embedded and same-process windowed devtools (done) | — |
 | 5 | Extension API; move the program log out of the inspector into `ui-app`; panels with data, then remote views (done) | Framework tabs |
-| 6 | Override layer, edit log, comments, MCP tools | Agent workflow |
+| 6 | Override layer, edit log, comments, MCP tools (done) | Agent workflow |
 | 7 | Tokens, TOML file, two-way editing | Theme editing |
 
 The Paper redesign can be built from step 2 onward. DOM multi-root and
@@ -520,6 +609,9 @@ the compiler can supply it.**
   tools like Agentation and React Grab precise.
 - This is a compiler change and yours to schedule. The edit record does not
   change shape when it lands.
+
+As built in step 6: `source` is absent from every target; the rest of the target is as above,
+with the test ids along the path as its keys.
 
 ### 6. Extra roots on the DOM backend
 
