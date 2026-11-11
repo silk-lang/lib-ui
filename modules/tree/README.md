@@ -138,8 +138,9 @@ root itself comes as a `RootEvent` (`ui_protocol.root`): `CloseRequested`, `Resi
 replaced by a later one of the same kind for the same root, so the queue stays short when
 nobody drains it. `rootSupport` says how many roots the tree shows (any number of headless
 surfaces by default); a root past it fails with `Failed` and stays closed. The native window
-host shows the first root only, sets `RootSupport.single()`, and reports its window's resize,
-scale, focus, appearance and close requests as root 0.
+host (`ui-tree-window`) shows each open root in an OS window of its own and reports each
+window's resize, scale, focus, appearance and close requests as its root's events; in the
+browser it shows the first root only.
 
 ## Moving from the old API
 

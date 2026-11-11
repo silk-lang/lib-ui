@@ -16,6 +16,30 @@ background work, `wakeAfter` bounds waits, and `nextDeadline` supplies timer dea
 in seconds relative to host startup. `frame`, `scene`, and `draw` support custom GPU
 composition. The host publishes accessibility geometry after client layout settles.
 
+### Several windows
+
+The window `runWindow` opens shows the first root. Every other root the client opens
+(`Mutation.OpenRoot`) gets an OS window of its own, with its `RootOptions` title, size and
+resizability; an `UpdateRoot` sets a new title or size, and `CloseRoot` closes the window.
+Position, parent and kind are requests the window layer has no call for, so they are not
+applied. A root whose window or surface cannot be made is closed again and gets a `Failed`
+root event. The host's tree says so in `rootSupport` (`ExtraRoot.Window`); in the browser it
+shows one root, as before.
+
+Each window's events go to its root: input through `beginAt`, and its size, scale, focus,
+appearance and close requests as root events (`reportWindowOf`). Closing such a window only
+reports `CloseRequested`: the client closes the root or keeps it. The first window behaves as
+before, and closing it ends the loop unless the client's `closing` keeps it. A window is framed
+when its root needs it (`tree.needsFrameOf(root)`), through the client's `layoutRoot` hook
+(`tree.frameRoot` by default), and only that root is laid out and painted.
+
+All windows draw on the one render thread, with one GPU device and one set of atlas textures:
+the render thread makes a surface per window (`RenderThread.openSurface`), takes each window's
+frames (`submitTo`), and writes every frame's atlas pixels, in the order they were painted,
+before it draws anything. The compositor's fast scrolling, accessibility publication and the
+inspector's overlay serve the first window only; the others scroll through the tree and publish
+no accessibility tree yet.
+
 The [direct-tree counter](demo/src/main.silk) is a complete example with no app or
 component framework dependency. From the repository root:
 

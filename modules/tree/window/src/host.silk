@@ -1,12 +1,21 @@
 //! Native GPU window lifecycle for any retained-tree client.
 //! Implement WindowClient to handle events and supply mutations. The host owns the window,
 //! GPU surface, input integration, accessibility publication, inspection, and frame scheduling.
+//!
+//! The first root is the window `runWindow` opens. Every other root the client opens gets an
+//! OS window of its own, drawn by the same render thread on a surface of its own: the host
+//! opens it when the root opens, applies the title and size of an `UpdateRoot`, and closes it
+//! when the root closes. Its events reach its root (`beginAt`, `reportRoot`); a request to
+//! close it is only a `CloseRequested` root event, which the client answers or not. Such a
+//! window is framed only when its root needs a frame (`needsFrameOf`), has no compositor
+//! scrolling and publishes no accessibility tree.
 import ui_scene.scene { Scene }
 import ui_tree.inspect { findAll }
 import ui_tree.legacy { UiTree, TreeError, FrameInput, CpuSnapshot, Mutation }
 import lib { toInput, windowCursor, HostState, serve, coalesce }
-import adapter { fastScrollOf, reportWindow }
-import ui_tree.lib { RootSupport }
+import adapter { fastScrollOf, reportWindow, reportWindowOf, serveInput }
+import ui_tree.lib { RootSupport, RootEventKind, ExtraRoot, RootOptions }
+import ui_tree.mutation { FIRST_ROOT }
 import render_thread { FastScroll, FastScrolled, RenderSettings }
 
 static if Intrinsic.targetArchitecture() == "wasm32" {
@@ -35,6 +44,8 @@ import silk.collections.list { List }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.geometry.size { Size2 }
+import silk.num.u32
+import silk.num.usize
 import console { StderrWriter }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import clock { Clock }
@@ -197,6 +208,19 @@ pub interface WindowClient<S, E, ? R> {
     run tree.frame(input)
   }
 
+  /// Lays out and paints root `root`, a root past the first, for its own window.
+  effect fn layoutRoot(
+    self: &mut Self,
+    state: &mut S,
+    tree: &mut UiTree<'_>,
+    root: u32,
+    input: FrameInput,
+  ) -> ()
+    ! E | TreeError | OutOfMemoryError
+    ? R | &mut Allocator {
+    run tree.frameRoot(root, input)
+  }
+
   /// Returns the next timer deadline in host monotonic seconds, or None.
   fn nextDeadline(self: &Self, state: &S) -> Option<f64> {
     return Option<f64>.None
@@ -288,6 +312,306 @@ effect fn seconds(clock: &mut Clock) -> f64 {
   return run clock.seconds()
 }
 
+/// The window of a root past the first.
+struct RootWindow {
+  root: u32,
+  window: WindowId,
+  /// Its surface on the render thread.
+  surface: u32,
+  width: f64,
+  height: f64,
+  scale: f64,
+  /// The title and size it was opened or last set with, to tell what an `UpdateRoot` changed.
+  title: String,
+  size: Option<Size2<f32>>,
+  host: HostState,
+}
+
+/// A window's size when its root asks for none, in logical points.
+const OTHER_WIDTH: f64 = 480.0
+
+const OTHER_HEIGHT: f64 = 360.0
+
+/// The window of `windows` with id `window`, or `usize.MAX`.
+fn windowAt(windows: &List<RootWindow>, window: u32) -> usize {
+  let list = windows.asSlice()
+  let mut i: usize = 0
+  while i < list.length {
+    if list[i].window.value == window {
+      return i
+    }
+    i = i + 1
+  }
+  return usize.MAX
+}
+
+/// The window an event is about, or 0 for one about the app (a menu, a dialog, appearance).
+fn windowOf(event: &Event) -> u32 {
+  return match &event.* {
+    Event.RequestFrame { window, .. } => window.value
+    Event.Resized { window, .. } => window.value
+    Event.ScaleFactorChanged { window, .. } => window.value
+    Event.Moved { window, .. } => window.value
+    Event.Focused { window, .. } => window.value
+    Event.Occluded { window, .. } => window.value
+    Event.CloseRequested { window } => window.value
+    Event.FullScreenChanged { window, .. } => window.value
+    Event.KeyDown { window, .. } => window.value
+    Event.KeyUp { window, .. } => window.value
+    Event.ModifiersChanged { window, .. } => window.value
+    Event.TextInput { window, .. } => window.value
+    Event.ImePreedit { window, .. } => window.value
+    Event.MouseMoved { window, .. } => window.value
+    Event.MouseDown { window, .. } => window.value
+    Event.MouseUp { window, .. } => window.value
+    Event.MouseEntered { window, .. } => window.value
+    Event.MouseExited { window } => window.value
+    Event.Scroll { window, .. } => window.value
+    Event.Pinch { window, .. } => window.value
+    _ => 0
+  }
+}
+
+/// Opens a window for each root past the first that opened since, applies the title and size
+/// of the ones that changed, and closes the windows of the roots that closed. A root whose
+/// window cannot open is closed again and hears `Failed`. Returns whether a root event was
+/// reported, for the client to hear.
+effect fn syncWindows(
+  tree: &mut UiTree<'_>,
+  platform: &mut HostPlatform,
+  renderer: &mut RenderThread,
+  windows: &mut List<RootWindow>,
+) -> bool
+  ! GpuError | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut reported = false
+  let mut open = List<u32>.make()
+  run tree.openRoots(&mut open)
+
+  // Closed roots first: their windows go.
+  let mut w: usize = 0
+  while w < windows.length() {
+    let root = windows.asSlice()[w].root
+    if contains(&open, root) {
+      w = w + 1
+    } else {
+      let gone = windows.remove(w)
+      renderer.closeSurface(gone.surface)
+      platform.closeWindow(gone.window)
+    }
+  }
+  let roots = open.asSlice()
+  let mut i: usize = 0
+  while i < roots.length {
+    let root = roots[i]
+    i = i + 1
+    if root == FIRST_ROOT {
+      continue
+    }
+    let mut title = String.make()
+    let mut size = Option<Size2<f32>>.None
+    let mut resizable = true
+    if let Option<&RootOptions>.Some { value } = tree.rootOptions(root) {
+      title = run String.copy(String.view(&value.title))
+      size = value.size
+      resizable = value.resizable
+    }
+    let mut at: usize = usize.MAX
+    let mut k: usize = 0
+    while k < windows.length() {
+      if windows.asSlice()[k].root == root {
+        at = k
+      }
+      k = k + 1
+    }
+    if at != usize.MAX {
+      let shown = &mut windows.asMutSlice()[at]
+      if String.view(&shown.title) != String.view(&title) {
+        run platform.setTitle(shown.window, String.view(&title))
+        shown.title = move title
+      }
+      if !sameSize(shown.size, size) {
+        if let Option<Size2<f32>>.Some { value } = size {
+          platform.setContentSize(
+            shown.window,
+            Size2<f64>.new(f32.toF64(value.width), f32.toF64(value.height)),
+          )
+        }
+        shown.size = size
+      }
+      continue
+    }
+    let mut options = match size {
+      Option<Size2<f32>>.Some { value } => WindowOptions.make(
+        String.view(&title),
+        f32.toF64(value.width),
+        f32.toF64(value.height),
+      )
+      Option<Size2<f32>>.None => WindowOptions.make(String.view(&title), OTHER_WIDTH, OTHER_HEIGHT)
+    }
+    options.resizable = resizable
+    let opened = run Effect.result(platform.openWindow(&options))
+    let window = match move opened {
+      Result.Success { value } => value
+      Result.Failure { error } => match move error {
+        WindowError failure => {
+          drop failure
+          run failRoot(&mut tree, root)
+          reported = true
+          continue
+        }
+        OutOfMemoryError failure => {
+          fail move failure
+        }
+      }
+    }
+    let surface = match run renderer.openSurface(platform.rawSurface(window), window) {
+      Option<u32>.Some { value } => value
+      Option<u32>.None => {
+        platform.closeWindow(window)
+        run failRoot(&mut tree, root)
+        reported = true
+        continue
+      }
+    }
+    let content = platform.contentSize(window)
+    run windows.append(
+      RootWindow {
+        root: root,
+        window: window,
+        surface: surface,
+        width: content.width,
+        height: content.height,
+        scale: platform.scaleFactor(window),
+        title: move title,
+        size: size,
+        host: HostState.make(),
+      },
+    )
+    run tree.reportRoot(
+      root,
+      RootEventKind.Resized { width: f64.toF32(content.width), height: f64.toF32(content.height) },
+    )
+    reported = true
+    platform.requestFrame(window)
+  }
+  return reported
+}
+
+/// Closes root `root`, whose window could not open, and tells the client.
+effect fn failRoot(tree: &mut UiTree<'_>, root: u32) -> ()
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut batch = List<Mutation>.make()
+  run batch.append(Mutation.CloseRoot { root: root })
+  run tree.apply(move batch)
+  run tree.reportRoot(root, RootEventKind.Failed)
+}
+
+fn sameSize(a: Option<Size2<f32>>, b: Option<Size2<f32>>) -> bool {
+  return match a {
+    Option<Size2<f32>>.Some { value: x } => match b {
+      Option<Size2<f32>>.Some { value: y } => x.width == y.width && x.height == y.height
+      Option<Size2<f32>>.None => false
+    }
+    Option<Size2<f32>>.None => b.isNone()
+  }
+}
+
+fn contains(list: &List<u32>, value: u32) -> bool {
+  let values = list.asSlice()
+  let mut i: usize = 0
+  while i < values.length {
+    if values[i] == value {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+/// Handles `event` for the window of a root past the first: frames it, reports what happened
+/// to it as root events, and feeds its input to its root.
+effect fn otherEvent<H: WindowClient<S, E, R>, S, E, ? R>(
+  state: &mut S,
+  tree: &mut UiTree<'_>,
+  content: &mut H,
+  platform: &mut HostPlatform,
+  renderer: &mut RenderThread,
+  snapshot: &mut CpuSnapshot,
+  shown: &mut RootWindow,
+  event: &Event,
+  time: f64,
+) -> ()
+  ! E | GpuError | TreeError | OutOfMemoryError
+  ? R | &mut Allocator {
+  let root = shown.root
+  run reportWindowOf(&mut tree, root, event)
+  match &event.* {
+    Event.RequestFrame { targetTime, .. } => {
+      let width = deviceSize(shown.width, shown.scale)
+      let height = deviceSize(shown.height, shown.scale)
+      if width == 0 || height == 0 {
+        return ()
+      }
+      let input = FrameInput {
+        width: f64.toF32(shown.width),
+        height: f64.toF32(shown.height),
+        scale: f64.toF32(shown.scale),
+        time: targetTime,
+      }
+      run content.layoutRoot(&mut state, &mut tree, root, input)
+      drop run tree.useRoot(root)
+      run serveInput(&mut platform, shown.window, &mut tree, &mut shown.host)
+      run snapshot.copyUploads(&tree)
+      run renderer.submitTo(
+        shown.surface,
+        tree.scene(),
+        &tree.atlas,
+        tree.pendingUploads(),
+        width,
+        height,
+      )
+      tree.clearUploads()
+      run content.pump(&mut state, &mut tree)
+      platform.setCursor(shown.window, windowCursor(tree.cursor()))
+    }
+    Event.Resized { size, scaleFactor, .. } => {
+      shown.width = size.width
+      shown.height = size.height
+      shown.scale = scaleFactor
+      run content.pump(&mut state, &mut tree)
+      platform.requestFrame(shown.window)
+    }
+    Event.ScaleFactorChanged { scaleFactor, .. } => {
+      shown.scale = scaleFactor
+      run content.pump(&mut state, &mut tree)
+      platform.requestFrame(shown.window)
+    }
+    Event.CloseRequested { .. } => {
+      // The window stays until the client closes its root.
+      run content.pump(&mut state, &mut tree)
+    }
+    _ => {
+      if let Option<Input>.Some { value: input } = run toInput(event) {
+        run tree.beginAt(root, &input)
+        let prevented = run content.decide(&mut state, &mut tree)
+        run tree.finish(move input, prevented)
+        drop run tree.useRoot(root)
+        run serveInput(&mut platform, shown.window, &mut tree, &mut shown.host)
+        run content.pump(&mut state, &mut tree)
+        drop run tree.useRoot(root)
+        platform.setCursor(shown.window, windowCursor(tree.cursor()))
+      } else {
+        match &event.* {
+          Event.Focused { .. } => run content.pump(&mut state, &mut tree)
+          _ => {}
+        }
+      }
+    }
+  }
+}
+
 /// Whether a node's test id, label or text is `value`.
 effect fn exists(tree: &UiTree<'_>, value: string) -> bool
   ! OutOfMemoryError
@@ -321,8 +645,12 @@ pub effect fn runWindow<H: WindowClient<S, E, R>, S, E, ? R>(
   let started = run seconds(&mut clock)
   let mut tree = run UiTree.make(collection)
 
-  // One window: it shows the first root, and any other root fails.
-  tree.rootSupport = RootSupport.single()
+  // A window per root where the render thread can draw several; the browser shows one.
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    tree.rootSupport = RootSupport.single()
+  } else {
+    tree.rootSupport = RootSupport { count: u32.MAX, extra: ExtraRoot.Window }
+  }
   run content.setup(&mut state, &mut tree)
   run tree.apply(move resources)
   if inspector.enabled() {
@@ -368,6 +696,12 @@ pub effect fn runWindow<H: WindowClient<S, E, R>, S, E, ? R>(
   let mut fastScrolls = List<FastScrolled>.make()
   let mut fastSeq: u64 = 0
 
+  // The windows of the roots past the first, with those `start` opened.
+  let mut others = List<RootWindow>.make()
+  if run syncWindows(&mut tree, &mut platform, &mut renderer, &mut others) {
+    run content.pump(&mut state, &mut tree)
+  }
+
   let initial = platform.contentSize(window)
   let mut width = initial.width
   let mut height = initial.height
@@ -378,6 +712,9 @@ pub effect fn runWindow<H: WindowClient<S, E, R>, S, E, ? R>(
   run content.resize(&mut state, &mut tree, f64.toF32(width), f64.toF32(height))
   platform.requestFrame(owner)
   while true {
+    // The first root is current but while a window of another root is served.
+    drop run tree.useRoot(FIRST_ROOT)
+
     // Wait for input or a frame, at most until the next timer.
     let now = (run seconds(&mut clock)) - started
     let backgroundChanged = run content.poll(&mut state, &mut tree, now)
@@ -480,9 +817,41 @@ pub effect fn runWindow<H: WindowClient<S, E, R>, S, E, ? R>(
       platform.setCursor(owner, windowCursor(tree.cursor()))
       redraw = true
     }
-    if let Option<Event>.Some { value } = &next {
+    let other = match &next {
+      Option<Event>.Some { value } => windowAt(&others, windowOf(&value))
+      Option<Event>.None => usize.MAX
+    }
+    if other != usize.MAX {
+      if let Option<Event>.Some { value } = &next {
+        let shown = &mut others.asMutSlice()[other]
+        run otherEvent(
+          &mut state,
+          &mut tree,
+          &mut content,
+          &mut platform,
+          &mut renderer,
+          &mut snapshot,
+          &mut shown,
+          &value,
+          time,
+        )
+      }
+      drop run tree.useRoot(FIRST_ROOT)
+      if !check {
+        redraw = redraw || content.needsFrame(&state.*, &tree)
+      }
+    } else if let Option<Event>.Some { value } = &next {
       let mut resized = false
       run reportWindow(&mut tree, &value)
+      if let Event.AppearanceChanged { .. } = &value {
+        // Every window shows in the one appearance.
+        let list = others.asSlice()
+        let mut o: usize = 0
+        while o < list.length {
+          run reportWindowOf(&mut tree, list[o].root, &value)
+          o = o + 1
+        }
+      }
       if !check && run content.event(&mut state, &mut tree, &value) {
         redraw = true
       } else {
@@ -616,7 +985,7 @@ pub effect fn runWindow<H: WindowClient<S, E, R>, S, E, ? R>(
               } else {
                 // As a browser does: the handlers of the input see it first, and the default
                 // action runs unless one of them prevented it.
-                run tree.begin(&input)
+                run tree.beginAt(FIRST_ROOT, &input)
                 let prevented = run content.decide(&mut state, &mut tree)
                 run tree.finish(move input, prevented)
                 run serve(&mut platform, owner, &mut tree, &mut host)
@@ -655,6 +1024,21 @@ pub effect fn runWindow<H: WindowClient<S, E, R>, S, E, ? R>(
       run inspector.afterFrameScene(&tree, content.scene(&state.*, &tree))
       redraw = true
     }
+
+    // Windows open, change and close with their roots; each is framed when its root needs it.
+    if run syncWindows(&mut tree, &mut platform, &mut renderer, &mut others) {
+      run content.pump(&mut state, &mut tree)
+      drop run tree.useRoot(FIRST_ROOT)
+      redraw = redraw || content.needsFrame(&state.*, &tree)
+    }
+    let list = others.asSlice()
+    let mut o: usize = 0
+    while o < list.length {
+      if tree.needsFrameOf(list[o].root) {
+        platform.requestFrame(list[o].window)
+      }
+      o = o + 1
+    }
     if redraw {
       platform.requestFrame(owner)
     }
@@ -662,6 +1046,9 @@ pub effect fn runWindow<H: WindowClient<S, E, R>, S, E, ? R>(
   run inspector.close()
   platform.clearCompositor()
   renderer.stop()
+  while others.length() != 0 {
+    platform.closeWindow(others.remove(0).window)
+  }
   platform.closeWindow(owner)
   return status
 }

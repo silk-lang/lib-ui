@@ -108,6 +108,14 @@ union Reply {
   Failed { error: WindowError },
 }
 
+/// The content size and scale of a window past the first, as the platform thread last saw
+/// them.
+struct Metrics {
+  window: u32,
+  size: Size2<f64>,
+  scale: f64,
+}
+
 /// What the two threads share. Each side holds the lock only to move values in or out.
 struct Link {
   /// OS events for the UI thread, oldest first.
@@ -117,11 +125,14 @@ struct Link {
   reply: Option<Reply>,
   /// Accessibility actions the OS asked for, for the UI thread.
   actions: List<AxAction>,
-  /// The window the app opened, for polling accessibility actions; 0 before.
+  /// The first window the app opened, for polling accessibility actions and for the
+  /// compositor; 0 before.
   window: u32,
   /// The window's content size and scale as the platform thread last saw them.
   size: Size2<f64>,
   scale: f64,
+  /// The same for the app's other windows.
+  others: List<Metrics>,
   appearance: Appearance,
   /// The app returned: the platform thread stops.
   done: bool,
@@ -381,6 +392,7 @@ effect fn makeLink(appearance: Appearance) -> Arc<Mutex<Link>>
     window: 0,
     size: Size2<f64>.new(0.0, 0.0),
     scale: 1.0,
+    others: List<Metrics>.make(),
     appearance: appearance,
     done: false,
     compositor: Option<Compositor>.None,
@@ -467,11 +479,30 @@ effect fn servePlatform(
             if which.value == state.window {
               state.size = size
               state.scale = scaleFactor
+            } else {
+              let others = state.others.asMutSlice()
+              let mut o: usize = 0
+              while o < others.length {
+                if others[o].window == which.value {
+                  others[o].size = size
+                  others[o].scale = scaleFactor
+                }
+                o = o + 1
+              }
             }
           }
           Event.ScaleFactorChanged { window: which, scaleFactor } => {
             if which.value == state.window {
               state.scale = scaleFactor
+            } else {
+              let others = state.others.asMutSlice()
+              let mut o: usize = 0
+              while o < others.length {
+                if others[o].window == which.value {
+                  others[o].scale = scaleFactor
+                }
+                o = o + 1
+              }
             }
           }
           Event.AppearanceChanged { appearance } => {
@@ -521,11 +552,13 @@ effect fn fastScroll(link: &Arc<Mutex<Link>>, event: &Event) -> bool
   ? &mut Allocator {
   let mut px: f64 = 0.0
   let mut py: f64 = 0.0
+  let mut target: u32 = 0
   let mut amount = ScrollDelta.Points { delta: Vector2<f64>.new(0.0, 0.0) }
   match &event.* {
-    Event.Scroll { position, delta, .. } => {
+    Event.Scroll { window, position, delta, .. } => {
       px = position.x
       py = position.y
+      target = window.value
       amount = delta
     }
     _ => {
@@ -534,6 +567,11 @@ effect fn fastScroll(link: &Arc<Mutex<Link>>, event: &Event) -> bool
   }
   let guard = link.get().lock()
   let state = guard.get()
+
+  // The compositor scrolls the first window's frame; the others scroll on the UI thread.
+  if target != state.window {
+    return false
+  }
   let compositor = match &state.compositor {
     Option<Compositor>.Some { value } => value.clone()
     Option<Compositor>.None => {
@@ -600,9 +638,13 @@ effect fn execute(
           let scale = platform.scaleFactor(value)
           let mut guard = link.get().lock()
           let state = guard.getMut()
-          state.window = value.value
-          state.size = size
-          state.scale = scale
+          if state.window == 0 {
+            state.window = value.value
+            state.size = size
+            state.scale = scale
+          } else {
+            run state.others.append(Metrics { window: value.value, size: size, scale: scale })
+          }
           drop guard
           answer(
             link,
@@ -630,6 +672,14 @@ effect fn execute(
       let state = guard.getMut()
       if state.window == window.value {
         state.window = 0
+      }
+      let mut o: usize = 0
+      while o < state.others.length() {
+        if state.others.asSlice()[o].window == window.value {
+          drop state.others.remove(o)
+        } else {
+          o = o + 1
+        }
       }
     }
     Command.RequestFrame { window } => platform.requestFrame(window)
@@ -910,11 +960,31 @@ impl Platform for PlatformProxy {
   }
 
   fn contentSize(self: &Self, window: WindowId) -> Size2<f64> {
-    return self.link.get().lock().get().size
+    let guard = self.link.get().lock()
+    let state = guard.get()
+    let others = state.others.asSlice()
+    let mut o: usize = 0
+    while o < others.length {
+      if others[o].window == window.value {
+        return others[o].size
+      }
+      o = o + 1
+    }
+    return state.size
   }
 
   fn scaleFactor(self: &Self, window: WindowId) -> f64 {
-    return self.link.get().lock().get().scale
+    let guard = self.link.get().lock()
+    let state = guard.get()
+    let others = state.others.asSlice()
+    let mut o: usize = 0
+    while o < others.length {
+      if others[o].window == window.value {
+        return others[o].scale
+      }
+      o = o + 1
+    }
+    return state.scale
   }
 
   fn rawSurface(self: &Self, window: WindowId) -> RawSurface {
