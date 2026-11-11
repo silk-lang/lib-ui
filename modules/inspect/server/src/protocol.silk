@@ -23,7 +23,6 @@ import ui_tree.inspect {
   describeNodeById,
   encodePng,
   info,
-  roleName,
   writeInt,
   writeNumber
 }
@@ -51,6 +50,9 @@ import ui_scene.scene { Scene }
 import capture { reduced }
 import nodes { nodeObject, nodeMembers }
 import program { ProgramLog, Timeline }
+import names { eventName, roleNamed }
+import extension { Extension, Extensions, ExtensionHandler, Routed }
+import remote { MUTATION_FORMAT }
 import topics {
   Changes,
   contains,
@@ -86,67 +88,13 @@ import silk.text.string { String }
 pub const VERSION: u32 = 3
 
 /// The commands `hello` lists. `subscribe` and `unsubscribe` are a session's (see `session.silk`).
-const COMMANDS: string = "[\"hello\",\"subscribe\",\"unsubscribe\",\"tree\",\"events\",\"snapshot\",\"query\",\"inspect\",\"pick\",\"highlight\",\"screenshot\",\"click\",\"hover\",\"scroll\",\"press\",\"pointer\",\"key\",\"type\",\"wait\",\"stats\",\"program\",\"messages\",\"model\",\"frames\",\"styles\",\"setStyle\",\"resetStyles\",\"pickMode\",\"audit\"]"
+const COMMANDS: string = "[\"hello\",\"subscribe\",\"unsubscribe\",\"tree\",\"events\",\"snapshot\",\"query\",\"inspect\",\"pick\",\"highlight\",\"screenshot\",\"click\",\"hover\",\"scroll\",\"press\",\"pointer\",\"key\",\"type\",\"wait\",\"stats\",\"program\",\"messages\",\"model\",\"frames\",\"styles\",\"setStyle\",\"resetStyles\",\"pickMode\",\"audit\",\"viewEvents\"]"
 
 /// How long `wait` waits when the request names no `timeout`, in milliseconds.
 pub const DEFAULT_TIMEOUT: u64 = 5000
 
-const ROLES: [Role; 28] = [
-  Role.None,
-  Role.Generic,
-  Role.Button,
-  Role.Link,
-  Role.Checkbox,
-  Role.Radio,
-  Role.TextBox,
-  Role.Heading,
-  Role.Paragraph,
-  Role.List,
-  Role.ListItem,
-  Role.Image,
-  Role.Dialog,
-  Role.Menu,
-  Role.MenuItem,
-  Role.Tab,
-  Role.TabList,
-  Role.TabPanel,
-  Role.Toolbar,
-  Role.Navigation,
-  Role.Main,
-  Role.Form,
-  Role.Group,
-  Role.Slider,
-  Role.Switch,
-  Role.ListBox,
-  Role.Option,
-  Role.Tooltip,
-]
-
 /// How many event records the event log keeps; older ones are dropped.
 pub const LOG_LIMIT: usize = 500
-
-/// The name of an event kind, as the `events` command writes it (the DOM event's name).
-pub fn eventName(kind: EventKind) -> string<'static> {
-  return match kind {
-    EventKind.PointerDown => "pointerdown"
-    EventKind.PointerUp => "pointerup"
-    EventKind.Click => "click"
-    EventKind.PointerMove => "pointermove"
-    EventKind.PointerEnter => "pointerenter"
-    EventKind.PointerLeave => "pointerleave"
-    EventKind.Wheel => "wheel"
-    EventKind.KeyDown => "keydown"
-    EventKind.KeyUp => "keyup"
-    EventKind.Focus => "focus"
-    EventKind.Blur => "blur"
-    EventKind.Input => "input"
-    EventKind.Layout => "layout"
-    EventKind.PointerCancel => "pointercancel"
-    EventKind.GotPointerCapture => "gotpointercapture"
-    EventKind.LostPointerCapture => "lostpointercapture"
-    EventKind.Scroll => "scroll"
-  }
-}
 
 /// One event record the app took from the tree, as the event log keeps it.
 pub struct LoggedEvent {
@@ -166,18 +114,6 @@ pub struct LoggedEvent {
   pub value: String,
 }
 
-/// The role whose ARIA name (as `describe` writes it) is `name`.
-pub fn roleNamed(name: string) -> Option<Role> {
-  let mut i: usize = 0
-  while i < ROLES.length {
-    if roleName(ROLES[i]) == name {
-      return Option<Role>.Some { value: ROLES[i] }
-    }
-    i = i + 1
-  }
-  return Option<Role>.None
-}
-
 /// What handling a request did.
 pub enum Outcome {
   /// The reply is written.
@@ -185,6 +121,9 @@ pub enum Outcome {
   /// A `wait` whose condition does not hold yet: nothing is written; hand the same request in
   /// again after the next frame.
   Pending,
+  /// A command of an extension: nothing is written yet. The reply comes when the extension is
+  /// served (`Extensions.serve`), for the session that asked.
+  Deferred,
 }
 
 /// The inspector state a connection shares with the app: the highlight, and a CPU copy of the
@@ -224,6 +163,8 @@ pub struct Protocol {
   /// The roots the inspector leaves out, as if they were not open: those of devtools drawn in
   /// the app's own tree (see [`Protocol.hide`]).
   pub hidden: List<u32>,
+  /// The extensions frameworks registered (see `extension.silk`).
+  pub extensions: Extensions,
 }
 
 impl Protocol {
@@ -249,7 +190,28 @@ impl Protocol {
       swallowUp: false,
       changes: Changes.make(),
       hidden: List<u32>.make(),
+      extensions: Extensions.make(),
     }
+  }
+
+  /// Registers extension `info` (see `extension.silk`): `hello` lists it, its commands are
+  /// served as `<id>.<command>` and its topics can be subscribed to.
+  pub effect fn extend(self: &mut Self, info: Extension) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.extensions.extend(move info)
+  }
+
+  /// Serves extension `id` with `handler`: its waiting requests, topics and views. The replies
+  /// and notifications wait in `extensions` for the sessions.
+  pub effect fn serveExtension<X: ExtensionHandler>(
+    self: &mut Self,
+    id: string,
+    handler: &mut X,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.extensions.serve(id, &mut handler)
   }
 
   /// Leaves root `root` out of everything the inspector serves, or shows it again: its nodes
@@ -431,6 +393,7 @@ impl Protocol {
     ! OutOfMemoryError
     ? &mut Allocator {
     run self.snapshot.copyUploads(tree)
+    self.extensions.frame = tree.stats.frame
     run self.timeline.record(tree.stats)
     if self.highlight.nodes.length() != 0 {
       run self.composeOverlay(tree)
@@ -553,10 +516,26 @@ impl Protocol {
       if top != NONE || !run hasTarget(request) {
         run audit(&tree.*, request, top, &mut out)
       }
+    } else if cmd == "viewEvents" {
+      let queued = run self.extensions.queueEvents(
+        textField(request, "topic"),
+        Json.field(request, "events"),
+      )
+      run begin(&mut out, request)
+      run putInt(&mut out, "queued", usize.toU64(queued))
+      run finish(&mut out)
     } else if cmd == "" {
       run failure(&mut out, request, "the request has no cmd")
     } else {
-      run failure(&mut out, request, "unknown cmd")
+      match run self.extensions.route(cmd, request, &mut out) {
+        Routed.NotOurs => {
+          run failure(&mut out, request, "unknown cmd")
+        }
+        Routed.Deferred => {
+          return Outcome.Deferred
+        }
+        Routed.Answered => {}
+      }
     }
     return Outcome.Done
   }
@@ -566,11 +545,15 @@ impl Protocol {
     ? &mut Allocator {
     run begin(&mut out, request)
     run putInt(&mut out, "protocol", u32.toU64(VERSION))
+    let mut commands = String.make()
+    run commands.append(String.slice(COMMANDS, 0, String.byteLength(COMMANDS) - 1))
+    run self.extensions.writeNames(&mut commands, false)
+    run commands.append("]")
     run putKey(&mut out, "commands")
-    run out.append(COMMANDS)
+    run out.append(String.view(&commands))
     run putKey(&mut out, "capabilities")
     run out.append("{\"commands\":")
-    run out.append(COMMANDS)
+    run out.append(String.view(&commands))
     run out.append(",\"topics\":[")
     let mut i: usize = 0
     while i < TOPIC_COUNT {
@@ -580,9 +563,11 @@ impl Protocol {
       run writeString(&mut out, TOPIC_NAMES[i])
       i = i + 1
     }
+    run self.extensions.writeNames(&mut out, true)
     run out.append("],\"sessions\":true}")
+    run putInt(&mut out, "mutationFormat", u32.toU64(MUTATION_FORMAT))
     run putKey(&mut out, "extensions")
-    run out.append("[]")
+    run self.extensions.describe(&mut out)
     run frameMembers(tree, &mut out)
     run putInt(&mut out, "root", u32.toU64(tree.rootId()))
     run rootMembers(tree, self.hidden.asSlice(), &mut out)
@@ -598,6 +583,7 @@ impl Protocol {
   pub effect fn takeChanges(self: &mut Self, tree: &UiTree<'_>, wanted: u32) -> u32
     ! OutOfMemoryError
     ? &mut Allocator {
+    self.extensions.frame = tree.stats.frame
     return run self.changes.take(tree, self.hidden.asSlice(), self.nextSeq, wanted)
   }
 

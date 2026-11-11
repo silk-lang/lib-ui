@@ -1,0 +1,983 @@
+//! Extensions: what a framework adds to the inspector, which itself knows the tree and nothing
+//! else. An extension registers once ([`Extension`], `Inspector.extend`) and is served by the
+//! code that owns it ([`ExtensionHandler`], `Inspector.serveExtension`), on the app's thread.
+//!
+//! - **Commands** are served as `<id>.<command>`. The inspector queues such a request and the
+//!   extension answers it the next time it is served; the reply goes to the session that asked.
+//! - **Topics** are pushed as `<id>.<topic>` to the sessions that subscribed to them, at most
+//!   once a frame, as the inspector's own topics are.
+//! - **Panels** have two faces. `data` names a command whose reply is the panel's JSON, which
+//!   devtools show with a generic view and agents read with the command. A panel with a `view`
+//!   renders itself as tree mutations ([`View`]): while some session subscribes to its view
+//!   topic `<id>.view.<panel>`, each batch is pushed to it (see `remote.silk` for the format),
+//!   and the event records the client sends back (`viewEvents`) come to the view. Nobody
+//!   subscribed: the extension is told the view is closed, and renders nothing.
+//!
+//! `hello` lists every extension (see [`Extension.describe`]); the MCP bridge makes tools of their
+//! commands and devtools tabs of their panels. No name of any framework is known here.
+import remote { MUTATION_FORMAT, writeMutations, readEvent }
+import reply { failure, writeString }
+import ui_tree.inspect { writeInt }
+import ui_tree.mutation { Mutation }
+import ui_tree.node { Event }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.json.value { Json, Value }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.text.string { String }
+
+/// The prefix of a panel's view topic: panel `program` renders on topic `view.program`.
+pub const VIEW_PREFIX: string = "view."
+
+const NEVER: u64 = 18446744073709551615
+
+/// The MCP description of one of an extension's commands.
+pub struct Tool {
+  /// The command, without the extension's id.
+  pub command: String,
+  pub title: String,
+  pub description: String,
+  /// The JSON Schema of the arguments, as JSON text; empty for no arguments.
+  pub inputSchema: String,
+  /// The command only reads.
+  pub readOnly: bool,
+}
+
+/// A panel an extension adds to devtools.
+pub struct Panel {
+  pub id: String,
+  /// The tab's title.
+  pub title: String,
+  /// The command whose reply is the panel's data, or empty.
+  pub data: String,
+  /// The topic that says the data changed, or empty.
+  pub topic: String,
+  /// The panel renders itself on topic `view.<id>`.
+  pub view: bool,
+}
+
+/// What an extension adds: commands, topics, tools and panels, all named without the id.
+pub struct Extension {
+  /// Names it among the extensions: `silk-ui`, `router`. Letters, digits and dashes.
+  pub id: String,
+  pub version: String,
+  pub commands: List<String>,
+  pub topics: List<String>,
+  pub tools: List<Tool>,
+  pub panels: List<Panel>,
+}
+
+impl Extension {
+  /// An extension with nothing in it yet.
+  pub effect fn make(id: string, version: string) -> Extension
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return Extension {
+      id: run String.copy(id),
+      version: run String.copy(version),
+      commands: List<String>.make(),
+      topics: List<String>.make(),
+      tools: List<Tool>.make(),
+      panels: List<Panel>.make(),
+    }
+  }
+
+  /// Adds command `name`, served as `<id>.<name>`.
+  pub effect fn command(self: &mut Self, name: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.commands.append(run String.copy(name))
+  }
+
+  /// Adds topic `name`, pushed as `<id>.<name>`.
+  pub effect fn topic(self: &mut Self, name: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.topics.append(run String.copy(name))
+  }
+
+  /// Describes command `command` for MCP clients. `inputSchema` is JSON text, or empty.
+  pub effect fn tool(
+    self: &mut Self,
+    command: string,
+    title: string,
+    description: string,
+    inputSchema: string,
+    readOnly: bool,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.tools.append(
+      Tool {
+        command: run String.copy(command),
+        title: run String.copy(title),
+        description: run String.copy(description),
+        inputSchema: run String.copy(inputSchema),
+        readOnly: readOnly,
+      },
+    )
+  }
+
+  /// Adds panel `id` titled `title`: its data is the reply of command `data` (empty for none),
+  /// read again when topic `topic` says so (empty for none), and with `view` it renders itself
+  /// on topic `view.<id>`, which this adds.
+  pub effect fn panel(
+    self: &mut Self,
+    id: string,
+    title: string,
+    data: string,
+    topic: string,
+    view: bool,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.panels.append(
+      Panel {
+        id: run String.copy(id),
+        title: run String.copy(title),
+        data: run String.copy(data),
+        topic: run String.copy(topic),
+        view: view,
+      },
+    )
+  }
+
+  pub fn hasCommand(self: &Self, name: string) -> bool {
+    return listed(&self.commands, name)
+  }
+
+  /// Whether `name` is one of its topics, or a view topic of one of its panels.
+  pub fn hasTopic(self: &Self, name: string) -> bool {
+    return listed(&self.topics, name) || self.viewNamed(name) != usize.MAX
+  }
+
+  /// The index of the panel with a view whose topic is `name`, or `usize.MAX`.
+  pub fn viewNamed(self: &Self, name: string) -> usize {
+    if !String.startsWith(name, VIEW_PREFIX) {
+      return usize.MAX
+    }
+    let prefix = String.byteLength(VIEW_PREFIX)
+    let panel = String.slice(name, prefix, String.byteLength(name) - prefix)
+    let list = self.panels.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      if list[i].view && String.view(&list[i].id) == panel {
+        return i
+      }
+      i = i + 1
+    }
+    return usize.MAX
+  }
+
+  /// Writes it as `hello` lists it: `{"id","version","commands","topics","tools","panels"}`,
+  /// names without the id. Topics include the panels' view topics; a panel's `view` is its view
+  /// topic, and its `data` and `topic` are there when it has them.
+  pub effect fn describe(self: &Self, out: &mut String) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run out.append("{\"id\":")
+    run writeString(&mut out, String.view(&self.id))
+    run out.append(",\"version\":")
+    run writeString(&mut out, String.view(&self.version))
+    run out.append(",\"commands\":")
+    run names(&mut out, &self.commands, "", true)
+    run out.append(",\"topics\":[")
+    let mut first = true
+    let topics = self.topics.asSlice()
+    let mut i: usize = 0
+    while i < topics.length {
+      run comma(&mut out, &mut first)
+      run writeString(&mut out, String.view(&topics[i]))
+      i = i + 1
+    }
+    let panels = self.panels.asSlice()
+    let mut p: usize = 0
+    while p < panels.length {
+      if panels[p].view {
+        run comma(&mut out, &mut first)
+        run writeViewTopic(&mut out, String.view(&panels[p].id))
+      }
+      p = p + 1
+    }
+    run out.append("],\"tools\":[")
+    let tools = self.tools.asSlice()
+    let mut t: usize = 0
+    while t < tools.length {
+      if t > 0 {
+        run out.append(",")
+      }
+      let tool = &tools[t]
+      run out.append("{\"command\":")
+      run writeString(&mut out, String.view(&tool.command))
+      run out.append(",\"title\":")
+      run writeString(&mut out, String.view(&tool.title))
+      run out.append(",\"description\":")
+      run writeString(&mut out, String.view(&tool.description))
+      run out.append(",\"inputSchema\":")
+      if tool.inputSchema.ownedByteLength() == 0 {
+        run out.append("{\"type\":\"object\",\"properties\":{}}")
+      } else {
+        run out.append(String.view(&tool.inputSchema))
+      }
+      run out.append(
+        if tool.readOnly {
+          ",\"readOnly\":true}"
+        } else {
+          ",\"readOnly\":false}"
+        },
+      )
+      t = t + 1
+    }
+    run out.append("],\"panels\":[")
+    let mut q: usize = 0
+    while q < panels.length {
+      if q > 0 {
+        run out.append(",")
+      }
+      let panel = &panels[q]
+      run out.append("{\"id\":")
+      run writeString(&mut out, String.view(&panel.id))
+      run out.append(",\"title\":")
+      run writeString(&mut out, String.view(&panel.title))
+      if panel.data.ownedByteLength() != 0 {
+        run out.append(",\"data\":")
+        run writeString(&mut out, String.view(&panel.data))
+      }
+      if panel.topic.ownedByteLength() != 0 {
+        run out.append(",\"topic\":")
+        run writeString(&mut out, String.view(&panel.topic))
+      }
+      if panel.view {
+        run out.append(",\"view\":")
+        run writeViewTopic(&mut out, String.view(&panel.id))
+      }
+      run out.append("}")
+      q = q + 1
+    }
+    run out.append("]}")
+  }
+}
+
+effect fn writeViewTopic(out: &mut String, panel: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut name = run String.copy(VIEW_PREFIX)
+  run name.append(panel)
+  run writeString(&mut out, String.view(&name))
+}
+
+effect fn comma(out: &mut String, first: &mut bool) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !first.* {
+    run out.append(",")
+  }
+  first.* = false
+}
+
+/// `list` as a JSON array of strings, each with `prefix` before it; `close` adds the brackets.
+effect fn names(out: &mut String, list: &List<String>, prefix: string, close: bool) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if close {
+    run out.append("[")
+  }
+  let items = list.asSlice()
+  let mut i: usize = 0
+  while i < items.length {
+    if i > 0 {
+      run out.append(",")
+    }
+    let mut name = run String.copy(prefix)
+    run name.append(String.view(&items[i]))
+    run writeString(&mut out, String.view(&name))
+    i = i + 1
+  }
+  if close {
+    run out.append("]")
+  }
+}
+
+fn listed(list: &List<String>, name: string) -> bool {
+  let items = list.asSlice()
+  let mut i: usize = 0
+  while i < items.length {
+    if String.view(&items[i]) == name {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+/// What an extension's topics have to say, collected while it is served.
+pub struct News {
+  posts: List<Post>,
+}
+
+struct Post {
+  topic: String,
+  members: String,
+}
+
+impl News {
+  pub fn make() -> News {
+    return News { posts: List<Post>.make() }
+  }
+
+  /// Topic `topic` (without the id) changed. `members` is a JSON object whose members the
+  /// notification carries after `event` and `frame` (`{"next":4}`), or empty. A later post in
+  /// the same frame replaces it.
+  pub effect fn post(self: &mut Self, topic: string, members: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.posts.append(Post { topic: run String.copy(topic), members: run String.copy(members) })
+  }
+}
+
+/// A panel's view while its extension is served: whether anyone looks, and where its mutation
+/// batches go and its event records come from.
+pub struct View {
+  /// Some session has the view open (subscribes to its topic).
+  pub open: bool,
+  /// It was opened, or another session opened it too, since the extension was last served:
+  /// send the whole view, from nothing (the batch goes out with `"reset": true`).
+  pub fresh: bool,
+  events: List<Event>,
+  batches: List<String>,
+}
+
+impl View {
+  pub fn make(open: bool, fresh: bool) -> View {
+    return View {
+      open: open,
+      fresh: fresh,
+      events: List<Event>.make(),
+      batches: List<String>.make(),
+    }
+  }
+
+  /// Sends one batch of mutations, ids as the view chose them. Nothing goes out while the view
+  /// is closed.
+  pub effect fn send(self: &mut Self, batch: &[Mutation]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.open || batch.length == 0 {
+      return ()
+    }
+    let mut text = String.make()
+    run writeMutations(&mut text, batch)
+    run self.batches.append(move text)
+  }
+
+  /// Moves the event records the client sent for the view's nodes into `out`, oldest first.
+  pub effect fn takeEvents(self: &mut Self, out: &mut List<Event>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    while self.events.length() != 0 {
+      run out.append(self.events.remove(0))
+    }
+  }
+
+  /// Whether event records wait.
+  pub fn hasEvents(self: &Self) -> bool {
+    return self.events.length() != 0
+  }
+
+  /// How many batches it sent since it was made.
+  pub fn sent(self: &Self) -> usize {
+    return self.batches.length()
+  }
+}
+
+/// The code that serves an extension: the app's own, on the app's thread.
+pub interface ExtensionHandler {
+  /// Answers command `name` (without the id): writes the whole reply line to `out`, with
+  /// `reply.begin(out, request)` … `reply.finish(out)` or `reply.failure`. False for a command
+  /// it does not know.
+  effect fn command(self: &mut Self, name: string, request: &Value, out: &mut String) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator
+
+  /// Posts the topics that changed since it was last asked.
+  effect fn topics(self: &mut Self, news: &mut News) -> () ! OutOfMemoryError ? &mut Allocator {}
+
+  /// The turn of panel `panel`'s view: render into `view` while it is open, and handle its
+  /// events. A closed view should cost nothing.
+  effect fn view(self: &mut Self, panel: string, view: &mut View) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {}
+}
+
+/// A line for the sessions: a reply for session `session`, or a notification on `topic`.
+pub struct Outgoing {
+  pub session: u64,
+  pub topic: String,
+  pub line: String,
+}
+
+struct TopicState {
+  name: String,
+  /// Sessions subscribed to it.
+  listeners: u32,
+  pending: bool,
+  members: String,
+  sentAt: u64,
+}
+
+struct ViewState {
+  panel: String,
+  viewers: u32,
+  fresh: bool,
+  events: List<Event>,
+  seq: u64,
+}
+
+struct Registered {
+  info: Extension,
+  topics: List<TopicState>,
+  views: List<ViewState>,
+}
+
+struct Call {
+  session: u64,
+  extension: usize,
+  command: String,
+  request: Value,
+  answered: bool,
+}
+
+/// What [`Extensions.route`] did with a request.
+pub enum Routed {
+  /// It is no extension's.
+  NotOurs,
+  /// It waits for its extension; the reply comes later.
+  Deferred,
+  /// It was answered at once (an unknown command of a known extension).
+  Answered,
+}
+
+/// The registered extensions, the requests that wait for them and what they have to push.
+pub struct Extensions {
+  list: List<Registered>,
+  calls: List<Call>,
+  replies: List<Outgoing>,
+  /// View batches waiting to be pushed, oldest first.
+  lines: List<Outgoing>,
+  /// The tree's frame as the protocol last saw it.
+  pub frame: u64,
+  /// A topic changed again in a frame that already pushed it: it goes with the next frame.
+  pub held: bool,
+  /// The session the request being handled came from, and whether it wants a reply.
+  pub caller: u64,
+  pub callerAnswered: bool,
+}
+
+/// Splits `name` at its first dot.
+fn prefixOf(name: string) -> usize {
+  let bytes = String.utf8Bytes(name)
+  let mut i: usize = 0
+  while i < bytes.length {
+    if bytes[i] == 46 {
+      return i
+    }
+    i = i + 1
+  }
+  return usize.MAX
+}
+
+impl Extensions {
+  pub fn make() -> Extensions {
+    return Extensions {
+      list: List<Registered>.make(),
+      calls: List<Call>.make(),
+      replies: List<Outgoing>.make(),
+      lines: List<Outgoing>.make(),
+      frame: 0,
+      held: false,
+      caller: 0,
+      callerAnswered: true,
+    }
+  }
+
+  /// Registers `info`, in place of an extension with the same id.
+  pub effect fn extend(self: &mut Self, info: Extension) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut topics = List<TopicState>.make()
+    let names = info.topics.asSlice()
+    let mut i: usize = 0
+    while i < names.length {
+      run topics.append(
+        TopicState {
+          name: run String.copy(String.view(&names[i])),
+          listeners: 0,
+          pending: false,
+          members: String.make(),
+          sentAt: NEVER,
+        },
+      )
+      i = i + 1
+    }
+    let mut views = List<ViewState>.make()
+    let panels = info.panels.asSlice()
+    let mut p: usize = 0
+    while p < panels.length {
+      if panels[p].view {
+        run views.append(
+          ViewState {
+            panel: run String.copy(String.view(&panels[p].id)),
+            viewers: 0,
+            fresh: false,
+            events: List<Event>.make(),
+            seq: 0,
+          },
+        )
+      }
+      p = p + 1
+    }
+    let at = self.indexOf(String.view(&info.id))
+    let entry = Registered { info: move info, topics: move topics, views: move views }
+    if at == usize.MAX {
+      run self.list.append(move entry)
+    } else {
+      self.list.set(at, move entry)
+    }
+  }
+
+  /// How many are registered.
+  pub fn count(self: &Self) -> usize {
+    return self.list.length()
+  }
+
+  /// The extension with id `id`, or `usize.MAX`.
+  pub fn indexOf(self: &Self, id: string) -> usize {
+    let list = self.list.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      if String.view(&list[i].info.id) == id {
+        return i
+      }
+      i = i + 1
+    }
+    return usize.MAX
+  }
+
+  /// The extension `<id>.<rest>` names, and where `rest` starts; `usize.MAX` for none.
+  fn owner(self: &Self, name: string) -> usize {
+    let dot = prefixOf(name)
+    if dot == usize.MAX {
+      return usize.MAX
+    }
+    return self.indexOf(String.slice(name, 0, dot))
+  }
+
+  fn rest(name: string) -> string {
+    let dot = prefixOf(name)
+    return String.slice(name, dot + 1, String.byteLength(name) - dot - 1)
+  }
+
+  /// Takes request `request` for command `cmd` if an extension owns it: queues it for that
+  /// extension (`Deferred`), or answers an unknown command into `out` (`Answered`).
+  pub effect fn route(self: &mut Self, cmd: string, request: &Value, out: &mut String) -> Routed
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let at = self.owner(cmd)
+    if at == usize.MAX {
+      return Routed.NotOurs
+    }
+    let command = Extensions.rest(cmd)
+    if !self.list.asSlice()[at].info.hasCommand(command) {
+      run failure(&mut out, request, "unknown cmd")
+      return Routed.Answered
+    }
+    run self.calls.append(
+      Call {
+        session: self.caller,
+        extension: at,
+        command: run String.copy(command),
+        request: run Json.copy(request),
+        answered: self.callerAnswered,
+      },
+    )
+    return Routed.Deferred
+  }
+
+  /// Whether requests wait for an extension to be served.
+  pub fn pending(self: &Self) -> bool {
+    return self.calls.length() != 0
+  }
+
+  /// Whether `name` (`<id>.<topic>`) is a topic of a registered extension.
+  pub fn isTopic(self: &Self, name: string) -> bool {
+    let at = self.owner(name)
+    return at != usize.MAX && self.list.asSlice()[at].info.hasTopic(Extensions.rest(name))
+  }
+
+  /// Whether `name` is a panel's view topic.
+  pub fn isView(self: &Self, name: string) -> bool {
+    let at = self.owner(name)
+    return at != usize.MAX
+      && self.list.asSlice()[at].info.viewNamed(Extensions.rest(name)) != usize.MAX
+  }
+
+  /// A session subscribed (`on`) to topic `name`, or unsubscribed. A view topic opens or
+  /// closes the view; news of a topic nobody hears is dropped.
+  pub fn watch(self: &mut Self, name: string, on: bool) -> () {
+    let at = self.owner(name)
+    if at == usize.MAX {
+      return ()
+    }
+    let rest = Extensions.rest(name)
+    if !String.startsWith(rest, VIEW_PREFIX) {
+      let topics = self.list.asMutSlice()[at].topics.asMutSlice()
+      let mut t: usize = 0
+      while t < topics.length {
+        if String.view(&topics[t].name) == rest {
+          if on {
+            topics[t].listeners = topics[t].listeners + 1
+          } else if topics[t].listeners > 0 {
+            topics[t].listeners = topics[t].listeners - 1
+          }
+        }
+        t = t + 1
+      }
+      return ()
+    }
+    let prefix = String.byteLength(VIEW_PREFIX)
+    let panel = String.slice(rest, prefix, String.byteLength(rest) - prefix)
+    let views = self.list.asMutSlice()[at].views.asMutSlice()
+    let mut i: usize = 0
+    while i < views.length {
+      if String.view(&views[i].panel) == panel {
+        if on {
+          views[i].viewers = views[i].viewers + 1
+          views[i].fresh = true
+        } else if views[i].viewers > 0 {
+          views[i].viewers = views[i].viewers - 1
+          if views[i].viewers == 0 {
+            views[i].events.clear()
+          }
+        }
+      }
+      i = i + 1
+    }
+  }
+
+  /// How many sessions have view topic `name` open.
+  pub fn viewers(self: &Self, name: string) -> u32 {
+    let at = self.owner(name)
+    if at == usize.MAX {
+      return 0
+    }
+    let entry = &self.list.asSlice()[at]
+    let index = entry.info.viewNamed(Extensions.rest(name))
+    if index == usize.MAX {
+      return 0
+    }
+    let panel = String.view(&entry.info.panels.asSlice()[index].id)
+    let views = entry.views.asSlice()
+    let mut i: usize = 0
+    while i < views.length {
+      if String.view(&views[i].panel) == panel {
+        return views[i].viewers
+      }
+      i = i + 1
+    }
+    return 0
+  }
+
+  /// The topics of every extension as `<id>.<topic>`, without the view topics: what a session
+  /// that subscribes to everything hears.
+  pub effect fn allTopics(self: &Self, out: &mut List<String>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let list = self.list.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      let topics = list[i].info.topics.asSlice()
+      let mut t: usize = 0
+      while t < topics.length {
+        let mut name = run String.copy(String.view(&list[i].info.id))
+        run name.append(".")
+        run name.append(String.view(&topics[t]))
+        run out.append(move name)
+        t = t + 1
+      }
+      i = i + 1
+    }
+  }
+
+  /// Queues the event records in `events` (a JSON array, see `remote.silk`) for view topic
+  /// `topic`, if a session has it open. Returns how many were queued.
+  pub effect fn queueEvents(self: &mut Self, topic: string, events: Option<&Value>) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let at = self.owner(topic)
+    if at == usize.MAX {
+      return 0
+    }
+    let index = self.list.asSlice()[at].info.viewNamed(Extensions.rest(topic))
+    if index == usize.MAX {
+      return 0
+    }
+    let panel = run String.copy(
+      String.view(&self.list.asSlice()[at].info.panels.asSlice()[index].id),
+    )
+    let mut queued: usize = 0
+    let views = self.list.asMutSlice()[at].views.asMutSlice()
+    let mut v: usize = 0
+    while v < views.length {
+      if String.view(&views[v].panel) == String.view(&panel) && views[v].viewers > 0 {
+        if let Option<&Value>.Some { value: list } = events {
+          if let Value.Array { values } = &list.* {
+            let items = values.asSlice()
+            let mut i: usize = 0
+            while i < items.length {
+              if let Option<Event>.Some { value: event } = run readEvent(&items[i]) {
+                run views[v].events.append(move event)
+                queued = queued + 1
+              }
+              i = i + 1
+            }
+          }
+        }
+      }
+      v = v + 1
+    }
+    return queued
+  }
+
+  /// Serves extension `id` with `handler`: answers the requests waiting for it, takes its topic
+  /// news, and gives each of its views its turn.
+  pub effect fn serve<X: ExtensionHandler>(self: &mut Self, id: string, handler: &mut X) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let at = self.indexOf(id)
+    if at == usize.MAX {
+      return ()
+    }
+    let mut i: usize = 0
+    while i < self.calls.length() {
+      if self.calls.asSlice()[i].extension != at {
+        i = i + 1
+        continue
+      }
+      let call = self.calls.remove(i)
+      let mut out = String.make()
+      if !run handler.command(String.view(&call.command), &call.request, &mut out) {
+        run failure(&mut out, &call.request, "unknown cmd")
+      }
+      if call.answered {
+        run self.replies.append(
+          Outgoing { session: call.session, topic: String.make(), line: move out },
+        )
+      }
+    }
+    let mut news = News.make()
+    run handler.topics(&mut news)
+    let posts = news.posts.asSlice()
+    let topics = self.list.asMutSlice()[at].topics.asMutSlice()
+    let mut p: usize = 0
+    while p < posts.length {
+      let mut t: usize = 0
+      while t < topics.length {
+        if String.view(&topics[t].name) == String.view(&posts[p].topic) {
+          topics[t].pending = true
+          topics[t].members = run String.copy(String.view(&posts[p].members))
+        }
+        t = t + 1
+      }
+      p = p + 1
+    }
+    let extension = run String.copy(id)
+    let count = self.list.asSlice()[at].views.length()
+    let mut v: usize = 0
+    while v < count {
+      let state = &mut self.list.asMutSlice()[at].views.asMutSlice()[v]
+      let open = state.viewers > 0
+      let fresh = state.fresh && open
+      state.fresh = false
+      let mut view = View.make(open, fresh)
+      if open {
+        while state.events.length() != 0 {
+          run view.events.append(state.events.remove(0))
+        }
+      }
+      let panel = run String.copy(String.view(&state.panel))
+      run handler.view(String.view(&panel), &mut view)
+      if open {
+        let mut topic = run String.copy(String.view(&extension))
+        run topic.append(".")
+        run topic.append(VIEW_PREFIX)
+        run topic.append(String.view(&panel))
+        let mut first = fresh
+        while view.batches.length() != 0 {
+          let batch = view.batches.remove(0)
+          let after = &mut self.list.asMutSlice()[at].views.asMutSlice()[v]
+          after.seq = after.seq + 1
+          let mut line = run String.copy("{\"event\":")
+          run writeString(&mut line, String.view(&topic))
+          run line.append(",\"frame\":")
+          run writeInt(&mut line, self.frame)
+          run line.append(",\"format\":")
+          run writeInt(&mut line, u32.toU64(MUTATION_FORMAT))
+          run line.append(",\"seq\":")
+          run writeInt(&mut line, after.seq)
+          run line.append(
+            if first {
+              ",\"reset\":true,\"mutations\":"
+            } else {
+              ",\"reset\":false,\"mutations\":"
+            },
+          )
+          first = false
+          run line.append(String.view(&batch))
+          run line.append("}")
+          run self.lines.append(
+            Outgoing { session: 0, topic: run String.copy(String.view(&topic)), line: move line },
+          )
+        }
+      }
+      v = v + 1
+    }
+  }
+
+  /// Moves the replies for session `session` into `out`.
+  pub effect fn takeReplies(self: &mut Self, session: u64, out: &mut List<String>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut i: usize = 0
+    while i < self.replies.length() {
+      if self.replies.asSlice()[i].session == session {
+        let reply = self.replies.remove(i)
+        run out.append(move reply.line)
+      } else {
+        i = i + 1
+      }
+    }
+  }
+
+  /// Drops the replies for a session that is gone.
+  pub fn forget(self: &mut Self, session: u64) -> () {
+    let mut i: usize = 0
+    while i < self.replies.length() {
+      if self.replies.asSlice()[i].session == session {
+        drop self.replies.remove(i)
+      } else {
+        i = i + 1
+      }
+    }
+  }
+
+  /// The notifications to push now: each topic that changed and was not pushed in this frame
+  /// yet (the others wait for the next frame, and `held` says so), then the view batches.
+  pub effect fn takeNews(self: &mut Self, out: &mut List<Outgoing>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.held = false
+    let frame = self.frame
+    let count = self.list.length()
+    let mut i: usize = 0
+    while i < count {
+      let id = run String.copy(String.view(&self.list.asSlice()[i].info.id))
+      let topics = self.list.asMutSlice()[i].topics.asMutSlice()
+      let mut t: usize = 0
+      while t < topics.length {
+        if topics[t].pending && topics[t].listeners == 0 {
+          // Nobody hears it.
+          topics[t].pending = false
+        } else if topics[t].pending {
+          if topics[t].sentAt == frame {
+            self.held = true
+          } else {
+            topics[t].pending = false
+            topics[t].sentAt = frame
+            let mut topic = run String.copy(String.view(&id))
+            run topic.append(".")
+            run topic.append(String.view(&topics[t].name))
+            let mut line = run String.copy("{\"event\":")
+            run writeString(&mut line, String.view(&topic))
+            run line.append(",\"frame\":")
+            run writeInt(&mut line, frame)
+            let members = String.trim(String.view(&topics[t].members))
+            let length = String.byteLength(members)
+            if length > 2 {
+              run line.append(",")
+              run line.append(String.slice(members, 1, length - 2))
+            }
+            run line.append("}")
+            run out.append(Outgoing { session: 0, topic: move topic, line: move line })
+          }
+        }
+        t = t + 1
+      }
+      i = i + 1
+    }
+    while self.lines.length() != 0 {
+      run out.append(self.lines.remove(0))
+    }
+  }
+
+  /// Writes the `extensions` member of `hello`: every extension's [`Extension.describe`].
+  pub effect fn describe(self: &Self, out: &mut String) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run out.append("[")
+    let list = self.list.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      if i > 0 {
+        run out.append(",")
+      }
+      run list[i].info.describe(&mut out)
+      i = i + 1
+    }
+    run out.append("]")
+  }
+
+  /// Appends `,"<id>.<name>"` for each command (`topics` false) or topic of every extension, as
+  /// `hello`'s capabilities list them.
+  pub effect fn writeNames(self: &Self, out: &mut String, topics: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let list = self.list.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      let info = &list[i].info
+      let mut prefix = run String.copy(String.view(&info.id))
+      run prefix.append(".")
+      let items = if topics {
+        info.topics.asSlice()
+      } else {
+        info.commands.asSlice()
+      }
+      let mut k: usize = 0
+      while k < items.length {
+        run out.append(",")
+        let mut name = run String.copy(String.view(&prefix))
+        run name.append(String.view(&items[k]))
+        run writeString(&mut out, String.view(&name))
+        k = k + 1
+      }
+      if topics {
+        let panels = info.panels.asSlice()
+        let mut p: usize = 0
+        while p < panels.length {
+          if panels[p].view {
+            run out.append(",")
+            let mut name = run String.copy(String.view(&prefix))
+            run name.append(VIEW_PREFIX)
+            run name.append(String.view(&panels[p].id))
+            run writeString(&mut out, String.view(&name))
+          }
+          p = p + 1
+        }
+      }
+      i = i + 1
+    }
+  }
+}

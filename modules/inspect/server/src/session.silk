@@ -7,7 +7,12 @@
 //! the app then sends `{"event": <topic>, ...}` lines when they change. Any other first line is
 //! a one-shot request as in protocol 2: it is answered (with or without an `id`), and the
 //! session ends.
+//!
+//! A request for an extension (`<id>.<command>`) is answered when the extension is served; the
+//! session sends that reply then ([`Session.deliver`]), and a one-shot session ends after it.
+//! Extension topics are subscribed to by name, beside the inspector's own.
 import channel { Channel }
+import extension { Outgoing }
 import protocol { Protocol, Outcome }
 import reply { begin, finish, putKey, malformed, notYet, has, textField, stringsField, writeString }
 import topics { TOPIC_COUNT, TOPIC_NAMES, topicNamed, allTopics }
@@ -29,8 +34,14 @@ pub const SESSION_PROTOCOL: u64 = 3
 
 /// One client's session.
 pub struct Session {
+  /// Tells this session's replies from other sessions' (the inspector numbers its sessions).
+  pub key: u64,
   /// The topics the client subscribed to, as `TOPIC_*` bits.
   pub topics: u32,
+  /// The extension topics it subscribed to, as `<id>.<topic>`.
+  pub extensionTopics: List<String>,
+  /// Requests of its that wait for an extension.
+  pub waiting: u64,
   /// Whether the session stays open after a reply.
   pub persistent: bool,
   /// Whether a line came yet: the first one decides whether the session stays open.
@@ -48,7 +59,10 @@ impl Session {
   /// protocol 2 client sends one request and reads one reply.
   pub fn make() -> Session {
     return Session {
+      key: 0,
       topics: 0,
+      extensionTopics: List<String>.make(),
+      waiting: 0,
       persistent: false,
       started: false,
       ended: false,
@@ -99,21 +113,97 @@ impl Session {
     }
 
     // Protocol 2 answered every request; in a session, a line without an id is a notification.
-    let answered = !self.persistent || has(&request, "id")
+    let mut answered = !self.persistent || has(&request, "id")
     if cmd == "subscribe" || cmd == "unsubscribe" {
-      run self.subscribe(&request, cmd == "subscribe")
+      run self.subscribe(&mut protocol, &request, cmd == "subscribe")
     } else {
       if cmd == "hello" && has(&request, "wants") {
-        run self.subscribeTo(&request, "wants", true)
+        run self.subscribeTo(&mut protocol, &request, "wants", true)
       }
+      protocol.extensions.caller = self.key
+      protocol.extensions.callerAnswered = answered
       let outcome = run protocol.handle(&mut tree, &request, 0, &mut self.reply)
       if outcome == Outcome.Pending {
         // A frame cannot come while this line is served: the client asks again.
         run notYet(&mut self.reply, &request)
+      } else if outcome == Outcome.Deferred {
+        // The extension answers later (`deliver`).
+        if answered {
+          self.waiting = self.waiting + 1
+        }
+        answered = false
       }
     }
     run self.answer(answered)
     return true
+  }
+
+  /// Sends the replies extensions wrote for this session's requests. A one-shot session ends
+  /// once its reply is sent.
+  pub effect fn deliver(self: &mut Self, protocol: &mut Protocol) -> ()
+    ! OutOfMemoryError
+    ? &mut Channel | &mut Allocator {
+    if self.waiting == 0 {
+      return ()
+    }
+    let mut lines = List<String>.make()
+    run protocol.extensions.takeReplies(self.key, &mut lines)
+    let list = lines.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      drop run Channel.send(String.view(&list[i]))
+      if self.waiting > 0 {
+        self.waiting = self.waiting - 1
+      }
+      i = i + 1
+    }
+    if !self.persistent && self.waiting == 0 {
+      self.ended = true
+    }
+  }
+
+  /// Sends the extension notifications in `news` whose topics this session subscribed to.
+  pub effect fn publishNews(self: &mut Self, news: &List<Outgoing>) -> ()
+    ! OutOfMemoryError
+    ? &mut Channel | &mut Allocator {
+    if self.ended || self.extensionTopics.length() == 0 {
+      return ()
+    }
+    let list = news.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      if self.hears(String.view(&list[i].topic)) {
+        drop run Channel.send(String.view(&list[i].line))
+      }
+      i = i + 1
+    }
+  }
+
+  /// Whether it subscribed to extension topic `topic`.
+  pub fn hears(self: &Self, topic: string) -> bool {
+    let list = self.extensionTopics.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      if String.view(&list[i]) == topic {
+        return true
+      }
+      i = i + 1
+    }
+    return false
+  }
+
+  /// The session is over: it hears no topic more, the views it had open are closed for it, and
+  /// replies still on their way to it are dropped.
+  pub fn leave(self: &mut Self, protocol: &mut Protocol) -> () {
+    let list = self.extensionTopics.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      protocol.extensions.watch(String.view(&list[i]), false)
+      i = i + 1
+    }
+    self.extensionTopics.clear()
+    protocol.extensions.forget(self.key)
+    self.waiting = 0
   }
 
   /// Sends the reply if `answered`, and ends a one-shot session.
@@ -123,22 +213,35 @@ impl Session {
     if answered {
       drop run Channel.send(String.view(&self.reply))
     }
-    if !self.persistent {
+    if !self.persistent && self.waiting == 0 {
       self.ended = true
     }
   }
 
-  /// subscribe and unsubscribe: `topics` names topics (all of them when left out); unknown
-  /// names are ignored. The reply lists the topics subscribed to now.
-  effect fn subscribe(self: &mut Self, request: &Value, on: bool) -> ()
+  /// subscribe and unsubscribe: `topics` names topics, the inspector's and extensions' (all
+  /// but the extensions' view topics when left out); unknown names are ignored. The reply lists
+  /// the topics subscribed to now.
+  effect fn subscribe(self: &mut Self, protocol: &mut Protocol, request: &Value, on: bool) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
     if has(request, "topics") {
-      run self.subscribeTo(request, "topics", on)
+      run self.subscribeTo(&mut protocol, request, "topics", on)
     } else if on {
       self.topics = allTopics()
+      let mut names = List<String>.make()
+      run protocol.extensions.allTopics(&mut names)
+      let list = names.asSlice()
+      let mut k: usize = 0
+      while k < list.length {
+        run self.extension(&mut protocol, String.view(&list[k]), true)
+        k = k + 1
+      }
     } else {
       self.topics = 0
+      while self.extensionTopics.length() != 0 {
+        let name = run String.copy(String.view(&self.extensionTopics.asSlice()[0]))
+        run self.extension(&mut protocol, String.view(&name), false)
+      }
     }
     run begin(&mut self.reply, request)
     run putKey(&mut self.reply, "topics")
@@ -155,11 +258,27 @@ impl Session {
       }
       i = i + 1
     }
+    let names = self.extensionTopics.asSlice()
+    let mut n: usize = 0
+    while n < names.length {
+      if !first {
+        run self.reply.append(",")
+      }
+      first = false
+      run writeString(&mut self.reply, String.view(&names[n]))
+      n = n + 1
+    }
     run self.reply.append("]")
     run finish(&mut self.reply)
   }
 
-  effect fn subscribeTo(self: &mut Self, request: &Value, key: string, on: bool) -> ()
+  effect fn subscribeTo(
+    self: &mut Self,
+    protocol: &mut Protocol,
+    request: &Value,
+    key: string,
+    on: bool,
+  ) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
     let mut names = List<string>.make()
@@ -168,12 +287,36 @@ impl Session {
     let mut i: usize = 0
     while i < list.length {
       let bit = topicNamed(list[i])
-      if on {
+      if bit == 0 {
+        run self.extension(&mut protocol, list[i], on)
+      } else if on {
         self.topics = self.topics | bit
       } else {
         self.topics = u32.bitAnd(self.topics, u32.bitXor(bit, 0xFFFFFFFF))
       }
       i = i + 1
+    }
+  }
+
+  /// Subscribes to extension topic `name`, or unsubscribes; a view topic opens or closes the
+  /// view for this session. A name no extension has is ignored.
+  effect fn extension(self: &mut Self, protocol: &mut Protocol, name: string, on: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let had = self.hears(name)
+    if on && !had && protocol.extensions.isTopic(name) {
+      run self.extensionTopics.append(run String.copy(name))
+      protocol.extensions.watch(name, true)
+    } else if !on && had {
+      let mut i: usize = 0
+      while i < self.extensionTopics.length() {
+        if String.view(&self.extensionTopics.asSlice()[i]) == name {
+          drop self.extensionTopics.remove(i)
+        } else {
+          i = i + 1
+        }
+      }
+      protocol.extensions.watch(name, false)
     }
   }
 

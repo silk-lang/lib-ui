@@ -1,0 +1,662 @@
+//! Remote views on the wire: tree [`Mutation`] batches as JSON, and the event records a client
+//! sends back for the nodes they made. Any client that drives a tree can render a panel through
+//! it (see `extension.silk`); the devtools replay it into a subtree of their own tree.
+//!
+//! A batch is a JSON array of objects, each with an `op` and the mutation's members, ids as the
+//! sender chose them. This is format [`MUTATION_FORMAT`], which `hello` reports:
+//!
+//! | `op` | Members |
+//! |---|---|
+//! | `create` | `id`, `kind` (`box`, `text`, `image`, `icon`, `input`, `canvas`) |
+//! | `insert` | `parent`, `child`, `before` (absent: last) |
+//! | `remove`, `destroy`, `focus`, `scrollIntoView`, `capture` | `id` |
+//! | `style` | `id`, `state` (`base`, `hover`, `active`, `focus`, `focus-visible`), `css` |
+//! | `clearStyle` | `id`, `state` |
+//! | `text` | `id`, `value` |
+//! | `selection` | `id`, `anchor`, `focus` |
+//! | `attribute` | `id`, `name`, `value` (`valueRange`: `min`, `max`, `value`) |
+//! | `listeners` | `id`, `flags` (`LISTEN_*` bits) |
+//! | `source` | `id`, `resource` |
+//! | `scrollTo` | `id`, `x`, `y` |
+//! | `openRoot` | `root`, `node` |
+//! | `closeRoot` | `root` |
+//! | `blur`, `release` | none |
+//!
+//! Styles travel as CSS text. Root options, resources (fonts, images, icons), canvases, grids,
+//! anchors and virtual lists do not travel: a remote view is drawn with the receiver's fonts and
+//! resources. A receiver skips an `op` it does not know.
+//!
+//! An event record is an object with `kind` (as the `events` command names it), `target`, `path`
+//! and the payload members that are not empty.
+import names { eventName, eventKindNamed, roleNamed, kindNamed, cursorNamed }
+import reply { writeString, textField, flagField, numberField, idField, has }
+import tools { stateNamed, stateName }
+import ui_inspect.view { cursorName, writeDeclaration }
+import ui_tree.css { Declaration }
+import ui_tree.inspect { roleName, kindName, writeInt, writeNumber }
+import ui_tree.mutation { Mutation, Attribute, Role, Cursor, NodeKind, StyleState }
+import ui_tree.node { Event, EventKind }
+import ui_tree.lib { RootOptions }
+import css_style.tokens { CssError }
+import css_style.written as written
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.geometry.rect { Rect }
+import silk.json.value { Json, Value }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.i32
+import silk.num.i64
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.text.string { String }
+
+/// The version of the batch format above. `hello` reports it as `mutationFormat`.
+pub const MUTATION_FORMAT: u32 = 1
+
+effect fn member(out: &mut String, key: string, value: u64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.append(",\"")
+  run out.append(key)
+  run out.append("\":")
+  run writeInt(&mut out, value)
+}
+
+effect fn textMember(out: &mut String, key: string, value: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.append(",\"")
+  run out.append(key)
+  run out.append("\":")
+  run writeString(&mut out, value)
+}
+
+effect fn numberMember(out: &mut String, key: string, value: f32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.append(",\"")
+  run out.append(key)
+  run out.append("\":")
+  run writeNumber(&mut out, value)
+}
+
+effect fn flagMember(out: &mut String, key: string, value: bool) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.append(",\"")
+  run out.append(key)
+  run out.append(
+    if value {
+      "\":true"
+    } else {
+      "\":false"
+    },
+  )
+}
+
+effect fn begin(out: &mut String, first: &mut bool, op: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !first.* {
+    run out.append(",")
+  }
+  first.* = false
+  run out.append("{\"op\":\"")
+  run out.append(op)
+  run out.append("\"")
+}
+
+effect fn idOp(out: &mut String, first: &mut bool, op: string, id: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run begin(&mut out, &mut first, op)
+  run member(&mut out, "id", u32.toU64(id))
+  run out.append("}")
+}
+
+/// The declarations as CSS text, `; ` between them.
+effect fn cssText(out: &mut String, declarations: &List<Declaration>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let items = declarations.asSlice()
+  let mut text = String.make()
+  let mut i: usize = 0
+  while i < items.length {
+    if i > 0 {
+      run text.append("; ")
+    }
+    run writeDeclaration(&mut text, &items[i])
+    i = i + 1
+  }
+  run writeString(&mut out, String.view(&text))
+}
+
+effect fn attribute(out: &mut String, attribute: &Attribute) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match &attribute.* {
+    Attribute.ValueRange { min, max, value } => {
+      run out.append(",\"name\":\"valueRange\"")
+      run numberMember(&mut out, "min", min)
+      run numberMember(&mut out, "max", max)
+      run numberMember(&mut out, "value", value)
+    }
+    Attribute.ClearValueRange => {
+      run out.append(",\"name\":\"clearValueRange\"")
+    }
+    Attribute.Role { value } => {
+      run out.append(",\"name\":\"role\"")
+      run textMember(&mut out, "value", roleName(value))
+    }
+    Attribute.Label { value } => {
+      run out.append(",\"name\":\"label\"")
+      run textMember(&mut out, "value", String.view(&value))
+    }
+    Attribute.TestId { value } => {
+      run out.append(",\"name\":\"testId\"")
+      run textMember(&mut out, "value", String.view(&value))
+    }
+    Attribute.TabIndex { value } => {
+      run out.append(",\"name\":\"tabIndex\",\"value\":")
+      if value < 0 {
+        run out.append("-")
+        run writeInt(&mut out, i64.toU64(0 - i32.toI64(value)))
+      } else {
+        run writeInt(&mut out, i64.toU64(i32.toI64(value)))
+      }
+    }
+    Attribute.Cursor { value } => {
+      run out.append(",\"name\":\"cursor\"")
+      run textMember(&mut out, "value", cursorName(value))
+    }
+    Attribute.Disabled { value } => {
+      run out.append(",\"name\":\"disabled\"")
+      run flagMember(&mut out, "value", value)
+    }
+    Attribute.FocusTrap { value } => {
+      run out.append(",\"name\":\"focusTrap\"")
+      run flagMember(&mut out, "value", value)
+    }
+    Attribute.Multiline { value } => {
+      run out.append(",\"name\":\"multiline\"")
+      run flagMember(&mut out, "value", value)
+    }
+    Attribute.ReadOnly { value } => {
+      run out.append(",\"name\":\"readOnly\"")
+      run flagMember(&mut out, "value", value)
+    }
+    Attribute.Placeholder { value } => {
+      run out.append(",\"name\":\"placeholder\"")
+      run textMember(&mut out, "value", String.view(&value))
+    }
+    Attribute.Checked { value } => {
+      run out.append(",\"name\":\"checked\"")
+      run flagMember(&mut out, "value", value)
+    }
+    Attribute.Selected { value } => {
+      run out.append(",\"name\":\"selected\"")
+      run flagMember(&mut out, "value", value)
+    }
+    Attribute.Expanded { value } => {
+      run out.append(",\"name\":\"expanded\"")
+      run flagMember(&mut out, "value", value)
+    }
+    Attribute.Prevent { actions } => {
+      run out.append(",\"name\":\"prevent\"")
+      run member(&mut out, "value", u32.toU64(actions))
+    }
+    Attribute.Href { value } => {
+      run out.append(",\"name\":\"href\"")
+      run textMember(&mut out, "value", String.view(&value))
+    }
+    Attribute.Transition { value } => {
+      run out.append(",\"name\":\"transition\"")
+      run textMember(&mut out, "value", String.view(&value))
+    }
+  }
+}
+
+/// Appends `batch` as a JSON array in format [`MUTATION_FORMAT`]. Mutations the format has no
+/// `op` for are left out.
+pub effect fn writeMutations(out: &mut String, batch: &[Mutation]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.append("[")
+  let mut first = true
+  let mut i: usize = 0
+  while i < batch.length {
+    match &batch[i] {
+      Mutation.Create { id, kind } => {
+        run begin(&mut out, &mut first, "create")
+        run member(&mut out, "id", u32.toU64(id))
+        run textMember(&mut out, "kind", kindName(kind))
+        run out.append("}")
+      }
+      Mutation.InsertBefore { parent, child, before } => {
+        run begin(&mut out, &mut first, "insert")
+        run member(&mut out, "parent", u32.toU64(parent))
+        run member(&mut out, "child", u32.toU64(child))
+        if let Option<u32>.Some { value } = before {
+          run member(&mut out, "before", u32.toU64(value))
+        }
+        run out.append("}")
+      }
+      Mutation.Remove { id } => run idOp(&mut out, &mut first, "remove", id)
+      Mutation.Destroy { id } => run idOp(&mut out, &mut first, "destroy", id)
+      Mutation.SetStyle { id, state, declarations } => {
+        run begin(&mut out, &mut first, "style")
+        run member(&mut out, "id", u32.toU64(id))
+        run textMember(&mut out, "state", stateName(state))
+        run out.append(",\"css\":")
+        run cssText(&mut out, &declarations)
+        run out.append("}")
+      }
+      Mutation.ClearStyle { id, state } => {
+        run begin(&mut out, &mut first, "clearStyle")
+        run member(&mut out, "id", u32.toU64(id))
+        run textMember(&mut out, "state", stateName(state))
+        run out.append("}")
+      }
+      Mutation.SetText { id, value } => {
+        run begin(&mut out, &mut first, "text")
+        run member(&mut out, "id", u32.toU64(id))
+        run textMember(&mut out, "value", String.view(&value))
+        run out.append("}")
+      }
+      Mutation.SetSelection { id, anchor, focus } => {
+        run begin(&mut out, &mut first, "selection")
+        run member(&mut out, "id", u32.toU64(id))
+        run member(&mut out, "anchor", usize.toU64(anchor))
+        run member(&mut out, "focus", usize.toU64(focus))
+        run out.append("}")
+      }
+      Mutation.SetAttribute { id, attribute: set } => {
+        run begin(&mut out, &mut first, "attribute")
+        run member(&mut out, "id", u32.toU64(id))
+        run attribute(&mut out, &set)
+        run out.append("}")
+      }
+      Mutation.SetListeners { id, flags } => {
+        run begin(&mut out, &mut first, "listeners")
+        run member(&mut out, "id", u32.toU64(id))
+        run member(&mut out, "flags", u32.toU64(flags))
+        run out.append("}")
+      }
+      Mutation.SetSource { id, resource } => {
+        run begin(&mut out, &mut first, "source")
+        run member(&mut out, "id", u32.toU64(id))
+        run member(&mut out, "resource", u32.toU64(resource))
+        run out.append("}")
+      }
+      Mutation.OpenRoot { root, node, .. } => {
+        run begin(&mut out, &mut first, "openRoot")
+        run member(&mut out, "root", u32.toU64(root))
+        run member(&mut out, "node", u32.toU64(node))
+        run out.append("}")
+      }
+      Mutation.CloseRoot { root } => {
+        run begin(&mut out, &mut first, "closeRoot")
+        run member(&mut out, "root", u32.toU64(root))
+        run out.append("}")
+      }
+      Mutation.Focus { id } => run idOp(&mut out, &mut first, "focus", id)
+      Mutation.Blur => {
+        run begin(&mut out, &mut first, "blur")
+        run out.append("}")
+      }
+      Mutation.SetPointerCapture { id } => run idOp(&mut out, &mut first, "capture", id)
+      Mutation.ReleasePointerCapture => {
+        run begin(&mut out, &mut first, "release")
+        run out.append("}")
+      }
+      Mutation.ScrollTo { id, x, y } => {
+        run begin(&mut out, &mut first, "scrollTo")
+        run member(&mut out, "id", u32.toU64(id))
+        run numberMember(&mut out, "x", x)
+        run numberMember(&mut out, "y", y)
+        run out.append("}")
+      }
+      Mutation.ScrollIntoView { id } => run idOp(&mut out, &mut first, "scrollIntoView", id)
+      _ => {}
+    }
+    i = i + 1
+  }
+  run out.append("]")
+}
+
+fn idOf(value: &Value, key: string) -> u32 {
+  return idField(value, key).unwrapOr(0)
+}
+
+effect fn attributeOf(value: &Value) -> Option<Attribute>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let name = textField(value, "name")
+  if name == "valueRange" {
+    return Option<Attribute>.some(
+      Attribute.ValueRange {
+        min: numberField(value, "min", 0.0),
+        max: numberField(value, "max", 0.0),
+        value: numberField(value, "value", 0.0),
+      },
+    )
+  }
+  if name == "clearValueRange" {
+    return Option<Attribute>.some(Attribute.ClearValueRange)
+  }
+  if name == "role" {
+    if let Option<Role>.Some { value: named } = roleNamed(textField(value, "value")) {
+      return Option<Attribute>.some(Attribute.Role { value: named })
+    }
+    return Option<Attribute>.None
+  }
+  if name == "label" {
+    return Option<Attribute>.some(
+      Attribute.Label { value: run String.copy(textField(value, "value")) },
+    )
+  }
+  if name == "testId" {
+    return Option<Attribute>.some(
+      Attribute.TestId { value: run String.copy(textField(value, "value")) },
+    )
+  }
+  if name == "tabIndex" {
+    let index = match Json.asI64(Json.field(value, "value")) {
+      Option<i64>.Some { value: n } => n
+      Option<i64>.None => 0
+    }
+    return Option<Attribute>.some(Attribute.TabIndex { value: i64.toI32(index) })
+  }
+  if name == "cursor" {
+    if let Option<Cursor>.Some { value: cursor } = cursorNamed(textField(value, "value")) {
+      return Option<Attribute>.some(Attribute.Cursor { value: cursor })
+    }
+    return Option<Attribute>.None
+  }
+  let flag = flagField(value, "value", false)
+  if name == "disabled" {
+    return Option<Attribute>.some(Attribute.Disabled { value: flag })
+  }
+  if name == "focusTrap" {
+    return Option<Attribute>.some(Attribute.FocusTrap { value: flag })
+  }
+  if name == "multiline" {
+    return Option<Attribute>.some(Attribute.Multiline { value: flag })
+  }
+  if name == "readOnly" {
+    return Option<Attribute>.some(Attribute.ReadOnly { value: flag })
+  }
+  if name == "checked" {
+    return Option<Attribute>.some(Attribute.Checked { value: flag })
+  }
+  if name == "selected" {
+    return Option<Attribute>.some(Attribute.Selected { value: flag })
+  }
+  if name == "expanded" {
+    return Option<Attribute>.some(Attribute.Expanded { value: flag })
+  }
+  if name == "placeholder" {
+    return Option<Attribute>.some(
+      Attribute.Placeholder { value: run String.copy(textField(value, "value")) },
+    )
+  }
+  if name == "prevent" {
+    return Option<Attribute>.some(Attribute.Prevent { actions: idOf(value, "value") })
+  }
+  if name == "href" {
+    return Option<Attribute>.some(
+      Attribute.Href { value: run String.copy(textField(value, "value")) },
+    )
+  }
+  if name == "transition" {
+    return Option<Attribute>.some(
+      Attribute.Transition { value: run String.copy(textField(value, "value")) },
+    )
+  }
+  return Option<Attribute>.None
+}
+
+/// The declarations of CSS text; none when it does not parse.
+effect fn declarationsOf(css: string) -> List<Declaration>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let parsed = run Effect.result(written.declarations(String.utf8Bytes(css)))
+  return match move parsed {
+    Result<List<Declaration>, CssError | OutOfMemoryError>.Success { value } => move value
+    Result<List<Declaration>, CssError | OutOfMemoryError>.Failure { error } => {
+      drop error
+      List<Declaration>.make()
+    }
+  }
+}
+
+/// One mutation of a batch, or None for an `op` this format does not have (or that lacks what
+/// it needs). Ids are as written.
+pub effect fn readMutation(value: &Value) -> Option<Mutation>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let op = textField(value, "op")
+  let id = idOf(value, "id")
+  if op == "create" {
+    if let Option<NodeKind>.Some { value: kind } = kindNamed(textField(value, "kind")) {
+      return Option<Mutation>.some(Mutation.Create { id: id, kind: kind })
+    }
+    return Option<Mutation>.None
+  }
+  if op == "insert" {
+    let before = if has(value, "before") {
+      Option<u32>.some(idOf(value, "before"))
+    } else {
+      Option<u32>.None
+    }
+    return Option<Mutation>.some(
+      Mutation.InsertBefore {
+        parent: idOf(value, "parent"),
+        child: idOf(value, "child"),
+        before: before,
+      },
+    )
+  }
+  if op == "remove" {
+    return Option<Mutation>.some(Mutation.Remove { id: id })
+  }
+  if op == "destroy" {
+    return Option<Mutation>.some(Mutation.Destroy { id: id })
+  }
+  if op == "style" || op == "clearStyle" {
+    let state = match stateNamed(textField(value, "state")) {
+      Option<StyleState>.Some { value: named } => named
+      Option<StyleState>.None => {
+        return Option<Mutation>.None
+      }
+    }
+    if op == "clearStyle" {
+      return Option<Mutation>.some(Mutation.ClearStyle { id: id, state: state })
+    }
+    return Option<Mutation>.some(
+      Mutation.SetStyle {
+        id: id,
+        state: state,
+        declarations: run declarationsOf(textField(value, "css")),
+      },
+    )
+  }
+  if op == "text" {
+    return Option<Mutation>.some(
+      Mutation.SetText { id: id, value: run String.copy(textField(value, "value")) },
+    )
+  }
+  if op == "selection" {
+    return Option<Mutation>.some(
+      Mutation.SetSelection {
+        id: id,
+        anchor: u32.toUsize(idOf(value, "anchor")),
+        focus: u32.toUsize(idOf(value, "focus")),
+      },
+    )
+  }
+  if op == "attribute" {
+    if let Option<Attribute>.Some { value: set } = run attributeOf(value) {
+      return Option<Mutation>.some(Mutation.SetAttribute { id: id, attribute: move set })
+    }
+    return Option<Mutation>.None
+  }
+  if op == "listeners" {
+    return Option<Mutation>.some(Mutation.SetListeners { id: id, flags: idOf(value, "flags") })
+  }
+  if op == "source" {
+    return Option<Mutation>.some(Mutation.SetSource { id: id, resource: idOf(value, "resource") })
+  }
+  if op == "openRoot" {
+    return Option<Mutation>.some(
+      Mutation.OpenRoot {
+        root: idOf(value, "root"),
+        node: idOf(value, "node"),
+        options: RootOptions.default(),
+      },
+    )
+  }
+  if op == "closeRoot" {
+    return Option<Mutation>.some(Mutation.CloseRoot { root: idOf(value, "root") })
+  }
+  if op == "focus" {
+    return Option<Mutation>.some(Mutation.Focus { id: id })
+  }
+  if op == "blur" {
+    return Option<Mutation>.some(Mutation.Blur)
+  }
+  if op == "capture" {
+    return Option<Mutation>.some(Mutation.SetPointerCapture { id: id })
+  }
+  if op == "release" {
+    return Option<Mutation>.some(Mutation.ReleasePointerCapture)
+  }
+  if op == "scrollTo" {
+    return Option<Mutation>.some(
+      Mutation.ScrollTo {
+        id: id,
+        x: numberField(value, "x", 0.0),
+        y: numberField(value, "y", 0.0),
+      },
+    )
+  }
+  if op == "scrollIntoView" {
+    return Option<Mutation>.some(Mutation.ScrollIntoView { id: id })
+  }
+  return Option<Mutation>.None
+}
+
+/// Appends `event` as an object; `path` and `target` as given (the caller maps them).
+pub effect fn writeEvent(out: &mut String, event: &Event) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.append("{\"kind\":")
+  run writeString(&mut out, eventName(event.kind))
+  run member(&mut out, "target", u32.toU64(event.target))
+  run out.append(",\"path\":[")
+  let path = event.path.asSlice()
+  let mut i: usize = 0
+  while i < path.length {
+    if i > 0 {
+      run out.append(",")
+    }
+    run writeInt(&mut out, u32.toU64(path[i]))
+    i = i + 1
+  }
+  run out.append("]")
+  if event.x != 0.0 || event.y != 0.0 {
+    run numberMember(&mut out, "x", event.x)
+    run numberMember(&mut out, "y", event.y)
+  }
+  if event.bounds.width() != 0.0 || event.bounds.height() != 0.0 {
+    run numberMember(&mut out, "left", event.bounds.xMin)
+    run numberMember(&mut out, "top", event.bounds.yMin)
+    run numberMember(&mut out, "width", event.bounds.width())
+    run numberMember(&mut out, "height", event.bounds.height())
+  }
+  if event.modifiers != 0 {
+    run member(&mut out, "modifiers", u32.toU64(event.modifiers))
+  }
+  if event.button != 0 {
+    run member(&mut out, "button", u32.toU64(event.button))
+  }
+  if event.detail != 0 {
+    run member(&mut out, "detail", u32.toU64(event.detail))
+  }
+  if event.deltaX != 0.0 || event.deltaY != 0.0 {
+    run numberMember(&mut out, "deltaX", event.deltaX)
+    run numberMember(&mut out, "deltaY", event.deltaY)
+  }
+  if event.key.ownedByteLength() != 0 {
+    run textMember(&mut out, "key", String.view(&event.key))
+  }
+  if event.code.ownedByteLength() != 0 {
+    run textMember(&mut out, "code", String.view(&event.code))
+  }
+  if event.repeat {
+    run out.append(",\"repeat\":true")
+  }
+  if event.value.ownedByteLength() != 0 || event.inputType.ownedByteLength() != 0 {
+    run textMember(&mut out, "value", String.view(&event.value))
+    run textMember(&mut out, "inputType", String.view(&event.inputType))
+    run member(&mut out, "selectionStart", usize.toU64(event.selectionStart))
+    run member(&mut out, "selectionEnd", usize.toU64(event.selectionEnd))
+  }
+  run out.append("}")
+}
+
+/// The event record `value` describes, or None without a known `kind`.
+pub effect fn readEvent(value: &Value) -> Option<Event>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let kind = match eventKindNamed(textField(value, "kind")) {
+    Option<EventKind>.Some { value: named } => named
+    Option<EventKind>.None => {
+      return Option<Event>.None
+    }
+  }
+  let mut path = List<u32>.make()
+  if let Option<&Value>.Some { value: list } = Json.field(value, "path") {
+    if let Value.Array { values } = &list.* {
+      let items = values.asSlice()
+      let mut i: usize = 0
+      while i < items.length {
+        match Json.asU64(Option<&Value>.Some { value: &items[i] }) {
+          Option<u64>.Some { value: n } => {
+            run path.append(u64.toU32(n))
+          }
+          Option<u64>.None => {}
+        }
+        i = i + 1
+      }
+    }
+  }
+  let mut event = Event.make(kind, idOf(value, "target"), move path)
+  event.x = numberField(value, "x", 0.0)
+  event.y = numberField(value, "y", 0.0)
+  let left = numberField(value, "left", 0.0)
+  let top = numberField(value, "top", 0.0)
+  event.bounds = Rect<f32>.new(
+    left,
+    top,
+    left + numberField(value, "width", 0.0),
+    top + numberField(value, "height", 0.0),
+  )
+  event.modifiers = idOf(value, "modifiers")
+  event.button = idOf(value, "button")
+  event.detail = idOf(value, "detail")
+  event.deltaX = numberField(value, "deltaX", 0.0)
+  event.deltaY = numberField(value, "deltaY", 0.0)
+  event.key = run String.copy(textField(value, "key"))
+  event.code = run String.copy(textField(value, "code"))
+  event.repeat = flagField(value, "repeat", false)
+  event.value = run String.copy(textField(value, "value"))
+  event.inputType = run String.copy(textField(value, "inputType"))
+  event.selectionStart = u32.toUsize(idOf(value, "selectionStart"))
+  event.selectionEnd = u32.toUsize(idOf(value, "selectionEnd"))
+  return Option<Event>.some(move event)
+}
