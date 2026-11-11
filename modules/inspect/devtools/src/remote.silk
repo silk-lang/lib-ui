@@ -1,0 +1,389 @@
+//! Remote views: an extension panel that the app renders itself. The app sends ordinary tree
+//! mutation batches on the panel's view topic (see `ui_inspect_server.remote` for the format);
+//! a [`ViewHost`] replays them into this tree, under the box the devtools draw for the panel
+//! (test id [`VIEW_HOST`]), with ids of its own. The event records the tree makes for those
+//! nodes are taken out before the devtools' program sees them, mapped back to the app's ids,
+//! and go back to the app as `viewEvents` (in [`ViewHost.outbox`]).
+//!
+//! The view is drawn with the devtools' fonts, images and look: what the panel's root box
+//! inherits from the box it is inserted in.
+import ui_inspect_server.remote { readMutation, writeEvent }
+import ui_inspect_server.reply { textField, flagField, writeString, has }
+import ui_inspect.query { Query, queryFirst }
+import ui_tree.legacy { UiTree, TreeError, Mutation }
+import ui_tree.node { NONE, Event }
+import silk.collections.hash { Hash, Word }
+import silk.collections.hash_map { HashMap }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.json.value { Json, Value }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.text.string { String }
+
+/// The test id of the box an extension panel's view is replayed under.
+pub const VIEW_HOST: string = "extension-view"
+
+/// The first id a replayed node gets: past the devtools' own (which count up from their root
+/// box) and the inspected app's (which count up from 1).
+pub const REMOTE_FIRST: u32 = 4160749568
+
+/// Whether a line the app pushed is a view batch.
+pub fn isViewBatch(value: &Value) -> bool {
+  return has(value, "mutations")
+}
+
+/// Replays a remote view into a tree. See the module documentation.
+pub struct ViewHost {
+  /// The view topic of the batches replayed, and the box they are under.
+  topic: String,
+  host: u32,
+  /// The app's id of the view's root node, or NONE.
+  root: u32,
+  toLocal: HashMap<Word, u32>,
+  toRemote: HashMap<Word, u32>,
+  next: u32,
+  /// Lines for the app: the event records of the view's nodes, and a request to send the view
+  /// again from nothing when a batch could not be replayed.
+  pub outbox: List<String>,
+  /// Batches replayed, for tests.
+  pub applied: u64,
+}
+
+impl ViewHost {
+  pub fn make() -> ViewHost {
+    return ViewHost {
+      topic: String.make(),
+      host: NONE,
+      root: NONE,
+      toLocal: HashMap<Word, u32>.make(Hash.seed(29)),
+      toRemote: HashMap<Word, u32>.make(Hash.seed(31)),
+      next: REMOTE_FIRST,
+      outbox: List<String>.make(),
+      applied: 0,
+    }
+  }
+
+  /// The tree's id of the app's node `remote`, or NONE.
+  pub fn local(self: &Self, remote: u32) -> u32 {
+    return HashMap<Word, u32>.get(&self.toLocal, Hash.word(u32.toU64(remote))).unwrapOr(NONE)
+  }
+
+  /// The app's id of the tree's node `local`, or NONE.
+  pub fn remote(self: &Self, local: u32) -> u32 {
+    return HashMap<Word, u32>.get(&self.toRemote, Hash.word(u32.toU64(local))).unwrapOr(NONE)
+  }
+
+  /// How many of the app's nodes are in the tree.
+  pub fn count(self: &Self) -> usize {
+    return self.toLocal.length()
+  }
+
+  /// The topic of the view being replayed.
+  pub fn viewTopic(self: &Self) -> string {
+    return String.view(&self.topic)
+  }
+
+  /// Destroys every node replayed so far.
+  effect fn clear(self: &mut Self, tree: &mut UiTree<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut i: usize = 0
+    while i < self.toLocal.bucketCount() {
+      if self.toLocal.occupiedAt(i) {
+        let local = self.toLocal.valueAt(i)
+        if tree.contains(local) {
+          let mut batch = List<Mutation>.make()
+          run batch.append(Mutation.Destroy { id: local })
+          drop run Effect.result(tree.apply(move batch))
+        }
+      }
+      i = i + 1
+    }
+    self.toLocal.clear()
+    self.toRemote.clear()
+    self.root = NONE
+    self.next = REMOTE_FIRST
+  }
+
+  effect fn bind(self: &mut Self, remote: u32, local: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    drop run HashMap<Word, u32>.insert(&mut self.toLocal, Hash.word(u32.toU64(remote)), local)
+    drop run HashMap<Word, u32>.insert(&mut self.toRemote, Hash.word(u32.toU64(local)), remote)
+  }
+
+  fn unbind(self: &mut Self, remote: u32) -> () {
+    let local = self.local(remote)
+    drop HashMap<Word, u32>.remove(&mut self.toLocal, Hash.word(u32.toU64(remote)))
+    if local != NONE {
+      drop HashMap<Word, u32>.remove(&mut self.toRemote, Hash.word(u32.toU64(local)))
+    }
+  }
+
+  /// One of the app's mutations with the tree's ids, or None when it names a node that is not
+  /// here. `Create` gives the node an id; `OpenRoot` inserts the view's root node under `host`.
+  effect fn mapped(self: &mut Self, mutation: Mutation, host: u32) -> Option<Mutation>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match move mutation {
+      Mutation.Create { id, kind } => {
+        let local = self.next
+        self.next = self.next + 1
+        run self.bind(id, local)
+        Option<Mutation>.some(Mutation.Create { id: local, kind: kind })
+      }
+      Mutation.InsertBefore { parent, child, before } => {
+        let p = self.local(parent)
+        let c = self.local(child)
+        let mut lost = false
+        let b = match before {
+          Option<u32>.Some { value } => {
+            let found = self.local(value)
+            lost = found == NONE
+            Option<u32>.some(found)
+          }
+          Option<u32>.None => Option<u32>.None
+        }
+        if p == NONE || c == NONE || lost {
+          return Option<Mutation>.None
+        }
+        Option<Mutation>.some(Mutation.InsertBefore { parent: p, child: c, before: b })
+      }
+      Mutation.OpenRoot { root: _, node, options: _ } => {
+        let c = self.local(node)
+        if c == NONE {
+          return Option<Mutation>.None
+        }
+        self.root = node
+        Option<Mutation>.some(
+          Mutation.InsertBefore { parent: host, child: c, before: Option<u32>.None },
+        )
+      }
+      Mutation.CloseRoot { root: _ } => {
+        let c = self.local(self.root)
+        self.root = NONE
+        if c == NONE {
+          return Option<Mutation>.None
+        }
+        Option<Mutation>.some(Mutation.Remove { id: c })
+      }
+      Mutation.Remove { id } => self.one(id, |local| Mutation.Remove { id: local })
+      Mutation.Destroy { id } => {
+        let local = self.local(id)
+        self.unbind(id)
+        if local == NONE {
+          return Option<Mutation>.None
+        }
+        Option<Mutation>.some(Mutation.Destroy { id: local })
+      }
+      Mutation.SetStyle { id, state, declarations } => {
+        let local = self.local(id)
+        if local == NONE {
+          return Option<Mutation>.None
+        }
+        Option<Mutation>.some(
+          Mutation.SetStyle { id: local, state: state, declarations: move declarations },
+        )
+      }
+      Mutation.ClearStyle { id, state } => self.one(
+        id,
+        |local| Mutation.ClearStyle { id: local, state: state },
+      )
+      Mutation.SetText { id, value } => {
+        let local = self.local(id)
+        if local == NONE {
+          return Option<Mutation>.None
+        }
+        Option<Mutation>.some(Mutation.SetText { id: local, value: move value })
+      }
+      Mutation.SetSelection { id, anchor, focus } => self.one(
+        id,
+        |local| Mutation.SetSelection { id: local, anchor: anchor, focus: focus },
+      )
+      Mutation.SetAttribute { id, attribute } => {
+        let local = self.local(id)
+        if local == NONE {
+          return Option<Mutation>.None
+        }
+        Option<Mutation>.some(Mutation.SetAttribute { id: local, attribute: move attribute })
+      }
+      Mutation.SetListeners { id, flags } => self.one(
+        id,
+        |local| Mutation.SetListeners { id: local, flags: flags },
+      )
+      Mutation.SetSource { id, resource } => self.one(
+        id,
+        |local| Mutation.SetSource { id: local, resource: resource },
+      )
+      Mutation.Focus { id } => self.one(id, |local| Mutation.Focus { id: local })
+      Mutation.SetPointerCapture { id } => self.one(
+        id,
+        |local| Mutation.SetPointerCapture { id: local },
+      )
+      Mutation.ScrollTo { id, x, y } => self.one(
+        id,
+        |local| Mutation.ScrollTo { id: local, x: x, y: y },
+      )
+      Mutation.ScrollIntoView { id } => self.one(id, |local| Mutation.ScrollIntoView { id: local })
+      Mutation.Blur => Option<Mutation>.some(Mutation.Blur)
+      Mutation.ReleasePointerCapture => Option<Mutation>.some(Mutation.ReleasePointerCapture)
+      Mutation kept => {
+        drop kept
+        Option<Mutation>.None
+      }
+    }
+  }
+
+  /// `make(local)` for the tree's id of node `id`, or None when it is not here.
+  fn one(self: &Self, id: u32, make: fn(u32) -> Mutation) -> Option<Mutation> {
+    let local = self.local(id)
+    if local == NONE {
+      return Option<Mutation>.None
+    }
+    return Option<Mutation>.some(make(local))
+  }
+
+  /// Replays batch `note` (a line the app pushed, parsed) into `tree` with root `root` current,
+  /// under the box with test id [`VIEW_HOST`] inside node `within` (the devtools' root box).
+  /// Returns whether it was replayed. A batch with nowhere to go (the panel is not shown) is
+  /// dropped; one that does not follow what was replayed (another view, or a box drawn anew)
+  /// asks the app for the whole view again.
+  pub effect fn apply(
+    self: &mut Self,
+    tree: &mut UiTree<'_>,
+    root: u32,
+    within: u32,
+    note: &Value,
+  ) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let topic = textField(note, "event")
+    let mut query = run Query.byTestId(VIEW_HOST)
+    query.within = within
+    query.includeHidden = true
+    let host = run queryFirst(&tree.*, &query)
+    if host == NONE {
+      return false
+    }
+    if flagField(note, "reset", false) {
+      run self.clear(&mut tree)
+      self.topic = run String.copy(topic)
+      self.host = host
+    } else if topic != String.view(&self.topic) || host != self.host
+      || (self.root != NONE && !tree.contains(self.local(self.root))) {
+      run self.restart(topic)
+      return false
+    }
+    let mut batch = List<Mutation>.make()
+    if let Option<&Value>.Some { value: list } = Json.field(note, "mutations") {
+      if let Value.Array { values } = &list.* {
+        let items = values.asSlice()
+        let mut i: usize = 0
+        while i < items.length {
+          if let Option<Mutation>.Some { value: read } = run readMutation(&items[i]) {
+            if let Option<Mutation>.Some { value: local } = run self.mapped(move read, host) {
+              run batch.append(move local)
+            }
+          }
+          i = i + 1
+        }
+      }
+    }
+    let back = tree.current
+    drop run tree.useRoot(root)
+    let result = run Effect.result(tree.apply(move batch))
+    drop run tree.useRoot(back)
+    match move result {
+      Result<(), TreeError | OutOfMemoryError>.Success { value: _ } => {}
+      Result<(), TreeError | OutOfMemoryError>.Failure { error } => {
+        drop error
+        run self.restart(topic)
+        return false
+      }
+    }
+    self.applied = self.applied + 1
+    return true
+  }
+
+  /// Asks the app to send view `topic` again from nothing.
+  effect fn restart(self: &mut Self, topic: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut off = run String.copy("{\"cmd\":\"unsubscribe\",\"topics\":[")
+    run writeString(&mut off, topic)
+    run off.append("]}")
+    run self.outbox.append(move off)
+    let mut on = run String.copy("{\"cmd\":\"subscribe\",\"topics\":[")
+    run writeString(&mut on, topic)
+    run on.append("]}")
+    run self.outbox.append(move on)
+  }
+
+  /// Takes the records of the replayed nodes out of `records` (the tree's, before the devtools'
+  /// program sees them) and adds them to the outbox with the app's ids, as one `viewEvents`.
+  pub effect fn intercept(self: &mut Self, records: &mut List<Event>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.toRemote.length() == 0 || records.length() == 0 {
+      return ()
+    }
+    let mut kept = List<Event>.make()
+    let mut line = String.make()
+    let mut count: usize = 0
+    while records.length() != 0 {
+      let mut record = records.remove(0)
+      let path = record.path.asSlice()
+      let mut from = path.length
+      let mut k: usize = 0
+      while k < path.length && from == path.length {
+        if self.remote(path[k]) != NONE {
+          from = k
+        }
+        k = k + 1
+      }
+      if from == path.length {
+        run kept.append(move record)
+        continue
+      }
+
+      // One of the view's: the app's ids from its node on.
+      let mut remote = List<u32>.make()
+      let mut whole = true
+      let mut j = from
+      while j < path.length {
+        let id = self.remote(path[j])
+        if id == NONE {
+          whole = false
+        }
+        run remote.append(id)
+        j = j + 1
+      }
+      let target = self.remote(record.target)
+      if !whole || target == NONE {
+        continue
+      }
+      record.target = target
+      record.path = move remote
+      if count > 0 {
+        run line.append(",")
+      }
+      run writeEvent(&mut line, &record)
+      count = count + 1
+    }
+    records.* = move kept
+    if count == 0 {
+      return ()
+    }
+    let mut out = run String.copy("{\"cmd\":\"viewEvents\",\"topic\":")
+    run writeString(&mut out, String.view(&self.topic))
+    run out.append(",\"events\":[")
+    run out.append(String.view(&line))
+    run out.append("]}")
+    run self.outbox.append(move out)
+  }
+}

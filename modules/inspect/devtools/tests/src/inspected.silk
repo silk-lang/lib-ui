@@ -2,7 +2,8 @@
 //! in the same process. It is the devtools' [`Link`]: a session over a memory channel, the same
 //! `Session` the socket server runs. Each line the devtools send is served at once, and input a
 //! request dispatches is pumped to the app and drawn, as the window loop does; after each frame
-//! the session is told what changed.
+//! the session is told what changed. The app is a silk-ui program, so the `silk-ui` extension is
+//! registered and served after each line, as the window host does.
 import ui_devtools.link { Link, Requests }
 import ui_app_examples.todo { Todo, Message as TodoMessage, Command as TodoCommand, Store }
 import ui_app_examples.look { SANS }
@@ -10,7 +11,9 @@ import ui_app.runtime { Runtime, pump }
 import ui_inspect_server.protocol { Protocol, Outcome }
 import ui_inspect_server.channel { Channel, MemoryChannel, MemoryPair }
 import ui_inspect_server.session { Session }
-import ui_inspect_server.program { ProgramStep }
+import ui_inspect_server.extension { Outgoing }
+import ui_app_inspect.lib { SilkUi, ProgramStep, ID as SILK_UI }
+import notes { Notes, ID as NOTES }
 import silk.collections.list { List }
 import ui_tree.legacy { UiTree, TreeError, Batch, FrameInput, CpuSnapshot }
 import font_collection.lib { FontCollection }
@@ -47,6 +50,14 @@ pub struct Inspected<'f> {
   pub down: bool,
   /// The session, the app's end of its channel and the devtools' end.
   pub session: Session,
+  /// The silk-ui extension of the todo app.
+  pub silkUi: SilkUi,
+  /// The view batches the app pushed, for the test to replay into the devtools' tree, as a
+  /// window does (`ui_devtools.remote`).
+  pub viewNotes: List<String>,
+  /// An extension of no framework, once `addNotes` registered it.
+  pub notes: Notes,
+  withNotes: bool,
   end: MemoryChannel,
   client: MemoryChannel,
   numbering: Requests,
@@ -73,10 +84,15 @@ impl<'f> Inspected<'f> {
       requests: 0,
       down: false,
       session: Session.open(),
+      silkUi: SilkUi.make(),
+      viewNotes: List<String>.make(),
+      notes: Notes.make(),
+      withNotes: false,
       end: move first,
       client: move second,
       numbering: Requests.make(),
     }
+    run inspected.protocol.extend(run SilkUi.extension())
     run inspected.frame()
     return move inspected
   }
@@ -103,6 +119,22 @@ impl<'f> Inspected<'f> {
       self.requests = self.requests + 1
       run self.answer()
     }
+    run self.serveExtension()
+  }
+
+  /// Serves the silk-ui extension, as the window loop does on each turn: what waits for it is
+  /// answered, and its news pushed.
+  pub effect fn serveExtension(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.protocol.serveExtension(SILK_UI, &mut self.silkUi)
+    if self.withNotes {
+      run self.protocol.serveExtension(NOTES, &mut self.notes)
+    }
+    run self.session.deliver(&mut self.protocol) |> Effect.provideMut<Channel>(&mut self.end)
+    let mut news = List<Outgoing>.make()
+    run self.protocol.extensions.takeNews(&mut news)
+    run self.session.publishNews(&news) |> Effect.provideMut<Channel>(&mut self.end)
   }
 
   /// Pumps input a request dispatched to the app, and draws.
@@ -142,6 +174,16 @@ impl<'f> Inspected<'f> {
   }
 }
 
+impl<'f> Inspected<'f> {
+  /// Registers the notes extension, which no framework has.
+  pub effect fn addNotes(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.protocol.extend(run Notes.extension())
+    self.withNotes = true
+  }
+}
+
 /// A step of a program, as a host reports it.
 effect fn step(
   seq: u64,
@@ -171,19 +213,20 @@ impl<'f> Inspected<'f> {
   pub effect fn reportProgram(self: &mut Self) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
-    self.protocol.program.attached = true
-    run self.protocol.program.subscriptions.append(run String.copy("every 1s"))
-    run self.protocol.program.subscriptions.append(run String.copy("key n"))
-    self.protocol.program.stats.messages = 3
-    self.protocol.program.stats.commands = 1
-    self.protocol.program.stats.renders = 4
-    self.protocol.program.stats.mutations = 6
-    self.protocol.program.stats.nodes = 40
-    self.protocol.program.stats.reused = 31
-    run self.protocol.program.add(
+    let log = &mut self.silkUi.log
+    log.attached = true
+    run log.subscriptions.append(run String.copy("every 1s"))
+    run log.subscriptions.append(run String.copy("key n"))
+    log.stats.messages = 3
+    log.stats.commands = 1
+    log.stats.renders = 4
+    log.stats.mutations = 6
+    log.stats.nodes = 40
+    log.stats.reused = 31
+    run log.add(
       run step(1, "init", "Started", "", "Todo {\n  draft: \"\"\n  items: 3\n  saved: 0\n}"),
     )
-    run self.protocol.program.add(
+    run log.add(
       run step(
         2,
         "input #9",
@@ -192,7 +235,7 @@ impl<'f> Inspected<'f> {
         "Todo {\n  draft: \"Buy milk\"\n  items: 3\n  saved: 0\n}",
       ),
     )
-    run self.protocol.program.add(
+    run log.add(
       run step(
         3,
         "click #12",
@@ -235,12 +278,34 @@ impl<'f> Link for Inspected<'f> {
     return run self.served()
   }
 
+  effect fn ask(self: &mut Self, line: string) -> u64
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.down {
+      return 0
+    }
+    let id = run self.numbering.ask(line) |> Effect.provideMut<Channel>(&mut self.client)
+    if !run self.served() {
+      return 0
+    }
+    return id
+  }
+
   effect fn take(self: &mut Self, out: &mut List<String>) -> bool
     ! OutOfMemoryError
     ? &mut Allocator {
     let mut none = String.make()
     drop run self.numbering.collect(0, &mut none) |> Effect.provideMut<Channel>(&mut self.client)
-    run self.numbering.takeNotes(&mut out)
+    let mut notes = List<String>.make()
+    run self.numbering.takeNotes(&mut notes)
+    while notes.length() != 0 {
+      let line = notes.remove(0)
+      if String.contains(String.view(&line), "\"mutations\":") {
+        run self.viewNotes.append(move line)
+      } else {
+        run out.append(move line)
+      }
+    }
     return true
   }
 }

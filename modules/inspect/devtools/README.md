@@ -1,27 +1,32 @@
 # ui-inspect-devtools
 
 A devtools window for a running Silk UI: the app's element tree on the left, and on the right
-the selected node's styles (editable), its box model, the program's messages with the model
-diff each one made, the event log, a frame timeline, an accessibility audit and the frame
-stats. Selecting an element highlights it in the app's window with the devtools box model
-colors, and Pick selects whatever is clicked in the app's window.
+the selected node's styles (editable), its box model, the event log, a frame timeline, an
+accessibility audit and the frame stats, then a tab for each panel the app's extensions add (a
+silk-ui program's Program panel among them). Selecting an element highlights it in the app's
+window with the devtools box model colors, and Pick selects whatever is clicked in the app's
+window.
 
 It is built with the Silk framework itself ([ui-app](../../app)) and talks to the app only
 through the inspector protocol ([ui-inspect-server](../server)), the same requests
 ui-inspect-cli and ui-inspect-mcp send. So anything it shows, a script or an agent can read
 too, and the devtools window is itself an app the inspector can drive. It keeps one protocol 3
 session open with the app, subscribes to its topics, and reads again only what the app says
-changed.
+changed. It knows no framework: the tabs past its own come from `hello`.
 
 Packages:
 
 - `modules/inspect/devtools` (`ui-inspect-devtools`): the app (`devtools.silk`), what it reads out of
   the protocol's replies (`data.silk`) and the `Link` service it talks through (`link.silk`):
-  requests numbered by `Requests` over the client end of a `Channel`, notifications, and what
-  the app pushed. `embedded.silk` runs the same app in the inspected app's own process.
+  requests numbered by `Requests` over the client end of a `Channel`, notifications, requests
+  answered later (`Link.ask`, for extensions), and what the app pushed. `remote.silk` replays an
+  extension panel's view (`ViewHost`). `embedded.silk` runs the same app in the inspected app's
+  own process.
 - `modules/inspect/devtools/app` (`ui-devtools`): the window, with a `Link` over a
   `SocketChannel` session. The pump thread rings a bell that wakes the window, which sends the
-  devtools `Message.Pull`.
+  devtools `Message.Pull`. View batches go from the session to the window's content, which
+  replays them and takes their nodes' records (`WindowContent.intercept`) before the devtools'
+  program does.
 - `modules/inspect/devtools/tests`: the devtools inspecting the todo example in the same process,
   and golden scenes.
 
@@ -94,11 +99,6 @@ second until it answers.
   refused with the reason and changes nothing. Reset undoes every edit.
 - **Box model**: margin, border, padding and content as nested boxes with their widths, in
   Chrome's colors, and the position of the border box.
-- **Program**: for an app built on ui-app's `Program`: its counters and subscriptions, then
-  every message newest first with what sent it (`click #12`, `port shell:menu`, `command
-  Save`) and the commands `update` returned. A marker shows the steps that changed the model;
-  click one for the model after it, with the lines it added and removed. Nothing in the app is
-  written for this: messages, commands and models are printed by reflection.
 - **Frames**: one bar per frame, layout over paint, against a 16.7 ms budget; frames over it
   are red. Below, the slowest and the average.
 - **Audit**: unnamed controls, clickable nodes without a role or out of the keyboard's reach,
@@ -108,9 +108,33 @@ second until it answers.
   are recorded (the tree queues nothing else). Clear empties the list.
 - **Stats**: the last frame's `FrameStats` (layout passes and cache hits, replayed and
   repainted subtrees, glyphs, primitives).
+- **The app's extension panels**, one tab each, as `hello` lists them (see
+  [Extensions](../server/README.md#extensions)). A panel with data only shows it with a generic
+  view: an object's members and an array's elements in rows, nested ones indented, read when
+  the tab opens and again when the panel's topic says it changed. A panel with a view shows what
+  the app renders for it (below). A silk-ui program's **Program** panel is such a view: its
+  counters and subscriptions, then every message newest first with what sent it (`click #12`,
+  `port shell:menu`, `command Save`) and the commands `update` returned; a marker shows the
+  steps that changed the model; click one for the model after it, with the lines it added and
+  removed.
+
+### Remote views
+
+A panel with a view is rendered by the app, in its own framework (silk-ui's with its `Document`
+builder), and only while a client has it open. When its tab opens the devtools subscribe to its
+view topic; the app sends ordinary tree mutation batches on it, the first from nothing. A
+`ViewHost` (`remote.silk`) replays them under the panel's box (test id `extension-view`) with
+ids of the devtools' own, from `REMOTE_FIRST` (`0xF8000000`) up, and turns the app's `OpenRoot`
+into an insert under that box. The view inherits the devtools' fonts, size, color and look; it
+brings no resources of its own. The tree records events for those nodes as for any; the host
+takes them out before the devtools' program sees them, maps them back to the app's ids and
+sends them with `viewEvents`, and the app's panel answers them with another batch. A batch that
+does not follow what was replayed (another view, a box drawn anew) asks the app for the whole
+view again. Closing the tab unsubscribes: the app stops rendering it.
 
 While **Live** is on (the default) the devtools subscribe to the app's `tree`, `roots`,
-`events` and `pick` topics, and to `frame` while the Stats, Frames or Program tab is open. A
+`events` and `pick` topics, to `frame` while the Stats or Frames tab is open, and to an
+extension panel's topic while its tab is open (its view topic, live or not). A
 notification makes them read again only what it says changed: the element tree and the selected
 node after `tree`, the event log after `events`, the open tab's numbers after `frame`, the
 picker after `pick`. The status line comes with the notification itself. With Live off they
@@ -122,9 +146,10 @@ A protocol 3 session (see [the server's protocol](../server/README.md#protocol))
 `"protocol": 3` when it connects, `subscribe` and `unsubscribe` as notifications whenever Live
 or the tab changes, and `highlight` as a notification on hover. Every other request carries an
 `id`. Besides `hello`, `inspect`, `highlight` and `stats`, these commands came with the devtools.
-Protocol 2 added `program`, `messages`, `model`, `frames`, `styles`, `setStyle`, `resetStyles`,
-`pickMode` and `audit` (see the [protocol table](../server/README.md#protocol)); against an
-older app those panels stay empty and the rest works.
+Protocol 2 added `frames`, `styles`, `setStyle`, `resetStyles`, `pickMode` and `audit` (see the
+[protocol table](../server/README.md#protocol)); against an older app those panels stay empty
+and the rest works. An extension's commands (a data panel's) go out with `Link.ask`: the app
+answers them when it next serves the extension, and the reply comes with the notifications.
 
 - `tree`: every node (or a target's subtree) in tree order as node objects with `parent`,
   `depth` and `children`.
@@ -153,12 +178,17 @@ silk task native devtools check
   event log and the tree again, each record once; ArrowDown moves the selection and the
   highlight; Escape clears both; folding the root hides the rest; with Live off nothing is
   pushed or read; an app that cannot be reached shows in the status line and the next good
-  refresh clears it. Then the reported program:
-  three steps, the model diff of one, the frame bars, an audit, a style typed in and applied
-  (and a bad one refused, and Reset), the filter, and a pick ending in a selection.
+  refresh clears it. Then silk-ui's Program panel, a view the app renders: its nodes replayed
+  with ids of the devtools' own, a click on a message going back to the app, which answers with
+  the model diff, and closing the tab stopping the app's rendering. Then the frame bars, an
+  audit, a style typed in and applied (and a bad one refused, and Reset), the filter, and a
+  pick ending in a selection.
+- A notes extension that belongs to no framework: its panel is a tab, its data shows in rows,
+  and is read again when its topic says it changed.
 - Goldens (`describe` text and PNG, tolerance 2 per channel): the styles panel, the box model
-  panel, the event log, the program, frames and audit panels, and the todo app with the
-  highlight the devtools asked for.
+  panel, the event log, silk-ui's Program panel (the app's view, replayed, a step opened by a
+  click on it), frames and audit panels, and the todo app with the highlight the devtools asked
+  for.
 - The devtools in the todo example's own tree, driven as the window host drives them
   (`embedded.silk`): they list the app's nodes and none of theirs; another local client's
   `tree`, `query` and `hello` leave them out and `pick` finds the app's nodes; once settled,
@@ -167,12 +197,18 @@ silk task native devtools check
   goes, the inspector turns off) and opens them again. Docked: the app's viewport is what the
   dock leaves, pointer input goes to the side it is on (a press keeps its side), the app's
   coordinates keep their origin and the devtools are hit only in the dock, and a click on a row
-  in the dock highlights in the app, which draws again.
+  in the dock highlights in the app, which draws again. With the app's silk-ui extension served
+  on each turn, the Program tab replays the app's view in the devtools' root (ids from
+  `REMOTE_FIRST`, hidden from other clients), shows a new message live, sends a click on a row
+  back to the app, which opens the step's model, and closing the tab removes the view's nodes
+  and stops the app's rendering.
 - `check` is the exit test in real windows: it starts the owned todo demo and devtools,
   under Xvfb on Linux, and drives the tools through their own inspector with ui-inspect-cli.
   It discovers and selects Add, checks highlighting and `padding-left: 10px`, opens the
-  box model, clicks Add, verifies the event log and new Task 4 in both element trees,
-  and captures both windows in `.cache/ui-inspect/`. Notes persistence and its
+  box model, clicks Add, verifies the event log and new Task 4 in both element trees, reads
+  the app's `silk-ui` extension with the CLI, opens the Program panel, which the app renders and
+  the window replays over the socket, clicks a message in it and waits for the model diff, and
+  captures both windows in `.cache/ui-inspect/`. Notes persistence and its
   application-specific devtools checks remain in the application repository.
 
 ## Limits
@@ -183,10 +219,14 @@ silk task native devtools check
   lose that until the next resize. The browser host has no inspector, so no devtools.
 
 - A full refresh (start, Refresh, a new tab, Live on, after the app was away) is still six to
-  eight requests, on the one session. The Program tab's messages are read with `tree` and
-  `frame` notifications while it is open; a program topic comes with silk-ui's extension.
+  eight requests, on the one session, and opens an open view again from nothing.
+- A remote view travels without root options, resources, canvases, grids, anchors and virtual
+  lists (`mutationFormat` 1). In the window, the `Layout` records of a view's nodes made during
+  the devtools' own layout passes do not reach the app; pointer, key, focus and input records
+  do.
 - A style edit lasts until the app next sets that node's style; it is for trying a value, not
   for keeping it.
 - Models are read, not restored: no time travel yet.
-- No network or storage panels: a Silk app's effects are its commands, and those are in Program.
+- No network or storage panels: a Silk app's effects are its commands, and those are in the
+  Program panel.
 - The window uses the tree fixtures' fonts (Noto Sans), as the demos do.

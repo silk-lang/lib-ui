@@ -1,0 +1,101 @@
+//! A remote view in the tests, as the devtools window replays one: the batches the app pushed
+//! go into the devtools' tree, and a click on a replayed node goes back to the app.
+import inspected { Inspected }
+import ui_devtools.lib { Devtools, Message, Command, Link, ViewHost }
+import ui_app.runtime { Runtime, drain, pump }
+import ui_app.ui { ROOT_ID }
+import ui_inspect.query { Query, queryFirst }
+import ui_inspect.synth as synth
+import ui_tree.legacy { UiTree, TreeError, FrameInput, Input, Event, NONE }
+import ui_tree.mutation { FIRST_ROOT }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.json.scanner { JsonError }
+import silk.json.value { Json, Value }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.string { String }
+
+/// Takes what the app pushed and the replies that came, as the window does when the app wakes
+/// it, and replays the view batches among them.
+pub effect fn pullViews(
+  devtools: &mut Runtime<Devtools, Message, Command>,
+  tree: &mut UiTree<'_>,
+  views: &mut ViewHost,
+  app: &mut Inspected<'_>,
+) -> ()
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  devtools.send(Message.Pull)
+  run drain(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
+  run replay(&mut tree, &mut views, &mut app)
+}
+
+/// Replays the batches that came into `tree`, and sends what the view has for the app.
+pub effect fn replay(tree: &mut UiTree<'_>, views: &mut ViewHost, app: &mut Inspected<'_>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  while app.viewNotes.length() != 0 {
+    let line = app.viewNotes.remove(0)
+    let parsed = run Effect.result(Json.parse(line.ownedUtf8Bytes()))
+    if let Result<Value, JsonError | OutOfMemoryError>.Success { value } = move parsed {
+      drop run views.apply(&mut tree, FIRST_ROOT, ROOT_ID, &value)
+    }
+  }
+  run send(&mut views, &mut app)
+}
+
+effect fn send(views: &mut ViewHost, app: &mut Inspected<'_>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  while views.outbox.length() != 0 {
+    let line = views.outbox.remove(0)
+    drop run Link.notify(String.view(&line)) |> Effect.provideMut<Link>(&mut app)
+  }
+}
+
+/// Clicks the box of the replayed text node that contains `text`, through the tree's input path; the
+/// records of the view's nodes go to the app, the rest to the devtools. False when there is no
+/// such node.
+pub effect fn clickView(
+  devtools: &mut Runtime<Devtools, Message, Command>,
+  tree: &mut UiTree<'_>,
+  viewport: FrameInput,
+  views: &mut ViewHost,
+  app: &mut Inspected<'_>,
+  text: string,
+) -> bool
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  run tree.frame(viewport)
+  let mut query = run Query.byText(text)
+  query.within = ROOT_ID
+  let node = run queryFirst(&tree.*, &query)
+  if node == NONE || views.remote(node) == NONE {
+    return false
+  }
+
+  // Text is not hit by the pointer: its box is.
+  let parent = tree.node(tree.slotOf(node)).parent
+  let target = if parent == NONE {
+    node
+  } else {
+    tree.node(parent).id
+  }
+  let mut inputs = List<Input>.make()
+  if !run synth.click(&tree.*, target, &mut inputs) {
+    return false
+  }
+  while inputs.length() != 0 {
+    run tree.dispatch(inputs.remove(0))
+    let mut records = List<Event>.make()
+    run tree.takeEvents(&mut records)
+    run views.intercept(&mut records)
+    while records.length() != 0 {
+      run tree.events.append(records.remove(0))
+    }
+    drop run pump(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
+  }
+  run send(&mut views, &mut app)
+  return true
+}

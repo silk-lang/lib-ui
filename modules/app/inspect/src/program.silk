@@ -1,12 +1,8 @@
-//! What the inspector knows beyond the tree: the program that drives it (its messages, the
-//! model after each, its subscriptions) and the frames it drew.
-//!
-//! The tree cannot tell any of this. A host that runs a program hands it over as text
-//! (`Inspector.program`), and a host that times its frames says how long they took
-//! (`Inspector.timed`); `ui-app-window` does both.
-import reply { begin, finish, putKey, putText, putInt, putNumber, putFlag, writeString }
+//! The program log: what a silk-ui program did, one step per message, with the model after
+//! each, as the `silk-ui` extension serves it (`silk-ui.program`, `silk-ui.messages`,
+//! `silk-ui.model`). The tree cannot tell any of this; the runtime's journal can.
+import ui_inspect_server.reply { begin, finish, putKey, putText, putInt, putFlag, writeString }
 import ui_tree.inspect { writeInt, writeNumber }
-import ui_tree.node { FrameStats }
 import silk.collections.list { List }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
@@ -20,9 +16,6 @@ import silk.text.string { String }
 
 /// How many steps the log keeps; older ones are dropped.
 pub const STEP_LIMIT: usize = 200
-
-/// How many frames the timeline keeps.
-pub const FRAME_LIMIT: usize = 240
 
 /// The most cells the line comparison of two models fills. Past it, the lines between what
 /// the two share at their ends all count as changed.
@@ -278,23 +271,64 @@ effect fn linesOf<'a>(text: string<'a>, out: &mut List<string<'a>>) -> ()
   run out.append(String.slice(text, from, bytes.length - from))
 }
 
-effect fn diffLine(out: &mut String, first: &mut bool, op: string, line: string) -> ()
+/// A line of a model kept by a step.
+pub const KEPT: u8 = 0
+
+/// A line a step added to the model.
+pub const ADDED: u8 = 1
+
+/// A line the model had before a step and not after.
+pub const REMOVED: u8 = 2
+
+/// One line of a model compared with the model before.
+pub struct DiffRow {
+  /// [`KEPT`], [`ADDED`] or [`REMOVED`].
+  pub op: u8,
+  pub line: String,
+}
+
+effect fn diffLine(out: &mut List<DiffRow>, op: u8, line: string) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
-  if !first.* {
-    run out.append(",")
-  }
-  first.* = false
-  run out.append("{\"op\":\"")
-  run out.append(op)
-  run out.append("\",\"line\":")
-  run writeString(&mut out, line)
-  run out.append("}")
+  run out.append(DiffRow { op: op, line: run String.copy(line) })
 }
 
 /// Writes the lines of `after` and the ones of `before` it lost as a JSON array, each marked
 /// kept (`" "`), added (`"+"`) or removed (`"-"`). Returns how many are added or removed.
 pub effect fn diffLines(before: string, after: string, out: &mut String) -> usize
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut rows = List<DiffRow>.make()
+  let changed = run diffRows(before, after, &mut rows)
+  run out.append("[")
+  let list = rows.asSlice()
+  let mut i: usize = 0
+  while i < list.length {
+    if i > 0 {
+      run out.append(",")
+    }
+    run out.append("{\"op\":\"")
+    run out.append(
+      if list[i].op == ADDED {
+        "+"
+      } else if list[i].op == REMOVED {
+        "-"
+      } else {
+        " "
+      },
+    )
+    run out.append("\",\"line\":")
+    run writeString(&mut out, String.view(&list[i].line))
+    run out.append("}")
+    i = i + 1
+  }
+  run out.append("]")
+  return changed
+}
+
+/// The lines of `after` and the ones of `before` it lost, in order, each marked kept, added or
+/// removed, into `out`. Returns how many are added or removed.
+pub effect fn diffRows(before: string, after: string, out: &mut List<DiffRow>) -> usize
   ! OutOfMemoryError
   ? &mut Allocator {
   let mut old = List<string>.make()
@@ -314,12 +348,10 @@ pub effect fn diffLines(before: string, after: string, out: &mut String) -> usiz
   }
   let n = a.length - head - tail
   let m = b.length - head - tail
-  let mut first = true
   let mut changed: usize = 0
-  run out.append("[")
   let mut i: usize = 0
   while i < head {
-    run diffLine(&mut out, &mut first, " ", a[i])
+    run diffLine(&mut out, KEPT, a[i])
     i = i + 1
   }
   if n != 0 && m != 0 && n * m <= DIFF_CELLS {
@@ -355,16 +387,16 @@ pub effect fn diffLines(before: string, after: string, out: &mut String) -> usiz
     let mut y: usize = 0
     while x < n || y < m {
       if x < n && y < m && a[head + x] == b[head + y] {
-        run diffLine(&mut out, &mut first, " ", a[head + x])
+        run diffLine(&mut out, KEPT, a[head + x])
         x = x + 1
         y = y + 1
       } else if x < n
         && (y == m || table.get((x + 1) * width + y) >= table.get(x * width + y + 1)) {
-        run diffLine(&mut out, &mut first, "-", a[head + x])
+        run diffLine(&mut out, REMOVED, a[head + x])
         changed = changed + 1
         x = x + 1
       } else {
-        run diffLine(&mut out, &mut first, "+", b[head + y])
+        run diffLine(&mut out, ADDED, b[head + y])
         changed = changed + 1
         y = y + 1
       }
@@ -372,152 +404,20 @@ pub effect fn diffLines(before: string, after: string, out: &mut String) -> usiz
   } else {
     let mut x: usize = 0
     while x < n {
-      run diffLine(&mut out, &mut first, "-", a[head + x])
+      run diffLine(&mut out, REMOVED, a[head + x])
       x = x + 1
     }
     let mut y: usize = 0
     while y < m {
-      run diffLine(&mut out, &mut first, "+", b[head + y])
+      run diffLine(&mut out, ADDED, b[head + y])
       y = y + 1
     }
     changed = n + m
   }
   let mut k: usize = 0
   while k < tail {
-    run diffLine(&mut out, &mut first, " ", a[a.length - tail + k])
+    run diffLine(&mut out, KEPT, a[a.length - tail + k])
     k = k + 1
   }
-  run out.append("]")
   return changed
-}
-
-/// One frame the tree drew.
-pub struct FrameRecord {
-  pub stats: FrameStats,
-  /// How long layout and paint took, in milliseconds; zero when the host does not time them.
-  pub layout: f32,
-  pub paint: f32,
-}
-
-impl Copy for FrameRecord {}
-
-/// The last [`FRAME_LIMIT`] frames.
-pub struct Timeline {
-  pub frames: List<FrameRecord>,
-  layout: f32,
-  paint: f32,
-}
-
-impl Timeline {
-  pub fn make() -> Timeline {
-    return Timeline { frames: List<FrameRecord>.make(), layout: 0.0, paint: 0.0 }
-  }
-
-  /// How long the frame about to be recorded took.
-  pub fn timed(self: &mut Self, layout: f32, paint: f32) -> () {
-    self.layout = layout
-    self.paint = paint
-  }
-
-  /// Records the tree's last frame, once.
-  pub effect fn record(self: &mut Self, stats: FrameStats) -> ()
-    ! OutOfMemoryError
-    ? &mut Allocator {
-    let count = self.frames.length()
-    if count != 0 && self.frames.get(count - 1).stats.frame == stats.frame {
-      return ()
-    }
-    run self.frames.append(FrameRecord { stats: stats, layout: self.layout, paint: self.paint })
-    self.layout = 0.0
-    self.paint = 0.0
-    if self.frames.length() > FRAME_LIMIT {
-      drop self.frames.remove(0)
-    }
-  }
-
-  /// frames: the frames after `since` (a frame number, 0 for all), oldest first, at most
-  /// `limit` of the newest.
-  pub effect fn describe(self: &Self, request: &Value, out: &mut String) -> ()
-    ! OutOfMemoryError
-    ? &mut Allocator {
-    let since = match Json.asU64(Json.field(request, "since")) {
-      Option<u64>.Some { value } => value
-      Option<u64>.None => 0
-    }
-    let frames = self.frames.asSlice()
-    let mut first: usize = 0
-    while first < frames.length && frames[first].stats.frame <= since {
-      first = first + 1
-    }
-    match Json.asU64(Json.field(request, "limit")) {
-      Option<u64>.Some { value } => {
-        let limit = u64.toUsize(value)
-        if frames.length - first > limit {
-          first = frames.length - limit
-        }
-      }
-      Option<u64>.None => {}
-    }
-    run begin(&mut out, request)
-    run putKey(&mut out, "frames")
-    run out.append("[")
-    let mut slowest: f32 = 0.0
-    let mut total: f32 = 0.0
-    let mut i = first
-    while i < frames.length {
-      if i > first {
-        run out.append(",")
-      }
-      let f = frames[i]
-      let cost = f.layout + f.paint
-      total = total + cost
-      if cost > slowest {
-        slowest = cost
-      }
-      run out.append("{\"frame\":")
-      run writeInt(&mut out, f.stats.frame)
-      run out.append(",\"layoutMs\":")
-      run writeNumber(&mut out, f.layout)
-      run out.append(",\"paintMs\":")
-      run writeNumber(&mut out, f.paint)
-      run out.append(",\"layoutSkipped\":")
-      run out.append(
-        if f.stats.layoutSkipped {
-          "true"
-        } else {
-          "false"
-        },
-      )
-      run out.append(",\"layoutPasses\":")
-      run writeInt(&mut out, usize.toU64(f.stats.layout.passes))
-      run out.append(",\"repainted\":")
-      run writeInt(&mut out, usize.toU64(f.stats.repaintedSubtrees))
-      run out.append(",\"replayed\":")
-      run writeInt(&mut out, usize.toU64(f.stats.replayedSubtrees))
-      run out.append(",\"fragments\":")
-      run writeInt(&mut out, usize.toU64(f.stats.paintedFragments))
-      run out.append(",\"primitives\":")
-      run writeInt(&mut out, usize.toU64(f.stats.primitives))
-      run out.append(",\"glyphs\":")
-      run writeInt(&mut out, usize.toU64(f.stats.glyphs))
-      run out.append(",\"nodes\":")
-      run writeInt(&mut out, usize.toU64(f.stats.nodes))
-      run out.append("}")
-      i = i + 1
-    }
-    run out.append("]")
-    let count = frames.length - first
-    run putInt(&mut out, "count", usize.toU64(count))
-    run putNumber(&mut out, "slowestMs", slowest)
-    run putNumber(
-      &mut out,
-      "averageMs",
-      if count == 0 {
-        0.0
-      } else {
-        total / usize.toF32(count)
-      },
-    )
-    run finish(&mut out)
-  }
 }

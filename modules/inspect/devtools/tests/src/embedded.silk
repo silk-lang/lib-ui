@@ -2,9 +2,12 @@
 //! it, driven as the window host drives them (frames when a root needs one, the companion
 //! pumped after each turn), with an inspector that has no socket. The devtools inspect the app
 //! and never themselves, settle without pushing anything to each other, highlight in the app
-//! the row clicked in their root, and docked, leave the app the rest of the window.
+//! the row clicked in their root, and docked, leave the app the rest of the window. The app's
+//! silk-ui extension is served on each turn, as the window host does, so its Program panel is
+//! the view the app renders, replayed in the devtools' root.
 import ui_devtools.embedded { EmbeddedDevtools, Placement, DEVTOOLS_ROOT, FIRST_ID, dockArea }
-import ui_devtools.lib { Devtools, Message, Command, NO_PARENT }
+import ui_devtools.lib { Devtools, Message, Command, NO_PARENT, REMOTE_FIRST }
+import ui_app_inspect.lib { SilkUi, ID as SILK_UI }
 import ui_app_examples.todo { Todo, Message as TodoMessage, Command as TodoCommand, Store }
 import ui_app_examples.look { SANS }
 import ui_app.runtime { Runtime, frame, pump }
@@ -43,6 +46,7 @@ struct Host<'f> {
   app: Runtime<Todo, TodoMessage, TodoCommand>,
   store: Kept,
   inspector: Inspector,
+  silkUi: SilkUi,
   devtools: EmbeddedDevtools,
   /// The first window's size, and the frames each root drew.
   width: f32,
@@ -71,12 +75,14 @@ impl<'f> Host<'f> {
       app: move app,
       store: Kept {},
       inspector: Inspector.off(),
+      silkUi: SilkUi.make(),
       devtools: EmbeddedDevtools.make(true, true, Option<Placement>.some(placement)),
       width: 600.0,
       height: 500.0,
       appFrames: 0,
       toolFrames: 0,
     }
+    run host.inspector.extend(run SilkUi.extension())
     run host.devtools.attach(&mut host.tree, &mut host.inspector)
     run host.turns(8)
     return move host
@@ -95,6 +101,10 @@ impl<'f> Host<'f> {
   effect fn turn(self: &mut Self) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
+    if self.inspector.enabled() {
+      run self.silkUi.record(&mut self.app)
+      run self.inspector.serveExtension(SILK_UI, &mut self.silkUi)
+    }
     if self.tree.needsFrameOf(DEVTOOLS_ROOT) {
       let whole = if self.devtools.dock(self.width, self.height).isSome() {
         input(self.width, self.height)
@@ -210,6 +220,61 @@ impl<'f> Host<'f> {
       drop run pump(&mut self.app, &mut self.tree) |> Effect.provideMut<Store>(&mut self.store)
     }
     drop run self.tree.useRoot(FIRST_ROOT)
+  }
+
+  /// The devtools' node of role `kind` named `name`, or None.
+  effect fn toolNamed(self: &mut Self, kind: Role, name: string) -> Option<NodeInfo>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut q = run Query.byRoleNamed(kind, name)
+    q.within = FIRST_ID
+    return run self.found(&q)
+  }
+
+  /// The devtools' node with text `text`'s box, or None.
+  effect fn toolText(self: &mut Self, text: string) -> Option<NodeInfo>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut q = run Query.byText(text)
+    q.within = FIRST_ID
+    q.exact = true
+    drop run self.tree.useRoot(DEVTOOLS_ROOT)
+    let found = run queryFirst(&self.tree, &q)
+    let node = if found == NONE {
+      Option<NodeInfo>.None
+    } else {
+      let parent = self.tree.node(self.tree.slotOf(found)).parent
+      run info(&self.tree, self.tree.node(parent).id)
+    }
+    drop run self.tree.useRoot(FIRST_ROOT)
+    return node
+  }
+
+  effect fn found(self: &mut Self, q: &Query) -> Option<NodeInfo>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    drop run self.tree.useRoot(DEVTOOLS_ROOT)
+    let found = run queryFirst(&self.tree, q)
+    let node = if found == NONE {
+      Option<NodeInfo>.None
+    } else {
+      run info(&self.tree, found)
+    }
+    drop run self.tree.useRoot(FIRST_ROOT)
+    return node
+  }
+
+  /// Clicks the middle of `node` in the devtools' root.
+  effect fn clickTool(self: &mut Self, node: Option<NodeInfo>) -> bool
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if let Option<NodeInfo>.Some { value } = node {
+      let x = (value.bounds.xMin + value.bounds.xMax) * 0.5
+      let y = (value.bounds.yMin + value.bounds.yMax) * 0.5
+      run self.click(DEVTOOLS_ROOT, x, y)
+      return true
+    }
+    return false
   }
 
   /// The middle of the devtools' node with test id `testId`, or None.
@@ -500,6 +565,69 @@ effect fn dockBody() -> ()
     run Testing.expect(lit.length == 1 && lit[0] == add, "the app highlights the Add button")
     run Testing.expect(host.appFrames > frames, "and draws its highlight")
   }
+}
+
+effect fn viewBody() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut host = run Host.make(&collection, Placement.Window)
+  run Testing.expect(!host.silkUi.panelRunning(), "the Program panel costs nothing unopened")
+
+  // The Program tab comes from hello; opening it opens the app's view of it.
+  let tab = run host.toolNamed(Role.Button, "Program")
+  run Testing.expect(run host.clickTool(tab), "the Program tab is there")
+  run host.turns(8)
+  run Testing.expect(host.silkUi.panelRunning(), "the app renders the panel")
+  let start = run host.toolText("init")
+  run Testing.expect(start.isSome(), "its first step is replayed in the devtools' root")
+  match &start {
+    Option<NodeInfo>.Some { value } => {
+      run Testing.expect(value.id >= REMOTE_FIRST, "with an id of the devtools' own")
+    }
+    Option<NodeInfo>.None => {}
+  }
+
+  // Another client of the same inspector sees none of it: it is in the devtools' root.
+  let mut cli = run host.inspector.openLocal()
+  let mut q = run String.copy("{\"id\":1,\"cmd\":\"query\",\"text\":\"init\"}")
+  let found = run ask(&mut host, &mut cli, String.view(&q))
+  run Testing.expect(array(&found, "nodes") == 0, "a query does not find the replayed nodes")
+  q.clear()
+
+  // The app handles a message: the panel shows it, live.
+  let add = run queryFirst(&host.tree, &run Query.byRoleNamed(Role.Button, "Add"))
+  run Testing.expect(add != NONE, "the app's Add button")
+  if let Option<NodeInfo>.Some { value } = run info(&host.tree, add) {
+    run host.click(
+      FIRST_ROOT,
+      (value.bounds.xMin + value.bounds.xMax) * 0.5,
+      (value.bounds.yMin + value.bounds.yMax) * 0.5,
+    )
+  }
+  run host.turns(8)
+  let added = run host.toolText("Add")
+  run Testing.expect(added.isSome(), "the new message shows in the panel")
+
+  // A click on a replayed row goes back to the app, which opens the step's model.
+  run Testing.expect(run host.clickTool(added), "the row is clicked in the devtools' root")
+  run host.turns(8)
+  let model = run host.toolNode("model")
+  run Testing.expect(model.isSome(), "the app answered the click with the model")
+
+  // Closing the tab closes the view.
+  let events = run host.toolNamed(Role.Button, "Events")
+  run Testing.expect(run host.clickTool(events), "another tab")
+  run host.turns(8)
+  run Testing.expect(!host.silkUi.panelRunning(), "the app no longer renders the panel")
+  let gone = run host.toolText("init")
+  run Testing.expect(gone.isNone(), "and its nodes are gone")
+}
+
+test effect fn extensionViewsReplayInTheAppsOwnTree() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run viewBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
 test effect fn devtoolsDockedInTheAppsWindow() -> ()

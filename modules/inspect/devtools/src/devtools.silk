@@ -1,8 +1,13 @@
 //! The devtools window as a ui-app app: the inspected app's element tree on the left, and on
-//! the right the selected node's styles (which can be edited), its box model, the program's
-//! messages with the model after each, the event log, the frame timeline, an accessibility
-//! audit and the frame stats. It talks to the app only through the inspector protocol (the
-//! same requests ui-inspect-cli and ui-inspect-mcp send), over a [`Link`] the host provides.
+//! the right the selected node's styles (which can be edited), its box model, the event log,
+//! the frame timeline, an accessibility audit and the frame stats, then a tab for each panel the
+//! app's extensions add (`hello` lists them). It talks to the app only through the inspector
+//! protocol (the same requests ui-inspect-cli and ui-inspect-mcp send), over a [`Link`] the host
+//! provides.
+//!
+//! An extension panel shows its data with a generic view of rows, or, when the panel has a
+//! view, what the app renders for it: the app's mutation batches, replayed by the host under the
+//! panel's box (see `remote.silk`). Devtools know no extension by name.
 //!
 //! Hovering a row highlights its node in the app's window; selecting a row inspects that node
 //! and keeps it highlighted; Pick selects the node pressed in the app's window instead. While
@@ -26,31 +31,29 @@ import data {
   parseEvents,
   parseStats,
   parseStatus,
-  parseSteps,
-  parseProgram,
-  parseModel,
   parseFrames,
   parseIssues,
+  parseExtensions,
+  parseData,
   matches,
+  PanelInfo,
+  DataRow,
+  ASK_DATA,
+  Asked,
   writeSize,
-  StepRow,
-  ModelView,
-  ProgramView,
   FrameView,
   Issue,
-  ADDED,
-  REMOVED,
   FRAME_BUDGET,
   PART_STATUS,
   PART_ROWS,
   PART_STATS,
   PART_EVENTS,
   PART_DETAIL,
-  PART_STEPS,
   PART_PICK,
   PART_ALL
 }
 import link { Link }
+import remote { VIEW_HOST }
 import ui_inspect_server.topics {
   TOPIC_TREE,
   TOPIC_FRAME,
@@ -94,13 +97,13 @@ pub const FONT: u32 = 1
 pub enum Panel {
   Styles,
   BoxModel,
-  /// The program's messages and the model after each.
-  Program,
   Events,
   /// The frame timeline.
   Frames,
   Audit,
   Stats,
+  /// A panel an extension of the app adds (`Devtools.shown` says which).
+  Extension,
 }
 
 /// How many frames the timeline shows.
@@ -127,6 +130,8 @@ pub union Message {
   /// Fold or unfold the children of node `id`.
   Collapse { pub id: u32 },
   Show { pub panel: Panel },
+  /// Show the extension panel at `index` of `Devtools.panels`.
+  ShowPanel { pub index: usize },
   SelectNext,
   SelectPrevious,
   ClearSelection,
@@ -145,10 +150,8 @@ pub union Message {
   /// The app took the edit; `detail` is the node after it.
   Styled { pub detail: Detail },
   StyleRefused { pub error: String },
-  /// Open the model after message `seq`, or close it when it is open.
-  OpenStep { pub seq: u64 },
-  Stepped { pub view: ModelView },
-  ClearSteps,
+  /// A request went out whose reply comes with the notifications.
+  Asked { pub asked: Asked },
   RunAudit,
   Audited { pub issues: List<Issue>, pub line: String },
   Synced { pub snapshot: Snapshot },
@@ -157,13 +160,22 @@ pub union Message {
 }
 
 pub union Command {
-  /// Subscribe to `topics` (`TOPIC_*` bits), then read status, tree, stats, the events after
-  /// `since`, the messages after `step`, what `panel` shows besides, and node `selected` again.
-  Sync { pub since: u64, pub step: u64, pub selected: u32, pub panel: Panel, pub topics: u32 },
+  /// Subscribe to `topics` (`TOPIC_*` bits) and the extension topics `names`, then read
+  /// status, tree, stats, the events after `since`, what `panel` shows besides, and node
+  /// `selected` again.
+  Sync {
+    pub since: u64,
+    pub selected: u32,
+    pub panel: Panel,
+    pub topics: u32,
+    pub names: List<String>,
+  },
   /// Take the app's notifications and read again what they say changed.
-  Pull { pub since: u64, pub step: u64, pub selected: u32, pub panel: Panel },
-  /// Subscribe to exactly `topics`.
-  Subscribe { pub topics: u32 },
+  Pull { pub since: u64, pub selected: u32, pub panel: Panel },
+  /// Subscribe to exactly `topics` and `names`.
+  Subscribe { pub topics: u32, pub names: List<String> },
+  /// Send request `line` without waiting; its reply comes with the notifications.
+  Ask { pub line: String, pub purpose: u32, pub index: usize },
   /// Highlight node `node` alone, or nothing for NO_PARENT, without waiting for an answer.
   Highlight { pub node: u32 },
   /// Highlight node `node` and inspect it.
@@ -176,8 +188,6 @@ pub union Command {
   SetStyle { pub node: u32, pub css: String },
   /// Take every style edit back, and inspect `selected` again.
   ResetStyles { pub selected: u32 },
-  /// The model after message `seq`.
-  Step { pub seq: u64 },
   Audit,
 }
 
@@ -211,13 +221,6 @@ pub struct Devtools {
   pub draft: String,
   /// Why the app refused the last style edit, or empty.
   pub styleError: String,
-  pub program: ProgramView,
-  /// The newest [`MAX_LOG`] messages the program handled, oldest first.
-  pub steps: List<StepRow>,
-  /// The `seq` of the last message read.
-  pub sinceStep: u64,
-  /// The model of the open step.
-  pub opened: ModelView,
   pub frames: FrameView,
   pub issues: List<Issue>,
   /// The audit's summary, or empty before the first one.
@@ -228,6 +231,17 @@ pub struct Devtools {
   pub topics: u32,
   /// The font family the devtools draw with: [`FONT`] unless they share the app's tree.
   pub font: u32,
+  /// The ids of the app's extensions, and the panels they add.
+  pub extensions: List<String>,
+  pub panels: List<PanelInfo>,
+  /// The extension topics subscribed to.
+  pub names: List<String>,
+  /// The requests whose replies come with the notifications.
+  pub asked: List<Asked>,
+  /// The extension panel shown while `panel` is `Extension`, and its data as the generic view
+  /// shows it.
+  pub shown: usize,
+  pub data: List<DataRow>,
 }
 
 impl Devtools {
@@ -253,20 +267,132 @@ impl Devtools {
       picking: false,
       draft: String.make(),
       styleError: String.make(),
-      program: ProgramView {
-        attached: false,
-        line: String.make(),
-        subscriptions: List<String>.make(),
-      },
-      steps: List<StepRow>.make(),
-      sinceStep: 0,
-      opened: ModelView.none(),
       frames: FrameView.none(),
       issues: List<Issue>.make(),
       auditLine: String.make(),
       hovered: NO_PARENT,
       topics: 0,
       font: FONT,
+      extensions: List<String>.make(),
+      panels: List<PanelInfo>.make(),
+      names: List<String>.make(),
+      asked: List<Asked>.make(),
+      shown: 0,
+      data: List<DataRow>.make(),
+    }
+  }
+
+  /// The extension panel that shows, if one does.
+  pub fn shownPanel(self: &Self) -> Option<&PanelInfo> {
+    if self.panel != Panel.Extension || self.shown >= self.panels.length() {
+      return Option<&PanelInfo>.None
+    }
+    return Option<&PanelInfo>.some(&self.panels.asSlice()[self.shown])
+  }
+
+  /// Whether the app has extension `id`.
+  pub fn hasExtension(self: &Self, id: string) -> bool {
+    let list = self.extensions.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      if String.view(&list[i]) == id {
+        return true
+      }
+      i = i + 1
+    }
+    return false
+  }
+
+  /// The extension topics to subscribe to: the view of the extension panel that shows, or
+  /// while live the topic that says its data changed.
+  effect fn wantedNames(self: &Self) -> List<String>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut names = List<String>.make()
+    if let Option<&PanelInfo>.Some { value: panel } = self.shownPanel() {
+      if panel.view.ownedByteLength() != 0 {
+        // A view shows what it shows, live or not, while it is open.
+        run names.append(run String.copy(String.view(&panel.view)))
+      } else if self.live && panel.topic.ownedByteLength() != 0 {
+        run names.append(run String.copy(String.view(&panel.topic)))
+      }
+    }
+    return move names
+  }
+
+  /// Reads the data of the extension panel that shows, when it has data.
+  fn readPanel(self: &mut Self, cx: &mut Context<Command>) -> () {
+    let mut line = String.make()
+    if let Option<&PanelInfo>.Some { value: panel } = self.shownPanel() {
+      if panel.data.ownedByteLength() != 0 && panel.view.ownedByteLength() == 0 {
+        line = cx.alloc(String.copy("{\"cmd\":"))
+        cx.alloc(writeString(&mut line, String.view(&panel.data)))
+        cx.alloc(line.append("}"))
+      }
+    }
+    if line.ownedByteLength() != 0 {
+      let index = self.shown
+      self.ask(&mut cx, String.view(&line), ASK_DATA, index)
+    }
+  }
+
+  /// Whether `names` has the topic of the extension panel that shows.
+  fn panelNews(self: &Self, names: &List<String>) -> bool {
+    if let Option<&PanelInfo>.Some { value: panel } = self.shownPanel() {
+      let list = names.asSlice()
+      let mut i: usize = 0
+      while i < list.length {
+        if panel.topic.ownedByteLength() != 0
+          && String.view(&list[i]) == String.view(&panel.topic) {
+          return true
+        }
+        i = i + 1
+      }
+    }
+    return false
+  }
+
+  /// Sends request `line` for `purpose` without waiting.
+  fn ask(
+    self: &mut Self,
+    cx: &mut Context<Command>,
+    line: string,
+    purpose: u32,
+    index: usize,
+  ) -> () {
+    let copied = cx.alloc(String.copy(line))
+    cx.command(Command.Ask { line: move copied, purpose: purpose, index: index })
+  }
+
+  /// Takes the reply `line` to a request sent with `ask`.
+  fn answered(self: &mut Self, line: &String, cx: &mut Context<Command>) -> () {
+    let parsed = cx.alloc(Effect.result(Json.parse(line.ownedUtf8Bytes())))
+    let reply = match move parsed {
+      Result<Value, JsonError | OutOfMemoryError>.Success { value } => move value
+      Result<Value, JsonError | OutOfMemoryError>.Failure { error } => {
+        drop error
+        return ()
+      }
+    }
+    let id = match Json.asU64(Json.field(&reply, "id")) {
+      Option<u64>.Some { value } => value
+      Option<u64>.None => {
+        return ()
+      }
+    }
+    let mut at: usize = 0
+    while at < self.asked.length() && self.asked.asSlice()[at].id != id {
+      at = at + 1
+    }
+    if at == self.asked.length() {
+      return ()
+    }
+    let asked = self.asked.remove(at)
+    if !ok(&reply) {
+      return ()
+    }
+    if asked.purpose == ASK_DATA && self.panel == Panel.Extension && asked.index == self.shown {
+      cx.alloc(parseData(&reply, &mut self.data))
     }
   }
 
@@ -381,7 +507,7 @@ impl Devtools {
       return TOPIC_PICK
     }
     let mut topics = TOPIC_TREE | TOPIC_ROOTS | TOPIC_EVENTS | TOPIC_PICK
-    if self.panel == Panel.Stats || self.panel == Panel.Frames || self.panel == Panel.Program {
+    if self.panel == Panel.Stats || self.panel == Panel.Frames {
       topics = topics | TOPIC_FRAME
     }
     return topics
@@ -390,22 +516,27 @@ impl Devtools {
   /// Subscribes to what is wanted and reads everything.
   fn sync(self: &mut Self, cx: &mut Context<Command>) -> () {
     self.topics = self.wanted()
+    self.names = cx.alloc(self.wantedNames())
+    let names = cx.alloc(copyNames(&self.names))
     cx.command(
       Command.Sync {
         since: self.since,
-        step: self.sinceStep,
         selected: self.selected,
         panel: self.panel,
         topics: self.topics,
+        names: move names,
       },
     )
   }
 
   /// Subscribes to what is wanted, when that changed.
   fn resubscribe(self: &mut Self, cx: &mut Context<Command>) -> () {
-    if self.wanted() != self.topics {
+    let names = cx.alloc(self.wantedNames())
+    if self.wanted() != self.topics || !sameNames(&names, &self.names) {
       self.topics = self.wanted()
-      cx.command(Command.Subscribe { topics: self.topics })
+      self.names = move names
+      let copy = cx.alloc(copyNames(&self.names))
+      cx.command(Command.Subscribe { topics: self.topics, names: move copy })
     }
   }
 
@@ -448,6 +579,35 @@ impl Devtools {
 }
 
 // Commands.
+
+effect fn copyNames(names: &List<String>) -> List<String>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut copy = List<String>.make()
+  let list = names.asSlice()
+  let mut i: usize = 0
+  while i < list.length {
+    run copy.append(run String.copy(String.view(&list[i])))
+    i = i + 1
+  }
+  return move copy
+}
+
+fn sameNames(a: &List<String>, b: &List<String>) -> bool {
+  if a.length() != b.length() {
+    return false
+  }
+  let x = a.asSlice()
+  let y = b.asSlice()
+  let mut i: usize = 0
+  while i < x.length {
+    if String.view(&x[i]) != String.view(&y[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
 
 fn ok(reply: &Value) -> bool {
   return match Json.field(reply, "ok") {
@@ -515,8 +675,9 @@ effect fn inspectNode(node: u32) -> Option<Detail>
   }
 }
 
-/// `{"cmd":"subscribe","topics":[...]}` for `topics` (`TOPIC_*` bits).
-effect fn subscribeLine(topics: u32) -> String
+/// `{"cmd":"subscribe","topics":[...]}` for `topics` (`TOPIC_*` bits) and extension topics
+/// `names`.
+effect fn subscribeLine(topics: u32, names: &List<String>) -> String
   ! OutOfMemoryError
   ? &mut Allocator {
   let mut line = run String.copy("{\"cmd\":\"subscribe\",\"topics\":[")
@@ -532,24 +693,34 @@ effect fn subscribeLine(topics: u32) -> String
     }
     i = i + 1
   }
+  let list = names.asSlice()
+  let mut k: usize = 0
+  while k < list.length {
+    if !first {
+      run line.append(",")
+    }
+    first = false
+    run writeString(&mut line, String.view(&list[k]))
+    k = k + 1
+  }
   run line.append("]}")
   return move line
 }
 
 /// Subscribes to exactly `topics`, with two notifications. The app handles lines in order, so
 /// the requests sent after them see the subscription.
-effect fn subscribe(topics: u32) -> bool
+effect fn subscribe(topics: u32, names: &List<String>) -> bool
   ! OutOfMemoryError
   ? &mut Link | &mut Allocator {
   if !run Link.notify("{\"cmd\":\"unsubscribe\"}") {
     return false
   }
-  let line = run subscribeLine(topics)
+  let line = run subscribeLine(topics, names)
   return run Link.notify(String.view(&line))
 }
 
 /// A snapshot with nothing read yet.
-fn emptySnapshot(since: u64, step: u64) -> Snapshot {
+fn emptySnapshot(since: u64) -> Snapshot {
   return Snapshot {
     parts: 0,
     status: String.make(),
@@ -558,37 +729,34 @@ fn emptySnapshot(since: u64, step: u64) -> Snapshot {
     events: List<LogRow>.make(),
     next: since + 1,
     detail: Option<Detail>.None,
-    steps: List<StepRow>.make(),
-    stepNext: step + 1,
-    program: Option<ProgramView>.None,
+    extensions: Option<List<String>>.None,
+    panels: List<PanelInfo>.make(),
+    news: List<String>.make(),
+    replies: List<String>.make(),
     frames: Option<FrameView>.None,
     picking: false,
     picked: NO_PARENT,
   }
 }
 
-effect fn syncAll(since: u64, step: u64, selected: u32, panel: Panel, topics: u32) -> Message
+effect fn syncAll(
+  since: u64,
+  selected: u32,
+  panel: Panel,
+  topics: u32,
+  names: &List<String>,
+) -> Message
   ! OutOfMemoryError
   ? &mut Link | &mut Allocator {
   let mut error = String.make()
-  let mut snapshot = Snapshot {
-    parts: PART_ALL,
-    status: String.make(),
-    rows: List<Row>.make(),
-    stats: List<Stat>.make(),
-    events: List<LogRow>.make(),
-    next: since + 1,
-    detail: Option<Detail>.None,
-    steps: List<StepRow>.make(),
-    stepNext: step + 1,
-    program: Option<ProgramView>.None,
-    frames: Option<FrameView>.None,
-    picking: false,
-    picked: NO_PARENT,
-  }
+  let mut snapshot = emptySnapshot(since)
+  snapshot.parts = PART_ALL
   match run ask("{\"cmd\":\"hello\"}", &mut error) {
     Option<Value>.Some { value } => {
       run parseStatus(&value, &mut snapshot.status)
+      let mut ids = List<String>.make()
+      run parseExtensions(&value, &mut ids, &mut snapshot.panels)
+      snapshot.extensions = Option<List<String>>.some(move ids)
     }
     Option<Value>.None => {
       return Message.Failed { error: move error }
@@ -596,7 +764,7 @@ effect fn syncAll(since: u64, step: u64, selected: u32, panel: Panel, topics: u3
   }
 
   // Before the reads, so no change after them goes unheard.
-  if !run subscribe(topics) {
+  if !run subscribe(topics, names) {
     run error.append("cannot reach the app")
     return Message.Failed { error: move error }
   }
@@ -631,21 +799,6 @@ effect fn syncAll(since: u64, step: u64, selected: u32, panel: Panel, topics: u3
 
   // What came with protocol 2: an older app answers "unknown cmd" and the panels stay empty.
   let mut quiet = String.make()
-  let messages = run requestLine("messages", "since", step)
-  match run ask(String.view(&messages), &mut quiet) {
-    Option<Value>.Some { value } => {
-      snapshot.stepNext = run parseSteps(&value, &mut snapshot.steps)
-    }
-    Option<Value>.None => {}
-  }
-  if panel == Panel.Program {
-    match run ask("{\"cmd\":\"program\"}", &mut quiet) {
-      Option<Value>.Some { value } => {
-        snapshot.program = Option<ProgramView>.Some { value: run parseProgram(&value) }
-      }
-      Option<Value>.None => {}
-    }
-  }
   if panel == Panel.Frames {
     let frames = run requestLine("frames", "limit", MAX_FRAMES)
     match run ask(String.view(&frames), &mut quiet) {
@@ -677,14 +830,14 @@ fn pickedOf(reply: &Value) -> u32 {
 
 /// Takes the app's notifications and reads again what they say changed: the element tree and
 /// the selected node after `tree` or `roots`, the event log after `events`, what `panel` shows
-/// after `frame` (or `tree`, for the program), the picker after `pick`. The status line comes
-/// with `tree` and `frame` notifications themselves.
-effect fn pull(since: u64, step: u64, selected: u32, panel: Panel) -> Message
+/// after `frame`, the picker after `pick`. The status line comes with `tree` and `frame`
+/// notifications themselves; extension topics and the replies to `ask` go into the snapshot.
+effect fn pull(since: u64, selected: u32, panel: Panel) -> Message
   ! OutOfMemoryError
   ? &mut Link | &mut Allocator {
   let mut notes = List<String>.make()
   let open = run Link.take(&mut notes)
-  let mut snapshot = emptySnapshot(since, step)
+  let mut snapshot = emptySnapshot(since)
   let mut changed: u32 = 0
   let list = notes.asSlice()
   let mut i: usize = 0
@@ -692,7 +845,14 @@ effect fn pull(since: u64, step: u64, selected: u32, panel: Panel) -> Message
     let parsed = run Effect.result(Json.parse(list[i].ownedUtf8Bytes()))
     match move parsed {
       Result<Value, JsonError | OutOfMemoryError>.Success { value } => {
-        let topic = topicNamed(textField(&value, "event"))
+        let event = textField(&value, "event")
+        if event == "" {
+          // The reply to a request sent with `ask`.
+          run snapshot.replies.append(run String.copy(String.view(&list[i])))
+        } else if topicNamed(event) == 0 {
+          run snapshot.news.append(run String.copy(event))
+        }
+        let topic = topicNamed(event)
         changed = changed | topic
         if topic == TOPIC_TREE || topic == TOPIC_FRAME {
           run parseStatus(&value, &mut snapshot.status)
@@ -706,7 +866,7 @@ effect fn pull(since: u64, step: u64, selected: u32, panel: Panel) -> Message
     i = i + 1
   }
   let mut error = String.make()
-  if !open && changed == 0 {
+  if !open && changed == 0 && snapshot.news.length() == 0 && snapshot.replies.length() == 0 {
     run error.append("cannot reach the app: it closed the session")
     return Message.Failed { error: move error }
   }
@@ -759,22 +919,6 @@ effect fn pull(since: u64, step: u64, selected: u32, panel: Panel) -> Message
         Option<Value>.None => {}
       }
     }
-    if panel == Panel.Program {
-      let messages = run requestLine("messages", "since", step)
-      match run ask(String.view(&messages), &mut quiet) {
-        Option<Value>.Some { value } => {
-          snapshot.stepNext = run parseSteps(&value, &mut snapshot.steps)
-          snapshot.parts = snapshot.parts | PART_STEPS
-        }
-        Option<Value>.None => {}
-      }
-      match run ask("{\"cmd\":\"program\"}", &mut quiet) {
-        Option<Value>.Some { value } => {
-          snapshot.program = Option<ProgramView>.Some { value: run parseProgram(&value) }
-        }
-        Option<Value>.None => {}
-      }
-    }
   }
   if u32.bitAnd(changed, TOPIC_PICK) != 0 {
     match run ask("{\"cmd\":\"pickMode\"}", &mut quiet) {
@@ -806,10 +950,10 @@ effect fn highlightNode(node: u32) -> Message
   return Message.Sent
 }
 
-effect fn subscribed(topics: u32) -> Message
+effect fn subscribed(topics: u32, names: &List<String>) -> Message
   ! OutOfMemoryError
   ? &mut Link | &mut Allocator {
-  if !run subscribe(topics) {
+  if !run subscribe(topics, names) {
     return Message.Failed { error: run String.copy("cannot reach the app") }
   }
   return Message.Sent
@@ -861,15 +1005,15 @@ effect fn setStyle(node: u32, declarations: string) -> Message
   return run afterEdit(String.view(&line), node)
 }
 
-effect fn openStep(seq: u64) -> Message
+/// Sends `line` without waiting for its reply.
+effect fn askLater(line: string, purpose: u32, index: usize) -> Message
   ! OutOfMemoryError
   ? &mut Link | &mut Allocator {
-  let mut error = String.make()
-  let line = run requestLine("model", "seq", seq)
-  return match run ask(String.view(&line), &mut error) {
-    Option<Value>.Some { value } => Message.Stepped { view: run parseModel(&value) }
-    Option<Value>.None => Message.Failed { error: move error }
+  let id = run Link.ask(line)
+  if id == 0 {
+    return Message.Failed { error: run String.copy("cannot reach the app") }
   }
+  return Message.Asked { asked: Asked { id: id, purpose: purpose, index: index } }
 }
 
 effect fn runAudit() -> Message
@@ -921,22 +1065,22 @@ impl Perform<Message, OutOfMemoryError ? &mut Link | &mut Allocator> for Command
     ! OutOfMemoryError
     ? &mut Link | &mut Allocator {
     return match &self {
-      Command.Sync { since, step, selected, panel, topics } => run syncAll(
+      Command.Sync { since, selected, panel, topics, names } => run syncAll(
         since,
-        step,
         selected,
         panel,
         topics,
+        &names,
       )
-      Command.Pull { since, step, selected, panel } => run pull(since, step, selected, panel)
-      Command.Subscribe { topics } => run subscribed(topics)
+      Command.Pull { since, selected, panel } => run pull(since, selected, panel)
+      Command.Subscribe { topics, names } => run subscribed(topics, &names)
+      Command.Ask { line, purpose, index } => run askLater(String.view(&line), purpose, index)
       Command.Highlight { node } => run highlightNode(node)
       Command.Inspect { node } => run highlightAndInspect(node)
       Command.Unhighlight => run unhighlight()
       Command.Pick { on } => run pick(on)
       Command.SetStyle { node, css: declarations } => run setStyle(node, String.view(&declarations))
       Command.ResetStyles { selected } => run afterEdit("{\"cmd\":\"resetStyles\"}", selected)
-      Command.Step { seq } => run openStep(seq)
       Command.Audit => run runAudit()
     }
   }
@@ -978,10 +1122,6 @@ const BORDER: u32 = 0xFDDD9B
 const PADDING: u32 = 0xC3D08B
 
 const CONTENT: u32 = 0x8CB6C0
-
-const ADDED_LINE: u32 = 0xDCFCE7
-
-const REMOVED_LINE: u32 = 0xFEE2E2
 
 const LAYOUT_BAR: u32 = 0xF59E0B
 
@@ -1485,12 +1625,6 @@ impl Devtools {
             )
             barButton(
               &mut ui,
-              "Program",
-              self.panel == Panel.Program,
-              || Message.Show { panel: Panel.Program },
-            )
-            barButton(
-              &mut ui,
               "Events",
               self.panel == Panel.Events,
               || Message.Show { panel: Panel.Events },
@@ -1513,6 +1647,21 @@ impl Devtools {
               self.panel == Panel.Stats,
               || Message.Show { panel: Panel.Stats },
             )
+
+            // The tabs of the app's extensions, as `hello` lists them.
+            ui.enumerate(
+              self.panels.asSlice(),
+              |panel| 0,
+              |ui, index, panel| {
+                ui.key(usize.toU64(index) + 1)
+                barButton(
+                  &mut ui,
+                  String.view(&panel.title),
+                  self.panel == Panel.Extension && self.shown == index,
+                  || Message.ShowPanel { index: index },
+                )
+              },
+            )
           },
         )
         ui.column(
@@ -1524,11 +1673,11 @@ impl Devtools {
             match self.panel {
               Panel.Styles => self.styles(&mut ui)
               Panel.BoxModel => self.boxModel(&mut ui)
-              Panel.Program => self.programPanel(&mut ui)
               Panel.Events => self.eventLog(&mut ui)
               Panel.Frames => self.framesPanel(&mut ui)
               Panel.Audit => self.auditPanel(&mut ui)
               Panel.Stats => self.statsPanel(&mut ui)
+              Panel.Extension => self.extensionPanel(&mut ui)
             }
           },
         )
@@ -1758,203 +1907,6 @@ impl Devtools {
     )
   }
 
-  fn programPanel(self: &Self, ui: &mut Ui<Message>) -> () {
-    if !self.program.attached && self.steps.length() == 0 {
-      muted(
-        &mut ui,
-        "This app reports no program. A silk-ui program in a window does: every message it handles shows here with what caused it, the commands it returned and the model after it.",
-      )
-      return ()
-    }
-    ui.box(
-      |ui| {
-        ui.testId("program-line")
-        ui.color(rgb(MUTED))
-        ui.text(String.view(&self.program.line))
-      },
-    )
-    ui.row(
-      |ui| {
-        ui.testId("subscriptions")
-        ui.style(&[css.alignItems(Align.Center), css.marginTop(px(2.0)), css.marginBottom(px(4.0))])
-        ui.gap(6.0)
-        ui.box(
-          |ui| {
-            ui.grow(1.0)
-            ui.color(rgb(MUTED))
-            if self.program.subscriptions.length() == 0 {
-              ui.text("No subscriptions")
-            } else {
-              ui.text("Subscribed to ")
-              ui.enumerate(
-                self.program.subscriptions.asSlice(),
-                |line| 0,
-                |ui, index, line| {
-                  if index > 0 {
-                    ui.text(", ")
-                  }
-                  ui.text(String.view(&line))
-                },
-              )
-            }
-          },
-        )
-        barButton(&mut ui, "Clear", false, || Message.ClearSteps)
-      },
-    )
-    if self.steps.length() == 0 {
-      muted(&mut ui, "No messages yet. Use the app, then look here.")
-      return ()
-    }
-    ui.column(
-      |ui| {
-        ui.testId("messages")
-        ui.accessRole(Role.List)
-        let rows = self.steps.asSlice()
-        let mut i = rows.length
-        while i > 0 {
-          i = i - 1
-          let step = &rows[i]
-          let open = self.opened.seq == step.seq
-          ui.key(step.seq)
-          ui.column(
-            |ui| {
-              ui.accessRole(Role.ListItem)
-              border(&mut ui, Property.BorderBottomWidth, BAR)
-              ui.row(
-                |ui| {
-                  ui.accessRole(Role.Button)
-                  ui.tabIndex(0)
-                  ui.cursor(Cursor.Pointer)
-                  ui.onClick(|| Message.OpenStep { seq: step.seq })
-                  ui.onEnter(|| Message.OpenStep { seq: step.seq })
-                  ui.gap(8.0)
-                  paddings(&mut ui, 2.0, 0.0)
-                  if open {
-                    ui.background(rgb(SELECTED))
-                  } else {
-                    ui.hover(&[css.backgroundColor(rgb(HOVER))])
-                  }
-                  ui.focusVisible(&[css.backgroundColor(rgb(SELECTED))])
-                  ui.box(
-                    |ui| {
-                      ui.style(&[css.width(px(36.0)), css.flexShrink(0.0)])
-                      ui.color(rgb(MUTED))
-                      let seq = ui.alloc(seqText(step.seq))
-                      ui.text(String.view(&seq))
-                    },
-                  )
-                  ui.box(
-                    |ui| {
-                      ui.label(
-                        if step.changed {
-                          "changed the model"
-                        } else {
-                          ""
-                        },
-                      )
-                      ui.style(
-                        &[
-                          css.width(px(6.0)),
-                          css.height(px(6.0)),
-                          css.marginTop(px(5.0)),
-                          css.flexShrink(0.0),
-                        ],
-                      )
-                      if step.changed {
-                        ui.background(rgb(ACCENT))
-                      }
-                    },
-                  )
-                  ui.column(
-                    |ui| {
-                      ui.grow(1.0)
-                      ui.style(&[css.flexBasis(px(0.0)), css.minWidth(px(0.0))])
-                      ui.box(
-                        |ui| {
-                          ui.color(rgb(TAG))
-                          ui.text(String.view(&step.message))
-                        },
-                      )
-                      ui.box(
-                        |ui| {
-                          ui.color(rgb(MUTED))
-                          ui.text("from ")
-                          ui.text(String.view(&step.cause))
-                        },
-                      )
-                      if step.commands.ownedByteLength() != 0 {
-                        ui.box(
-                          |ui| {
-                            ui.color(rgb(ACCENT))
-                            ui.text("returned ")
-                            ui.text(String.view(&step.commands))
-                          },
-                        )
-                      }
-                    },
-                  )
-                },
-              )
-              if open {
-                self.modelDiff(&mut ui)
-              }
-            },
-          )
-        }
-      },
-    )
-  }
-
-  /// The open step's model, the lines the step changed marked.
-  fn modelDiff(self: &Self, ui: &mut Ui<Message>) -> () {
-    ui.column(
-      |ui| {
-        ui.testId("model")
-        ui.background(rgb(0xF9FAFB))
-        ui.style(
-          &[
-            css.whiteSpace(WhiteSpace.Pre),
-            css.marginBottom(px(4.0)),
-            css.overflowX(Overflow.Hidden),
-          ],
-        )
-        paddings(&mut ui, 4.0, 0.0)
-        if self.opened.changed == 0 {
-          ui.box(
-            |ui| {
-              paddings(&mut ui, 0.0, 8.0)
-              muted(&mut ui, "The model did not change.")
-            },
-          )
-        }
-        ui.enumerate(
-          self.opened.lines.asSlice(),
-          |line| 0,
-          |ui, index, line| {
-            ui.key(usize.toU64(index))
-            ui.row(
-              |ui| {
-                paddings(&mut ui, 0.0, 8.0)
-                if line.op == ADDED {
-                  ui.background(rgb(ADDED_LINE))
-                  ui.text("+ ")
-                } else if line.op == REMOVED {
-                  ui.background(rgb(REMOVED_LINE))
-                  ui.text("- ")
-                } else {
-                  ui.color(rgb(MUTED))
-                  ui.text("  ")
-                }
-                ui.text(String.view(&line.text))
-              },
-            )
-          },
-        )
-      },
-    )
-  }
-
   fn framesPanel(self: &Self, ui: &mut Ui<Message>) -> () {
     if self.frames.bars.length() == 0 {
       muted(&mut ui, "No frames yet.")
@@ -2138,6 +2090,66 @@ impl Devtools {
     )
   }
 
+  /// An extension's panel: its data, members and elements in rows, nested ones indented.
+  fn extensionPanel(self: &Self, ui: &mut Ui<Message>) -> () {
+    if let Option<&PanelInfo>.Some { value: panel } = self.shownPanel() {
+      if panel.view.ownedByteLength() != 0 {
+        // The app renders the panel: its batches are replayed under this box (see `remote`).
+        ui.key(1)
+        ui.column(
+          |ui| {
+            ui.testId(VIEW_HOST)
+            ui.grow(1.0)
+            ui.style(&[css.minHeight(px(0.0))])
+          },
+        )
+        return ()
+      }
+    }
+    if self.data.length() == 0 {
+      muted(&mut ui, "No data yet.")
+      return ()
+    }
+    ui.column(
+      |ui| {
+        ui.testId("panel-data")
+        ui.accessRole(Role.List)
+        ui.enumerate(
+          self.data.asSlice(),
+          |row| 0,
+          |ui, index, row| {
+            ui.key(usize.toU64(index))
+            ui.row(
+              |ui| {
+                ui.accessRole(Role.ListItem)
+                ui.style(
+                  &[
+                    css.whiteSpace(WhiteSpace.NoWrap),
+                    css.paddingLeft(px(u32.toF32(row.depth) * 12.0)),
+                    css.columnGap(px(6.0)),
+                  ],
+                )
+                border(&mut ui, Property.BorderBottomWidth, BAR)
+                ui.box(
+                  |ui| {
+                    ui.color(rgb(ATTRIBUTE))
+                    ui.text(String.view(&row.key))
+                  },
+                )
+                ui.box(
+                  |ui| {
+                    ui.color(rgb(TEXT))
+                    ui.text(String.view(&row.value))
+                  },
+                )
+              },
+            )
+          },
+        )
+      },
+    )
+  }
+
   fn statsPanel(self: &Self, ui: &mut Ui<Message>) -> () {
     if self.stats.length() == 0 {
       muted(&mut ui, "No frame stats yet.")
@@ -2204,14 +2216,7 @@ impl App<Message, Command> for Devtools {
         }
       }
       Message.Pull => {
-        cx.command(
-          Command.Pull {
-            since: self.since,
-            step: self.sinceStep,
-            selected: self.selected,
-            panel: self.panel,
-          },
-        )
+        cx.command(Command.Pull { since: self.since, selected: self.selected, panel: self.panel })
       }
       Message.Hover { id } => {
         self.hovered = id
@@ -2256,6 +2261,12 @@ impl App<Message, Command> for Devtools {
         self.panel = panel
         self.sync(&mut cx)
       }
+      Message.ShowPanel { index } => {
+        self.panel = Panel.Extension
+        self.shown = index
+        self.data.clear()
+        self.sync(&mut cx)
+      }
       Message.Search { value } => {
         self.search = move value
         self.updateVisibility()
@@ -2289,19 +2300,8 @@ impl App<Message, Command> for Devtools {
       Message.StyleRefused { error } => {
         self.styleError = move error
       }
-      Message.OpenStep { seq } => {
-        if self.opened.seq == seq {
-          self.opened = ModelView.none()
-        } else {
-          cx.command(Command.Step { seq: seq })
-        }
-      }
-      Message.Stepped { view } => {
-        self.opened = move view
-      }
-      Message.ClearSteps => {
-        self.steps.clear()
-        self.opened = ModelView.none()
+      Message.Asked { asked } => {
+        cx.alloc(self.asked.append(asked))
       }
       Message.RunAudit => {
         cx.command(Command.Audit)
@@ -2328,7 +2328,26 @@ impl App<Message, Command> for Devtools {
       }
       Message.Synced { snapshot } => {
         let mut s = move snapshot
-        if s.parts == 0 && s.program.isNone() && s.frames.isNone() {
+        while s.replies.length() != 0 {
+          let line = s.replies.remove(0)
+          self.answered(&line, &mut cx)
+        }
+        let full = s.parts == PART_ALL
+        if let Option<List<String>>.Some { value } = Intrinsic.replace(
+          s.extensions,
+          Option<List<String>>.None,
+        ) {
+          self.extensions = move value
+          self.panels = Intrinsic.replace(s.panels, List<PanelInfo>.make())
+          if self.panel == Panel.Extension && self.shown >= self.panels.length() {
+            self.panel = Panel.Styles
+          }
+          self.resubscribe(&mut cx)
+        }
+        if full || self.panelNews(&s.news) {
+          self.readPanel(&mut cx)
+        }
+        if s.parts == 0 && s.frames.isNone() {
           return ()
         }
         self.syncs = self.syncs + 1
@@ -2364,38 +2383,6 @@ impl App<Message, Command> for Devtools {
           }
         }
 
-        if u32.bitAnd(s.parts, PART_STEPS) != 0 {
-          // A program that started again counts from one: what was read is another run's.
-          if s.stepNext <= self.sinceStep {
-            self.steps.clear()
-            self.opened = ModelView.none()
-          }
-          let mut held: u64 = 0
-          if self.steps.length() != 0 {
-            held = self.steps.asSlice()[self.steps.length() - 1].seq
-          }
-          while s.steps.length() != 0 {
-            let step = s.steps.remove(0)
-            if step.seq > held {
-              held = step.seq
-              cx.alloc(self.steps.append(move step))
-            }
-          }
-          while self.steps.length() > MAX_LOG {
-            drop self.steps.remove(0)
-          }
-          self.sinceStep = if s.stepNext > 0 {
-            s.stepNext - 1
-          } else {
-            0
-          }
-        }
-        match Intrinsic.replace(s.program, Option<ProgramView>.None) {
-          Option<ProgramView>.Some { value } => {
-            self.program = move value
-          }
-          Option<ProgramView>.None => {}
-        }
         match Intrinsic.replace(s.frames, Option<FrameView>.None) {
           Option<FrameView>.Some { value } => {
             self.frames = move value

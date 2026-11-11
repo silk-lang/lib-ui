@@ -3,6 +3,10 @@
 //! pushes (`{"event": ...}`) waits until the devtools take it. The window provides a link over
 //! the inspector socket; tests provide one over a memory channel to a tree in the same process.
 //! Both are the client end of a [`Channel`], numbered by [`Requests`].
+//!
+//! A request for an app's extension is answered when the app next serves that extension, which
+//! a link in the app's own process cannot wait for: such requests go out with [`Link.ask`], and
+//! their replies come out of [`Link.take`] with the notifications.
 import ui_inspect_server.channel { Channel }
 import ui_inspect_server.reply { has }
 import ui_tree.inspect { writeInt }
@@ -28,6 +32,11 @@ pub service Link {
   /// reached.
   effect fn notify(line: string) -> bool ! OutOfMemoryError ? &mut Link | &mut Allocator
 
+  /// Sends `line` (one JSON request without an `id`) as a request without waiting for the
+  /// reply, which [`Link.take`] hands over later as a line with the `id` this returns. 0 when
+  /// the app could not be reached.
+  effect fn ask(line: string) -> u64 ! OutOfMemoryError ? &mut Link | &mut Allocator
+
   /// Moves the notification lines the app pushed since the last call into `out`, oldest first.
   /// False when the session is over: the app went away.
   effect fn take(out: &mut List<String>) -> bool ! OutOfMemoryError ? &mut Link | &mut Allocator
@@ -37,13 +46,41 @@ pub service Link {
 /// and keeps the notifications that come in meanwhile.
 pub struct Requests {
   next: u64,
-  /// Notification lines that came in and were not taken yet, oldest first.
+  /// Notification lines that came in and were not taken yet, oldest first, with the replies to
+  /// the requests sent with `ask`.
   pub notes: List<String>,
+  /// The ids of the requests sent with `ask` whose replies did not come yet.
+  asked: List<u64>,
 }
 
 impl Requests {
   pub fn make() -> Requests {
-    return Requests { next: 1, notes: List<String>.make() }
+    return Requests { next: 1, notes: List<String>.make(), asked: List<u64>.make() }
+  }
+
+  /// Sends `line` with the next `id`, whose reply goes with the notifications. Returns the id;
+  /// 0 when the other end is gone.
+  pub effect fn ask(self: &mut Self, line: string) -> u64
+    ! OutOfMemoryError
+    ? &mut Channel | &mut Allocator {
+    let id = run self.send(line)
+    if id != 0 {
+      run self.asked.append(id)
+    }
+    return id
+  }
+
+  /// Whether `id` was asked for and is not answered yet; it is not after this.
+  fn answers(self: &mut Self, id: u64) -> bool {
+    let mut i: usize = 0
+    while i < self.asked.length() {
+      if self.asked.get(i) == id {
+        drop self.asked.remove(i)
+        return true
+      }
+      i = i + 1
+    }
+    return false
   }
 
   /// Sends `line` (an object without an `id`) with the next `id`, which it returns; 0 when the
@@ -66,8 +103,9 @@ impl Requests {
     return id
   }
 
-  /// Takes what came in: notifications into `notes`, and the reply to `id` into `reply`. True
-  /// when that reply came. Replies to other ids (requests given up on) are dropped.
+  /// Takes what came in: notifications and replies to `ask` into `notes`, and the reply to `id`
+  /// into `reply`. True when that reply came. Replies to other ids (requests given up on) are
+  /// dropped.
   pub effect fn collect(self: &mut Self, id: u64, reply: &mut String) -> bool
     ! OutOfMemoryError
     ? &mut Channel | &mut Allocator {
@@ -80,7 +118,7 @@ impl Requests {
             Option<u64>.Some { value: n } => n
             Option<u64>.None => 0
           }
-          if has(&value, "event") {
+          if has(&value, "event") || (answers != 0 && answers != id && self.answers(answers)) {
             run self.notes.append(run String.copy(String.view(&line)))
           } else if answers == id && id != 0 {
             reply.clear()

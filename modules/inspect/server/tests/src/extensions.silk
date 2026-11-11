@@ -1,0 +1,766 @@
+//! Extensions, with one that belongs to no framework: a notes list with commands, a topic, a
+//! data panel and a view panel. Registry and namespacing, `hello`, deferred replies, topics
+//! pushed once a frame, a remote view's batches and events, the batch format, and MCP tools made
+//! from `hello`.
+import ui_fixtures.fixtures as fixtures
+import ui_inspect_server.lib {
+  Protocol,
+  Outcome,
+  Session,
+  Channel,
+  MemoryChannel,
+  MemoryPair,
+  Extension,
+  ExtensionHandler,
+  News,
+  View,
+  Outgoing,
+  Bridge,
+  Action,
+  MUTATION_FORMAT,
+  writeMutations,
+  readMutation,
+  writeEvent,
+  readEvent
+}
+import ui_inspect_server.reply { begin, finish, putInt, putKey, writeString, textField }
+import ui_tree.legacy { UiTree, TreeError, Batch, FrameInput }
+import ui_tree.mutation { Mutation, NodeKind, StyleState }
+import ui_tree.node { Event, EventKind }
+import ui_tree.css
+import ui_tree.css { px }
+import ui_tree.lib { RootOptions }
+import ui_tree.mutation { Attribute, Role, Cursor, LISTEN_CLICK }
+import font_collection.lib { FontCollection }
+import silk.collections.list { List }
+import silk.color.rgba { Rgba }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.json.scanner { JsonError }
+import silk.json.value { Json, Value }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.usize
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+/// A notes list: what any extension could be, with no framework behind it.
+struct Notes {
+  items: List<String>,
+  changed: bool,
+  clicks: u32,
+  /// How many times the view was rendered from nothing, and batches sent in all.
+  renders: u32,
+  batches: usize,
+  /// Whether the view was open the last time it had its turn.
+  open: bool,
+}
+
+effect fn notesExtension() -> Extension
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut info = run Extension.make("notes", "1.2")
+  run info.command("count")
+  run info.command("list")
+  run info.command("add")
+  run info.topic("changed")
+  run info.tool(
+    "add",
+    "Add a note",
+    "Adds a note to the list.",
+    "{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}},\"required\":[\"text\"]}",
+    false,
+  )
+  run info.panel("list", "Notes", "list", "changed", false)
+  run info.panel("badge", "Badge", "", "", true)
+  return move info
+}
+
+effect fn clicksText(clicks: u32) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = run String.copy("clicks: ")
+  let mut digits = String.make()
+  let mut n = clicks
+  while true {
+    let mut one = String.make()
+    run one.append(String.slice("0123456789", u32.toUsize(n % 10), 1))
+    run one.append(String.view(&digits))
+    digits = move one
+    n = n / 10
+    if n == 0 {
+      break
+    }
+  }
+  run text.append(String.view(&digits))
+  return move text
+}
+
+impl ExtensionHandler for Notes {
+  effect fn command(self: &mut Self, name: string, request: &Value, out: &mut String) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if name == "count" {
+      run begin(&mut out, request)
+      run putInt(&mut out, "count", usize.toU64(self.items.length()))
+      run finish(&mut out)
+      return true
+    }
+    if name == "list" {
+      run begin(&mut out, request)
+      run putKey(&mut out, "items")
+      run out.append("[")
+      let items = self.items.asSlice()
+      let mut i: usize = 0
+      while i < items.length {
+        if i > 0 {
+          run out.append(",")
+        }
+        run out.append("{\"text\":")
+        run writeString(&mut out, String.view(&items[i]))
+        run out.append("}")
+        i = i + 1
+      }
+      run out.append("]")
+      run finish(&mut out)
+      return true
+    }
+    if name == "add" {
+      run self.items.append(run String.copy(textField(request, "text")))
+      self.changed = true
+      run begin(&mut out, request)
+      run putInt(&mut out, "count", usize.toU64(self.items.length()))
+      run finish(&mut out)
+      return true
+    }
+    return false
+  }
+
+  effect fn topics(self: &mut Self, news: &mut News) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.changed {
+      self.changed = false
+      let mut members = run String.copy("{\"count\":")
+      run members.append(String.slice("0123456789", self.items.length() % 10, 1))
+      run members.append("}")
+      run news.post("changed", String.view(&members))
+    }
+  }
+
+  effect fn view(self: &mut Self, panel: string, view: &mut View) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.open = view.open
+    if !view.open || panel != "badge" {
+      return ()
+    }
+    if view.fresh {
+      // The whole view, from nothing: a button with a label, in a root of its own.
+      self.renders = self.renders + 1
+      let mut batch = List<Mutation>.make()
+      run batch.append(Mutation.Create { id: 1, kind: NodeKind.Box })
+      run batch.append(Mutation.Create { id: 2, kind: NodeKind.Text })
+      run batch.append(Mutation.SetText { id: 2, value: run clicksText(self.clicks) })
+      run batch.append(Mutation.InsertBefore { parent: 1, child: 2, before: Option<u32>.None })
+      let mut style = List<css.Declaration>.make()
+      run style.append(css.width(px(80.0)))
+      run style.append(css.color(Rgba<f32> { r: 1.0, g: 0.0, b: 0.0, a: 1.0 }))
+      run batch.append(
+        Mutation.SetStyle { id: 1, state: StyleState.Base, declarations: move style },
+      )
+      run batch.append(
+        Mutation.SetAttribute { id: 1, attribute: Attribute.Role { value: Role.Button } },
+      )
+      run batch.append(
+        Mutation.SetAttribute { id: 1, attribute: Attribute.Cursor { value: Cursor.Pointer } },
+      )
+      run batch.append(Mutation.SetListeners { id: 1, flags: LISTEN_CLICK })
+      run batch.append(Mutation.OpenRoot { root: 0, node: 1, options: RootOptions.default() })
+      run view.send(batch.asSlice())
+    }
+    let mut events = List<Event>.make()
+    run view.takeEvents(&mut events)
+    let list = events.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      if list[i].kind == EventKind.Click && list[i].target == 1 {
+        self.clicks = self.clicks + 1
+        let mut batch = List<Mutation>.make()
+        run batch.append(Mutation.SetText { id: 2, value: run clicksText(self.clicks) })
+        run view.send(batch.asSlice())
+      }
+      i = i + 1
+    }
+    self.batches = self.batches + view.sent()
+  }
+}
+
+fn makeNotes() -> Notes {
+  return Notes {
+    items: List<String>.make(),
+    changed: false,
+    clicks: 0,
+    renders: 0,
+    batches: 0,
+    open: false,
+  }
+}
+
+effect fn inbox(collection: &FontCollection) -> UiTree<'_>
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut tree = run UiTree.make(collection)
+  let mut batch = Batch.make()
+  run fixtures.inbox(&mut batch)
+  run tree.apply(run batch.take())
+  run tree.frame(FrameInput { width: 360.0, height: 440.0, scale: 2.0, time: 0.0 })
+  return move tree
+}
+
+effect fn put(client: &mut MemoryChannel, line: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  drop run Channel.send(line) |> Effect.provideMut<Channel>(&mut client)
+}
+
+/// The next line at the client's end, parsed, or `{"none":true}`.
+effect fn take(client: &mut MemoryChannel) -> Value
+  ! JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut line = String.make()
+  if !run Channel.receive(&mut line) |> Effect.provideMut<Channel>(&mut client) {
+    return run Json.parse(b"{\"none\":true}")
+  }
+  let value = run Json.parse(line.ownedUtf8Bytes())
+  return move value
+}
+
+/// The next line at the client's end as it came, or "".
+effect fn takeLine(client: &mut MemoryChannel) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut line = String.make()
+  drop run Channel.receive(&mut line) |> Effect.provideMut<Channel>(&mut client)
+  return move line
+}
+
+effect fn serveLines(
+  session: &mut Session,
+  protocol: &mut Protocol,
+  tree: &mut UiTree<'_>,
+  end: &mut MemoryChannel,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  while run session.serveNext(&mut protocol, &mut tree) |> Effect.provideMut<Channel>(&mut end) {}
+}
+
+/// What the inspector does on each turn of the app's loop: serves the extension, delivers its
+/// replies and pushes its news.
+effect fn turn(
+  session: &mut Session,
+  protocol: &mut Protocol,
+  notes: &mut Notes,
+  end: &mut MemoryChannel,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run protocol.serveExtension("notes", &mut notes)
+  run session.deliver(&mut protocol) |> Effect.provideMut<Channel>(&mut end)
+  let mut news = List<Outgoing>.make()
+  run protocol.extensions.takeNews(&mut news)
+  run session.publishNews(&news) |> Effect.provideMut<Channel>(&mut end)
+}
+
+fn ok(reply: &Value) -> bool {
+  return match Json.field(reply, "ok") {
+    Option<&Value>.Some { value } => match &value.* {
+      Value.Bool { value: b } => b
+      _ => false
+    }
+    Option<&Value>.None => false
+  }
+}
+
+fn has(value: &Value, key: string) -> bool {
+  return match Json.field(value, key) {
+    Option<&Value>.Some { value: _ } => true
+    Option<&Value>.None => false
+  }
+}
+
+fn text<'a>(reply: &'a Value, key: string) -> string<'a> {
+  return Json.asString(Json.field(reply, key)).unwrapOr("")
+}
+
+fn int(reply: &Value, key: string) -> i64 {
+  return Json.asI64(Json.field(reply, key)).unwrapOr(-1)
+}
+
+fn contains(text: string, needle: string) -> bool {
+  return String.contains(text, needle)
+}
+
+effect fn registryBody() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run inbox(&collection)
+  let mut protocol = Protocol.make()
+  run protocol.afterFrame(&tree)
+  run protocol.extend(run notesExtension())
+  let mut notes = makeNotes()
+  let pair = run MemoryChannel.pair()
+  let MemoryPair { first, second } = move pair
+  let mut app = move first
+  let mut client = move second
+  let mut session = Session.open()
+  session.key = 7
+
+  // hello lists the extension, its names prefixed in the capabilities.
+  run put(&mut client, "{\"id\":1,\"cmd\":\"hello\",\"protocol\":3}")
+  run serveLines(&mut session, &mut protocol, &mut tree, &mut app)
+  let hello = run takeLine(&mut client)
+  let line = String.view(&hello)
+  run Testing.expect(
+    contains(
+      line,
+      "\"extensions\":[{\"id\":\"notes\",\"version\":\"1.2\",\"commands\":[\"count\",\"list\",\"add\"]",
+    ),
+    "hello lists the extension",
+  )
+  run Testing.expect(contains(line, "\"topics\":[\"changed\",\"view.badge\"]"), "with its topics")
+  run Testing.expect(
+    contains(line, "{\"id\":\"list\",\"title\":\"Notes\",\"data\":\"list\",\"topic\":\"changed\"}"),
+    "a data panel",
+  )
+  run Testing.expect(
+    contains(line, "{\"id\":\"badge\",\"title\":\"Badge\",\"view\":\"view.badge\"}"),
+    "a view panel",
+  )
+  run Testing.expect(contains(line, "\"notes.count\",\"notes.list\",\"notes.add\""), "commands")
+  run Testing.expect(contains(line, "\"notes.changed\",\"notes.view.badge\""), "topics")
+  run Testing.expect(contains(line, "\"mutationFormat\":1"), "the batch format")
+
+  // A command waits for the extension; the reply goes to the session that asked, by id.
+  run put(&mut client, "{\"id\":2,\"cmd\":\"notes.add\",\"text\":\"milk\"}")
+  run serveLines(&mut session, &mut protocol, &mut tree, &mut app)
+  let early = run take(&mut client)
+  run Testing.expect(has(&early, "none"), "no reply before the extension is served")
+  run Testing.expect(protocol.extensions.pending() && session.waiting == 1, "the request waits")
+  run turn(&mut session, &mut protocol, &mut notes, &mut app)
+  let added = run take(&mut client)
+  run Testing.expect(int(&added, "id") == 2 && int(&added, "count") == 1, "the extension answers")
+  run Testing.expect(!protocol.extensions.pending() && session.waiting == 0, "nothing waits")
+
+  // Unknown commands of a known extension are answered at once; other prefixes are unknown.
+  run put(&mut client, "{\"id\":3,\"cmd\":\"notes.fly\"}")
+  run put(&mut client, "{\"id\":4,\"cmd\":\"other.count\"}")
+  run serveLines(&mut session, &mut protocol, &mut tree, &mut app)
+  let fly = run take(&mut client)
+  run Testing.expect(
+    int(&fly, "id") == 3 && text(&fly, "error") == "unknown cmd",
+    "not its command",
+  )
+  let other = run take(&mut client)
+  run Testing.expect(
+    int(&other, "id") == 4 && text(&other, "error") == "unknown cmd",
+    "no such one",
+  )
+
+  // A data panel is the reply of its command.
+  run put(&mut client, "{\"id\":5,\"cmd\":\"notes.list\"}")
+  run serveLines(&mut session, &mut protocol, &mut tree, &mut app)
+  run turn(&mut session, &mut protocol, &mut notes, &mut app)
+  let listed = run takeLine(&mut client)
+  run Testing.expect(
+    contains(String.view(&listed), "\"items\":[{\"text\":\"milk\"}]"),
+    "the data panel's JSON",
+  )
+
+  // Topics: subscribed by name, pushed at most once a frame, nothing when nothing changed.
+  run put(
+    &mut client,
+    "{\"id\":6,\"cmd\":\"subscribe\",\"topics\":[\"notes.changed\",\"notes.nope\"]}",
+  )
+  run serveLines(&mut session, &mut protocol, &mut tree, &mut app)
+  let subscribed = run takeLine(&mut client)
+  run Testing.expect(
+    contains(String.view(&subscribed), "\"topics\":[\"notes.changed\"]"),
+    "an extension topic is subscribed to; an unknown one ignored",
+  )
+  run turn(&mut session, &mut protocol, &mut notes, &mut app)
+  let quiet = run take(&mut client)
+  run Testing.expect(has(&quiet, "none"), "nothing changed since the last news: nothing pushed")
+  run put(&mut client, "{\"cmd\":\"notes.add\",\"text\":\"eggs\"}")
+  run serveLines(&mut session, &mut protocol, &mut tree, &mut app)
+  run turn(&mut session, &mut protocol, &mut notes, &mut app)
+  let changed = run take(&mut client)
+  run Testing.expect(text(&changed, "event") == "notes.changed", "the change is pushed")
+  run Testing.expect(int(&changed, "count") == 2, "with the extension's members")
+  let noReply = run take(&mut client)
+  run Testing.expect(has(&noReply, "none"), "a notification gets no reply")
+  run put(&mut client, "{\"cmd\":\"notes.add\",\"text\":\"tea\"}")
+  run serveLines(&mut session, &mut protocol, &mut tree, &mut app)
+  run turn(&mut session, &mut protocol, &mut notes, &mut app)
+  let same = run take(&mut client)
+  run Testing.expect(has(&same, "none"), "not twice in one frame")
+  run Testing.expect(protocol.extensions.held, "held for the next frame")
+  run tree.frame(FrameInput { width: 360.0, height: 440.0, scale: 2.0, time: 0.1 })
+  run protocol.afterFrame(&tree)
+  run turn(&mut session, &mut protocol, &mut notes, &mut app)
+  let later = run take(&mut client)
+  run Testing.expect(
+    text(&later, "event") == "notes.changed" && int(&later, "count") == 3,
+    "pushed with the next frame, as it is then",
+  )
+  run turn(&mut session, &mut protocol, &mut notes, &mut app)
+  let settled = run take(&mut client)
+  run Testing.expect(has(&settled, "none") && !protocol.extensions.held, "once")
+
+  // A one-shot session (protocol 2) waits for its reply, then ends.
+  let mut single = Session.make()
+  single.key = 8
+  run put(&mut client, "{\"cmd\":\"notes.count\"}")
+  run serveLines(&mut single, &mut protocol, &mut tree, &mut app)
+  run Testing.expect(!single.ended, "a one-shot session waits for the extension")
+  run turn(&mut single, &mut protocol, &mut notes, &mut app)
+  let counted = run take(&mut client)
+  run Testing.expect(ok(&counted) && int(&counted, "count") == 3, "then it is answered")
+  run Testing.expect(single.ended, "and over")
+}
+
+test effect fn extensionsAreRegisteredNamespacedAndServed() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run registryBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn viewBody() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run inbox(&collection)
+  let mut protocol = Protocol.make()
+  run protocol.afterFrame(&tree)
+  run protocol.extend(run notesExtension())
+  let mut notes = makeNotes()
+  let pair = run MemoryChannel.pair()
+  let MemoryPair { first, second } = move pair
+  let mut app = move first
+  let mut client = move second
+  let mut session = Session.open()
+  session.key = 3
+
+  // Closed: the view's turn comes, it renders nothing.
+  run turn(&mut session, &mut protocol, &mut notes, &mut app)
+  run Testing.expect(!notes.open && notes.renders == 0 && notes.batches == 0, "no cost unseen")
+
+  // Opened by subscribing to its topic: the whole view, from nothing.
+  run put(&mut client, "{\"id\":1,\"cmd\":\"subscribe\",\"topics\":[\"notes.view.badge\"]}")
+  run serveLines(&mut session, &mut protocol, &mut tree, &mut app)
+  drop run take(&mut client)
+  run Testing.expect(protocol.extensions.viewers("notes.view.badge") == 1, "one viewer")
+  run turn(&mut session, &mut protocol, &mut notes, &mut app)
+  let opened = run take(&mut client)
+  run Testing.expect(text(&opened, "event") == "notes.view.badge", "a batch on the view topic")
+  run Testing.expect(
+    int(&opened, "format") == 1 && int(&opened, "seq") == 1
+      && match Json.field(&opened, "reset") {
+        Option<&Value>.Some { value } => match &value.* {
+          Value.Bool { value: b } => b
+          _ => false
+        }
+        Option<&Value>.None => false
+      },
+    "the first batch resets",
+  )
+  let mut mutations = List<Mutation>.make()
+  if let Option<&Value>.Some { value: list } = Json.field(&opened, "mutations") {
+    if let Value.Array { values } = &list.* {
+      let items = values.asSlice()
+      let mut i: usize = 0
+      while i < items.length {
+        if let Option<Mutation>.Some { value: m } = run readMutation(&items[i]) {
+          run mutations.append(move m)
+        }
+        i = i + 1
+      }
+    }
+  }
+  run Testing.expect(mutations.length() == 9, "every mutation reads back")
+
+  // Replayed into another tree under a node of its own, it draws.
+  let mut other = run UiTree.make(&collection)
+  let mut setup = List<Mutation>.make()
+  run setup.append(Mutation.Create { id: 100, kind: NodeKind.Box })
+  run setup.append(Mutation.OpenRoot { root: 0, node: 100, options: RootOptions.default() })
+  run other.apply(move setup)
+  let mut replay = List<Mutation>.make()
+  while mutations.length() != 0 {
+    let m = mutations.remove(0)
+    match move m {
+      Mutation.OpenRoot { root: _, node, options: _ } => {
+        run replay.append(
+          Mutation.InsertBefore { parent: 100, child: node, before: Option<u32>.None },
+        )
+      }
+      Mutation kept => {
+        run replay.append(move kept)
+      }
+    }
+  }
+  run other.apply(move replay)
+  run other.frame(FrameInput { width: 200.0, height: 100.0, scale: 1.0, time: 0.0 })
+  run Testing.expect(other.contains(1) && other.contains(2), "the view's nodes are there")
+
+  // Events come back for the view's nodes, and the view answers them.
+  run put(
+    &mut client,
+    "{\"id\":2,\"cmd\":\"viewEvents\",\"topic\":\"notes.view.badge\",\"events\":[{\"kind\":\"click\",\"target\":1,\"path\":[1],\"x\":3,\"y\":4,\"detail\":1}]}",
+  )
+  run serveLines(&mut session, &mut protocol, &mut tree, &mut app)
+  let queued = run take(&mut client)
+  run Testing.expect(int(&queued, "queued") == 1, "the event is queued for the view")
+  run turn(&mut session, &mut protocol, &mut notes, &mut app)
+  run Testing.expect(notes.clicks == 1, "the view heard the click")
+  let answered = run takeLine(&mut client)
+  run Testing.expect(
+    contains(
+      String.view(&answered),
+      "\"seq\":2,\"reset\":false,\"mutations\":[{\"op\":\"text\",\"id\":2,\"value\":\"clicks: 1\"}]",
+    ),
+    "and sent what changed",
+  )
+
+  // Closed again: no batches, no renders, events are dropped.
+  run put(&mut client, "{\"id\":3,\"cmd\":\"unsubscribe\",\"topics\":[\"notes.view.badge\"]}")
+  run put(
+    &mut client,
+    "{\"cmd\":\"viewEvents\",\"topic\":\"notes.view.badge\",\"events\":[{\"kind\":\"click\",\"target\":1,\"path\":[1]}]}",
+  )
+  run serveLines(&mut session, &mut protocol, &mut tree, &mut app)
+  drop run take(&mut client)
+  let before = notes.batches
+  run turn(&mut session, &mut protocol, &mut notes, &mut app)
+  let nothing = run take(&mut client)
+  run Testing.expect(has(&nothing, "none") && !notes.open, "closed: nothing")
+  run Testing.expect(notes.batches == before && notes.clicks == 1, "no batch, no event")
+
+  // A session that ends closes what it had open.
+  run put(&mut client, "{\"id\":4,\"cmd\":\"subscribe\",\"topics\":[\"notes.view.badge\"]}")
+  run serveLines(&mut session, &mut protocol, &mut tree, &mut app)
+  run Testing.expect(protocol.extensions.viewers("notes.view.badge") == 1, "open again")
+  session.leave(&mut protocol)
+  run Testing.expect(
+    protocol.extensions.viewers("notes.view.badge") == 0,
+    "closed with the session",
+  )
+}
+
+test effect fn extensionViewsRenderOnlyWhileOpen() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run viewBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn formatBody() -> ()
+  ! AssertionError<'static> | JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  // Every op the format has, written, read and written again, is the same text.
+  let mut batch = List<Mutation>.make()
+  run batch.append(Mutation.Create { id: 5, kind: NodeKind.Input })
+  run batch.append(Mutation.InsertBefore { parent: 1, child: 5, before: Option<u32>.some(3) })
+  run batch.append(Mutation.Remove { id: 5 })
+  run batch.append(Mutation.Destroy { id: 6 })
+  let mut style = List<css.Declaration>.make()
+  run style.append(css.width(px(12.0)))
+  run style.append(css.paddingLeft(px(4.0)))
+  run batch.append(Mutation.SetStyle { id: 5, state: StyleState.Hover, declarations: move style })
+  run batch.append(Mutation.ClearStyle { id: 5, state: StyleState.FocusVisible })
+  run batch.append(Mutation.SetText { id: 5, value: run String.copy("a \"quoted\"\nline") })
+  run batch.append(Mutation.SetSelection { id: 5, anchor: 1, focus: 3 })
+  run batch.append(
+    Mutation.SetAttribute { id: 5, attribute: Attribute.Label { value: run String.copy("Name") } },
+  )
+  run batch.append(Mutation.SetAttribute { id: 5, attribute: Attribute.TabIndex { value: -1 } })
+  run batch.append(Mutation.SetAttribute { id: 5, attribute: Attribute.Checked { value: true } })
+  run batch.append(
+    Mutation.SetAttribute {
+      id: 5,
+      attribute: Attribute.ValueRange { min: 0.0, max: 10.0, value: 2.5 },
+    },
+  )
+  run batch.append(Mutation.SetListeners { id: 5, flags: 4 })
+  run batch.append(Mutation.OpenRoot { root: 2, node: 5, options: RootOptions.default() })
+  run batch.append(Mutation.CloseRoot { root: 2 })
+  run batch.append(Mutation.Focus { id: 5 })
+  run batch.append(Mutation.Blur)
+  run batch.append(Mutation.ScrollTo { id: 5, x: 1.5, y: 2.0 })
+  run batch.append(Mutation.ScrollIntoView { id: 5 })
+  let mut written = String.make()
+  run writeMutations(&mut written, batch.asSlice())
+  let parsed = run Json.parse(written.ownedUtf8Bytes())
+  let mut back = List<Mutation>.make()
+  if let Value.Array { values } = &parsed {
+    let items = values.asSlice()
+    let mut i: usize = 0
+    while i < items.length {
+      if let Option<Mutation>.Some { value } = run readMutation(&items[i]) {
+        run back.append(move value)
+      }
+      i = i + 1
+    }
+  }
+  run Testing.expect(back.length() == batch.length(), "every op reads back")
+  let mut again = String.make()
+  run writeMutations(&mut again, back.asSlice())
+  run Testing.expect(String.view(&again) == String.view(&written), "and writes the same")
+  run Testing.expect(
+    contains(String.view(&written), "\"css\":\"width: 12px; padding-left: 4px\""),
+    "CSS text",
+  )
+  run Testing.expect(MUTATION_FORMAT == 1, "format 1")
+
+  // An event record round-trips.
+  let mut path = List<u32>.make()
+  run path.append(1)
+  run path.append(5)
+  let mut event = Event.make(EventKind.Input, 5, move path)
+  event.value = run String.copy("hé")
+  event.inputType = run String.copy("insertText")
+  event.selectionStart = 3
+  event.selectionEnd = 3
+  event.modifiers = 2
+  let mut one = String.make()
+  run writeEvent(&mut one, &event)
+  let read = run Json.parse(one.ownedUtf8Bytes())
+  let mut two = String.make()
+  match run readEvent(&read) {
+    Option<Event>.Some { value } => {
+      run writeEvent(&mut two, &value)
+      run Testing.expect(value.kind == EventKind.Input && value.path.length() == 2, "kind and path")
+    }
+    Option<Event>.None => {
+      run Testing.expect(false, "the event reads back")
+    }
+  }
+  run Testing.expect(String.view(&one) == String.view(&two), "the same record")
+}
+
+test effect fn mutationBatchesRoundTrip() -> ()
+  ! AssertionError<'static> | JsonError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run formatBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// One MCP message through the bridge, the app served in place of a socket: requests for the
+/// extension are answered by serving it, as the app's loop would.
+effect fn mcp(
+  bridge: &mut Bridge,
+  protocol: &mut Protocol,
+  tree: &mut UiTree<'_>,
+  notes: &mut Notes,
+  line: string,
+) -> Value
+  ! JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = String.make()
+  let mut reply = String.make()
+  let mut action = run bridge.handle(String.utf8Bytes(line), &mut out)
+  while action == Action.Ask || action == Action.Retry {
+    let request = run Json.parse(out.ownedUtf8Bytes())
+    protocol.extensions.caller = 0
+    protocol.extensions.callerAnswered = true
+    let outcome = run protocol.handle(&mut tree, &request, 0, &mut reply)
+    if outcome == Outcome.Deferred {
+      run protocol.serveExtension("notes", &mut notes)
+      let mut lines = List<String>.make()
+      run protocol.extensions.takeReplies(0, &mut lines)
+      reply = lines.remove(0)
+    }
+    action = run bridge.answer(reply.ownedUtf8Bytes(), true, 0, &mut out)
+  }
+  let response = run Json.parse(out.ownedUtf8Bytes())
+  return move response
+}
+
+/// The text of a tool result's first content item.
+fn contentText<'a>(response: &'a Value) -> string<'a> {
+  if let Option<&'a Value>.Some { value } = Json.fieldAt(
+    Json.field(response, "result"),
+    "content",
+  ) {
+    if let Option<&'a Value>.Some { value: item } = Json.item(value, 0) {
+      return Json.asString(Json.field(item, "text")).unwrapOr("")
+    }
+  }
+  return ""
+}
+
+effect fn mcpBody() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run inbox(&collection)
+  let mut protocol = Protocol.make()
+  run protocol.afterFrame(&tree)
+  run protocol.extend(run notesExtension())
+  let mut notes = makeNotes()
+
+  // A call before the tools were listed learns them first.
+  let mut early = run Bridge.make("unix:/tmp/test.sock")
+  let first = run mcp(
+    &mut early,
+    &mut protocol,
+    &mut tree,
+    &mut notes,
+    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"notes_add\",\"arguments\":{\"text\":\"milk\"}}}",
+  )
+  let firstText = contentText(&first)
+  run Testing.expect(contains(firstText, "\"count\":1"), "an extension tool is called by its name")
+
+  let mut bridge = run Bridge.make("unix:/tmp/test.sock")
+  let tools = run mcp(
+    &mut bridge,
+    &mut protocol,
+    &mut tree,
+    &mut notes,
+    "{\"jsonrpc\":\"2.0\",\"id\":\"t\",\"method\":\"tools/list\"}",
+  )
+  let mut listed = String.make()
+  match Json.fieldAt(Json.field(&tools, "result"), "tools") {
+    Option<&Value>.Some { value } => {
+      if let Value.Array { values } = &value.* {
+        let items = values.asSlice()
+        let mut i: usize = 0
+        while i < items.length {
+          run listed.append(Json.asString(Json.field(&items[i], "name")).unwrapOr(""))
+          run listed.append(" ")
+          i = i + 1
+        }
+      }
+    }
+    Option<&Value>.None => {}
+  }
+  let names = String.view(&listed)
+  run Testing.expect(contains(names, "ui_snapshot "), "the inspector's tools")
+  run Testing.expect(contains(names, "notes_count notes_list notes_add "), "then the extension's")
+  run Testing.expect(!contains(names, "notes.count"), "named as MCP allows")
+  let call = run mcp(
+    &mut bridge,
+    &mut protocol,
+    &mut tree,
+    &mut notes,
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"notes_count\"}}",
+  )
+  let callText = contentText(&call)
+  run Testing.expect(contains(callText, "\"count\":1"), "and answers through the extension")
+}
+
+test effect fn mcpToolsComeFromHello() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run mcpBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}

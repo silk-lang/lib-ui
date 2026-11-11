@@ -111,7 +111,7 @@ A client opens a session by sending `hello` with `"protocol": 3` first:
 
 ```text
 → {"id":1,"cmd":"hello","protocol":3,"client":"devtools","wants":["tree","events"]}
-← {"id":1,"ok":true,"protocol":3,"capabilities":{"commands":[...],"topics":[...],"sessions":true},"extensions":[],"roots":[...],...}
+← {"id":1,"ok":true,"protocol":3,"capabilities":{"commands":[...],"topics":[...],"sessions":true},"mutationFormat":1,"extensions":[...],"roots":[...],...}
 ← {"event":"tree","frame":12,"width":360,"height":300,"scale":2,"nodes":40,"revision":7}
 → {"cmd":"highlight","nodes":[41]}          // no id, no reply
 ```
@@ -127,8 +127,10 @@ end a pump joins to a socket (`client.openSession` connects one to an app).
 
 ### Topics
 
-`subscribe` and `unsubscribe` take `topics` (names; all of them when left out) and answer with
-the topics subscribed now; `hello` takes the same names in `wants`. Unknown names are ignored.
+`subscribe` and `unsubscribe` take `topics` (names; all of them when left out, but extensions'
+view topics) and answer with the topics subscribed now; `hello` takes the same names in `wants`.
+Unknown names are ignored. Extension topics are subscribed to by their full name
+(`<id>.<topic>`, see Extensions).
 The app then sends `{"event": <topic>, "frame", ...}` when the topic changes, at most once per
 topic per frame:
 
@@ -153,7 +155,7 @@ Node objects in replies are `{"id", "kind", "role", "name", "testId", "x", "y", 
 
 | cmd | members | reply |
 | --- | --- | --- |
-| `hello` | `protocol` (3 opens a session), `client`, `wants` (topics) | `protocol` (3), `commands`, `capabilities` (`commands`, `topics`, `sessions`), `extensions` (none yet), `width`, `height`, `scale`, `frame`, `root`, `roots`, `hidden` (roots left out), `nodes`, `highlight` |
+| `hello` | `protocol` (3 opens a session), `client`, `wants` (topics) | `protocol` (3), `commands`, `capabilities` (`commands`, `topics`, `sessions`; the extensions' with their full names), `mutationFormat` (1), `extensions` (see Extensions), `width`, `height`, `scale`, `frame`, `root`, `roots`, `hidden` (roots left out), `nodes`, `highlight` |
 | `subscribe` | `topics` | `topics`: subscribed now (sessions only) |
 | `unsubscribe` | `topics` | `topics`: subscribed now (sessions only) |
 | `snapshot` | target (optional, a subtree), `styles` | `text`: `describe` output, `frame` |
@@ -173,21 +175,69 @@ Node objects in replies are `{"id", "kind", "role", "name", "testId", "x", "y", 
 | `stats` | | the last frame's `FrameStats`: nodes, fragments, layout counters, replayed and repainted subtrees, glyphs, primitives |
 | `tree` | target (optional, a subtree) | `nodes`: node objects in tree order, each with `parent` (left out at the top), `depth` and `children` (the count); `roots`: the open roots, `{"root", "node"}`, the current one first; `width`, `height`, `scale`, `frame` |
 | `events` | `since` (a `seq`, default 0), `limit` (the newest N) | `events`: the logged records after `since`, oldest first, each `{"seq", "frame", "kind", "target", "path"}` plus `x`, `y` (pointer, wheel and scroll records), `modifiers`, `key` and `value` (input records) where they apply; `next`: the `seq` the next record gets |
-| `program` | | `attached`; `steps` held with the `first` and `last` seq; the `model` now, as text; `subscriptions`; `stats`: `renders`, `dispatches`, `messages`, `commands`, `mutations`, `nodes`, `reused` |
-| `messages` | `since` (a `seq`), `limit` | `messages`: the steps after `since`, oldest first, each `{"seq", "time", "cause", "message", "commands", "changed"}`; `next` |
-| `model` | `seq` (default: the last step) | `model`: the model after that step, one line per field; `diff`: `{"op": " "\|"+"\|"-", "line"}` against the step before; `changed` (lines) |
 | `frames` | `since` (a frame number), `limit` | `frames`: one per frame drawn, `{"frame", "layoutMs", "paintMs", "layoutSkipped", "layoutPasses", "repainted", "replayed", "fragments", "primitives", "glyphs", "nodes"}`; `count`, `slowestMs`, `averageMs` (times are 0 when the host does not time frames) |
 | `styles` | target | `node`, and its style patches as declarations: `base`, `hover`, `active`, `focus`, `focus-visible` |
 | `setStyle` | target, `style` (`"width: 200px; color: red"`), `state` (default `base`), `replace` | `node`, `state`, `style` as set, `edited` (node and state pairs edited so far); a declaration that does not parse is an error and changes nothing |
 | `resetStyles` | | `restored`: every edit undone |
 | `pickMode` | `on` (left out: just asks) | `on`; `picked`: the node the last pick chose. While on, the app's own pointer highlights what it is over and the next click selects it instead of reaching the app |
 | `audit` | target (optional, a subtree) | `issues`: `{"rule", "message", "node"}` for `unnamed`, `no-role`, `not-focusable`, `small-target` (under 24 by 24) and `contrast` (under 4.5, or 3 for large text); `count`, `checked` |
+| `viewEvents` | `topic` (an extension view topic), `events` (records, see `remote.silk`) | `queued`: the records queued for the view (none while nobody has it open) |
+| `<id>.<command>` | the extension's | the extension's, when the app next serves it (see Extensions) |
 
-The program commands answer for what the host reported: `Inspector.report` takes a
-`ProgramLog` (ui-app's window host fills it from the program's journal after every step) and
-`inspector.timed(layout, paint)` gives the frame about to be recorded its times. A host that
-reports nothing answers `"attached": false` and frames without times. Style edits live in the tree
-like any patch; the app's next render of that node's style wins over them.
+`inspector.timed(layout, paint)` gives the frame about to be recorded its times; a host that
+does not time its frames records them without. Style edits live in the tree like any patch; the
+app's next render of that node's style wins over them.
+
+### Extensions
+
+The inspector knows the tree and nothing else: a framework (or any code that drives the tree)
+adds what it knows through an extension (`extension.silk`). It registers once and is served
+from the app's loop, on the app's thread:
+
+```silk
+let mut info = run Extension.make("router", "1.0")
+run info.command("routes")                       // served as router.routes
+run info.topic("navigated")                      // pushed as router.navigated
+run info.tool("routes", "Routes", "The app's routes.", "", true)  // its MCP description
+run info.panel("routes", "Routes", "routes", "navigated", false)  // a devtools tab, data only
+run inspector.extend(move info)
+...
+// on every turn of the loop, while the inspector is on:
+run inspector.serveExtension("router", &mut router)  // router: an ExtensionHandler
+```
+
+`ExtensionHandler` has three methods: `command(name, request, out)` writes a whole reply line
+(`reply.begin` … `reply.finish`) or returns false for a command it does not know; `topics(news)`
+posts the topics that changed (`news.post("navigated", "{\"to\":\"/a\"}")`); `view(panel, view)`
+renders a panel's view. The last two do nothing by default.
+
+- **Commands** are served as `<id>.<command>`. Such a request waits until the app next serves
+  the extension (`pollInterval` is 0 meanwhile), and the reply goes to the session that asked;
+  a protocol 2 connection stays open until then. An unknown command of a known extension is
+  answered `unknown cmd` at once.
+- **Topics** are pushed as `{"event":"<id>.<topic>","frame",...members}` to the sessions that
+  subscribed, at most once a frame as the inspector's own; news nobody subscribed to is dropped.
+- **Panels** have two faces. `data` names a command whose reply is the panel's JSON: devtools
+  show it with a generic view, agents read it with the command, and `topic` names the topic that
+  says it changed. A panel with a view renders itself: while some session subscribes to
+  `<id>.view.<panel>`, `view` gets an open `View` and each `view.send(batch)` goes to those
+  sessions as `{"event":"<id>.view.<panel>","frame","format":1,"seq","reset","mutations":[...]}`;
+  `fresh` (and `"reset": true` on the batch) means a session opened it since the last turn, so
+  the whole view goes from nothing. The records a client sends back with `viewEvents` come out of
+  `view.takeEvents`, with the view's own ids. Nobody subscribed: the view is told it is closed,
+  and should cost nothing.
+
+`hello` lists the extensions: `{"id","version","commands","topics","tools","panels"}`, names
+without the id; a tool is `{"command","title","description","inputSchema","readOnly"}`, a panel
+`{"id","title","data","topic","view"}` (`view` is its view topic, the others are there when it
+has them). `mutationFormat` is the version of the batch format (`remote.silk`): mutations as
+JSON objects with an `op`, styles as CSS text; root options, resources, canvases, grids,
+anchors and virtual lists do not travel, so a remote view is drawn with the client's fonts,
+images and look.
+
+silk-ui's own extension, `silk-ui` (a program's messages and model, and its Program panel), is
+in [ui-app-inspect](../../app/inspect); the window host registers and serves it as any framework
+would.
 
 `key` down/up tracks held Shift/Control/Alt/Meta for subsequent commands that omit `modifiers`. Explicit `modifiers` overrides the event snapshot.
 
@@ -242,6 +292,14 @@ silk task native inspect      # the CLI drives the demo in a window
   not logged, five changes and frames of it push nothing while a change to the app pushes
   `tree`, and the inspector is off again once the client closes its end.
 - The MCP bridge over the same fixture (see [ui-inspect-mcp](../mcp/README.md#tests)).
+- Extensions, with a notes extension that belongs to no framework (`extensions.silk`): `hello`
+  lists it and names its commands and topics in full; a command waits for the extension and its
+  reply reaches the session that asked, a one-shot session too; unknown commands and prefixes;
+  a data panel's command; a topic pushed once a frame, held for the next, and not at all when
+  nothing changed; a view that renders only while open, from nothing when opened, whose batch
+  replays into another tree and whose click comes back through `viewEvents`; the batch and event
+  formats read back to the same text; MCP tools listed from `hello` and called, a call before
+  the list learning them first.
 - `demo inspect` (CI job `demo` in ui-inspect.yml): snapshot, click New by role and name, wait
   for the new row, highlight Archive, inspect it, screenshot to a PNG.
 
@@ -252,9 +310,10 @@ silk task native inspect      # the CLI drives the demo in a window
 - A connection costs two pump threads, besides the one accept thread. Closing the inspector
   waits for them, up to a read pause (0.2 s).
 - `type` sends `TextInput` records (Enter and Tab for newlines and tabs); IME preedit is not driven.
-- The program log keeps the last 200 steps and the timeline the last 240 frames. A model is
-  text (what `show` prints), so `model` diffs lines, not values, and there is no time travel:
-  an old model can be read, not put back.
+- The timeline keeps the last 240 frames.
+- An extension is served on the app's thread when the app's loop serves it: its replies and
+  views come a turn of the loop after the request, never on the spot (a client in the app's
+  process sends such requests without waiting, `Link.ask` in the devtools).
 - The event log keeps the last 500 records the app took (`Inspector.observe`); input the
   tree did not queue a record for (no node listens) is not in it. No session recording over
   the wire yet; sessions are still in memory

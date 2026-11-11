@@ -9,7 +9,7 @@ native window (macOS, Windows, X11, Wayland) through [modules/platform/window](h
 | --- | --- |
 | [modules/text](text) | Text for layout: font fallback, line breaking, bidi, shaping |
 | [modules/tree](tree) | The retained tree: nodes, typed styles, layout, paint, input, focus, scrolling, text editing. Driven by plain-data `Mutation`s, reports plain-data `Event`s |
-| [modules/app](app) | The framework: model, messages, `view`, `update`, commands and subscriptions; the view is diffed into tree mutations |
+| [modules/app](app) | The framework: model, messages, `view`, `update`, commands and subscriptions; the view is diffed into tree mutations. Its inspector extension is [modules/app/inspect](app/inspect) |
 | [modules/components](components) | Buttons, checkboxes, switches, sliders, fields, lists, tabs, menus, selects, dialogs, popovers, tooltips, and a theme |
 | [modules/inspect](inspect) | Queries, highlights and recording; a socket protocol with a CLI, an MCP server for agents, and a devtools window |
 | [examples/notes](https://github.com/silk-lang/nonstd/tree/7d6c3693a9ad1fec24127985626ab4224f9f1995/examples/notes) | The example app: a notes app with a file, search, sorting, an editor, a dialog, shortcuts and a dark theme |

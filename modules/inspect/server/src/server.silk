@@ -21,10 +21,13 @@
 //! [`Inspector.openLocal`] gives it the other end of a [`MemoryChannel`] session, served on the
 //! spot by [`Inspector.serveLocal`]. The inspector is on while such a session is open, socket or
 //! not, and that client's roots can be left out of everything it serves ([`Inspector.hide`]).
+//!
+//! A framework extends the inspector with [`Inspector.extend`] and serves its extension from the
+//! app's loop with [`Inspector.serveExtension`] (see `extension.silk`).
 import protocol { Protocol }
-import program { ProgramLog }
 import channel { Channel, MemoryChannel, MemoryPair, Wake, NoWake }
 import session { Session }
+import extension { Extension, ExtensionHandler, Outgoing }
 import ui_tree.input { Input }
 import ui_tree.engine { UiTree }
 import ui_scene.scene { Scene }
@@ -214,6 +217,8 @@ pub struct Inspector {
   turn: usize,
   /// Requests served, for tests and logs.
   pub served: u64,
+  /// The key the next session gets.
+  nextKey: u64,
 }
 
 /// A session, with this thread's end of its channel.
@@ -265,7 +270,49 @@ impl Inspector {
       woken: false,
       turn: 0,
       served: 0,
+      nextKey: 1,
     }
+  }
+
+  /// A new session's key.
+  fn key(self: &mut Self) -> u64 {
+    let key = self.nextKey
+    self.nextKey = self.nextKey + 1
+    return key
+  }
+
+  /// Registers extension `info` (see `extension.silk`). Call it once, before the loop starts;
+  /// it works on an inspector that is off, so a session opened later finds it.
+  pub effect fn extend(self: &mut Self, info: Extension) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.protocol.extend(move info)
+  }
+
+  /// Serves extension `id` with `handler`, from the app's loop on every turn while the inspector
+  /// is on: answers the requests that wait for it, sends the replies to the sessions that asked,
+  /// and pushes what its topics and views have to say. Nothing happens while the inspector is
+  /// off.
+  pub effect fn serveExtension<X: ExtensionHandler>(
+    self: &mut Self,
+    id: string,
+    handler: &mut X,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.enabled() {
+      return ()
+    }
+    run self.protocol.serveExtension(id, &mut handler)
+    let mut j: usize = 0
+    while j < self.sessions.length() {
+      let served = &mut self.sessions.asMutSlice()[j]
+      run served.session.deliver(&mut self.protocol)
+        |> Effect.provideMut<Channel>(&mut served.channel)
+      j = j + 1
+    }
+    run self.publishNews()
+    self.release()
   }
 
   /// Starts the inspector when the build and `SILK_UI_INSPECT` allow it, and returns one that
@@ -374,7 +421,9 @@ impl Inspector {
     ? &mut Allocator {
     let pair = run MemoryChannel.pair()
     let MemoryPair { first, second } = move pair
-    run self.sessions.append(Served { session: Session.open(), channel: move first, local: true })
+    let mut session = Session.open()
+    session.key = self.key()
+    run self.sessions.append(Served { session: move session, channel: move first, local: true })
     return move second
   }
 
@@ -469,6 +518,10 @@ impl Inspector {
   /// served. None when the inspector is off, or when it wakes the loop itself (`wakeWith`) and
   /// no request waits: wait as usual. 0 while requests wait, 0.02 without a wake.
   pub fn pollInterval(self: &Self) -> Option<f64> {
+    if self.enabled() && self.protocol.extensions.pending() {
+      // Requests wait for an extension, which the loop serves on its next turn.
+      return Option<f64>.some(0.0)
+    }
     if !self.enabled() || (self.listener.isNone() && self.acceptor.isNone()) {
       // Off, or serving only clients in this process, which are served on the spot.
       return Option<f64>.None
@@ -568,8 +621,11 @@ impl Inspector {
     let state = guard.getMut()
     while state.arrived.length() != 0 {
       let channel = state.arrived.remove(0)
+      let mut session = Session.make()
+      session.key = self.nextKey
+      self.nextKey = self.nextKey + 1
       run self.sessions.append(
-        Served { session: Session.make(), channel: move channel, local: false },
+        Served { session: move session, channel: move channel, local: false },
       )
     }
   }
@@ -602,6 +658,7 @@ impl Inspector {
         || !self.sessions.asSlice()[i].channel.open()
       if over {
         let mut gone = self.sessions.remove(i)
+        gone.session.leave(&mut self.protocol)
         gone.channel.close()
       } else {
         i = i + 1
@@ -614,6 +671,7 @@ impl Inspector {
   effect fn publish(self: &mut Self, tree: &UiTree<'_>) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
+    run self.publishNews()
     let mut wanted: u32 = 0
     let list = self.sessions.asSlice()
     let mut i: usize = 0
@@ -634,6 +692,23 @@ impl Inspector {
       let served = &mut self.sessions.asMutSlice()[j]
       run served.session.publish(&self.protocol, tree, topics)
         |> Effect.provideMut<Channel>(&mut served.channel)
+      j = j + 1
+    }
+  }
+
+  /// Pushes what extensions have to say to the sessions that subscribed to it.
+  effect fn publishNews(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut news = List<Outgoing>.make()
+    run self.protocol.extensions.takeNews(&mut news)
+    if news.length() == 0 {
+      return ()
+    }
+    let mut j: usize = 0
+    while j < self.sessions.length() {
+      let served = &mut self.sessions.asMutSlice()[j]
+      run served.session.publishNews(&news) |> Effect.provideMut<Channel>(&mut served.channel)
       j = j + 1
     }
   }
@@ -738,12 +813,7 @@ impl Inspector {
       return false
     }
     return self.protocol.dispatched || self.protocol.repaint || self.protocol.changes.held != 0
-  }
-
-  /// The program log, for a host that runs a program to fill: its steps, subscriptions and
-  /// counters answer the `program`, `messages` and `model` commands.
-  pub fn program(self: &mut Self) -> &mut ProgramLog {
-    return &mut self.protocol.program
+      || self.protocol.extensions.held
   }
 
   /// Says how long the frame about to be handed to `afterFrame` took, in milliseconds, for
