@@ -1,6 +1,7 @@
-//! The highlight overlay: the box model of chosen nodes drawn as devtools draws it (content
-//! blue, padding green, border yellow, margin orange), in an isolated layer on top of the
-//! tree's frame. The tree's own scene and paint caches are never touched.
+//! The highlight overlay, in an isolated layer on top of the tree's frame: the nodes pointed at
+//! washed in cyan with a hairline around their border box, the selected ones ringed in amber a
+//! little outside it, as the devtools draw them. The tree's own scene and paint caches are never
+//! touched. [`boxModels`] gives the four boxes for clients that show them in numbers.
 import ui_tree.engine { UiTree }
 import ui_tree.node { NONE }
 import ui_tree.inspect { FragmentInfo, fragmentsOf }
@@ -15,6 +16,7 @@ import silk.geometry.insets { Insets }
 import silk.geometry.rect { Rect }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.f32
+import silk.num.u32
 
 /// The four boxes of one fragment of a node, in CSS pixels of the viewport.
 pub struct BoxModel {
@@ -82,41 +84,66 @@ fn merged(a: Rect<f32>, b: Rect<f32>) -> Rect<f32> {
   )
 }
 
-/// The overlay's colors. [`HighlightColors.devtools`] are Chrome's.
+/// The overlay's colors and widths. [`HighlightColors.devtools`] are the devtools': a pointed-at
+/// node is washed in cyan with a hairline around its border box, a selected one gets an amber
+/// ring a little outside it.
 pub struct HighlightColors {
-  pub content: Rgba<f32>,
-  pub padding: Rgba<f32>,
-  pub border: Rgba<f32>,
-  pub margin: Rgba<f32>,
+  /// Over the border box of a highlighted node.
+  pub fill: Rgba<f32>,
+  /// Just outside it, `outlineWidth` wide.
+  pub outline: Rgba<f32>,
+  pub outlineWidth: f32,
+  /// The ring of a selected node: `ringWidth` wide, `ringOffset` outside its border box.
+  pub ring: Rgba<f32>,
+  pub ringWidth: f32,
+  pub ringOffset: f32,
 }
 
 impl Copy for HighlightColors {}
 
-fn rgba(r: f32, g: f32, b: f32, a: f32) -> Rgba<f32> {
-  return Rgba<f32> { r: r / 255.0, g: g / 255.0, b: b / 255.0, a: a }
+/// `0xRRGGBB` with alpha `a` (0 to 255).
+fn hex(value: u32, a: f32) -> Rgba<f32> {
+  let r = u32.toF32(u32.bitAnd(u32.shiftRight(value, 16), 255)) / 255.0
+  let g = u32.toF32(u32.bitAnd(u32.shiftRight(value, 8), 255)) / 255.0
+  let b = u32.toF32(u32.bitAnd(value, 255)) / 255.0
+  return Rgba<f32> { r: r, g: g, b: b, a: a / 255.0 }
 }
 
 impl HighlightColors {
   pub fn devtools() -> HighlightColors {
     return HighlightColors {
-      content: rgba(111.0, 168.0, 220.0, 0.66),
-      padding: rgba(147.0, 196.0, 125.0, 0.55),
-      border: rgba(255.0, 229.0, 153.0, 0.66),
-      margin: rgba(246.0, 178.0, 107.0, 0.66),
+      fill: hex(0x5AC8FA, 71.0),
+      outline: hex(0x5AC8FA, 255.0),
+      outlineWidth: 1.0,
+      ring: hex(0xFFB020, 255.0),
+      ringWidth: 2.0,
+      ringOffset: 2.0,
     }
   }
 }
 
 /// What to highlight.
 pub struct Highlight {
-  /// Client ids; unknown ids and nodes without a box are skipped.
+  /// Client ids of the nodes pointed at (washed and outlined); unknown ids and nodes without a
+  /// box are skipped.
   pub nodes: List<u32>,
+  /// Client ids of the selected nodes (ringed).
+  pub selected: List<u32>,
   pub colors: HighlightColors,
 }
 
 impl Highlight {
   pub fn make() -> Highlight {
-    return Highlight { nodes: List<u32>.make(), colors: HighlightColors.devtools() }
+    return Highlight {
+      nodes: List<u32>.make(),
+      selected: List<u32>.make(),
+      colors: HighlightColors.devtools(),
+    }
+  }
+
+  /// Whether it draws anything.
+  pub fn any(self: &Self) -> bool {
+    return self.nodes.length() != 0 || self.selected.length() != 0
   }
 
   /// A highlight of node `id` alone.
@@ -137,13 +164,15 @@ fn transparent() -> Rgba<f32> {
   return Rgba<f32> { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }
 }
 
-/// The ring between `outer` and `inner` (device pixels) as one bordered quad.
+/// The ring between `outer` and `inner` (device pixels) as one bordered quad, its outer
+/// corners rounded by `radii`.
 effect fn ring(
   scene: &mut Scene,
   outer: Rect<f32>,
   inner: Rect<f32>,
   mask: ContentMask,
   color: Rgba<f32>,
+  radii: Corners<f32>,
 ) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
@@ -159,7 +188,7 @@ effect fn ring(
       bounds: outer,
       mask: mask,
       background: Background.solid(transparent()),
-      cornerRadii: Corners<f32>.uniform(0.0),
+      cornerRadii: radii,
       borderWidths: Insets<f32>.new(top, right, bottom, left),
       borderColor: color,
       borderStyle: BorderStyle.Solid,
@@ -167,8 +196,37 @@ effect fn ring(
   )
 }
 
+/// `r` grown by `by` on every side.
+fn grown(r: Rect<f32>, by: f32) -> Rect<f32> {
+  return Rect<f32>.new(r.xMin - by, r.yMin - by, r.xMax + by, r.yMax + by)
+}
+
+/// Node `id`'s corner radii in device pixels at scale `s`, grown by `by` where they round (an
+/// outline follows the corner it goes round, as CSS draws one).
+fn radiiOf(tree: &UiTree<'_>, id: u32, s: f32, by: f32) -> Corners<f32> {
+  let slot = tree.slotOf(id)
+  if slot == NONE {
+    return Corners<f32>.uniform(0.0)
+  }
+  let r = tree.node(slot).computed.paint.radii
+  return Corners<f32>.new(
+    roundedBy(r.topLeft, s, by),
+    roundedBy(r.topRight, s, by),
+    roundedBy(r.bottomRight, s, by),
+    roundedBy(r.bottomLeft, s, by),
+  )
+}
+
+fn roundedBy(radius: f32, s: f32, by: f32) -> f32 {
+  if radius <= 0.0 {
+    return 0.0
+  }
+  return radius * s + by
+}
+
 /// Adds the highlight to `scene` (not finished) as one isolated layer over the whole viewport,
-/// in the device pixels of the tree's last frame.
+/// in the device pixels of the tree's last frame: the selected nodes' rings, then the nodes
+/// pointed at, washed and outlined, on top.
 pub effect fn paintHighlight(tree: &UiTree<'_>, highlight: &Highlight, scene: &mut Scene) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
@@ -178,6 +236,28 @@ pub effect fn paintHighlight(tree: &UiTree<'_>, highlight: &Highlight, scene: &m
   drop run scene.pushIsolatedLayer(viewport, mask, Isolation { opacity: 1.0, blend: 0 })
   let colors = highlight.colors
   let mut models = List<BoxModel>.make()
+  let chosen = highlight.selected.asSlice()
+  let mut k: usize = 0
+  while k < chosen.length {
+    run boxModels(tree, chosen[k], &mut models)
+    let list = models.asSlice()
+    let mut j: usize = 0
+    while j < list.length {
+      let border = scaled(list[j].border, s)
+      let inner = grown(border, colors.ringOffset * s)
+      let reach = (colors.ringOffset + colors.ringWidth) * s
+      run ring(
+        &mut scene,
+        grown(inner, colors.ringWidth * s),
+        inner,
+        mask,
+        colors.ring,
+        radiiOf(tree, chosen[k], s, reach),
+      )
+      j = j + 1
+    }
+    k = k + 1
+  }
   let ids = highlight.nodes.asSlice()
   let mut i: usize = 0
   while i < ids.length {
@@ -185,17 +265,20 @@ pub effect fn paintHighlight(tree: &UiTree<'_>, highlight: &Highlight, scene: &m
     let list = models.asSlice()
     let mut j: usize = 0
     while j < list.length {
-      let m = list[j]
-      let content = scaled(m.content, s)
-      let padding = scaled(m.padding, s)
-      let border = scaled(m.border, s)
-      let margin = scaled(m.margin, s)
-      if content.xMax > content.xMin && content.yMax > content.yMin {
-        drop run scene.quad(Quad.fill(content, mask, Background.solid(colors.content)))
+      let border = scaled(list[j].border, s)
+      if border.xMax > border.xMin && border.yMax > border.yMin {
+        let mut wash = Quad.fill(border, mask, Background.solid(colors.fill))
+        wash.cornerRadii = radiiOf(tree, ids[i], s, 0.0)
+        drop run scene.quad(wash)
       }
-      run ring(&mut scene, padding, content, mask, colors.padding)
-      run ring(&mut scene, border, padding, mask, colors.border)
-      run ring(&mut scene, margin, border, mask, colors.margin)
+      run ring(
+        &mut scene,
+        grown(border, colors.outlineWidth * s),
+        border,
+        mask,
+        colors.outline,
+        radiiOf(tree, ids[i], s, colors.outlineWidth * s),
+      )
       j = j + 1
     }
     i = i + 1

@@ -55,7 +55,7 @@ match in tree order wins.
 | `ui_query` | `query` | the matching nodes as JSON (id, kind, role, name, rect, focus, hover) |
 | `ui_inspect` | `inspect` | the devtools-style node view as text |
 | `ui_pick` | `pick` | the node at `x`, `y` and the hit path |
-| `ui_highlight` | `highlight` | box model overlay on `nodes` or the target matches; neither clears it |
+| `ui_highlight` | `highlight` | the devtools highlight on `nodes` or the target matches, and a selection ring on `selected`; none clears it |
 | `ui_screenshot` | `screenshot` | the frame (or one node, cropped) as **image content** (PNG) |
 | `ui_capture` | repeated `screenshot` | one PNG mosaic; `count` (default 10), `intervalMs` (100), `columns` (up to 6), `tileWidth` (480), optional target |
 | `ui_pointer` | `pointer` | individual `down` / `move` / `up`; supports drags through normal pointer capture |

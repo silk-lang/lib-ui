@@ -140,7 +140,7 @@ topic per frame:
 | `frame` | a frame of the current root was drawn | `width`, `height`, `scale`, `nodes` |
 | `events` | the event log has new records | `next`: the `seq` the next record gets |
 | `roots` | a root opened or closed | `roots`, as `tree` lists them |
-| `highlight` | the highlight changed | `nodes` |
+| `highlight` | the highlight changed | `nodes`, `selected` |
 | `pick` | the picker turned on or off, or picked | `on`, `picked` (an id) |
 | `edits` | the edit log changed (see Style edits and the edit log) | `seq` (the log's), `open` (entries open) |
 
@@ -156,14 +156,14 @@ Node objects in replies are `{"id", "kind", "role", "name", "testId", "x", "y", 
 
 | cmd | members | reply |
 | --- | --- | --- |
-| `hello` | `protocol` (3 opens a session), `client`, `wants` (topics) | `protocol` (3), `commands`, `capabilities` (`commands`, `topics`, `sessions`; the extensions' with their full names), `mutationFormat` (1), `extensions` (see Extensions), `width`, `height`, `scale`, `frame`, `root`, `roots`, `hidden` (roots left out), `nodes`, `highlight` |
+| `hello` | `protocol` (3 opens a session), `client`, `wants` (topics) | `protocol` (3), `commands`, `capabilities` (`commands`, `topics`, `sessions`; the extensions' with their full names), `mutationFormat` (1), `extensions` (see Extensions), `width`, `height`, `scale`, `frame`, `root`, `roots`, `hidden` (roots left out), `nodes`, `highlight`, `selected` |
 | `subscribe` | `topics` | `topics`: subscribed now (sessions only) |
 | `unsubscribe` | `topics` | `topics`: subscribed now (sessions only) |
 | `snapshot` | target (optional, a subtree), `styles` | `text`: `describe` output, `frame` |
 | `query` | target, `limit` | `count`, `nodes` (node objects, tree order) |
 | `inspect` | target, `patches`, `computed` | `node`, `text`: the devtools-style node view; `box`: the `margin`, `border`, `padding` and `content` rects of the first fragment and the `fragments` count (left out when the node has no box) |
 | `pick` | `x`, `y` | `node` (what the element picker selects), `path` (ids hit testing reaches) |
-| `highlight` | `nodes` (ids) or a target (all matches); none clears it | `nodes` highlighted |
+| `highlight` | `nodes` (ids) or a target (all matches), washed and outlined; `selected` (ids), ringed; none clears it | `nodes` and `selected` highlighted |
 | `screenshot` | target (optional: that node alone, cropped), `highlight` (default true), `maxWidth` (optional 1–4096, reduce before encoding) | `png` (Base64), `width`, `height` (device pixels), `scale`, `frame`, `node` |
 | `click` | target or `x`, `y`; `count`, `modifiers` | `node`, `x`, `y` |
 | `hover` | target or `x`, `y`; `modifiers` | `node`, `x`, `y` |
