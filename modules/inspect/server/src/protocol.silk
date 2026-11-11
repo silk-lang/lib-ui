@@ -51,6 +51,17 @@ import ui_scene.scene { Scene }
 import capture { reduced }
 import nodes { nodeObject, nodeMembers }
 import program { ProgramLog, Timeline }
+import topics {
+  Changes,
+  TOPIC_TREE,
+  TOPIC_FRAME,
+  TOPIC_EVENTS,
+  TOPIC_ROOTS,
+  TOPIC_HIGHLIGHT,
+  TOPIC_PICK,
+  TOPIC_COUNT,
+  TOPIC_NAMES
+}
 import tools { StyleEdits, audit, stateNamed, styles }
 import vector.geometry_error { GeometryError }
 import vector.pixmap { Pixmap }
@@ -70,7 +81,10 @@ import silk.num.usize
 import silk.text.string { String }
 
 /// The protocol version `hello` reports.
-pub const VERSION: u32 = 2
+pub const VERSION: u32 = 3
+
+/// The commands `hello` lists. `subscribe` and `unsubscribe` are a session's (see `session.silk`).
+const COMMANDS: string = "[\"hello\",\"subscribe\",\"unsubscribe\",\"tree\",\"events\",\"snapshot\",\"query\",\"inspect\",\"pick\",\"highlight\",\"screenshot\",\"click\",\"hover\",\"scroll\",\"press\",\"pointer\",\"key\",\"type\",\"wait\",\"stats\",\"program\",\"messages\",\"model\",\"frames\",\"styles\",\"setStyle\",\"resetStyles\",\"pickMode\",\"audit\"]"
 
 /// How long `wait` waits when the request names no `timeout`, in milliseconds.
 pub const DEFAULT_TIMEOUT: u64 = 5000
@@ -203,6 +217,8 @@ pub struct Protocol {
   pub picked: u32,
   /// The release of the press that picked is not the app's either.
   swallowUp: bool,
+  /// What sessions were last told (see `topics.silk`).
+  pub changes: Changes,
 }
 
 impl Protocol {
@@ -226,6 +242,7 @@ impl Protocol {
       picking: false,
       picked: NONE,
       swallowUp: false,
+      changes: Changes.make(),
     }
   }
 
@@ -491,14 +508,81 @@ impl Protocol {
     run begin(&mut out, request)
     run putInt(&mut out, "protocol", u32.toU64(VERSION))
     run putKey(&mut out, "commands")
-    run out.append(
-      "[\"hello\",\"tree\",\"events\",\"snapshot\",\"query\",\"inspect\",\"pick\",\"highlight\",\"screenshot\",\"click\",\"hover\",\"scroll\",\"press\",\"pointer\",\"key\",\"type\",\"wait\",\"stats\",\"program\",\"messages\",\"model\",\"frames\",\"styles\",\"setStyle\",\"resetStyles\",\"pickMode\",\"audit\"]",
-    )
+    run out.append(COMMANDS)
+    run putKey(&mut out, "capabilities")
+    run out.append("{\"commands\":")
+    run out.append(COMMANDS)
+    run out.append(",\"topics\":[")
+    let mut i: usize = 0
+    while i < TOPIC_COUNT {
+      if i != 0 {
+        run out.append(",")
+      }
+      run writeString(&mut out, TOPIC_NAMES[i])
+      i = i + 1
+    }
+    run out.append("],\"sessions\":true}")
+    run putKey(&mut out, "extensions")
+    run out.append("[]")
     run frameMembers(tree, &mut out)
     run putInt(&mut out, "root", u32.toU64(tree.rootId()))
+    run rootMembers(tree, &mut out)
     run putInt(&mut out, "nodes", usize.toU64(tree.nodeCount()))
     run putIds(&mut out, "highlight", &self.highlight.nodes)
     run putFlag(&mut out, "program", self.program.attached)
+    run finish(&mut out)
+  }
+
+  /// The topics among `wanted` (`TOPIC_*` bits) that changed since sessions were last told
+  /// and were not told in this frame yet, marked told now.
+  pub effect fn takeChanges(self: &mut Self, tree: &UiTree<'_>, wanted: u32) -> u32
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run self.changes.take(tree, self.nextSeq, wanted)
+  }
+
+  /// Writes the notification line for `topic` (one `TOPIC_*` bit): `{"event": <name>, "frame",
+  /// ...}` with what a client needs to decide what to read again. `tree` and `frame` carry the
+  /// viewport and the node count; `events` the next `seq`; `roots` the open roots; `highlight`
+  /// the highlighted nodes; `pick` whether the picker is on and what it picked.
+  pub effect fn notification(self: &Self, tree: &UiTree<'_>, topic: u32, out: &mut String) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    out.clear()
+    run out.append("{\"event\":")
+    let mut i: usize = 0
+    while i < TOPIC_COUNT && u32.shiftLeft(1, usize.toU32(i)) != topic {
+      i = i + 1
+    }
+    run writeString(
+      &mut out,
+      if i < TOPIC_COUNT {
+        TOPIC_NAMES[i]
+      } else {
+        ""
+      },
+    )
+    if topic == TOPIC_TREE || topic == TOPIC_FRAME {
+      run frameMembers(tree, &mut out)
+      run putInt(&mut out, "nodes", usize.toU64(tree.nodeCount()))
+      if topic == TOPIC_TREE {
+        run putInt(&mut out, "revision", tree.semanticRevision)
+      }
+    } else {
+      run putInt(&mut out, "frame", tree.stats.frame)
+    }
+    if topic == TOPIC_EVENTS {
+      run putInt(&mut out, "next", self.nextSeq)
+    } else if topic == TOPIC_ROOTS {
+      run rootMembers(tree, &mut out)
+    } else if topic == TOPIC_HIGHLIGHT {
+      run putIds(&mut out, "nodes", &self.highlight.nodes)
+    } else if topic == TOPIC_PICK {
+      run putFlag(&mut out, "on", self.picking)
+      if self.picked != NONE {
+        run putInt(&mut out, "picked", u32.toU64(self.picked))
+      }
+    }
     run finish(&mut out)
   }
 
@@ -551,6 +635,9 @@ impl Protocol {
       if !on && self.picking {
         run self.point(tree, NONE)
       }
+      if on != self.picking {
+        self.changes.pick = true
+      }
       self.picking = on
     }
     run begin(&mut out, request)
@@ -577,6 +664,7 @@ impl Protocol {
       run self.composeOverlay(tree)
     }
     self.repaint = true
+    self.changes.highlight = true
   }
 
   /// Whether window input goes through [`Protocol.pickInput`] first.
@@ -613,6 +701,7 @@ impl Protocol {
         run self.point(tree, chosen)
         self.picking = false
         self.swallowUp = true
+        self.changes.pick = true
         return true
       }
       Input.PointerLeave => {
@@ -623,6 +712,7 @@ impl Protocol {
         if String.view(&key) == "Escape" {
           run self.point(tree, NONE)
           self.picking = false
+          self.changes.pick = true
           return true
         }
         return false
@@ -791,6 +881,7 @@ impl Protocol {
       i = i + 1
     }
     self.repaint = true
+    self.changes.highlight = true
     if self.highlight.nodes.length() != 0 {
       run self.composeOverlay(tree)
     }

@@ -1,0 +1,187 @@
+//! Topics: what a session can subscribe to, so the app tells it when something changed instead
+//! of the client asking again and again. Each is a bit; [`Changes`] keeps what was last
+//! published, so a topic goes out at most once a frame.
+import ui_tree.engine { UiTree }
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.usize
+
+/// The tree changed: nodes, their text, styles or geometry (the tree's `semanticRevision`).
+pub const TOPIC_TREE: u32 = 1
+
+/// A frame was drawn.
+pub const TOPIC_FRAME: u32 = 2
+
+/// The event log has new records.
+pub const TOPIC_EVENTS: u32 = 4
+
+/// A root opened or closed.
+pub const TOPIC_ROOTS: u32 = 8
+
+/// The highlight changed.
+pub const TOPIC_HIGHLIGHT: u32 = 16
+
+/// The picker turned on or off, or picked a node.
+pub const TOPIC_PICK: u32 = 32
+
+/// Every topic, in the order of [`TOPIC_NAMES`].
+pub const TOPIC_COUNT: usize = 6
+
+/// The topics' names on the wire, bit 0 first.
+pub const TOPIC_NAMES: [string<'static>; 6] = [
+  "tree",
+  "frame",
+  "events",
+  "roots",
+  "highlight",
+  "pick",
+]
+
+/// The bit of the topic called `name`, or 0 when there is none.
+pub fn topicNamed(name: string) -> u32 {
+  let mut i: usize = 0
+  while i < TOPIC_COUNT {
+    if TOPIC_NAMES[i] == name {
+      return u32.shiftLeft(1, usize.toU32(i))
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+/// Every topic's bit.
+pub fn allTopics() -> u32 {
+  return u32.shiftLeft(1, usize.toU32(TOPIC_COUNT)) - 1
+}
+
+const NEVER: u64 = 18446744073709551615
+
+/// What was last published for each topic, and the flags the protocol sets for the changes the
+/// tree does not count itself.
+pub struct Changes {
+  /// The tree's `semanticRevision` last published.
+  revision: u64,
+  /// The frame last published.
+  frame: u64,
+  /// The event log's next `seq` last published.
+  nextSeq: u64,
+  /// The open roots last published, as (root, node) pairs.
+  roots: List<u32>,
+  /// Set when the highlight changed, and when the picker did.
+  pub highlight: bool,
+  pub pick: bool,
+  /// The frame each topic was last published in.
+  sentAt: [u64; 6],
+  /// Topics that changed again in a frame that already published them: they go out with the
+  /// next frame, so the host should draw one.
+  pub held: u32,
+}
+
+impl Changes {
+  pub fn make() -> Changes {
+    return Changes {
+      revision: 0,
+      frame: NEVER,
+      nextSeq: 1,
+      roots: List<u32>.make(),
+      highlight: false,
+      pick: false,
+      sentAt: [NEVER, NEVER, NEVER, NEVER, NEVER, NEVER],
+      held: 0,
+    }
+  }
+
+  /// The topics among `wanted` that changed since they were last published and were not
+  /// published in this frame yet, marked published now. `nextSeq` is the event log's.
+  pub effect fn take(self: &mut Self, tree: &UiTree<'_>, nextSeq: u64, wanted: u32) -> u32
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let frame = tree.stats.frame
+    let mut changed: u32 = 0
+    if tree.semanticRevision != self.revision {
+      changed = changed | TOPIC_TREE
+    }
+    if frame != self.frame {
+      changed = changed | TOPIC_FRAME
+    }
+    if nextSeq != self.nextSeq {
+      changed = changed | TOPIC_EVENTS
+    }
+    if self.highlight {
+      changed = changed | TOPIC_HIGHLIGHT
+    }
+    if self.pick {
+      changed = changed | TOPIC_PICK
+    }
+    let mut roots = List<u32>.make()
+    if u32.bitAnd(wanted, TOPIC_ROOTS) != 0 {
+      run rootPairs(tree, &mut roots)
+      if !same(roots.asSlice(), self.roots.asSlice()) {
+        changed = changed | TOPIC_ROOTS
+      }
+    }
+    changed = u32.bitAnd(changed, wanted)
+    self.held = 0
+    let mut i: usize = 0
+    while i < TOPIC_COUNT {
+      let bit = u32.shiftLeft(1, usize.toU32(i))
+      if u32.bitAnd(changed, bit) != 0 && self.sentAt[i] == frame {
+        changed = u32.bitAnd(changed, u32.bitXor(bit, 0xFFFFFFFF))
+        self.held = self.held | bit
+      } else if u32.bitAnd(changed, bit) != 0 {
+        self.sentAt[i] = frame
+      }
+      i = i + 1
+    }
+    if u32.bitAnd(changed, TOPIC_TREE) != 0 {
+      self.revision = tree.semanticRevision
+    }
+    if u32.bitAnd(changed, TOPIC_FRAME) != 0 {
+      self.frame = frame
+    }
+    if u32.bitAnd(changed, TOPIC_EVENTS) != 0 {
+      self.nextSeq = nextSeq
+    }
+    if u32.bitAnd(changed, TOPIC_HIGHLIGHT) != 0 {
+      self.highlight = false
+    }
+    if u32.bitAnd(changed, TOPIC_PICK) != 0 {
+      self.pick = false
+    }
+    if u32.bitAnd(changed, TOPIC_ROOTS) != 0 {
+      self.roots = move roots
+    }
+    return changed
+  }
+}
+
+/// The open roots of `tree` as (root, node) pairs, the current one first.
+pub effect fn rootPairs(tree: &UiTree<'_>, out: &mut List<u32>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut roots = List<u32>.make()
+  run tree.openRoots(&mut roots)
+  out.clear()
+  let list = roots.asSlice()
+  let mut i: usize = 0
+  while i < list.length {
+    run out.append(list[i])
+    run out.append(tree.rootNode(list[i]))
+    i = i + 1
+  }
+}
+
+fn same(a: &[u32], b: &[u32]) -> bool {
+  if a.length != b.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < a.length {
+    if a[i] != b[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}

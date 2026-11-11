@@ -1,0 +1,562 @@
+//! Channels: what an inspector session's lines travel through. A [`Channel`] is one end of a
+//! two-way queue of lines. [`MemoryChannel`] is the pair of queues itself, for a client in the
+//! same process and for tests. [`SocketChannel`] is a memory channel whose other end a pump
+//! thread joins to a socket, so the code at either end only touches the queues and never waits
+//! for the network.
+//!
+//! Lines carry no newline. Everything crossing threads is allocated with the system allocator,
+//! whatever allocator the caller provides.
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.concurrency.sync { Arc, Mutex, Parker, Unparker }
+import silk.concurrency.thread { Transferable }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Drop }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.string { String, InvalidUtf8 }
+
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  import silk.concurrency.thread_native { JoinHandle, NativeThread, SpawnError }
+  import silk.io.byte_duplex { ByteDuplex, ByteIoError, ReadTransfer }
+  import silk.net.socket_native { Connection, ConnectionHalves }
+  import silk.system.monotonic_clock { MonotonicClock }
+  import silk.system.monotonic_clock_native { OsMonotonicClock }
+  import silk.system.system_clock { Instant }
+}
+
+/// The longest line a pump reads; a longer one ends the session.
+pub const MAX_LINE: usize = 1048576
+
+/// How long a pump's read waits before it looks whether the session is over, in nanoseconds.
+pub const READ_PAUSE: u64 = 200000000
+
+/// How long writing one line may take before the session is given up, in nanoseconds.
+pub const WRITE_TIMEOUT: u64 = 10000000000
+
+/// One end of a session's queue of lines: what the other end sends comes out of `receive`, and
+/// what this end sends goes to the other end.
+pub service Channel {
+  /// Takes the oldest line that came in into `line`. Never waits: false when none is there.
+  effect fn receive(line: &mut String) -> bool ! OutOfMemoryError ? &mut Channel | &mut Allocator
+
+  /// Queues `line` for the other end. False when the other end is gone.
+  effect fn send(line: string) -> bool ! OutOfMemoryError ? &mut Channel | &mut Allocator
+}
+
+/// Wakes a thread that sleeps until something comes, from any thread. The window host passes
+/// one that ends its wait for the next event.
+pub interface Wake {
+  fn wake(self: &Self) -> ()
+
+  /// Another handle that wakes the same thread.
+  fn copy(self: &Self) -> Self
+}
+
+/// A [`Wake`] that wakes nobody, for a thread that looks for lines on its own.
+pub struct NoWake {}
+
+impl Wake for NoWake {
+  fn wake(self: &Self) -> () {}
+
+  fn copy(self: &Self) -> NoWake {
+    return NoWake {}
+  }
+}
+
+/// What the two ends of a pair share.
+struct Pipe {
+  /// Lines on their way to the first end and to the second, oldest first.
+  toFirst: List<String>,
+  toSecond: List<String>,
+  /// An end that is done sends nothing more; an end that is gone takes nothing more.
+  firstDone: bool,
+  firstGone: bool,
+  secondDone: bool,
+  secondGone: bool,
+  /// Wakes the thread waiting at each end.
+  firstWaiter: Unparker,
+  secondWaiter: Unparker,
+}
+
+// The lines are allocated with the system allocator, and only moved in and out under the lock.
+impl Transferable for Pipe {}
+
+/// One end of an in-memory pair (see [`MemoryChannel.pair`]). It may move to another thread.
+pub struct MemoryChannel {
+  side: Side,
+  /// [`MemoryChannel.wait`] sleeps here.
+  parker: Parker,
+}
+
+/// The two ends of a [`MemoryChannel`].
+pub struct MemoryPair {
+  pub first: MemoryChannel,
+  pub second: MemoryChannel,
+}
+
+effect fn systemCopy(text: string) -> String
+  ! OutOfMemoryError {
+  let mut heap = Allocator.systemAllocatorProvider()
+  return run String.copy(text) |> Effect.provideMut<Allocator>(&mut heap)
+}
+
+/// One side of a pipe, for the code here that acts for an end without owning it.
+struct Side {
+  pipe: Arc<Mutex<Pipe>>,
+  second: bool,
+}
+
+impl Side {
+  /// Whether lines from the other side still may come: it is not done, or lines wait.
+  fn open(self: &Self) -> bool {
+    let guard = self.pipe.get().lock()
+    let state = guard.get()
+    if self.second {
+      return !state.firstDone || state.toSecond.length() != 0
+    }
+    return !state.secondDone || state.toFirst.length() != 0
+  }
+
+  fn pending(self: &Self) -> bool {
+    let guard = self.pipe.get().lock()
+    let state = guard.get()
+    if self.second {
+      return state.toSecond.length() != 0
+    }
+    return state.toFirst.length() != 0
+  }
+
+  fn deserted(self: &Self) -> bool {
+    let guard = self.pipe.get().lock()
+    let state = guard.get()
+    if self.second {
+      return state.firstGone
+    }
+    return state.secondGone
+  }
+
+  /// This side sends nothing more; with `gone`, it takes nothing more either.
+  fn finish(self: &Self, gone: bool) -> () {
+    let mut guard = self.pipe.get().lock()
+    let state = guard.getMut()
+    if self.second {
+      state.secondDone = true
+      if gone {
+        state.secondGone = true
+      }
+      state.firstWaiter.unpark()
+    } else {
+      state.firstDone = true
+      if gone {
+        state.firstGone = true
+      }
+      state.secondWaiter.unpark()
+    }
+  }
+
+  /// Queues `line` (system-allocated) for the other side. False when it is gone.
+  effect fn push(self: &Self, line: String) -> bool
+    ! OutOfMemoryError {
+    let mut heap = Allocator.systemAllocatorProvider()
+    let mut guard = self.pipe.get().lock()
+    let state = guard.getMut()
+    if self.second {
+      if state.firstGone || state.secondDone {
+        return false
+      }
+      run state.toFirst.append(move line) |> Effect.provideMut<Allocator>(&mut heap)
+      state.firstWaiter.unpark()
+    } else {
+      if state.secondGone || state.firstDone {
+        return false
+      }
+      run state.toSecond.append(move line) |> Effect.provideMut<Allocator>(&mut heap)
+      state.secondWaiter.unpark()
+    }
+    return true
+  }
+
+  /// Takes the oldest line for this side.
+  fn take(self: &Self) -> Option<String> {
+    let mut guard = self.pipe.get().lock()
+    let state = guard.getMut()
+    let queue = if self.second {
+      &mut state.toSecond
+    } else {
+      &mut state.toFirst
+    }
+    if queue.length() == 0 {
+      return Option<String>.None
+    }
+    return Option<String>.some(queue.remove(0))
+  }
+}
+
+impl MemoryChannel {
+  /// Two ends: what one sends, the other receives.
+  pub effect fn pair() -> MemoryPair
+    ! OutOfMemoryError {
+    let mut heap = Allocator.systemAllocatorProvider()
+    return run MemoryChannel.made() |> Effect.provideMut<Allocator>(&mut heap)
+  }
+
+  effect fn made() -> MemoryPair
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let first = run Parker.make()
+    let second = run Parker.make()
+    let pipe = Pipe {
+      toFirst: List<String>.make(),
+      toSecond: List<String>.make(),
+      firstDone: false,
+      firstGone: false,
+      secondDone: false,
+      secondGone: false,
+      firstWaiter: first.unparker(),
+      secondWaiter: second.unparker(),
+    }
+    let shared = run Arc<Mutex<Pipe>>.make(run Mutex<Pipe>.make(move pipe))
+    return MemoryPair {
+      first: MemoryChannel {
+        side: Side { pipe: shared.clone(), second: false },
+        parker: move first,
+      },
+      second: MemoryChannel { side: Side { pipe: move shared, second: true }, parker: move second },
+    }
+  }
+
+  /// Whether more may come in: the other end has not closed, or lines from it still wait.
+  pub fn open(self: &Self) -> bool {
+    return self.side.open()
+  }
+
+  /// Whether lines wait to be received.
+  pub fn pending(self: &Self) -> bool {
+    return self.side.pending()
+  }
+
+  /// Whether the other end takes nothing more, so what this end sends is dropped.
+  pub fn deserted(self: &Self) -> bool {
+    return self.side.deserted()
+  }
+
+  /// Sleeps until a line comes in, the other end closes, or `timeout` nanoseconds pass. It may
+  /// also return early: look again.
+  pub fn wait(self: &Self, timeout: u64) -> () {
+    if self.side.pending() || !self.side.open() {
+      return ()
+    }
+    drop self.parker.parkTimeout(timeout)
+  }
+
+  /// Ends this end: it sends and takes nothing more. The other end still receives what was
+  /// sent before, then sees the channel closed. Dropping an end closes it too.
+  pub fn close(self: &mut Self) -> () {
+    self.side.finish(true)
+  }
+}
+
+impl Drop for MemoryChannel {
+  fn drop(self: &mut MemoryChannel) -> () {
+    self.side.finish(true)
+  }
+}
+
+impl Channel for MemoryChannel {
+  effect fn receive(self: &mut Self, line: &mut String) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match self.side.take() {
+      Option<String>.Some { value } => {
+        line.clear()
+        run line.append(String.view(&value))
+        true
+      }
+      Option<String>.None => false
+    }
+  }
+
+  effect fn send(self: &mut Self, line: string) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run self.side.push(run systemCopy(line))
+  }
+}
+
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  /// A [`MemoryChannel`] whose other end a pump thread joins to a socket connection: the pump
+  /// queues each line that comes in (and wakes the owner), and writes each line this end sends.
+  /// Make one with [`SocketChannel.over`], or `client.openSession` for the inspector at an
+  /// address.
+  pub struct SocketChannel {
+    channel: MemoryChannel,
+    pump: Option<JoinHandle<()>>,
+  }
+
+  impl SocketChannel {
+    /// Starts the pump over `connection`; `wake` is woken after each line that comes in, and
+    /// when the other side closes.
+    pub effect fn over<W: 'static + Wake + Transferable>(
+      connection: Connection,
+      wake: W,
+    ) -> SocketChannel
+      ! SpawnError | OutOfMemoryError {
+      let pair = run MemoryChannel.pair()
+      let MemoryPair { first, second } = move pair
+      let mut heap = Allocator.systemAllocatorProvider()
+      let handle = run NativeThread.spawn(
+        fn() -> () {
+          bridge(move connection, move second, move wake)
+        },
+      )
+        |> Effect.provideMut<Allocator>(&mut heap)
+      return SocketChannel { channel: move first, pump: Option<JoinHandle<()>>.some(move handle) }
+    }
+
+    /// See [`MemoryChannel.open`].
+    pub fn open(self: &Self) -> bool {
+      return self.channel.open()
+    }
+
+    /// See [`MemoryChannel.pending`].
+    pub fn pending(self: &Self) -> bool {
+      return self.channel.pending()
+    }
+
+    /// See [`MemoryChannel.wait`].
+    pub fn wait(self: &Self, timeout: u64) -> () {
+      self.channel.wait(timeout)
+    }
+
+    /// Closes the channel, lets the pump write what is queued, and waits for it to end (at
+    /// most [`READ_PAUSE`] after the queue is written).
+    pub fn close(self: &mut Self) -> () {
+      self.channel.close()
+      let pump = Intrinsic.replace(self.pump, Option<JoinHandle<()>>.None)
+      drop pump
+    }
+  }
+
+  impl Channel for SocketChannel {
+    effect fn receive(self: &mut Self, line: &mut String) -> bool
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      return run Channel.receive(&mut line) |> Effect.provideMut<Channel>(&mut self.channel)
+    }
+
+    effect fn send(self: &mut Self, line: string) -> bool
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      return run Channel.send(line) |> Effect.provideMut<Channel>(&mut self.channel)
+    }
+  }
+
+  /// Joins `end` to `connection` until either side is over: this thread reads the socket and
+  /// queues each line for the other end (waking it with `wake`), and a second thread writes
+  /// what the other end sends. A blocked read cannot be woken to write, hence two threads.
+  /// Returns when both are done; the socket closes then.
+  pub fn bridge<W: Wake>(connection: Connection, end: MemoryChannel, wake: W) -> () {
+    let mut heap = Allocator.systemAllocatorProvider()
+    let feed = Side { pipe: end.side.pipe.clone(), second: end.side.second }
+    let split = run Effect.result(connection.split()) |> Effect.provideMut<Allocator>(&mut heap)
+    let halves = match move split {
+      Result.Success { value } => move value
+      Result.Failure { error } => {
+        drop error
+        drop end
+        wake.wake()
+        return ()
+      }
+    }
+    let ConnectionHalves { reader, writer } = move halves
+    let writing = run Effect.result(
+      NativeThread.spawn(
+        fn() -> () {
+          writeLines(move writer, move end)
+        },
+      ),
+    )
+      |> Effect.provideMut<Allocator>(&mut heap)
+    match move writing {
+      Result.Success { value } => {
+        readLines(move reader, &feed, &wake)
+        feed.finish(false)
+        wake.wake()
+
+        // The writer ends once the other end closes and every reply is written.
+        drop value
+      }
+      Result.Failure { error } => {
+        drop error
+        drop reader
+        feed.finish(true)
+        wake.wake()
+      }
+    }
+  }
+
+  /// Reads lines from `reader` into `feed` until the socket ends, fails or sends a line that is
+  /// too long, or the other end of `feed` is gone.
+  fn readLines<W: Wake>(reader: Connection, feed: &Side, wake: &W) -> () {
+    let mut heap = Allocator.systemAllocatorProvider()
+    let mut clock = OsMonotonicClock.make()
+    let mut connection = move reader
+    let mut line = Bytes.make()
+    let mut chunk: [u8; 4096] = [0; 4096]
+    while !feed.deserted() {
+      let read = run Effect.result(readSome(&mut connection, &mut chunk))
+        |> Effect.provideMut<MonotonicClock>(&mut clock)
+      let mut count: usize = 0
+      match move read {
+        Result.Success { value } => {
+          count = value
+        }
+        Result.Failure { error } => {
+          let waited = match &error {
+            ByteIoError.Timeout { .. } => true
+            _ => false
+          }
+          drop error
+          if !waited {
+            return ()
+          }
+          continue
+        }
+      }
+      if count == 0 {
+        return ()
+      }
+      let mut came = false
+      let mut start: usize = 0
+      let mut i: usize = 0
+      while i < count {
+        if chunk[i] == 10 {
+          let appended = run Effect.result(line.append(Slice.view(&chunk, start, i - start)))
+            |> Effect.provideMut<Allocator>(&mut heap)
+          drop appended
+          if !queueLine(feed, line.asSlice()) {
+            return ()
+          }
+          line.clear()
+          came = true
+          start = i + 1
+        }
+        i = i + 1
+      }
+      let rest = run Effect.result(line.append(Slice.view(&chunk, start, count - start)))
+        |> Effect.provideMut<Allocator>(&mut heap)
+      drop rest
+      if came {
+        wake.wake()
+      }
+      if line.length() > MAX_LINE {
+        return ()
+      }
+    }
+  }
+
+  /// Queues one line read from the socket. A line that is not UTF-8 goes as `"?"`, which the
+  /// session answers as malformed. False when the other end is gone.
+  fn queueLine(feed: &Side, bytes: &[u8]) -> bool {
+    let text = match String.fromUtf8(bytes) {
+      Result<string, InvalidUtf8>.Success { value } => value
+      Result<string, InvalidUtf8>.Failure { error: _ } => "?"
+    }
+    let pushed = run Effect.result(pushCopy(feed, text))
+    return match move pushed {
+      Result.Success { value } => value
+      Result.Failure { error } => {
+        drop error
+        false
+      }
+    }
+  }
+
+  effect fn pushCopy(feed: &Side, text: string) -> bool
+    ! OutOfMemoryError {
+    return run feed.push(run systemCopy(text))
+  }
+
+  /// One read: the byte count, 0 at the end of the stream.
+  effect fn readSome(connection: &mut Connection, chunk: &mut [u8; 4096]) -> usize
+    ! ByteIoError
+    ? &mut MonotonicClock {
+    let start = run MonotonicClock.now()
+    let deadline = MonotonicClock.deadlineAfter(&start, READ_PAUSE)
+    return match run ByteDuplex.readSome(&mut chunk.*, Option<Instant>.some(move deadline))
+      |> Effect.provideMut<ByteDuplex>(&mut connection.*) {
+      ReadTransfer.Data { count } => count
+      ReadTransfer.End => 0
+    }
+  }
+
+  /// Writes each line `end` receives, with its newline, until the other end closes and every
+  /// line is written, or a write fails. Then shuts the socket's write side, so a client that
+  /// reads to the end of the stream sees it.
+  fn writeLines(writer: Connection, end: MemoryChannel) -> () {
+    let mut heap = Allocator.systemAllocatorProvider()
+    let mut clock = OsMonotonicClock.make()
+    let mut connection = move writer
+    let mut channel = move end
+    let mut line = String.make()
+    while true {
+      let taken = run Effect.result(
+        Channel.receive(&mut line) |> Effect.provideMut<Channel>(&mut channel),
+      )
+        |> Effect.provideMut<Allocator>(&mut heap)
+      let got = match move taken {
+        Result.Success { value } => value
+        Result.Failure { error } => {
+          drop error
+          false
+        }
+      }
+      if got {
+        let written = run Effect.result(writeLine(&mut connection, String.view(&line)))
+          |> Effect.provideMut<MonotonicClock>(&mut clock)
+        match move written {
+          Result.Success { value: _ } => {}
+          Result.Failure { error } => {
+            drop error
+            break
+          }
+        }
+      } else if !channel.open() {
+        break
+      } else {
+        channel.wait(1000000000)
+      }
+    }
+    drop run Effect.result(connection.shutdownWrite())
+    channel.close()
+  }
+
+  effect fn writeLine(connection: &mut Connection, line: string) -> ()
+    ! ByteIoError
+    ? &mut MonotonicClock {
+    let start = run MonotonicClock.now()
+    run writeAll(&mut connection, String.utf8Bytes(line), &start)
+    run writeAll(&mut connection, b"\n", &start)
+    let deadline = MonotonicClock.deadlineAfter(&start, WRITE_TIMEOUT)
+    run ByteDuplex.flush(Option<Instant>.some(move deadline))
+      |> Effect.provideMut<ByteDuplex>(&mut connection.*)
+  }
+
+  effect fn writeAll(connection: &mut Connection, bytes: &[u8], start: &Instant) -> ()
+    ! ByteIoError
+    ? &mut MonotonicClock {
+    let mut at: usize = 0
+    while at < bytes.length {
+      let deadline = MonotonicClock.deadlineAfter(start, WRITE_TIMEOUT)
+      let n = run ByteDuplex.writeSome(
+        Slice.view(bytes, at, bytes.length - at),
+        Option<Instant>.some(move deadline),
+      )
+        |> Effect.provideMut<ByteDuplex>(&mut connection.*)
+      at = at + n
+    }
+  }
+}
