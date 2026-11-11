@@ -1,0 +1,554 @@
+//! The edit log: the style edits made through the inspector and the comments people leave on
+//! nodes, kept in the app (in `Protocol`), so they outlive a client's session, for an agent to
+//! read, carry into the code and mark resolved. Devtools never change source.
+//!
+//! An entry is an edit or a comment. Both have an `id` (one sequence for both), a `seq` (the log's
+//! change counter when the entry last changed: the log's `seq` grows with every change, so a
+//! client reads on with `since`), a `status` (`open` or `resolved`) and a `target`: the node as
+//! it was when the entry was made (see [`writeTarget`]).
+//!
+//! An edit is one property of one node in one state: `before` (the client's value then, or
+//! none) and `after` (the value tried, or none when a replacing edit left the client's out).
+//! Editing the same open property again changes its `after`; setting it back to `before` takes
+//! the edit out of the log, and its declaration out of the override. `applied` says whether its
+//! declaration is still laid over the node: not once resolved, nor after its node was destroyed.
+//! `origin` is `inline` (typed in devtools or sent with `setStyle`) or `token` (a design token,
+//! reserved for token editing). A comment has `text`, an `author` and a `thread` of replies.
+import nodes { nodeObject, nodeMembers }
+import reply { writeString }
+import ui_inspect.query { accessibleName }
+import ui_tree.engine { UiTree }
+import ui_tree.inspect { writeInt }
+import ui_tree.mutation { StyleState }
+import ui_tree.node { NONE }
+import tools { stateName }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.usize
+import silk.text.string { String }
+
+/// What an entry is.
+pub enum EntryKind {
+  Edit,
+  Comment,
+}
+
+pub enum Status {
+  /// To be done: the code does not do this yet, or the comment is not answered.
+  Open,
+  /// Done: the code now does what the edit tried, or the comment was taken care of.
+  Resolved,
+}
+
+/// Where an edit's value came from.
+pub enum Origin {
+  /// Typed as a value (devtools' Styles panel, `setStyle`).
+  Inline,
+  /// A design token's value (reserved: token editing comes later).
+  Token,
+}
+
+/// A reply in a comment's thread.
+pub struct Reply {
+  pub seq: u64,
+  pub text: String,
+  pub author: String,
+}
+
+/// An edit or a comment.
+pub struct Entry {
+  pub id: u64,
+  /// The log's `seq` when the entry last changed.
+  pub seq: u64,
+  pub kind: EntryKind,
+  pub status: Status,
+  /// The root and the node it is about (NONE for a comment on no node).
+  pub root: u32,
+  pub node: u32,
+  /// The target as a JSON object (see [`writeTarget`]).
+  pub target: String,
+  /// An edit's state and property (the name CSS writes, such as `padding-top`).
+  pub state: StyleState,
+  pub property: String,
+  /// An edit's values as CSS text; `hasBefore` is false when the client had no declaration of
+  /// the property, `hasAfter` false when a replacing edit leaves the client's out.
+  pub before: String,
+  pub hasBefore: bool,
+  pub after: String,
+  pub hasAfter: bool,
+  pub origin: Origin,
+  /// Whether an edit's declaration is laid over its node now.
+  pub applied: bool,
+  /// A comment's text, author and replies.
+  pub text: String,
+  pub author: String,
+  pub thread: List<Reply>,
+}
+
+/// What recording an edit did.
+pub enum Recorded {
+  /// A new open edit.
+  Added,
+  /// The open edit of the same node, state and property took the new value.
+  Changed,
+  /// The value went back to the client's: the edit is gone.
+  Reverted,
+  /// No edit was open and the value is the client's: nothing to record.
+  Unchanged,
+}
+
+/// The edits and comments, oldest first.
+pub struct EditLog {
+  pub entries: List<Entry>,
+  nextId: u64,
+  /// Changes so far: each one counts (an entry added, changed or removed).
+  pub seq: u64,
+}
+
+fn statusName(status: Status) -> string<'static> {
+  return match status {
+    Status.Open => "open"
+    Status.Resolved => "resolved"
+  }
+}
+
+fn originName(origin: Origin) -> string<'static> {
+  return match origin {
+    Origin.Inline => "inline"
+    Origin.Token => "token"
+  }
+}
+
+effect fn copy(text: string) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return run String.copy(text)
+}
+
+impl EditLog {
+  pub fn make() -> EditLog {
+    return EditLog { entries: List<Entry>.make(), nextId: 1, seq: 0 }
+  }
+
+  fn bump(self: &mut Self) -> u64 {
+    self.seq = self.seq + 1
+    return self.seq
+  }
+
+  /// How many entries are open.
+  pub fn openCount(self: &Self) -> usize {
+    let list = self.entries.asSlice()
+    let mut count: usize = 0
+    let mut i: usize = 0
+    while i < list.length {
+      if list[i].status == Status.Open {
+        count = count + 1
+      }
+      i = i + 1
+    }
+    return count
+  }
+
+  /// The index of entry `id`, or `usize.MAX`.
+  pub fn find(self: &Self, id: u64) -> usize {
+    let list = self.entries.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      if list[i].id == id {
+        return i
+      }
+      i = i + 1
+    }
+    return usize.MAX
+  }
+
+  /// The index of the open edit of `property` of node `node` in `state` whose declaration is
+  /// laid over the node, or `usize.MAX`.
+  pub fn openEdit(self: &Self, node: u32, state: StyleState, property: string) -> usize {
+    let list = self.entries.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      let e = &list[i]
+      if e.kind == EntryKind.Edit && e.status == Status.Open && e.applied && e.node == node
+        && e.state == state
+        && String.view(&e.property) == property {
+        return i
+      }
+      i = i + 1
+    }
+    return usize.MAX
+  }
+
+  /// Records that `property` of node `node` in `state` now shows `after` (none without
+  /// `hasAfter`: left out by a replacing edit), where the client's value is `before` (none
+  /// without `hasBefore`: it sets none). `target` is kept only for a new edit (see
+  /// [`writeTarget`]).
+  pub effect fn record(
+    self: &mut Self,
+    root: u32,
+    node: u32,
+    state: StyleState,
+    property: string,
+    before: string,
+    hasBefore: bool,
+    after: string,
+    hasAfter: bool,
+    target: &String,
+  ) -> Recorded
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    // The override would change nothing: the client shows `after` itself.
+    let theClients = if hasAfter {
+      hasBefore && before == after
+    } else {
+      !hasBefore
+    }
+    let at = self.openEdit(node, state, property)
+    if at != usize.MAX {
+      if theClients {
+        drop self.entries.remove(at)
+        drop self.bump()
+        return Recorded.Reverted
+      }
+      let seq = self.bump()
+      let e = &mut self.entries.asMutSlice()[at]
+      e.seq = seq
+      e.after.clear()
+      run e.after.append(after)
+      e.hasAfter = hasAfter
+      return Recorded.Changed
+    }
+    if theClients {
+      return Recorded.Unchanged
+    }
+    let id = self.nextId
+    self.nextId = self.nextId + 1
+    let seq = self.bump()
+    run self.entries.append(
+      Entry {
+        id: id,
+        seq: seq,
+        kind: EntryKind.Edit,
+        status: Status.Open,
+        root: root,
+        node: node,
+        target: run copy(String.view(&target)),
+        state: state,
+        property: run copy(property),
+        before: run copy(before),
+        hasBefore: hasBefore,
+        after: run copy(after),
+        hasAfter: hasAfter,
+        origin: Origin.Inline,
+        applied: true,
+        text: String.make(),
+        author: String.make(),
+        thread: List<Reply>.make(),
+      },
+    )
+    return Recorded.Added
+  }
+
+  /// Adds an open comment with `text` by `author` on node `node` of root `root` (NONE: on the
+  /// app as a whole). Returns its id.
+  pub effect fn comment(
+    self: &mut Self,
+    root: u32,
+    node: u32,
+    target: String,
+    text: string,
+    author: string,
+  ) -> u64
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let id = self.nextId
+    self.nextId = self.nextId + 1
+    let seq = self.bump()
+    run self.entries.append(
+      Entry {
+        id: id,
+        seq: seq,
+        kind: EntryKind.Comment,
+        status: Status.Open,
+        root: root,
+        node: node,
+        target: move target,
+        state: StyleState.Base,
+        property: String.make(),
+        before: String.make(),
+        hasBefore: false,
+        after: String.make(),
+        hasAfter: false,
+        origin: Origin.Inline,
+        applied: false,
+        text: run copy(text),
+        author: run copy(author),
+        thread: List<Reply>.make(),
+      },
+    )
+    return id
+  }
+
+  /// Adds a reply to the thread of the entry at `at`.
+  pub effect fn reply(self: &mut Self, at: usize, text: string, author: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let seq = self.bump()
+    let e = &mut self.entries.asMutSlice()[at]
+    e.seq = seq
+    run e.thread.append(Reply { seq: seq, text: run copy(text), author: run copy(author) })
+  }
+
+  /// Sets the status of the entry at `at`; an edit's `applied` too.
+  pub fn mark(self: &mut Self, at: usize, status: Status, applied: bool) -> () {
+    let seq = self.bump()
+    let e = &mut self.entries.asMutSlice()[at]
+    e.seq = seq
+    e.status = status
+    e.applied = applied
+  }
+
+  /// Takes the open edits of node `node` (every node for NONE) out of the log: in `state` alone
+  /// when one is given, and of `property` alone unless it is "". Returns how many went.
+  pub fn removeOpen(
+    self: &mut Self,
+    node: u32,
+    state: Option<StyleState>,
+    property: string,
+  ) -> usize {
+    let mut removed: usize = 0
+    let mut i: usize = 0
+    while i < self.entries.length() {
+      let e = &self.entries.asSlice()[i]
+      let inState = match state {
+        Option<StyleState>.Some { value } => e.state == value
+        Option<StyleState>.None => true
+      }
+      let matches = e.kind == EntryKind.Edit && e.status == Status.Open
+        && (node == NONE || e.node == node)
+        && inState
+        && (property == "" || String.view(&e.property) == property)
+      if matches {
+        drop self.entries.remove(i)
+        removed = removed + 1
+      } else {
+        i = i + 1
+      }
+    }
+    if removed != 0 {
+      drop self.bump()
+    }
+    return removed
+  }
+
+  /// Notes the open edits whose declaration is no longer laid over their node: the node was
+  /// destroyed (its override went with it). Costs a look at each open applied edit.
+  pub fn sweep(self: &mut Self, tree: &UiTree<'_>) -> () {
+    let mut i: usize = 0
+    while i < self.entries.length() {
+      let e = &self.entries.asSlice()[i]
+      if e.kind == EntryKind.Edit && e.status == Status.Open && e.applied
+        && !tree.overridden(e.node, e.state) {
+        let seq = self.bump()
+        let gone = &mut self.entries.asMutSlice()[i]
+        gone.applied = false
+        gone.seq = seq
+      }
+      i = i + 1
+    }
+  }
+
+  /// Whether some open edit is laid over its node (`sweep` has work).
+  pub fn hasApplied(self: &Self) -> bool {
+    let list = self.entries.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      if list[i].applied && list[i].status == Status.Open {
+        return true
+      }
+      i = i + 1
+    }
+    return false
+  }
+}
+
+/// Appends entry `e` as JSON: `{"id","seq","kind","status","target",...}`, then for an edit
+/// `"state","property","before","after","origin","applied"` (`before` and `after` null when
+/// none), for a comment `"text","author","thread":[{"seq","text","author"}]`.
+pub effect fn writeEntry(e: &Entry, out: &mut String) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.append("{\"id\":")
+  run writeInt(&mut out, e.id)
+  run out.append(",\"seq\":")
+  run writeInt(&mut out, e.seq)
+  run out.append(",\"kind\":")
+  run out.append(
+    if e.kind == EntryKind.Edit {
+      "\"edit\""
+    } else {
+      "\"comment\""
+    },
+  )
+  run out.append(",\"status\":")
+  run writeString(&mut out, statusName(e.status))
+  run out.append(",\"target\":")
+  run out.append(String.view(&e.target))
+  if e.kind == EntryKind.Edit {
+    run out.append(",\"state\":")
+    run writeString(&mut out, stateName(e.state))
+    run out.append(",\"property\":")
+    run writeString(&mut out, String.view(&e.property))
+    run out.append(",\"before\":")
+    if e.hasBefore {
+      run writeString(&mut out, String.view(&e.before))
+    } else {
+      run out.append("null")
+    }
+    run out.append(",\"after\":")
+    if e.hasAfter {
+      run writeString(&mut out, String.view(&e.after))
+    } else {
+      run out.append("null")
+    }
+    run out.append(",\"origin\":")
+    run writeString(&mut out, originName(e.origin))
+    run out.append(",\"applied\":")
+    run out.append(
+      if e.applied {
+        "true"
+      } else {
+        "false"
+      },
+    )
+  } else {
+    run out.append(",\"text\":")
+    run writeString(&mut out, String.view(&e.text))
+    if e.author.ownedByteLength() != 0 {
+      run out.append(",\"author\":")
+      run writeString(&mut out, String.view(&e.author))
+    }
+    run out.append(",\"thread\":[")
+    let replies = e.thread.asSlice()
+    let mut i: usize = 0
+    while i < replies.length {
+      if i > 0 {
+        run out.append(",")
+      }
+      run out.append("{\"seq\":")
+      run writeInt(&mut out, replies[i].seq)
+      run out.append(",\"text\":")
+      run writeString(&mut out, String.view(&replies[i].text))
+      if replies[i].author.ownedByteLength() != 0 {
+        run out.append(",\"author\":")
+        run writeString(&mut out, String.view(&replies[i].author))
+      }
+      run out.append("}")
+      i = i + 1
+    }
+    run out.append("]")
+  }
+  run out.append("}")
+}
+
+/// Whether `slot` has something to search the code for: a test id, a label or a name.
+effect fn named(tree: &UiTree<'_>, slot: u32, name: &mut String) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let node = tree.node(slot)
+  if node.testId.ownedByteLength() != 0 || node.label.ownedByteLength() != 0 {
+    return true
+  }
+  name.clear()
+  run accessibleName(tree, node.id, &mut name)
+  return name.ownedByteLength() != 0
+}
+
+/// Writes the target of an entry about node `id` (NONE: the app) in root `root`, as it is now,
+/// for an agent to find the code that makes it: `{"root","node","path","element","named","keys"}`.
+///
+/// - `path`: the node ids from the root's node down to the node.
+/// - `element`: the node as replies write nodes (kind, role, accessible name, test id, rect).
+/// - `named`: the nearest node at or above it with a test id, a label or a name, the same way;
+///   left out when there is none.
+/// - `keys`: the test ids along the path, `{"id","testId"}`, root first (the tree's only keys);
+///   left out when there are none.
+/// - `source` (a file and line) is left out: the tree does not know where a node was built.
+pub effect fn writeTarget(tree: &UiTree<'_>, root: u32, id: u32, out: &mut String) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.append("{\"root\":")
+  run writeInt(&mut out, u32.toU64(root))
+  let slot = if id == NONE {
+    NONE
+  } else {
+    tree.slotOf(id)
+  }
+  if slot == NONE {
+    run out.append("}")
+    return ()
+  }
+  run out.append(",\"node\":")
+  run writeInt(&mut out, u32.toU64(id))
+  let mut path = List<u32>.make()
+  let mut at = slot
+  while at != NONE {
+    run path.append(at)
+    at = tree.node(at).parent
+  }
+  run out.append(",\"path\":[")
+  let mut i = path.length()
+  while i > 0 {
+    i = i - 1
+    run writeInt(&mut out, u32.toU64(tree.node(path.get(i)).id))
+    if i > 0 {
+      run out.append(",")
+    }
+  }
+  run out.append("]")
+  let mut name = String.make()
+  run out.append(",\"element\":")
+  run nodeObject(tree, id, &mut name, &mut out)
+  let mut k: usize = 0
+  while k < path.length() {
+    if run named(tree, path.get(k), &mut name) {
+      run out.append(",\"named\":")
+      run nodeMembers(tree, tree.node(path.get(k)).id, &mut name, &mut out)
+      let label = &tree.node(path.get(k)).label
+      if label.ownedByteLength() != 0 {
+        run out.append(",\"label\":")
+        run writeString(&mut out, String.view(&label))
+      }
+      run out.append("}")
+      break
+    }
+    k = k + 1
+  }
+  let mut first = true
+  let mut j = path.length()
+  while j > 0 {
+    j = j - 1
+    let node = tree.node(path.get(j))
+    if node.testId.ownedByteLength() != 0 {
+      run out.append(
+        if first {
+          ",\"keys\":["
+        } else {
+          ","
+        },
+      )
+      first = false
+      run out.append("{\"id\":")
+      run writeInt(&mut out, u32.toU64(node.id))
+      run out.append(",\"testId\":")
+      run writeString(&mut out, String.view(&node.testId))
+      run out.append("}")
+    }
+  }
+  if !first {
+    run out.append("]")
+  }
+  run out.append("}")
+}

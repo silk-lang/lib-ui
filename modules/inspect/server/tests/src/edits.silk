@@ -1,0 +1,575 @@
+//! Style edits through the override layer and the edit log, over the inbox fixture: an edit
+//! survives the app restyling the node, a reset shows what the app set meanwhile, edits
+//! coalesce and leave the log when set back, `seq` only grows, comments and their threads,
+//! resolve and reopen, a destroyed node's edit is no longer applied, the `edits` topic goes out
+//! once a frame and not at all while nothing changes, nothing asks for frames once an edit is
+//! drawn, and the log outlives the session that made it.
+import ui_fixtures.fixtures as fixtures
+import ui_inspect_server.lib { Protocol, Session, Channel, MemoryChannel, MemoryPair }
+import ui_inspect_server.topics { TOPIC_EDITS }
+import ui_tree.legacy { UiTree, TreeError, Batch, FrameInput }
+import ui_tree.mutation { Mutation, StyleState }
+import ui_tree.node { Event }
+import ui_tree.css
+import ui_tree.css { px, Declaration }
+import ui_tree.inspect { writeInt }
+import silk.num.i64
+import font_collection.lib { FontCollection }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.json.scanner { JsonError }
+import silk.json.value { Json, Value }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+const ARCHIVE: u32 = 20
+
+fn viewport(time: f64) -> FrameInput {
+  return FrameInput { width: 360.0, height: 440.0, scale: 2.0, time: time }
+}
+
+effect fn inbox(collection: &FontCollection) -> UiTree<'_>
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut tree = run UiTree.make(collection)
+  let mut batch = Batch.make()
+  run fixtures.inbox(&mut batch)
+  run tree.apply(run batch.take())
+  run tree.frame(viewport(0.0))
+  return move tree
+}
+
+effect fn ask(protocol: &mut Protocol, tree: &mut UiTree<'_>, line: string) -> Value
+  ! JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  let request = run Json.parse(String.utf8Bytes(line))
+  let mut out = String.make()
+  drop run protocol.handle(&mut tree, &request, 0, &mut out)
+  return run Json.parse(out.ownedUtf8Bytes())
+}
+
+fn ok(reply: &Value) -> bool {
+  return match Json.field(reply, "ok") {
+    Option<&Value>.Some { value } => match &value.* {
+      Value.Bool { value: b } => b
+      _ => false
+    }
+    Option<&Value>.None => false
+  }
+}
+
+fn int(value: &Value, key: string) -> i64 {
+  return Json.asI64(Json.field(value, key)).unwrapOr(-1)
+}
+
+fn text<'a>(value: &'a Value, key: string) -> string<'a> {
+  return Json.asString(Json.field(value, key)).unwrapOr("")
+}
+
+fn isNull(value: &Value, key: string) -> bool {
+  return match Json.field(value, key) {
+    Option<&Value>.Some { value: found } => match &found.* {
+      Value.Null => true
+      _ => false
+    }
+    Option<&Value>.None => false
+  }
+}
+
+fn flag(value: &Value, key: string) -> bool {
+  return match Json.field(value, key) {
+    Option<&Value>.Some { value: found } => match &found.* {
+      Value.Bool { value: b } => b
+      _ => false
+    }
+    Option<&Value>.None => false
+  }
+}
+
+fn array<'a>(value: &'a Value, key: string) -> &'a [Value] {
+  return match Json.field(value, key) {
+    Option<&'a Value>.Some { value: found } => match &found.* {
+      Value.Array { values } => values.asSlice()
+      _ => &[]
+    }
+    Option<&'a Value>.None => &[]
+  }
+}
+
+fn member<'a>(value: &'a Value, key: string) -> &'a Value {
+  return Json.field(value, key).unwrapOr(value)
+}
+
+/// The text of `key` in the `styles` reply's `section` (`overrides`, `client`, or the reply
+/// itself for ""), for state `base`, joined with "; ".
+effect fn baseOf(reply: &Value, section: string) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let from = if section == "" {
+    reply
+  } else {
+    member(reply, section)
+  }
+  let list = array(from, "base")
+  let mut out = String.make()
+  let mut i: usize = 0
+  while i < list.length {
+    if i > 0 {
+      run out.append("; ")
+    }
+    run out.append(Json.asString(Option<&Value>.some(&list[i])).unwrapOr(""))
+    i = i + 1
+  }
+  return move out
+}
+
+/// The Archive button's left padding as laid out, from `inspect`'s box.
+effect fn paddingLeft(protocol: &mut Protocol, tree: &mut UiTree<'_>) -> f32
+  ! JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  let reply = run ask(&mut protocol, &mut tree, "{\"cmd\":\"inspect\",\"node\":20}")
+  let box = member(&reply, "box")
+  let content = Json.asF32(Json.field(member(box, "content"), "x")).unwrapOr(-1.0)
+  let padding = Json.asF32(Json.field(member(box, "padding"), "x")).unwrapOr(-1.0)
+  return content - padding
+}
+
+effect fn clientRestyle(tree: &mut UiTree<'_>, css: &[Declaration]) -> ()
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut batch = Batch.make()
+  run batch.style(ARCHIVE, css)
+  run tree.apply(run batch.take())
+}
+
+effect fn editsBody() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run inbox(&collection)
+  let mut protocol = Protocol.make()
+  let mut seqs = List<i64>.make()
+
+  // An edit: one open entry, with the client's value before it and the node to find it by.
+  let set = run ask(
+    &mut protocol,
+    &mut tree,
+    "{\"cmd\":\"setStyle\",\"node\":20,\"style\":\"padding-left: 20px\"}",
+  )
+  run Testing.expect(ok(&set) && array(&set, "edits").length == 1, "setStyle records an edit")
+  run seqs.append(int(&set, "seq"))
+  let listed = run ask(&mut protocol, &mut tree, "{\"cmd\":\"edits\"}")
+  let edits = array(&listed, "edits")
+  run Testing.expect(edits.length == 1 && int(&listed, "open") == 1, "one open edit")
+  let edit = &edits[0]
+  run Testing.expect(
+    text(edit, "kind") == "edit" && text(edit, "status") == "open"
+      && text(edit, "property") == "padding-left"
+      && text(edit, "before") == "12px"
+      && text(edit, "after") == "20px"
+      && text(edit, "origin") == "inline"
+      && text(edit, "state") == "base"
+      && flag(edit, "applied"),
+    "the edit says what changed, from what",
+  )
+  let target = member(edit, "target")
+  let path = array(target, "path")
+  run Testing.expect(
+    int(target, "node") == 20 && int(target, "root") == 0 && path.length == 3
+      && Json.asI64(Option<&Value>.some(&path[0])).unwrapOr(-1) == 1
+      && text(member(target, "named"), "name") == "Archive"
+      && text(member(target, "named"), "label") == "Archive"
+      && text(member(target, "element"), "role") == "button"
+      && !Json.field(target, "source").isSome(),
+    "and where: root, path, the named element, no source",
+  )
+  let first = int(edit, "id")
+
+  // Again: the same edit, with the new value; the client's value stays the one before.
+  let again = run ask(
+    &mut protocol,
+    &mut tree,
+    "{\"cmd\":\"setStyle\",\"node\":20,\"style\":\"padding-left: 24px\"}",
+  )
+  run seqs.append(int(&again, "seq"))
+  let coalesced = run ask(&mut protocol, &mut tree, "{\"cmd\":\"edits\"}")
+  let one = array(&coalesced, "edits")
+  run Testing.expect(
+    one.length == 1 && int(&one[0], "id") == first && text(&one[0], "after") == "24px"
+      && text(&one[0], "before") == "12px",
+    "editing the property again changes the open edit",
+  )
+
+  // The app restyles the node: the edit stays over it, the app's value under it.
+  run clientRestyle(&mut tree, &[css.paddingLeft(px(16.0))])
+  run tree.frame(viewport(0.1))
+  run protocol.afterFrame(&tree)
+  let styled = run ask(&mut protocol, &mut tree, "{\"cmd\":\"styles\",\"node\":20}")
+  run Testing.expect(
+    String.contains(String.view(&run baseOf(&styled, "")), "padding-left: 24px")
+      && String.view(&run baseOf(&styled, "overrides")) == "padding-left: 24px"
+      && String.contains(String.view(&run baseOf(&styled, "client")), "padding-left: 16px"),
+    "the edit survives the app's restyle, which is kept underneath",
+  )
+  run Testing.expect((run paddingLeft(&mut protocol, &mut tree)) == 24.0, "and is drawn")
+
+  // Back to what the app shows: the edit is gone and the app's value shows.
+  let back = run ask(
+    &mut protocol,
+    &mut tree,
+    "{\"cmd\":\"setStyle\",\"node\":20,\"style\":\"padding-left: 16px\"}",
+  )
+  run seqs.append(int(&back, "seq"))
+  let reverted = run ask(&mut protocol, &mut tree, "{\"cmd\":\"edits\"}")
+  run Testing.expect(
+    array(&reverted, "edits").length == 0 && !tree.overridden(ARCHIVE, StyleState.Base),
+    "setting it back removes the edit and its override",
+  )
+
+  // A reset shows what the app set while the edit was over it.
+  drop run ask(
+    &mut protocol,
+    &mut tree,
+    "{\"cmd\":\"setStyle\",\"node\":20,\"style\":\"padding-left: 30px\"}",
+  )
+  run clientRestyle(&mut tree, &[css.paddingLeft(px(18.0))])
+  let reset = run ask(&mut protocol, &mut tree, "{\"cmd\":\"resetStyles\"}")
+  run seqs.append(int(&reset, "seq"))
+  run Testing.expect(
+    int(&reset, "restored") == 1 && int(&reset, "removed") == 1,
+    "reset takes the edit back",
+  )
+  run tree.frame(viewport(0.2))
+  run Testing.expect(
+    (run paddingLeft(&mut protocol, &mut tree)) == 18.0,
+    "and the app's last value shows, set while overridden",
+  )
+
+  // One property of one node is reset alone.
+  drop run ask(
+    &mut protocol,
+    &mut tree,
+    "{\"cmd\":\"setStyle\",\"node\":20,\"style\":\"color: red; padding-top: 2px\"}",
+  )
+  let partial = run ask(
+    &mut protocol,
+    &mut tree,
+    "{\"cmd\":\"resetStyles\",\"node\":20,\"property\":\"padding-top\"}",
+  )
+  run Testing.expect(int(&partial, "removed") == 1, "one property is reset")
+  let left = run ask(&mut protocol, &mut tree, "{\"cmd\":\"edits\",\"status\":\"open\"}")
+  let remaining = array(&left, "edits")
+  run Testing.expect(
+    remaining.length == 1 && text(&remaining[0], "property") == "color"
+      && isNull(&remaining[0], "before"),
+    "the other stays; the app set no color, so it was none before",
+  )
+  let colour = int(&remaining[0], "id")
+
+  // Comments, with a thread.
+  let comment = run ask(
+    &mut protocol,
+    &mut tree,
+    "{\"cmd\":\"comment\",\"node\":10,\"text\":\"Should be primary\",\"author\":\"julia\"}",
+  )
+  run seqs.append(int(&comment, "seq"))
+  let entry = member(&comment, "entry")
+  run Testing.expect(
+    ok(&comment) && text(entry, "kind") == "comment" && text(entry, "status") == "open"
+      && int(member(entry, "target"), "node") == 10
+      && text(entry, "author") == "julia",
+    "a comment on a node",
+  )
+  let note = int(entry, "id")
+  let mut line = run String.copy("{\"cmd\":\"comment\",\"text\":\"Agreed\",\"reply\":")
+  run appendInt(&mut line, note)
+  run line.append("}")
+  let replied = run ask(&mut protocol, &mut tree, String.view(&line))
+  run seqs.append(int(&replied, "seq"))
+  let thread = array(member(&replied, "entry"), "thread")
+  run Testing.expect(
+    thread.length == 1 && text(&thread[0], "text") == "Agreed",
+    "a reply in its thread",
+  )
+  let mut toEdit = run String.copy("{\"cmd\":\"comment\",\"text\":\"x\",\"reply\":")
+  run appendInt(&mut toEdit, colour)
+  run toEdit.append("}")
+  run Testing.expect(
+    !ok(&run ask(&mut protocol, &mut tree, String.view(&toEdit))),
+    "edits take no replies",
+  )
+  let general = run ask(
+    &mut protocol,
+    &mut tree,
+    "{\"cmd\":\"comment\",\"text\":\"Looks cramped\"}",
+  )
+  run Testing.expect(
+    ok(&general) && !Json.field(member(member(&general, "entry"), "target"), "node").isSome(),
+    "a comment on the app as a whole",
+  )
+  let comments = run ask(&mut protocol, &mut tree, "{\"cmd\":\"edits\",\"kind\":\"comment\"}")
+  run Testing.expect(
+    array(&comments, "comments").length == 2 && array(&comments, "edits").length == 0,
+    "kind filters",
+  )
+
+  // Resolve: the code does it now, so the edit's override goes; reopen lays it on again.
+  let mut resolving = run String.copy("{\"cmd\":\"resolve\",\"entries\":[")
+  run appendInt(&mut resolving, colour)
+  run resolving.append(",")
+  run appendInt(&mut resolving, note)
+  run resolving.append("]}")
+  let resolved = run ask(&mut protocol, &mut tree, String.view(&resolving))
+  run seqs.append(int(&resolved, "seq"))
+  let done = array(&resolved, "entries")
+  run Testing.expect(
+    done.length == 2 && text(&done[0], "status") == "resolved" && !flag(&done[0], "applied")
+      && text(&done[1], "status") == "resolved",
+    "an edit and a comment are resolved",
+  )
+  run Testing.expect(
+    !tree.overridden(ARCHIVE, StyleState.Base),
+    "the resolved edit's override is gone",
+  )
+  let open = run ask(&mut protocol, &mut tree, "{\"cmd\":\"edits\",\"status\":\"open\"}")
+  run Testing.expect(
+    array(&open, "edits").length == 0 && array(&open, "comments").length == 1,
+    "only the general comment is open",
+  )
+  let mut reopening = run String.copy("{\"cmd\":\"resolve\",\"reopen\":true,\"entry\":")
+  run appendInt(&mut reopening, colour)
+  run reopening.append("}")
+  let reopened = run ask(&mut protocol, &mut tree, String.view(&reopening))
+  run seqs.append(int(&reopened, "seq"))
+  run Testing.expect(
+    text(&array(&reopened, "entries")[0], "status") == "open"
+      && flag(&array(&reopened, "entries")[0], "applied")
+      && tree.overridden(ARCHIVE, StyleState.Base),
+    "reopening lays the edit on again",
+  )
+  let before = protocol.edits.seq
+  let unknown = run ask(&mut protocol, &mut tree, "{\"cmd\":\"resolve\",\"entries\":[999]}")
+  run Testing.expect(!ok(&unknown) && protocol.edits.seq == before, "an unknown id changes nothing")
+  let since = run ask(&mut protocol, &mut tree, "{\"cmd\":\"edits\",\"since\":0}")
+  let mut sinceLine = run String.copy("{\"cmd\":\"edits\",\"since\":")
+  run appendInt(&mut sinceLine, int(&since, "seq") - 1)
+  run sinceLine.append("}")
+  let recent = run ask(&mut protocol, &mut tree, String.view(&sinceLine))
+  run Testing.expect(
+    array(&recent, "edits").length + array(&recent, "comments").length == 1,
+    "since lists what changed after a seq",
+  )
+
+  // A destroyed node takes its override along: its edit is no longer applied.
+  drop run ask(
+    &mut protocol,
+    &mut tree,
+    "{\"cmd\":\"setStyle\",\"node\":120,\"style\":\"padding-left: 30px\"}",
+  )
+  let mut destroy = Batch.make()
+  run destroy.push(Mutation.Destroy { id: 120 })
+  run tree.apply(run destroy.take())
+  run tree.frame(viewport(0.3))
+  run protocol.afterFrame(&tree)
+  let gone = run ask(&mut protocol, &mut tree, "{\"cmd\":\"edits\",\"status\":\"open\"}")
+  let openEdits = array(&gone, "edits")
+  let mut stale = false
+  let mut i: usize = 0
+  while i < openEdits.length {
+    if int(member(&openEdits[i], "target"), "node") == 120 {
+      stale = !flag(&openEdits[i], "applied")
+    }
+    i = i + 1
+  }
+  run Testing.expect(stale && !tree.overridden(120, StyleState.Base), "the edit stays, not applied")
+  run seqs.append(int(&gone, "seq"))
+
+  // `seq` only grows.
+  let list = seqs.asSlice()
+  let mut growing = true
+  let mut k: usize = 1
+  while k < list.length {
+    if list[k] <= list[k - 1] {
+      growing = false
+    }
+    k = k + 1
+  }
+  run Testing.expect(growing && list[0] >= 1, "seq grows with every change")
+}
+
+effect fn appendInt(out: &mut String, value: i64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run writeInt(&mut out, i64.toU64(value))
+}
+
+test effect fn editsLiveInTheLog() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run editsBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// The `edits` topic, and the log across sessions.
+
+effect fn serveAll(
+  session: &mut Session,
+  protocol: &mut Protocol,
+  tree: &mut UiTree<'_>,
+  end: &mut MemoryChannel,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  while run session.serveNext(&mut protocol, &mut tree) |> Effect.provideMut<Channel>(&mut end) {
+    while run protocol.dispatchNext(&mut tree) {}
+    let mut taken = List<Event>.make()
+    run tree.takeEvents(&mut taken)
+  }
+}
+
+effect fn publishTo(
+  session: &mut Session,
+  protocol: &mut Protocol,
+  tree: &UiTree<'_>,
+  end: &mut MemoryChannel,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let topics = run protocol.takeChanges(tree, session.topics)
+  run session.publish(&protocol.*, tree, topics) |> Effect.provideMut<Channel>(&mut end)
+}
+
+/// Every line waiting for the client.
+effect fn received(client: &mut MemoryChannel) -> List<Value>
+  ! JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = List<Value>.make()
+  let mut line = String.make()
+  while run Channel.receive(&mut line) |> Effect.provideMut<Channel>(&mut client) {
+    run out.append(run Json.parse(line.ownedUtf8Bytes()))
+  }
+  return move out
+}
+
+fn eventsNamed(lines: &List<Value>, name: string) -> usize {
+  let list = lines.asSlice()
+  let mut count: usize = 0
+  let mut i: usize = 0
+  while i < list.length {
+    if text(&list[i], "event") == name {
+      count = count + 1
+    }
+    i = i + 1
+  }
+  return count
+}
+
+effect fn send(client: &mut MemoryChannel, line: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  drop run Channel.send(line) |> Effect.provideMut<Channel>(&mut client)
+}
+
+effect fn topicBody() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run inbox(&collection)
+  let mut protocol = Protocol.make()
+  run protocol.afterFrame(&tree)
+  let pair = run MemoryChannel.pair()
+  let MemoryPair { first, second } = move pair
+  let mut app = move first
+  let mut client = move second
+  let mut session = Session.open()
+
+  run send(&mut client, "{\"id\":1,\"cmd\":\"hello\",\"protocol\":3,\"wants\":[\"edits\"]}")
+  run serveAll(&mut session, &mut protocol, &mut tree, &mut app)
+  let hello = run received(&mut client)
+  run Testing.expect(session.topics == TOPIC_EDITS, "edits is a topic")
+  let listed = hello.asSlice()
+  let mut names = false
+  let commands = array(member(&listed[0], "capabilities"), "commands")
+  let mut i: usize = 0
+  while i < commands.length {
+    if Json.asString(Option<&Value>.some(&commands[i])).unwrapOr("") == "resolve" {
+      names = true
+    }
+    i = i + 1
+  }
+  run Testing.expect(names, "hello lists edits, comment and resolve")
+
+  // Nothing changed: nothing is pushed.
+  run publishTo(&mut session, &mut protocol, &tree, &mut app)
+  run Testing.expect(
+    (run received(&mut client)).length() == 0,
+    "no edits event while nothing changed",
+  )
+
+  // Two changes in one frame: one event now, one with the next frame.
+  run send(&mut client, "{\"cmd\":\"setStyle\",\"node\":20,\"style\":\"padding-left: 20px\"}")
+  run serveAll(&mut session, &mut protocol, &mut tree, &mut app)
+  run publishTo(&mut session, &mut protocol, &tree, &mut app)
+  let pushed = run received(&mut client)
+  run Testing.expect(
+    eventsNamed(&pushed, "edits") == 1 && int(&pushed.asSlice()[0], "open") == 1
+      && int(&pushed.asSlice()[0], "seq") == 1,
+    "the change is pushed with the log's seq",
+  )
+  run send(&mut client, "{\"cmd\":\"comment\",\"node\":20,\"text\":\"Too tight\"}")
+  run serveAll(&mut session, &mut protocol, &mut tree, &mut app)
+  run publishTo(&mut session, &mut protocol, &tree, &mut app)
+  run Testing.expect((run received(&mut client)).length() == 0, "not twice in one frame")
+  run Testing.expect(protocol.changes.held == TOPIC_EDITS, "held for the next frame")
+  run tree.frame(viewport(0.1))
+  run protocol.afterFrame(&tree)
+  run publishTo(&mut session, &mut protocol, &tree, &mut app)
+  let later = run received(&mut client)
+  run Testing.expect(
+    eventsNamed(&later, "edits") == 1 && int(&later.asSlice()[0], "seq") == 2,
+    "pushed with the next frame",
+  )
+
+  // Drawn once, an edit costs nothing more: no frame, no news.
+  run Testing.expect(!tree.needsFrame(), "the tree needs no frame for an edit it drew")
+  run tree.frame(viewport(0.2))
+  run protocol.afterFrame(&tree)
+  run publishTo(&mut session, &mut protocol, &tree, &mut app)
+  run Testing.expect((run received(&mut client)).length() == 0, "and nothing is pushed")
+  run Testing.expect(protocol.changes.held == 0, "nor held")
+
+  // The session ends; the log is the app's, and a new session reads it.
+  client.close()
+  run serveAll(&mut session, &mut protocol, &mut tree, &mut app)
+  session.leave(&mut protocol)
+  drop session
+  drop app
+  let pair2 = run MemoryChannel.pair()
+  let MemoryPair { first: first2, second: second2 } = move pair2
+  let mut app2 = move first2
+  let mut client2 = move second2
+  let mut next = Session.open()
+  run send(&mut client2, "{\"id\":2,\"cmd\":\"edits\"}")
+  run serveAll(&mut next, &mut protocol, &mut tree, &mut app2)
+  let read = run received(&mut client2)
+  run Testing.expect(
+    array(&read.asSlice()[0], "edits").length == 1
+      && array(&read.asSlice()[0], "comments").length == 1
+      && tree.overridden(ARCHIVE, StyleState.Base),
+    "the log and the edit outlive the session",
+  )
+
+  // A one-shot client (protocol 2) reads it too.
+  let mut single = Session.make()
+  run send(&mut client2, "{\"cmd\":\"edits\",\"status\":\"open\"}")
+  run serveAll(&mut single, &mut protocol, &mut tree, &mut app2)
+  let oneShot = run received(&mut client2)
+  run Testing.expect(oneShot.length() == 1 && ok(&oneShot.asSlice()[0]) && single.ended, "one-shot")
+}
+
+test effect fn editsTopicAndSessions() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run topicBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
