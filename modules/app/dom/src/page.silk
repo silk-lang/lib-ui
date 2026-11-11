@@ -19,14 +19,16 @@
 import dom { Dom }
 import ui_app.backend { TreeError }
 import ui_app.program { Program, CommandSet, Hosted, Run, make }
-import ui_app.runtime { Runtime, drain, pump, tick, resize }
+import ui_app.runtime { Runtime, drain, settle, navigate, post, pump, tick, resize }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.mem.box { Box }
 import silk.mem.pointer { Pointer }
 import silk.num.f64
 import silk.num.usize
+import silk.text.string { String }
 
 /// Renders the first view. `a`, `b`: the viewport, in CSS pixels. `c`: the clock, in seconds.
+/// A `CALL_LOCATION` before it says where the app starts.
 pub const CALL_START: u32 = 0
 
 /// Returns where to write an event record of `a` bytes.
@@ -47,6 +49,14 @@ pub const CALL_DEADLINE: u32 = 5
 
 /// Returns 1 when the program wants animation frames.
 pub const CALL_FRAMES: u32 = 6
+
+/// The location is now the path in the first `a` bytes of the scratch: where the document
+/// opened, or where its history went.
+pub const CALL_LOCATION: u32 = 7
+
+/// The host posts to a port: the scratch holds the port's name in its first `a` bytes and
+/// the text in the `b` after them.
+pub const CALL_POST: u32 = 8
 
 struct Unrooted {}
 
@@ -109,14 +119,34 @@ pub effect fn call<P: Program<M, C>, M, C: CommandSet<M, R>, ? R>(
   let mut anchor = ()
   let page = unsafe Pointer.borrowMut(&mut anchor, pinned)
   if op == CALL_START {
+    // The first render is already where the app starts: past the commands `init` gave, at
+    // the location and in the viewport. A server render does the same, so the two agree.
     page.dom.setViewport(f64.toF32(a), f64.toF32(b))
+    page.host.time = c
+    run page.host.sized(f64.toF32(a), f64.toF32(b))
+    drop run settle<Hosted<P>, M, Run<C>, OutOfMemoryError, R>(&mut page.host)
+    drop page.host.takeWent()
     run page.host.start(&mut page.dom, c)
     run drain<Hosted<P>, M, Run<C>, OutOfMemoryError, Dom, R>(&mut page.host, &mut page.dom)
-    run resize<Hosted<P>, M, Run<C>, OutOfMemoryError, Dom, R>(
+  } else if op == CALL_LOCATION {
+    let path = run String.copy(page.dom.written(f64.toUsize(a)))
+    if page.host.running() {
+      run navigate<Hosted<P>, M, Run<C>, OutOfMemoryError, Dom, R>(
+        &mut page.host,
+        &mut page.dom,
+        String.view(&path),
+      )
+    } else {
+      run page.host.locate(String.view(&path))
+    }
+  } else if op == CALL_POST {
+    let name = run String.copy(page.dom.written(f64.toUsize(a)))
+    let text = run String.copy(page.dom.writtenAt(f64.toUsize(a), f64.toUsize(b)))
+    run post<Hosted<P>, M, Run<C>, OutOfMemoryError, Dom, R>(
       &mut page.host,
       &mut page.dom,
-      f64.toF32(a),
-      f64.toF32(b),
+      String.view(&name),
+      String.view(&text),
     )
   } else if op == CALL_SCRATCH {
     return usize.toF64(run page.dom.reserve(f64.toUsize(a)))

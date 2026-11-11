@@ -1,0 +1,853 @@
+//! [`Html`]: a document that is written down instead of shown. It is a [`Backend`] that keeps
+//! what the mutations built and serializes it as markup `js/silk-ui-dom.js` hydrates: the page
+//! is readable before the program loads, and the program adopts the nodes it finds.
+//!
+//! ```silk
+//! let mut html = Html.make()
+//! html.setViewport(1280.0, 800.0)
+//! run html.font(1, "Inter, sans-serif")
+//! let markup = run render<Site, Message, Command>(&mut html, "/guide/")
+//! ```
+//!
+//! The markup goes inside the element `mount` gets as its root.
+import grid_css { writeGrid }
+import wire { roleName, cursorName }
+import ui_app.backend { Backend, Measured, TreeError }
+import ui_app.program { Program, CommandSet, Hosted, Run, make }
+import ui_app.runtime { drain, settle }
+import ui_protocol.css
+import ui_protocol.css { Declaration, writeDeclaration }
+import ui_protocol.mutation {
+  Mutation,
+  NodeKind,
+  StyleState,
+  Attribute,
+  Role,
+  Cursor,
+  NOT_FOCUSABLE
+}
+import ui_protocol.record { Event }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.geometry.rect { Rect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.i32
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+import silk.text.string { String }
+
+/// The rules every document starts from. `js/silk-ui-dom.js` has the same ones.
+pub const RESET: string = "[data-silk]{outline:none;border-width:0;-webkit-tap-highlight-color:transparent}[data-silk][role=\"button\"]{user-select:none;-webkit-user-select:none}a[data-silk]{display:block;color:inherit;text-decoration:none}input[data-silk],textarea[data-silk]{font:inherit;color:inherit;background:transparent;border:0 solid;margin:0;padding:0;min-width:0;resize:none;appearance:none;border-radius:0}[data-silk-icon]{display:inline-block;flex:none;width:1em;height:1em;background-color:currentColor;-webkit-mask:var(--silk-icon) center/contain no-repeat;mask:var(--silk-icon) center/contain no-repeat}[data-silk]::selection{background:var(--silk-selection-color,highlight)}[data-silk]::placeholder{color:var(--silk-placeholder-color,gray);opacity:1}"
+
+// The looks of a node, by state: base, hover, active, focus, focus-visible.
+const LOOKS: usize = 5
+
+// A flag attribute nothing set yet, then its two values.
+const UNSET: u8 = 0
+
+const OFF: u8 = 1
+
+const ON: u8 = 2
+
+struct Element {
+  id: u32,
+  kind: NodeKind,
+  alive: bool,
+  parent: u32,
+  children: List<u32>,
+  looks: List<List<Declaration>>,
+  text: String,
+  aria: Role,
+  label: String,
+  testId: String,
+  tabSet: bool,
+  tab: i32,
+  cursor: Option<Cursor>,
+  disabled: bool,
+  multiline: bool,
+  readOnly: bool,
+  placeholder: String,
+  checked: u8,
+  selected: u8,
+  expanded: u8,
+  ranged: bool,
+  min: f32,
+  max: f32,
+  value: f32,
+  href: String,
+  transition: String,
+  grid: Bytes,
+  source: u32,
+  anchored: bool,
+}
+
+/// A font family, an image or an icon: what number `id` stands for in the markup.
+struct Named {
+  id: u32,
+  value: String,
+}
+
+pub struct Html {
+  nodes: List<Element>,
+  /// Where node `id` is in `nodes`, plus one; zero for no such node.
+  slots: List<usize>,
+  root: u32,
+  width: f32,
+  height: f32,
+  fonts: List<Named>,
+  images: List<Named>,
+  icons: List<Named>,
+  base: String,
+}
+
+fn stateIndex(state: StyleState) -> usize {
+  return match state {
+    StyleState.Base => 0
+    StyleState.Hover => 1
+    StyleState.Active => 2
+    StyleState.Focus => 3
+    StyleState.FocusVisible => 4
+  }
+}
+
+fn flagOf(value: bool) -> u8 {
+  if value {
+    return ON
+  }
+  return OFF
+}
+
+fn startsWith(bytes: &[u8], prefix: &[u8]) -> bool {
+  if bytes.length < prefix.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < prefix.length {
+    if bytes[i] != prefix[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn sameBytes(a: &[u8], b: &[u8]) -> bool {
+  return a.length == b.length && startsWith(a, b)
+}
+
+effect fn digits(out: &mut Bytes, value: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if value >= 10 {
+    run digits(&mut out, value / 10)
+  }
+  run out.append(&[u32.toU8(48 + value % 10)])
+}
+
+/// Appends `bytes` as HTML text; inside an attribute's quotes with `quoted`.
+effect fn escape(out: &mut Bytes, bytes: &[u8], quoted: bool) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut from: usize = 0
+  let mut i: usize = 0
+  while i < bytes.length {
+    let at = bytes[i]
+    if at == 38 || at == 60 || at == 62 || quoted && at == 34 {
+      run out.append(Slice.view<u8>(bytes, from, i - from))
+      if at == 38 {
+        run out.append(b"&amp;")
+      } else if at == 60 {
+        run out.append(b"&lt;")
+      } else if at == 62 {
+        run out.append(b"&gt;")
+      } else {
+        run out.append(b"&quot;")
+      }
+      from = i + 1
+    }
+    i = i + 1
+  }
+  run out.append(Slice.view<u8>(bytes, from, bytes.length - from))
+}
+
+effect fn attribute(out: &mut Bytes, name: string, value: &[u8]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.append(b" ")
+  run out.append(String.utf8Bytes(name))
+  run out.append(b"=\"")
+  run escape(&mut out, value, true)
+  run out.append(b"\"")
+}
+
+effect fn flagAttribute(out: &mut Bytes, name: string, value: u8) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if value == ON {
+    run attribute(&mut out, name, b"true")
+  } else if value == OFF {
+    run attribute(&mut out, name, b"false")
+  }
+}
+
+effect fn numberAttribute(out: &mut Bytes, name: string, value: f32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = Bytes.make()
+  run css.write(&mut text, &css.number(value))
+  run attribute(&mut out, name, text.asSlice())
+}
+
+effect fn named(list: &mut List<Named>, id: u32, value: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let copy = run String.copy(value)
+  let mut i: usize = 0
+  while i < list.length() {
+    if list.asSlice()[i].id == id {
+      let entries = list.asMutSlice()
+      entries[i].value = move copy
+      return ()
+    }
+    i = i + 1
+  }
+  run list.append(Named { id: id, value: move copy })
+}
+
+fn nameOf(list: &List<Named>, id: u32) -> &[u8] {
+  let entries = list.asSlice()
+  let mut i: usize = 0
+  while i < entries.length {
+    if entries[i].id == id {
+      return entries[i].value.ownedUtf8Bytes()
+    }
+    i = i + 1
+  }
+  return b""
+}
+
+impl Html {
+  pub fn make() -> Html {
+    return Html {
+      nodes: List<Element>.make(),
+      slots: List<usize>.make(),
+      root: 0,
+      width: 1280.0,
+      height: 800.0,
+      fonts: List<Named>.make(),
+      images: List<Named>.make(),
+      icons: List<Named>.make(),
+      base: String.make(),
+    }
+  }
+
+  /// The viewport the program is told it has, in CSS pixels. The page that hydrates the
+  /// markup tells it the real one.
+  pub fn setViewport(self: &mut Self, width: f32, height: f32) -> () {
+    self.width = width
+    self.height = height
+  }
+
+  /// The font family `css.fontFamily(id)` stands for, as a CSS `font-family` value: what
+  /// `mount` gets as `fonts`.
+  pub effect fn font(self: &mut Self, id: u32, names: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run named(&mut self.fonts, id, names)
+  }
+
+  /// The address of image resource `id`: what `mount` gets as `images`.
+  pub effect fn image(self: &mut Self, id: u32, address: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run named(&mut self.images, id, address)
+  }
+
+  /// The address of icon resource `id`: what `mount` gets as `icons`.
+  pub effect fn icon(self: &mut Self, id: u32, address: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run named(&mut self.icons, id, address)
+  }
+
+  /// What comes before a link's path in its address, when the site is not at the root of its
+  /// origin: what `mount` gets as `base`.
+  pub effect fn setBase(self: &mut Self, base: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.base = run String.copy(base)
+  }
+
+  fn slot(self: &Self, id: u32) -> usize {
+    let at = u32.toUsize(id)
+    if at >= self.slots.length() {
+      return 0
+    }
+    return self.slots.get(at)
+  }
+
+  fn detach(self: &mut Self, id: u32) -> () {
+    let slot = self.slot(id)
+    if slot == 0 {
+      return ()
+    }
+    let parent = self.slot(self.nodes.asSlice()[slot - 1].parent)
+    let nodes = self.nodes.asMutSlice()
+    nodes[slot - 1].parent = 0
+    if parent == 0 {
+      return ()
+    }
+    let mut i: usize = 0
+    while i < self.nodes.asSlice()[parent - 1].children.length() {
+      if self.nodes.asSlice()[parent - 1].children.get(i) == id {
+        drop self.nodes.asMutSlice()[parent - 1].children.remove(i)
+        return ()
+      }
+      i = i + 1
+    }
+  }
+
+  effect fn take(self: &mut Self, mutation: &Mutation) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match &mutation.* {
+      Mutation.Create { id, kind } => {
+        let mut looks = List<List<Declaration>>.make()
+        let mut i: usize = 0
+        while i < LOOKS {
+          run looks.append(List<Declaration>.make())
+          i = i + 1
+        }
+        run self.nodes.append(
+          Element {
+            id: id,
+            kind: kind,
+            alive: true,
+            parent: 0,
+            children: List<u32>.make(),
+            looks: move looks,
+            text: String.make(),
+            aria: Role.None,
+            label: String.make(),
+            testId: String.make(),
+            tabSet: false,
+            tab: 0,
+            cursor: Option<Cursor>.None,
+            disabled: false,
+            multiline: false,
+            readOnly: false,
+            placeholder: String.make(),
+            checked: UNSET,
+            selected: UNSET,
+            expanded: UNSET,
+            ranged: false,
+            min: 0.0,
+            max: 0.0,
+            value: 0.0,
+            href: String.make(),
+            transition: String.make(),
+            grid: Bytes.make(),
+            source: 0,
+            anchored: false,
+          },
+        )
+        while self.slots.length() <= u32.toUsize(id) {
+          run self.slots.append(0)
+        }
+        self.slots.set(u32.toUsize(id), self.nodes.length())
+      }
+      Mutation.InsertBefore { parent, child, before } => {
+        self.detach(child)
+        let into = self.slot(parent)
+        let moved = self.slot(child)
+        if into == 0 || moved == 0 {
+          return ()
+        }
+        let nodes = self.nodes.asMutSlice()
+        nodes[moved - 1].parent = parent
+        let mut at = self.nodes.asSlice()[into - 1].children.length()
+        if let Option<u32>.Some { value: next } = before {
+          let mut i: usize = 0
+          while i < self.nodes.asSlice()[into - 1].children.length() {
+            if self.nodes.asSlice()[into - 1].children.get(i) == next {
+              at = i
+              break
+            }
+            i = i + 1
+          }
+        }
+        run self.nodes.asMutSlice()[into - 1].children.insert(at, child)
+      }
+      Mutation.Remove { id } => {
+        self.detach(id)
+      }
+      Mutation.Destroy { id } => {
+        self.detach(id)
+        let mut waiting = List<u32>.make()
+        run waiting.append(id)
+        while waiting.length() != 0 {
+          let last = waiting.length() - 1
+          let next = waiting.remove(last)
+          let slot = self.slot(next)
+          if slot != 0 {
+            run waiting.appendSlice(self.nodes.asSlice()[slot - 1].children.asSlice())
+            let nodes = self.nodes.asMutSlice()
+            nodes[slot - 1].alive = false
+            self.nodes.asMutSlice()[slot - 1].children.clear()
+            self.slots.set(u32.toUsize(next), 0)
+          }
+        }
+      }
+      Mutation.SetStyle { id, state, declarations } => {
+        let slot = self.slot(id)
+        if slot == 0 {
+          return ()
+        }
+        let list = declarations.asSlice()
+        let mut i: usize = 0
+        while i < list.length {
+          run css.set(
+            &mut self.nodes.asMutSlice()[slot - 1].looks.asMutSlice()[stateIndex(state)],
+            &list[i],
+          )
+          i = i + 1
+        }
+      }
+      Mutation.ClearStyle { id, state } => {
+        let slot = self.slot(id)
+        if slot != 0 {
+          self.nodes.asMutSlice()[slot - 1].looks.asMutSlice()[stateIndex(state)].clear()
+        }
+      }
+      Mutation.SetText { id, value } => {
+        let slot = self.slot(id)
+        if slot != 0 {
+          let nodes = self.nodes.asMutSlice()
+          nodes[slot - 1].text = run String.copy(String.view(&value))
+        }
+      }
+      Mutation.SetAttribute { id, attribute: entry } => {
+        let slot = self.slot(id)
+        if slot != 0 {
+          run self.assign(slot - 1, &entry)
+        }
+      }
+      Mutation.SetRoot { id } => {
+        self.root = id
+      }
+      Mutation.SetGrid { id, value } => {
+        let slot = self.slot(id)
+        if slot != 0 {
+          let mut text = Bytes.make()
+          run writeGrid(&mut text, &value)
+          let nodes = self.nodes.asMutSlice()
+          nodes[slot - 1].grid = move text
+        }
+      }
+      Mutation.SetSource { id, resource } => {
+        let slot = self.slot(id)
+        if slot != 0 {
+          let nodes = self.nodes.asMutSlice()
+          nodes[slot - 1].source = resource
+        }
+      }
+      Mutation.SetAnchor { id, .. } => {
+        let slot = self.slot(id)
+        if slot != 0 {
+          let nodes = self.nodes.asMutSlice()
+          nodes[slot - 1].anchored = true
+        }
+      }
+      Mutation.ClearAnchor { id } => {
+        let slot = self.slot(id)
+        if slot != 0 {
+          let nodes = self.nodes.asMutSlice()
+          nodes[slot - 1].anchored = false
+        }
+      }
+      Mutation.DefineFontFamily { family, names } => {
+        run named(&mut self.fonts, family, String.view(&names))
+      }
+      _ => {
+        // Focus, selection, scrolling, listeners and canvases: nothing markup can say.
+        return ()
+      }
+    }
+  }
+
+  effect fn assign(self: &mut Self, at: usize, entry: &Attribute) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let node = &mut self.nodes.asMutSlice()[at]
+    match &entry.* {
+      Attribute.ValueRange { min, max, value } => {
+        node.ranged = true
+        node.min = min
+        node.max = max
+        node.value = value
+      }
+      Attribute.ClearValueRange => {
+        node.ranged = false
+      }
+      Attribute.Role { value } => {
+        node.aria = value
+      }
+      Attribute.Label { value } => {
+        node.label = run String.copy(String.view(&value))
+      }
+      Attribute.TestId { value } => {
+        node.testId = run String.copy(String.view(&value))
+      }
+      Attribute.TabIndex { value } => {
+        node.tabSet = true
+        node.tab = value
+      }
+      Attribute.Cursor { value } => {
+        node.cursor = Option<Cursor>.Some { value: value }
+      }
+      Attribute.Disabled { value } => {
+        node.disabled = value
+      }
+      Attribute.FocusTrap { .. } => {
+        return ()
+      }
+      Attribute.Multiline { value } => {
+        node.multiline = value
+      }
+      Attribute.ReadOnly { value } => {
+        node.readOnly = value
+      }
+      Attribute.Placeholder { value } => {
+        node.placeholder = run String.copy(String.view(&value))
+      }
+      Attribute.Checked { value } => {
+        node.checked = flagOf(value)
+      }
+      Attribute.Selected { value } => {
+        node.selected = flagOf(value)
+      }
+      Attribute.Expanded { value } => {
+        node.expanded = flagOf(value)
+      }
+      Attribute.Prevent { .. } => {
+        return ()
+      }
+      Attribute.Href { value } => {
+        node.href = run String.copy(String.view(&value))
+      }
+      Attribute.Transition { value } => {
+        node.transition = run String.copy(String.view(&value))
+      }
+    }
+  }
+
+  /// Appends one declaration as the document spells it: a font family by its names, a
+  /// `-silk-` property as the custom property it is.
+  effect fn declaration(self: &Self, out: &mut Bytes, entry: &Declaration, important: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut line = Bytes.make()
+    run writeDeclaration(&mut line, entry)
+    let bytes = line.asSlice()
+    if startsWith(bytes, b"font-family: ") {
+      run out.append(b"font-family:")
+      let wanted = Slice.view<u8>(bytes, 13, bytes.length - 13)
+      let fonts = self.fonts.asSlice()
+      let mut found = false
+      let mut i: usize = 0
+      while i < fonts.length {
+        let mut number = Bytes.make()
+        run digits(&mut number, fonts[i].id)
+        if sameBytes(number.asSlice(), wanted) {
+          run out.append(fonts[i].value.ownedUtf8Bytes())
+          found = true
+          break
+        }
+        i = i + 1
+      }
+      if !found {
+        run out.append(b"inherit")
+      }
+    } else {
+      if startsWith(bytes, b"-silk-") {
+        run out.append(b"-")
+      }
+      run out.append(bytes)
+    }
+    if important && !entry.important {
+      run out.append(b" !important")
+    }
+    run out.append(b";")
+  }
+
+  /// The `style` attribute of `node`: its base look, then what its attributes add.
+  effect fn style(self: &Self, out: &mut Bytes, node: &Element) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut text = Bytes.make()
+    let base = node.looks.asSlice()[0].asSlice()
+    let mut i: usize = 0
+    while i < base.length {
+      run self.declaration(&mut text, &base[i], false)
+      i = i + 1
+    }
+    if let Option<Cursor>.Some { value: cursor } = node.cursor {
+      run text.append(b"cursor:")
+      run text.append(String.utf8Bytes(cursorName(cursor)))
+      run text.append(b";")
+    }
+    if node.transition.ownedByteLength() != 0 {
+      run text.append(b"transition:")
+      run text.append(node.transition.ownedUtf8Bytes())
+      run text.append(b";")
+    }
+    if node.grid.length() != 0 {
+      run text.append(node.grid.asSlice())
+      run text.append(b";")
+    }
+    if node.kind == NodeKind.Icon && nameOf(&self.icons, node.source).length != 0 {
+      run text.append(b"--silk-icon:url(\"")
+      run text.append(nameOf(&self.icons, node.source))
+      run text.append(b"\");")
+    }
+    if node.anchored {
+      // Where a popup goes takes layout: it stays hidden until the page places it.
+      run text.append(b"position:fixed;visibility:hidden;")
+    }
+    if text.length() != 0 {
+      run attribute(&mut out, "style", text.asSlice())
+    }
+  }
+
+  effect fn attributes(self: &Self, out: &mut Bytes, node: &Element) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run out.append(b" data-silk=\"")
+    run digits(&mut out, node.id)
+    run out.append(b"\"")
+    if node.kind == NodeKind.Icon {
+      run out.append(b" data-silk-icon")
+    }
+    if node.href.ownedByteLength() != 0 {
+      let mut address = Bytes.make()
+      if startsWith(node.href.ownedUtf8Bytes(), b"/") {
+        run address.append(self.base.ownedUtf8Bytes())
+      }
+      run address.append(node.href.ownedUtf8Bytes())
+      run attribute(&mut out, "href", address.asSlice())
+    }
+    if node.aria != Role.None {
+      run attribute(&mut out, "role", String.utf8Bytes(roleName(node.aria)))
+    }
+    if node.label.ownedByteLength() != 0 {
+      run attribute(&mut out, "aria-label", node.label.ownedUtf8Bytes())
+    }
+    if node.testId.ownedByteLength() != 0 {
+      run attribute(&mut out, "data-testid", node.testId.ownedUtf8Bytes())
+    }
+    if node.tabSet {
+      if node.tab == NOT_FOCUSABLE {
+        if node.kind == NodeKind.Input {
+          run attribute(&mut out, "tabindex", b"-1")
+        }
+      } else if node.tab < 0 {
+        run attribute(&mut out, "tabindex", b"-1")
+      } else {
+        let mut index = Bytes.make()
+        run digits(&mut index, i32.toU32(node.tab))
+        run attribute(&mut out, "tabindex", index.asSlice())
+      }
+    }
+    if node.disabled {
+      run attribute(&mut out, "aria-disabled", b"true")
+      if node.kind == NodeKind.Input {
+        run out.append(b" disabled")
+      }
+    }
+    if node.readOnly && node.kind == NodeKind.Input {
+      run out.append(b" readonly")
+    }
+    if node.placeholder.ownedByteLength() != 0 {
+      run attribute(&mut out, "placeholder", node.placeholder.ownedUtf8Bytes())
+    }
+    run flagAttribute(&mut out, "aria-checked", node.checked)
+    run flagAttribute(&mut out, "aria-selected", node.selected)
+    run flagAttribute(&mut out, "aria-expanded", node.expanded)
+    if node.ranged {
+      run numberAttribute(&mut out, "aria-valuemin", node.min)
+      run numberAttribute(&mut out, "aria-valuemax", node.max)
+      run numberAttribute(&mut out, "aria-valuenow", node.value)
+    }
+    run self.style(&mut out, node)
+  }
+
+  effect fn element(self: &Self, out: &mut Bytes, id: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let slot = self.slot(id)
+    if slot == 0 {
+      return ()
+    }
+    let node = &self.nodes.asSlice()[slot - 1]
+    match node.kind {
+      NodeKind.Text => {
+        // A marker keeps two texts in a row apart, and an empty one findable.
+        run out.append(b"<!--")
+        run digits(&mut out, id)
+        run out.append(b"-->")
+        run escape(&mut out, node.text.ownedUtf8Bytes(), false)
+      }
+      NodeKind.Input => {
+        if node.multiline {
+          run out.append(b"<textarea")
+          run self.attributes(&mut out, node)
+
+          // A textarea drops the line break it starts with.
+          run out.append(b">\n")
+          run escape(&mut out, node.text.ownedUtf8Bytes(), false)
+          run out.append(b"</textarea>")
+        } else {
+          run out.append(b"<input")
+          run self.attributes(&mut out, node)
+          if node.text.ownedByteLength() != 0 {
+            run attribute(&mut out, "value", node.text.ownedUtf8Bytes())
+          }
+          run out.append(b">")
+        }
+      }
+      NodeKind.Image => {
+        run out.append(b"<img")
+        run self.attributes(&mut out, node)
+        if nameOf(&self.images, node.source).length != 0 {
+          run attribute(&mut out, "src", nameOf(&self.images, node.source))
+        }
+        run attribute(&mut out, "alt", node.label.ownedUtf8Bytes())
+        run out.append(b">")
+      }
+      NodeKind.Icon => {
+        run out.append(b"<span")
+        run self.attributes(&mut out, node)
+        run out.append(b"></span>")
+      }
+      NodeKind.Canvas => {
+        run out.append(b"<canvas")
+        run self.attributes(&mut out, node)
+        run out.append(b"></canvas>")
+      }
+      NodeKind.Box => {
+        let mut tag: string = "div"
+        if node.href.ownedByteLength() != 0 {
+          tag = "a"
+        }
+        run out.append(b"<")
+        run out.append(String.utf8Bytes(tag))
+        run self.attributes(&mut out, node)
+        run out.append(b">")
+        let children = node.children.asSlice()
+        let mut i: usize = 0
+        while i < children.length {
+          run self.element(&mut out, children[i])
+          i = i + 1
+        }
+        run out.append(b"</")
+        run out.append(String.utf8Bytes(tag))
+        run out.append(b">")
+      }
+    }
+  }
+
+  /// The rules of one state look, for every node that has it.
+  effect fn rules(self: &Self, out: &mut Bytes, state: usize, selector: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let nodes = self.nodes.asSlice()
+    let mut i: usize = 0
+    while i < nodes.length {
+      let look = nodes[i].looks.asSlice()[state].asSlice()
+      if nodes[i].alive && look.length != 0 {
+        run out.append(b"[data-silk=\"")
+        run digits(&mut out, nodes[i].id)
+        run out.append(b"\"]")
+        run out.append(String.utf8Bytes(selector))
+        run out.append(b"{")
+        let mut j: usize = 0
+        while j < look.length {
+          run self.declaration(&mut out, &look[j], true)
+          j = j + 1
+        }
+        run out.append(b"}")
+      }
+      i = i + 1
+    }
+  }
+
+  /// The document as markup: one `style` element (the reset and the state looks) and the root
+  /// node. It goes inside the element the page mounts the program in.
+  pub effect fn markup(self: &Self) -> Bytes
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut out = Bytes.make()
+    run out.append(b"<style data-silk-ssr>")
+    run out.append(String.utf8Bytes(RESET))
+
+    // Later rules win: a pressed node shows its active look over its hover look.
+    run self.rules(&mut out, 1, ":hover")
+    run self.rules(&mut out, 3, ":focus")
+    run self.rules(&mut out, 4, ":focus-visible")
+    run self.rules(&mut out, 2, ":active")
+    run out.append(b"</style>")
+    run self.element(&mut out, self.root)
+    return move out
+  }
+}
+
+impl Backend for Html {
+  effect fn mutate(self: &mut Self, batch: List<Mutation>) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let list = batch.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      run self.take(&list[i])
+      i = i + 1
+    }
+  }
+
+  effect fn events(self: &mut Self, out: &mut List<Event>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return ()
+  }
+
+  fn viewport(self: &Self) -> Rect<f32> {
+    return Rect<f32>.new(0.0, 0.0, self.width, self.height)
+  }
+
+  effect fn measure(self: &Self, id: u32) -> Option<Measured>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return Option<Measured>.None
+  }
+}
+
+/// Runs program `P` at `path` until its first render and returns the markup of it: the model
+/// `init` makes, past the commands it starts with, at that location and in `html`'s viewport.
+/// It is what `mount` renders first in the page, so the page adopts every node.
+pub effect fn render<P: Program<M, C>, M, C: CommandSet<M, R>, ? R>(
+  html: &mut Html,
+  path: string,
+) -> Bytes
+  ! TreeError | OutOfMemoryError
+  ? R | &mut Allocator {
+  let mut host = run make<P, M, C>()
+  run host.locate(path)
+  run host.sized(html.width, html.height)
+  drop run settle<Hosted<P>, M, Run<C>, OutOfMemoryError, R>(&mut host)
+  drop host.takeWent()
+  run host.start(&mut html, 0.0)
+  run drain<Hosted<P>, M, Run<C>, OutOfMemoryError, Html, R>(&mut host, &mut html)
+  return run html.markup()
+}

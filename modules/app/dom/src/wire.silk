@@ -1,8 +1,9 @@
 //! The bytes that cross between the program and `js/silk-ui-dom.js`: mutation batches out,
 //! event records in. Integers are little-endian; a string is its length (u32) and its UTF-8.
 //!
-//! The mutations a document has no use for yet (anchors, virtual lists, grids, canvases,
-//! images, icons) are not written: see the README.
+//! Virtual lists are the one thing not written: a document scrolls its own content, and the
+//! tree's virtualization is not part of the core (see the README).
+import grid_css { writeGrid }
 import ui_protocol.css { writeDeclaration }
 import ui_protocol.mutation {
   Mutation,
@@ -11,6 +12,7 @@ import ui_protocol.mutation {
   Attribute,
   Role,
   Cursor,
+  CanvasCommand,
   NOT_FOCUSABLE
 }
 import ui_protocol.record { Event, EventKind }
@@ -20,6 +22,7 @@ import silk.collections.slice { Slice }
 import silk.core.option { Option }
 import silk.core.result { Result }
 import silk.geometry.rect { Rect }
+import silk.color.rgba { Rgba }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.f32
 import silk.num.i32
@@ -63,6 +66,26 @@ pub const OP_SCROLL_TO: u8 = 16
 pub const OP_SCROLL_INTO_VIEW: u8 = 17
 
 pub const OP_FONT_FAMILY: u8 = 18
+
+/// A grid template, as the CSS declarations of `grid_css`.
+pub const OP_GRID: u8 = 19
+
+/// The image or icon resource a node shows.
+pub const OP_SOURCE: u8 = 20
+
+pub const OP_CANVAS: u8 = 21
+
+pub const OP_ANCHOR: u8 = 22
+
+pub const OP_CLEAR_ANCHOR: u8 = 23
+
+/// An image resource, as the bytes of its file.
+pub const OP_IMAGE: u8 = 24
+
+/// An icon resource, as SVG.
+pub const OP_ICON: u8 = 25
+
+pub const OP_RELEASE_RESOURCE: u8 = 26
 
 effect fn byte(out: &mut Bytes, value: u8) -> ()
   ! OutOfMemoryError
@@ -131,7 +154,7 @@ fn stateCode(state: StyleState) -> u8 {
 }
 
 /// The ARIA role name; empty for no role.
-fn roleName(value: Role) -> string<'static> {
+pub fn roleName(value: Role) -> string<'static> {
   return match value {
     Role.None => ""
     Role.Generic => "generic"
@@ -165,7 +188,7 @@ fn roleName(value: Role) -> string<'static> {
 }
 
 /// The CSS `cursor` value.
-fn cursorName(value: Cursor) -> string<'static> {
+pub fn cursorName(value: Cursor) -> string<'static> {
   return match value {
     Cursor.Default => "default"
     Cursor.Pointer => "pointer"
@@ -214,6 +237,73 @@ const ATTR_SELECTED: u8 = 13
 const ATTR_EXPANDED: u8 = 14
 
 const ATTR_PREVENT: u8 = 15
+
+const ATTR_HREF: u8 = 16
+
+const ATTR_TRANSITION: u8 = 17
+
+effect fn color(out: &mut Bytes, value: Rgba<f32>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run float(&mut out, value.r)
+  run float(&mut out, value.g)
+  run float(&mut out, value.b)
+  run float(&mut out, value.a)
+}
+
+effect fn writeCanvas(out: &mut Bytes, command: CanvasCommand) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match command {
+    CanvasCommand.FillRect { x, y, width, height, radius, color: fill } => {
+      run byte(&mut out, 0)
+      run float(&mut out, x)
+      run float(&mut out, y)
+      run float(&mut out, width)
+      run float(&mut out, height)
+      run float(&mut out, radius)
+      run color(&mut out, fill)
+    }
+    CanvasCommand.MoveTo { x, y } => {
+      run byte(&mut out, 1)
+      run float(&mut out, x)
+      run float(&mut out, y)
+    }
+    CanvasCommand.LineTo { x, y } => {
+      run byte(&mut out, 2)
+      run float(&mut out, x)
+      run float(&mut out, y)
+    }
+    CanvasCommand.QuadTo { x1, y1, x, y } => {
+      run byte(&mut out, 3)
+      run float(&mut out, x1)
+      run float(&mut out, y1)
+      run float(&mut out, x)
+      run float(&mut out, y)
+    }
+    CanvasCommand.CubicTo { x1, y1, x2, y2, x, y } => {
+      run byte(&mut out, 4)
+      run float(&mut out, x1)
+      run float(&mut out, y1)
+      run float(&mut out, x2)
+      run float(&mut out, y2)
+      run float(&mut out, x)
+      run float(&mut out, y)
+    }
+    CanvasCommand.Close => {
+      run byte(&mut out, 5)
+    }
+    CanvasCommand.Fill { color: fill } => {
+      run byte(&mut out, 6)
+      run color(&mut out, fill)
+    }
+    CanvasCommand.Stroke { color: line, width } => {
+      run byte(&mut out, 7)
+      run color(&mut out, line)
+      run float(&mut out, width)
+    }
+  }
+}
 
 effect fn writeAttribute(out: &mut Bytes, entry: &Attribute) -> ()
   ! OutOfMemoryError
@@ -293,6 +383,14 @@ effect fn writeAttribute(out: &mut Bytes, entry: &Attribute) -> ()
     Attribute.Prevent { actions } => {
       run byte(&mut out, ATTR_PREVENT)
       run word(&mut out, actions)
+    }
+    Attribute.Href { value } => {
+      run byte(&mut out, ATTR_HREF)
+      run text(&mut out, value.ownedUtf8Bytes())
+    }
+    Attribute.Transition { value } => {
+      run byte(&mut out, ATTR_TRANSITION)
+      run text(&mut out, value.ownedUtf8Bytes())
     }
   }
 }
@@ -395,6 +493,56 @@ pub effect fn writeMutation(out: &mut Bytes, mutation: &Mutation) -> bool
       run byte(&mut out, OP_FONT_FAMILY)
       run word(&mut out, family)
       run text(&mut out, names.ownedUtf8Bytes())
+    }
+    Mutation.SetGrid { id, value } => {
+      run byte(&mut out, OP_GRID)
+      run word(&mut out, id)
+      let mut css = Bytes.make()
+      run writeGrid(&mut css, &value)
+      run text(&mut out, css.asSlice())
+    }
+    Mutation.SetSource { id, resource } => {
+      run byte(&mut out, OP_SOURCE)
+      run word(&mut out, id)
+      run word(&mut out, resource)
+    }
+    Mutation.SetCanvas { id, commands } => {
+      run byte(&mut out, OP_CANVAS)
+      run word(&mut out, id)
+      let list = commands.asSlice()
+      run word(&mut out, usize.toU32(list.length))
+      let mut i: usize = 0
+      while i < list.length {
+        run writeCanvas(&mut out, list[i])
+        i = i + 1
+      }
+    }
+    Mutation.SetAnchor { id, target, options } => {
+      run byte(&mut out, OP_ANCHOR)
+      run word(&mut out, id)
+      run word(&mut out, target)
+      run float(&mut out, options.gap)
+      run float(&mut out, options.preferredHeight)
+      run flag(&mut out, options.alignEnd)
+      run flag(&mut out, options.matchWidth)
+    }
+    Mutation.ClearAnchor { id } => {
+      run byte(&mut out, OP_CLEAR_ANCHOR)
+      run word(&mut out, id)
+    }
+    Mutation.DefineImage { resource, data } => {
+      run byte(&mut out, OP_IMAGE)
+      run word(&mut out, resource)
+      run text(&mut out, data.asSlice())
+    }
+    Mutation.DefineIcon { resource, data } => {
+      run byte(&mut out, OP_ICON)
+      run word(&mut out, resource)
+      run text(&mut out, data.asSlice())
+    }
+    Mutation.ReleaseResource { resource } => {
+      run byte(&mut out, OP_RELEASE_RESOURCE)
+      run word(&mut out, resource)
     }
     _ => {
       return false

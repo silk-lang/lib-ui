@@ -33,10 +33,11 @@ import silk.collections.hash_map { HashMap }
 import silk.collections.hash { Hash }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
+import silk.core.result { Result }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.u32
 import silk.num.usize
-import silk.text.string { String }
+import silk.text.string { String, InvalidUtf8 }
 
 /// A running `Every` subscription.
 struct Timer {
@@ -84,6 +85,8 @@ pub struct Runtime<A, M, C> {
   animating: bool,
   keyBindings: bool,
   resizes: bool,
+  /// A link was followed since the backend was last told.
+  went: bool,
   width: f32,
   height: f32,
   started: bool,
@@ -119,6 +122,7 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
       animating: false,
       keyBindings: false,
       resizes: false,
+      went: false,
       width: 0.0,
       height: 0.0,
       started: false,
@@ -164,6 +168,11 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
     run Backend.mutate(&mut tree, move batch)
     self.started = true
     run self.render(&mut tree)
+  }
+
+  /// Whether `start` has run.
+  pub fn running(self: &Self) -> bool {
+    return self.started
   }
 
   /// Queues `message`, as if a handler sent it. `drain` handles it.
@@ -363,7 +372,7 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
         self.animating = true
       } else if record.kind == SubscriptionKind.KeyBinding {
         self.keyBindings = true
-      } else {
+      } else if record.kind == SubscriptionKind.Resize {
         self.resizes = true
       }
       i = i + 1
@@ -416,6 +425,127 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
     }
   }
 
+  /// Where the app is (see `Subscriptions.location`).
+  pub fn location(self: &Self) -> string {
+    if String.byteLength(String.view(&self.subscriptions.current)) == 0 {
+      return "/"
+    }
+    return String.view(&self.subscriptions.current)
+  }
+
+  /// Moves the location to `path` and tells the location subscriptions; their messages join
+  /// the queue. Before `start` it sets where the app starts: `settle` then handles the messages
+  /// so the first render is already there.
+  pub effect fn locate(self: &mut Self, path: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.subscriptions.current = run String.copy(path)
+    self.subscriptions.beginCollect()
+    App<M, C>.subscriptions(&self.model, &mut self.subscriptions)
+    let list = self.subscriptions.list()
+    let mut keys = List<u64>.make()
+    let mut j: usize = 0
+    while j < list.length {
+      if list[j].kind == SubscriptionKind.Location {
+        run keys.append(list[j].key)
+      }
+      j = j + 1
+    }
+    let mut k: usize = 0
+    while k < keys.length() {
+      let delivery = Delivery {
+        kind: SubscriptionKind.Location,
+        key: keys.get(k),
+        time: self.time,
+        width: 0.0,
+        height: 0.0,
+      }
+      run self.deliver(delivery)
+      k = k + 1
+    }
+  }
+
+  /// The host posts `text` to the port `name`: tells the port subscriptions of that name,
+  /// whose messages join the queue.
+  pub effect fn posted(self: &mut Self, name: string, text: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.subscriptions.posted = run String.copy(text)
+    self.subscriptions.beginCollect()
+    App<M, C>.subscriptions(&self.model, &mut self.subscriptions)
+    let wanted = String.utf8Bytes(name)
+    let list = self.subscriptions.list()
+    let mut keys = List<u64>.make()
+    let mut j: usize = 0
+    while j < list.length {
+      if list[j].kind == SubscriptionKind.Port {
+        let named = self.subscriptions.keyName(list[j])
+        let mut same = named.length == wanted.length
+        let mut i: usize = 0
+        while same && i < named.length {
+          same = named[i] == wanted[i]
+          i = i + 1
+        }
+        if same {
+          run keys.append(list[j].key)
+        }
+      }
+      j = j + 1
+    }
+    let mut k: usize = 0
+    while k < keys.length() {
+      let delivery = Delivery {
+        kind: SubscriptionKind.Port,
+        key: keys.get(k),
+        time: self.time,
+        width: 0.0,
+        height: 0.0,
+      }
+      run self.deliver(delivery)
+      k = k + 1
+    }
+    self.subscriptions.posted = String.make()
+  }
+
+  /// The viewport is `width` by `height` CSS pixels: tells the resize subscriptions, whose
+  /// messages join the queue. For before `start`, as `locate` is; afterwards `resize` does it.
+  pub effect fn sized(self: &mut Self, width: f32, height: f32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.width = width
+    self.height = height
+    self.subscriptions.beginCollect()
+    App<M, C>.subscriptions(&self.model, &mut self.subscriptions)
+    let list = self.subscriptions.list()
+    let mut keys = List<u64>.make()
+    let mut j: usize = 0
+    while j < list.length {
+      if list[j].kind == SubscriptionKind.Resize {
+        run keys.append(list[j].key)
+      }
+      j = j + 1
+    }
+    let mut k: usize = 0
+    while k < keys.length() {
+      let delivery = Delivery {
+        kind: SubscriptionKind.Resize,
+        key: keys.get(k),
+        time: self.time,
+        width: width,
+        height: height,
+      }
+      run self.deliver(delivery)
+      k = k + 1
+    }
+  }
+
+  /// Whether a link was followed since the last call: the location is where it went.
+  pub fn takeWent(self: &mut Self) -> bool {
+    let value = self.went
+    self.went = false
+    return value
+  }
+
   /// Whether a handler prevented a default action since the last call. A host that feeds
   /// input in two steps (`tree.begin`, `pump`, `tree.finish`) hands this to `finish`.
   pub fn takePrevented(self: &mut Self) -> bool {
@@ -438,16 +568,29 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
 
     // Whether the record's target is a text input: the keys it types are not key bindings.
     let mut typing = false
+
+    // The link the record is in, if any: the innermost one.
+    let mut link = List<u8>.make()
     let mut i: usize = 1
     while i < ids.length {
       let entry = self.diffState.entryOf(ids[i])
       if entry == NO_ENTRY {
         return ()
       }
-      run self.path.append(self.ui.arena.entry(entry).identity)
-      typing = isTextInput(self.ui.arena.entry(entry).kind)
+      let found = self.ui.arena.entry(entry)
+      run self.path.append(found.identity)
+      typing = isTextInput(found.kind)
+      if found.href.length != 0 {
+        link.clear()
+        run link.appendSlice(self.ui.arena.text(found.href))
+      }
       i = i + 1
     }
+
+    // Only a path inside the app is followed; any other address is the document's to load.
+    let follows = record.kind == EventKind.Click && link.length() != 0 && link.get(0) == 47
+      && record.modifiers == 0
+      && record.button == 0
     let isKey = record.kind == EventKind.KeyDown
     let mut name = List<u8>.make()
     let modifiers = record.modifiers
@@ -458,10 +601,19 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
     App<M, C>.view(&self.model, &mut self.ui)
     let before = self.queue.length()
     run self.ui.endDispatch(&mut self.queue)
-    if self.ui.takePrevented() {
+    let prevented = self.ui.takePrevented()
+    if prevented {
       self.prevented = true
     }
     self.stats.dispatches = self.stats.dispatches + 1
+    if follows && !prevented {
+      // The click is the runtime's now: a document must not load the page the link names.
+      self.prevented = true
+      self.went = true
+      if let Result<string, InvalidUtf8>.Success { value: path } = String.fromUtf8(link.asSlice()) {
+        run self.locate(path)
+      }
+    }
     if isKey && self.keyBindings && self.queue.length() == before {
       // No handler in the view took the key: try the key bindings.
       let list = self.subscriptions.list()
@@ -520,8 +672,25 @@ pub effect fn drain<A: App<M, C>, M, C: Perform<M, E, R>, E, B: Backend, ? R>(
 ) -> ()
   ! E | TreeError | OutOfMemoryError
   ? R | &mut Allocator {
+  let handled = run settle(&mut runtime)
+  if runtime.takeWent() {
+    Backend.navigate(&mut tree, runtime.location())
+  }
+  if handled {
+    run runtime.render(&mut tree)
+  }
+}
+
+/// Handles every queued message as `drain` does, without rendering. Returns whether anything
+/// was handled. Before `start`, it brings the model to where the first render should be: past
+/// the commands `init` started with and the location the app starts at.
+pub effect fn settle<A: App<M, C>, M, C: Perform<M, E, R>, E, ? R>(
+  runtime: &mut Runtime<A, M, C>,
+) -> bool
+  ! E | OutOfMemoryError
+  ? R | &mut Allocator {
   if !runtime.pending() && runtime.context.commands.length() == 0 {
-    return ()
+    return false
   }
   while true {
     // Commands first: the ones a program starts with wait here before any message.
@@ -541,10 +710,44 @@ pub effect fn drain<A: App<M, C>, M, C: Perform<M, E, R>, E, B: Backend, ? R>(
     let message = runtime.queue.remove(runtime.head)
     runtime.stats.messages = runtime.stats.messages + 1
     App<M, C>.update(&mut runtime.model, move message, &mut runtime.context)
+    if let Option<String>.Some { value: path } = Intrinsic.replace(
+      runtime.context.destination,
+      Option<String>.none(),
+    ) {
+      runtime.went = true
+      run runtime.locate(String.view(&path))
+    }
   }
   runtime.queue.clear()
   runtime.head = 0
-  run runtime.render(&mut tree)
+  return true
+}
+
+/// Moves the location to `path`, as a click on a link to it does, and handles the messages.
+pub effect fn navigate<A: App<M, C>, M, C: Perform<M, E, R>, E, B: Backend, ? R>(
+  runtime: &mut Runtime<A, M, C>,
+  tree: &mut B,
+  path: string,
+) -> ()
+  ! E | TreeError | OutOfMemoryError
+  ? R | &mut Allocator {
+  run runtime.locate(path)
+  run drain(&mut runtime, &mut tree)
+}
+
+/// Posts `text` to the port `name` (see `Subscriptions.port`) and handles the messages.
+pub effect fn post<A: App<M, C>, M, C: Perform<M, E, R>, E, B: Backend, ? R>(
+  runtime: &mut Runtime<A, M, C>,
+  tree: &mut B,
+  name: string,
+  text: string,
+) -> ()
+  ! E | TreeError | OutOfMemoryError
+  ? R | &mut Allocator {
+  run runtime.posted(name, text)
+  if runtime.running() {
+    run drain(&mut runtime, &mut tree)
+  }
 }
 
 /// Feeds one input to the tree the way a browser does: the handlers of the input's own record

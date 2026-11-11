@@ -1,0 +1,304 @@
+//! A [`Grid`] as CSS: the declarations a document needs to lay a grid template out, as
+//! `name:value` pairs joined by `;`. Only what the template sets is written, so an empty
+//! template is the empty text.
+import ui_protocol.css { write, px, percent, number }
+import ui_protocol.grid {
+  Grid,
+  GridAxis,
+  GridTrack,
+  GridTrackKind,
+  GridBreadth,
+  GridBreadthKind,
+  GridRepeat,
+  GridRepeatKind,
+  GridAutoFlow,
+  GridLine,
+  GridLineKind
+}
+import silk.collections.bytes { Bytes }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.i32
+import silk.num.usize
+import silk.text.string { String }
+
+/// The properties [`writeGrid`] may write: what a document clears before it applies a new
+/// template.
+pub const GRID_PROPERTIES: string = "grid-template-columns grid-template-rows grid-template-areas grid-auto-columns grid-auto-rows grid-auto-flow grid-row-start grid-row-end grid-column-start grid-column-end"
+
+effect fn breadth(out: &mut Bytes, value: GridBreadth) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match value.kind {
+    GridBreadthKind.Length => {
+      run write(&mut out, &px(value.length))
+    }
+    GridBreadthKind.Percent => {
+      run write(&mut out, &percent(value.percent))
+    }
+    GridBreadthKind.Calc => {
+      run out.append(b"calc(")
+      run write(&mut out, &px(value.length))
+      run out.append(b" + ")
+      run write(&mut out, &percent(value.percent))
+      run out.append(b")")
+    }
+    GridBreadthKind.Flex => {
+      run write(&mut out, &number(value.length))
+      run out.append(b"fr")
+    }
+    GridBreadthKind.Auto => {
+      run out.append(b"auto")
+    }
+    GridBreadthKind.MinContent => {
+      run out.append(b"min-content")
+    }
+    GridBreadthKind.MaxContent => {
+      run out.append(b"max-content")
+    }
+  }
+}
+
+effect fn track(out: &mut Bytes, value: GridTrack) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match value.kind {
+    GridTrackKind.Breadth => {
+      run breadth(&mut out, value.min)
+    }
+    GridTrackKind.Minmax => {
+      run out.append(b"minmax(")
+      run breadth(&mut out, value.min)
+      run out.append(b", ")
+      run breadth(&mut out, value.max)
+      run out.append(b")")
+    }
+    GridTrackKind.FitContent => {
+      run out.append(b"fit-content(")
+      run breadth(&mut out, value.max)
+      run out.append(b")")
+    }
+  }
+}
+
+effect fn name(out: &mut Bytes, grid: &Grid, index: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if index != 0 && index <= grid.names.length() {
+    run out.append(grid.names.asSlice()[index - 1].ownedUtf8Bytes())
+  }
+}
+
+/// The names of line `line` that belong to repeat `repeat` (zero: to none), as ` [a b]`.
+/// Nothing without a name, unless `always`: a subgrid writes its empty groups too.
+effect fn names(
+  out: &mut Bytes,
+  grid: &Grid,
+  axis: &GridAxis,
+  line: usize,
+  repeat: usize,
+  always: bool,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let lines = axis.lines.asSlice()
+  let mut found = false
+  let mut i: usize = 0
+  while i < lines.length {
+    if lines[i].line == line && lines[i].repeat == repeat {
+      if found {
+        run out.append(b" ")
+      } else {
+        run out.append(b" [")
+        found = true
+      }
+      run name(&mut out, grid, lines[i].name)
+    }
+    i = i + 1
+  }
+  if found {
+    run out.append(b"]")
+  } else if always {
+    run out.append(b" []")
+  }
+}
+
+effect fn repeatHead(out: &mut Bytes, repeat: GridRepeat) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.append(b" repeat(")
+  match repeat.kind {
+    GridRepeatKind.Count => {
+      run write(&mut out, &number(usize.toF32(repeat.count)))
+    }
+    GridRepeatKind.AutoFill => {
+      run out.append(b"auto-fill")
+    }
+    GridRepeatKind.AutoFit => {
+      run out.append(b"auto-fit")
+    }
+  }
+  run out.append(b",")
+}
+
+effect fn axisValue(out: &mut Bytes, grid: &Grid, axis: &GridAxis) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let repeats = axis.repeats.asSlice()
+  let mut next: usize = 0
+  let mut i: usize = 0
+  if axis.subgrid {
+    run out.append(b"subgrid")
+    while i < axis.lineCount {
+      if next < repeats.length && repeats[next].start == i {
+        let repeat = repeats[next]
+        run repeatHead(&mut out, repeat)
+        let mut j = i
+        while j < i + repeat.length {
+          run names(&mut out, grid, axis, j, next + 1, true)
+          j = j + 1
+        }
+        run out.append(b")")
+        i = i + repeat.length
+        next = next + 1
+      } else {
+        run names(&mut out, grid, axis, i, 0, true)
+        i = i + 1
+      }
+    }
+    return ()
+  }
+  let tracks = axis.tracks.asSlice()
+  while i <= tracks.length {
+    run names(&mut out, grid, axis, i, 0, false)
+    if i == tracks.length {
+      break
+    }
+    if next < repeats.length && repeats[next].start == i {
+      let repeat = repeats[next]
+      run repeatHead(&mut out, repeat)
+      let mut j = i
+      while j < i + repeat.length {
+        run names(&mut out, grid, axis, j, next + 1, false)
+        run out.append(b" ")
+        run track(&mut out, tracks[j])
+        j = j + 1
+      }
+      run names(&mut out, grid, axis, i + repeat.length, next + 1, false)
+      run out.append(b")")
+      i = i + repeat.length
+      next = next + 1
+    } else {
+      run out.append(b" ")
+      run track(&mut out, tracks[i])
+      i = i + 1
+    }
+  }
+}
+
+effect fn begin(out: &mut Bytes, property: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if out.length() != 0 {
+    run out.append(b";")
+  }
+  run out.append(String.utf8Bytes(property))
+  run out.append(b":")
+}
+
+effect fn tracksOf(out: &mut Bytes, property: string, tracks: &[GridTrack]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if tracks.length == 0 {
+    return ()
+  }
+  run begin(&mut out, property)
+  let mut i: usize = 0
+  while i < tracks.length {
+    run out.append(b" ")
+    run track(&mut out, tracks[i])
+    i = i + 1
+  }
+}
+
+effect fn lineOf(out: &mut Bytes, grid: &Grid, property: string, line: GridLine) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if line.kind == GridLineKind.Auto {
+    return ()
+  }
+  run begin(&mut out, property)
+  if line.kind == GridLineKind.Span {
+    run out.append(b"span")
+  }
+  if line.number != 0 {
+    run out.append(b" ")
+    run write(&mut out, &number(i32.toF32(line.number)))
+  }
+  if line.name != 0 {
+    run out.append(b" ")
+    run name(&mut out, grid, line.name)
+  }
+}
+
+/// Appends `grid` to `out` as CSS declarations.
+pub effect fn writeGrid(out: &mut Bytes, grid: &Grid) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let template = &grid.template
+  if template.columns.subgrid || template.columns.tracks.length() != 0 {
+    run begin(&mut out, "grid-template-columns")
+    run axisValue(&mut out, grid, &template.columns)
+  }
+  if template.rows.subgrid || template.rows.tracks.length() != 0 {
+    run begin(&mut out, "grid-template-rows")
+    run axisValue(&mut out, grid, &template.rows)
+  }
+  run tracksOf(&mut out, "grid-auto-columns", template.autoColumns.asSlice())
+  run tracksOf(&mut out, "grid-auto-rows", template.autoRows.asSlice())
+  let areas = template.areas.asSlice()
+  if areas.length != 0 && template.areaRows != 0 && template.areaColumns != 0 {
+    run begin(&mut out, "grid-template-areas")
+    let mut row: usize = 0
+    while row < template.areaRows {
+      run out.append(b" \"")
+      let mut column: usize = 0
+      while column < template.areaColumns {
+        if column != 0 {
+          run out.append(b" ")
+        }
+        let mut found: usize = 0
+        let mut i: usize = 0
+        while i < areas.length {
+          if row >= areas[i].rowStart && row < areas[i].rowEnd && column >= areas[i].columnStart
+            && column < areas[i].columnEnd {
+            found = areas[i].name
+          }
+          i = i + 1
+        }
+        if found == 0 {
+          run out.append(b".")
+        } else {
+          run name(&mut out, grid, found)
+        }
+        column = column + 1
+      }
+      run out.append(b"\"")
+      row = row + 1
+    }
+  }
+  if template.flow == GridAutoFlow.Column || template.dense {
+    run begin(&mut out, "grid-auto-flow")
+    if template.flow == GridAutoFlow.Column {
+      run out.append(b"column")
+    } else {
+      run out.append(b"row")
+    }
+    if template.dense {
+      run out.append(b" dense")
+    }
+  }
+  run lineOf(&mut out, grid, "grid-row-start", template.placement.rowStart)
+  run lineOf(&mut out, grid, "grid-row-end", template.placement.rowEnd)
+  run lineOf(&mut out, grid, "grid-column-start", template.placement.columnStart)
+  run lineOf(&mut out, grid, "grid-column-end", template.placement.columnEnd)
+}

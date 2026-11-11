@@ -13,17 +13,21 @@ import heap { Heap }
 import program { Submodel }
 import ui { Ui, Span }
 // What a view names next to the builder.
-pub import ui { Reply }
-pub import ui_protocol.mutation { Role, Cursor }
+pub import ui { Reply, DefaultAction }
+pub import ui_protocol.grid { Grid }
+pub import ui_protocol.mutation { Role, Cursor, CanvasCommand }
+pub import ui_protocol.options { AnchorOptions }
 pub import ui_protocol.record { Event, EventKind }
 import ui_protocol.css
 import ui_protocol.css { Declaration, Keyword }
+import ui_protocol.event { preventFlags }
 import ui_protocol.mutation { NodeKind, StyleState, FlexDirection }
 import silk.collections.list { List }
 import silk.collections.slice { Slice }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
 import silk.core.result { Result }
+import silk.geometry.rect { Rect }
 import silk.mem.pointer { Pointer }
 import silk.num.i64
 import silk.num.u32
@@ -52,6 +56,12 @@ enum Shape {
   Box,
   Text,
   Input,
+  Image,
+  Icon,
+  /// Its `text` is a span of the tree's `canvas`.
+  Canvas,
+  /// Its children go in the overlay layer, in the overlay `key` names.
+  Overlay,
   /// Its children become children of the node that holds it.
   Fragment,
 }
@@ -82,6 +92,20 @@ union Op {
   Checked { value: bool },
   Selected { value: bool },
   Expanded { value: bool },
+  Href { text: Span },
+  Transition { text: Span },
+  FocusTrap { value: bool },
+  TakeFocus,
+  Reveal,
+  Prevent { flags: u32 },
+  Multiline { value: bool },
+  ReadOnly { value: bool },
+  ValueRange { min: f32, max: f32, value: f32 },
+  Anchor { key: u64 },
+  Anchored { key: u64, options: AnchorOptions },
+  /// The template at `index` of the tree's `grids`.
+  Template { index: u32 },
+  Source { resource: u32 },
   /// The node listens for `kind`, and has nothing to answer in this pass.
   Listen { kind: EventKind },
   /// The node answers the record of this pass with the reply in `slot`.
@@ -100,6 +124,8 @@ struct Tree {
   ops: List<Op>,
   attrs: List<u32>,
   styles: List<Declaration>,
+  grids: List<Grid>,
+  canvas: List<CanvasCommand>,
   bytes: List<u8>,
   /// How many replies this pass kept.
   replies: u32,
@@ -117,6 +143,8 @@ impl Tree {
       ops: List<Op>.make(),
       attrs: List<u32>.make(),
       styles: List<Declaration>.make(),
+      grids: List<Grid>.make(),
+      canvas: List<CanvasCommand>.make(),
       bytes: List<u8>.make(),
       replies: 0,
       dispatching: dispatching,
@@ -315,6 +343,68 @@ impl<M> Document<M> {
       self.cursor(Cursor.Pointer),
     ]
     return self.node(Shape.Box, &lead, attributes, children)
+  }
+
+  /// An inline box: a run of styled text inside a paragraph.
+  pub fn span(self: &Self, attributes: &[Attr], children: &[Node]) -> Node {
+    let inline = self.style(&[css.display(Keyword.Inline)])
+    return self.node(Shape.Box, &[inline], attributes, children)
+  }
+
+  /// A grid container. `template` has the tracks, names and areas.
+  pub fn grid(self: &Self, template: &Grid, attributes: &[Attr], children: &[Node]) -> Node {
+    let lead: [Attr; 2] = [self.style(&[css.display(Keyword.Grid)]), self.gridTemplate(template)]
+    return self.node(Shape.Box, &lead, attributes, children)
+  }
+
+  /// A link to `path`, a path of the app such as `"/guide"`. A click moves the location there
+  /// without loading a page (see `Subscriptions.location`); a document backend makes it an `a`,
+  /// so it opens in a new tab and shows its address as any link does.
+  pub fn link(self: &Self, path: string, attributes: &[Attr], children: &[Node]) -> Node {
+    let lead: [Attr; 4] = [
+      self.href(path),
+      self.accessRole(Role.Link),
+      self.tabIndex(0),
+      self.cursor(Cursor.Pointer),
+    ]
+    return self.node(Shape.Box, &lead, attributes, children)
+  }
+
+  /// An image showing a registered resource. Size it with `h.style`.
+  pub fn image(self: &Self, resource: u32, attributes: &[Attr]) -> Node {
+    let lead: [Attr; 2] = [self.op(Op.Source { resource: resource }), self.accessRole(Role.Image)]
+    return self.node(Shape.Image, &lead, attributes, &[])
+  }
+
+  /// An icon: a registered SVG, drawn in the text color.
+  pub fn icon(self: &Self, resource: u32, attributes: &[Attr]) -> Node {
+    return self.node(Shape.Icon, &[self.op(Op.Source { resource: resource })], attributes, &[])
+  }
+
+  /// A canvas drawing `commands`, in CSS pixels from its top left.
+  pub fn canvas(self: &Self, commands: &[CanvasCommand], attributes: &[Attr]) -> Node {
+    let mut anchor: u8 = 0
+    let tree = unsafe Pointer.borrowMut(&mut anchor, self.tree)
+    let mut span = Span.empty()
+    if !tree.dispatching {
+      span = Span { start: usize.toU32(tree.canvas.length()), length: usize.toU32(commands.length) }
+      tree.heap.alloc(tree.canvas.appendSlice(commands))
+    }
+    return tree.add(Shape.Canvas, span, &[], attributes, &[])
+  }
+
+  /// `children`, in the overlay layer: above the rest of the view, whatever node holds the
+  /// result (menus, popovers, dialogs). `key` names this overlay among the others. Place the
+  /// children with `h.anchored`, or `position: fixed`.
+  pub fn overlay(self: &Self, key: u64, children: &[Node]) -> Node {
+    let mut anchor: u8 = 0
+    let tree = unsafe Pointer.borrowMut(&mut anchor, self.tree)
+    let node = tree.add(Shape.Overlay, Span.empty(), &[], &[], children)
+    let at = u32.toUsize(node.index)
+    let mut record = tree.records.get(at)
+    record.key = key
+    tree.records.set(at, record)
+    return node
   }
 
   /// A text node: a run of text styled by its parent.
@@ -543,6 +633,79 @@ impl<M> Document<M> {
     return self.op(Op.Expanded { value: value })
   }
 
+  /// Makes the node a link to `path` (see `link`).
+  pub fn href(self: &Self, path: string) -> Attr {
+    return self.op(Op.Href { text: self.store(path) })
+  }
+
+  /// How the node's style changes ease, as CSS `transition` text
+  /// (`"background-color 150ms ease"`). A document backend applies it; the tree renderer
+  /// changes styles at once.
+  pub fn transition(self: &Self, value: string) -> Attr {
+    return self.op(Op.Transition { text: self.store(value) })
+  }
+
+  /// The grid template of a node with `display: grid`, or its placement in its parent's.
+  pub fn gridTemplate(self: &Self, template: &Grid) -> Attr {
+    let mut anchor: u8 = 0
+    let tree = unsafe Pointer.borrowMut(&mut anchor, self.tree)
+    if tree.dispatching {
+      return Attr { index: NO_ATTR }
+    }
+    let index = usize.toU32(tree.grids.length())
+    let copy = tree.heap.alloc(template.copy())
+    tree.heap.alloc(tree.grids.append(move copy))
+    return tree.op(Op.Template { index: index })
+  }
+
+  /// Keeps Tab inside the node: a dialog.
+  pub fn focusTrap(self: &Self, value: bool) -> Attr {
+    return self.op(Op.FocusTrap { value: value })
+  }
+
+  /// Moves focus to the node when a render asks and the last one did not, or the node is new.
+  /// `h.none()` is the branch that does not ask.
+  pub fn takeFocus(self: &Self) -> Attr {
+    return self.op(Op.TakeFocus)
+  }
+
+  /// Scrolls the node into view when a render asks and the last one did not, or the node is
+  /// new.
+  pub fn reveal(self: &Self) -> Attr {
+    return self.op(Op.Reveal)
+  }
+
+  /// Turns default actions off for input aimed at the node or below it: what a handler that
+  /// always prevents would do. The handlers still run.
+  pub fn prevent(self: &Self, actions: &[DefaultAction]) -> Attr {
+    return self.op(Op.Prevent { flags: preventFlags(actions) })
+  }
+
+  /// Makes an input take several lines.
+  pub fn multiline(self: &Self, value: bool) -> Attr {
+    return self.op(Op.Multiline { value: value })
+  }
+
+  pub fn readOnly(self: &Self, value: bool) -> Attr {
+    return self.op(Op.ReadOnly { value: value })
+  }
+
+  /// The range and value of a slider or progress bar (`aria-valuemin`, `-max`, `-now`).
+  pub fn valueRange(self: &Self, min: f32, max: f32, value: f32) -> Attr {
+    return self.op(Op.ValueRange { min: min, max: max, value: value })
+  }
+
+  /// Names the node `key`, for `anchored`.
+  pub fn anchor(self: &Self, key: u64) -> Attr {
+    return self.op(Op.Anchor { key: key })
+  }
+
+  /// Places the node, a popup, next to the node named `anchor(key)`, and keeps it there as the
+  /// page scrolls and lays out.
+  pub fn anchored(self: &Self, key: u64, options: AnchorOptions) -> Attr {
+    return self.op(Op.Anchored { key: key, options: options })
+  }
+
   // Handlers.
 
   /// Whether this pass dispatches a record of `kind`.
@@ -597,6 +760,21 @@ impl<M> Document<M> {
 
   pub fn onBlur(self: &Self, message: M) -> Attr {
     return self.send(EventKind.Blur, move message)
+  }
+
+  /// Answers a key going down in the node or below it.
+  pub fn onKeyDown(self: &Self, handler: fn(&Event) -> Reply<M>) -> Attr {
+    return self.on(EventKind.KeyDown, handler)
+  }
+
+  /// Answers a pointer going down on the node or below it.
+  pub fn onPointerDown(self: &Self, handler: fn(&Event) -> Reply<M>) -> Attr {
+    return self.on(EventKind.PointerDown, handler)
+  }
+
+  /// Sends `handler(box)` when the node's border box, in CSS pixels of the viewport, changes.
+  pub fn onLayout(self: &Self, handler: fn(Rect<f32>) -> M) -> Attr {
+    return self.on(EventKind.Layout, |event| Reply<M>.Emit { message: handler(event.bounds) })
   }
 
   /// Sends `handler(value)` when the input's value changes; `value` is the input's new value,
@@ -677,6 +855,45 @@ fn apply<M>(ui: &mut Ui<M>, tree: &Tree, slots: *mut Slots<M>, start: u32, count
       Op.Expanded { value } => {
         ui.expanded(value)
       }
+      Op.Href { text } => {
+        ui.href(tree.text(text))
+      }
+      Op.Transition { text } => {
+        ui.transition(tree.text(text))
+      }
+      Op.FocusTrap { value } => {
+        ui.focusTrap(value)
+      }
+      Op.TakeFocus => {
+        ui.takeFocus()
+      }
+      Op.Reveal => {
+        ui.reveal()
+      }
+      Op.Prevent { flags } => {
+        ui.preventMask(flags)
+      }
+      Op.Multiline { value } => {
+        ui.multiline(value)
+      }
+      Op.ReadOnly { value } => {
+        ui.readOnly(value)
+      }
+      Op.ValueRange { min, max, value } => {
+        ui.valueRange(min, max, value)
+      }
+      Op.Anchor { key } => {
+        ui.anchor(key)
+      }
+      Op.Anchored { key, options } => {
+        ui.anchored(key, options)
+      }
+      Op.Template { index } => {
+        ui.gridTemplate(&tree.grids.asSlice()[u32.toUsize(index)])
+      }
+      Op.Source { resource } => {
+        ui.source(resource)
+      }
       Op.Listen { kind } => {
         ui.on(kind, |event| Reply<M>.Pass)
       }
@@ -708,10 +925,27 @@ fn place<M>(ui: &mut Ui<M>, tree: &Tree, slots: *mut Slots<M>, index: u32) -> ()
     fill<M>(&mut ui, tree, slots, record)
     return ()
   }
+  if record.shape == Shape.Overlay {
+    ui.overlay(record.key, |ui| fill<M>(&mut ui, tree, slots, record))
+    return ()
+  }
   if record.keyed {
     ui.key(record.key)
   }
-  if record.shape == Shape.Text {
+  if record.shape == Shape.Image {
+    ui.node(NodeKind.Image, |ui| fill<M>(&mut ui, tree, slots, record))
+  } else if record.shape == Shape.Icon {
+    ui.node(NodeKind.Icon, |ui| fill<M>(&mut ui, tree, slots, record))
+  } else if record.shape == Shape.Canvas {
+    ui.canvas(
+      Slice.view(
+        tree.canvas.asSlice(),
+        u32.toUsize(record.text.start),
+        u32.toUsize(record.text.length),
+      ),
+      |ui| fill<M>(&mut ui, tree, slots, record),
+    )
+  } else if record.shape == Shape.Text {
     ui.text(tree.text(record.text))
   } else if record.shape == Shape.Input {
     ui.input(tree.text(record.text), |ui| fill<M>(&mut ui, tree, slots, record))

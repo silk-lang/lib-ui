@@ -11,6 +11,7 @@ import silk.collections.list { List }
 import silk.core.option { Option }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.mem.pointer { Pointer }
+import silk.text.string { String }
 
 /// A program, implemented by its model. `M` is its message type and `C` its command type.
 pub interface Program<M, C> {
@@ -75,6 +76,8 @@ pub struct Update<Model, C, O> {
   pub model: Model,
   pub commands: List<C>,
   pub out: Option<O>,
+  /// Where the update moves the location to, if anywhere (see `navigating`).
+  pub destination: Option<String>,
 }
 
 impl<Model, C, O> Update<Model, C, O> {
@@ -84,6 +87,7 @@ impl<Model, C, O> Update<Model, C, O> {
       model: move model,
       commands: List<C>.make(),
       out: Option<O>.none(),
+      destination: Option<String>.none(),
     }
   }
 
@@ -93,12 +97,22 @@ impl<Model, C, O> Update<Model, C, O> {
     ? &mut Allocator {
     let mut commands = List<C>.make()
     run commands.append(move command)
-    return Update<Model, C, O> { model: move model, commands: move commands, out: Option<O>.none() }
+    return Update<Model, C, O> {
+      model: move model,
+      commands: move commands,
+      out: Option<O>.none(),
+      destination: Option<String>.none(),
+    }
   }
 
   /// The next model and a list of commands.
   pub fn batch(model: Model, commands: List<C>) -> Update<Model, C, O> {
-    return Update<Model, C, O> { model: move model, commands: move commands, out: Option<O>.none() }
+    return Update<Model, C, O> {
+      model: move model,
+      commands: move commands,
+      out: Option<O>.none(),
+      destination: Option<String>.none(),
+    }
   }
 
   /// The same update, with a report for the parent.
@@ -107,6 +121,33 @@ impl<Model, C, O> Update<Model, C, O> {
       model: move self.model,
       commands: move self.commands,
       out: Option<O>.some(move out),
+      destination: move self.destination,
+    }
+  }
+
+  /// The same update, moving the location to `path`, as a click on a link to it does: the
+  /// location subscriptions hear of it next. A parent passes a child's on with `heading`.
+  pub effect fn navigating(self: Self, path: string) -> Update<Model, C, O>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return Update<Model, C, O> {
+      model: move self.model,
+      commands: move self.commands,
+      out: move self.out,
+      destination: Option<String>.some(run String.copy(path)),
+    }
+  }
+
+  /// The same update, moving the location where a child's update asked (`Folded.destination`).
+  pub fn heading(self: Self, destination: Option<String>) -> Update<Model, C, O> {
+    if destination.isNone() {
+      return move self
+    }
+    return Update<Model, C, O> {
+      model: move self.model,
+      commands: move self.commands,
+      out: move self.out,
+      destination: move destination,
     }
   }
 }
@@ -115,6 +156,7 @@ impl<Model, C, O> Update<Model, C, O> {
 pub struct Folded<C, O> {
   pub commands: List<C>,
   pub out: Option<O>,
+  pub destination: Option<String>,
 }
 
 /// Runs a child's `update` on the child where it lies, in its parent's model.
@@ -127,7 +169,11 @@ pub effect fn fold<Child: Submodel<M, C, O>, M, C, O>(child: &mut Child, message
   let before = unsafe Pointer.take(place)
   let next = run Submodel.update(move before, move message)
   unsafe Pointer.put(place, move next.model)
-  return Folded<C, O> { commands: move next.commands, out: move next.out }
+  return Folded<C, O> {
+    commands: move next.commands,
+    out: move next.out,
+    destination: move next.destination,
+  }
 }
 
 /// Hands a child a request from its parent, where the child lies.
@@ -141,7 +187,11 @@ pub effect fn foldInput<Child: Receives<I, C, O>, I, C, O>(child: &mut Child, in
   let before = unsafe Pointer.take(place)
   let next = run Receives.receive(move before, move input)
   unsafe Pointer.put(place, move next.model)
-  return Folded<C, O> { commands: move next.commands, out: move next.out }
+  return Folded<C, O> {
+    commands: move next.commands,
+    out: move next.out,
+    destination: move next.destination,
+  }
 }
 
 /// Wraps a child's commands as the parent's and adds them to `into`.
@@ -186,6 +236,9 @@ impl<P: Program<M, C>, M, C> App<M, Run<C>> for Hosted<P> {
     let before = unsafe Pointer.take(place)
     let next: Update<P, C, NoOutput> = cx.alloc(Program.update(move before, move message))
     unsafe Pointer.put(place, move next.model)
+    if let Option<String>.Some { value: path } = move next.destination {
+      cx.navigate(String.view(&path))
+    }
     let mut commands = move next.commands
     while commands.length() > 0 {
       cx.command(Run<C> { command: commands.remove(0) })

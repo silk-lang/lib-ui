@@ -3,6 +3,7 @@
 import heap { Heap }
 import program { Submodel }
 import ui { Ui }
+import silk.core.option { Option }
 import silk.collections.list { List }
 import silk.collections.slice { Slice }
 import silk.core.effect { Effect }
@@ -54,11 +55,22 @@ impl<M> Perform<M, never ? never> for NoCommand {
 pub struct Context<C> {
   pub heap: Heap,
   pub commands: List<C>,
+  /// Where this update moves the location to, if anywhere.
+  pub destination: Option<String>,
 }
 
 impl<C> Context<C> {
   pub fn make() -> Context<C> {
-    return Context<C> { heap: Heap.make(), commands: List<C>.make() }
+    return Context<C> {
+      heap: Heap.make(),
+      commands: List<C>.make(),
+      destination: Option<String>.none(),
+    }
+  }
+
+  /// Moves the location to `path` after this update, as a click on a link to it does.
+  pub fn navigate(self: &mut Self, path: string) -> () {
+    self.destination = Option<String>.some(self.heap.alloc(String.copy(path)))
   }
 
   /// Performs `command` after this update; the message it produces is handled next.
@@ -87,6 +99,10 @@ pub enum SubscriptionKind {
   KeyBinding,
   /// A message when the viewport changes size.
   Resize,
+  /// A message when the location changes.
+  Location,
+  /// A message when the host posts to a named port.
+  Port,
 }
 
 /// One subscription the model asked for.
@@ -123,6 +139,10 @@ pub struct Subscriptions<M> {
   delivering: bool,
   delivery: Delivery,
   pub messages: List<M>,
+  /// Where the app is: the path the runtime was last moved to. `"/"` until then.
+  pub current: String,
+  /// What the host posted, while a port's handler is asked for its message.
+  pub posted: String,
 }
 
 impl<M> Subscriptions<M> {
@@ -140,6 +160,8 @@ impl<M> Subscriptions<M> {
         height: 0.0,
       },
       messages: List<M>.make(),
+      current: String.make(),
+      posted: String.make(),
     }
   }
 
@@ -263,6 +285,56 @@ impl<M> Subscriptions<M> {
     }
   }
 
+  /// `handler(path)` when the location changes, and once with the location the app starts at,
+  /// before the first render. The path is the app's own, such as `"/guide"`: a document backend
+  /// takes it from the address bar, and every backend moves it when a link (`h.link`) is
+  /// clicked.
+  pub fn location(self: &mut Self, key: u64, handler: fn(string) -> M) -> () {
+    if self.wants(SubscriptionKind.Location, key) {
+      let mut path: string = String.view(&self.current)
+      if String.byteLength(path) == 0 {
+        path = "/"
+      }
+      let message = handler(path)
+      self.heap.alloc(self.messages.append(move message))
+    } else if !self.delivering {
+      self.add(
+        SubscriptionRecord {
+          key: key,
+          kind: SubscriptionKind.Location,
+          interval: 0.0,
+          keyStart: 0,
+          keyLength: 0,
+          modifiers: 0,
+        },
+      )
+    }
+  }
+
+  /// `handler(text)` when the host posts `text` to the port `name`. This is how work that
+  /// outlives a command comes back: the command starts it (a request, a timer, a socket) and
+  /// returns, and the host posts the result when it has one (`post`; `page.post(name, text)`
+  /// in a document).
+  pub fn port(self: &mut Self, key: u64, name: string, handler: fn(String) -> M) -> () {
+    if self.wants(SubscriptionKind.Port, key) {
+      let message = handler(self.heap.alloc(String.copy(String.view(&self.posted))))
+      self.heap.alloc(self.messages.append(move message))
+    } else if !self.delivering {
+      let start = usize.toU32(self.bytes.length())
+      self.heap.alloc(self.bytes.appendSlice(String.utf8Bytes(name)))
+      self.add(
+        SubscriptionRecord {
+          key: key,
+          kind: SubscriptionKind.Port,
+          interval: 0.0,
+          keyStart: start,
+          keyLength: usize.toU32(String.byteLength(name)),
+          modifiers: 0,
+        },
+      )
+    }
+  }
+
   /// The subscriptions `body` asks for, as this builder's: each message goes through `wrap`.
   /// `scope` keeps the keys in `body` apart from the ones around it, so two children may use
   /// the same keys under different scopes.
@@ -273,6 +345,8 @@ impl<M> Subscriptions<M> {
     wrap: fn(CM) -> M,
   ) -> () {
     let mut inner = Subscriptions<CM>.make()
+    inner.current = self.heap.alloc(String.copy(String.view(&self.current)))
+    inner.posted = self.heap.alloc(String.copy(String.view(&self.posted)))
     body(&mut inner)
     if !self.delivering {
       let mut i: usize = 0

@@ -1,6 +1,6 @@
 //! The site's program: how the model changes, what it listens to, and the shell around the
 //! pages.
-import kit { Tone, pad, press, raw, round }
+import kit { Tone, pad, pressLook, press, round }
 import model {
   Command,
   Message,
@@ -15,7 +15,9 @@ import model {
   SLOTS,
   SUBMODELS,
   SUBSCRIPTIONS,
-  VIEWS
+  VIEWS,
+  sectionAt,
+  sectionPath
 }
 import pages
 import stepper { Stepper, StepperInput, StepperOutput }
@@ -84,6 +86,8 @@ impl Program<Message, Command> for Docs {
     let model = Site {
       section: OVERVIEW,
       dark: true,
+      menu: false,
+      picked: 2,
       width: 0.0,
       height: 0.0,
       count: 0,
@@ -101,6 +105,8 @@ impl Program<Message, Command> for Docs {
       face: 5,
       rolls: 0,
       total: 0,
+      asking: false,
+      answer: String.make(),
       first: Stepper { name: "By ones", value: 7, step: 1, dark: true },
       second: Stepper { name: "By fives", value: 0, step: 5, dark: true },
       tens: 0,
@@ -120,7 +126,9 @@ impl Program<Message, Command> for Docs {
       Message.WentBy { by } => {
         let next = u32.toI64(model.section) + by
         if next >= 0 && next < u32.toI64(SECTIONS) {
-          model.section = i64.toU32(next)
+          // The location subscription answers with `Went`.
+          let path = sectionPath(i64.toU32(next))
+          return run Next.of(Docs { site: move model }).navigating(path)
         }
       }
       Message.ToggledTheme => {
@@ -135,6 +143,13 @@ impl Program<Message, Command> for Docs {
       Message.Resized { width, height } => {
         model.width = width
         model.height = height
+      }
+      Message.ToggledMenu => {
+        model.menu = !model.menu
+      }
+      Message.PickedBar { bar } => {
+        model.picked = bar
+        model.menu = false
       }
       Message.Incremented => {
         model.count = model.count + 1
@@ -224,6 +239,15 @@ impl Program<Message, Command> for Docs {
         model.rolls = model.rolls + 1
         model.total = model.total + u32.toI64(face)
       }
+      Message.ClickedAsk => {
+        model.asking = true
+        return run Next.with(Docs { site: move model }, Command.Ask)
+      }
+      Message.Asked => {}
+      Message.Answered { text } => {
+        model.asking = false
+        model.answer = move text
+      }
       Message.GotFirst { message: inner } => {
         let folded = run fold(&mut model.first, move inner)
         noteReport(&mut model, &folded.out)
@@ -253,7 +277,7 @@ impl Program<Message, Command> for Docs {
         css.color(t.text),
         css.backgroundColor(t.page),
         css.selectionColor(t.accentSoft),
-        raw(Property.FontFeatureSettings, b"\"cv11\", \"ss01\""),
+        css.raw(Property.FontFeatureSettings, "\"cv11\", \"ss01\""),
       ],
     )
     if narrow {
@@ -267,9 +291,16 @@ impl Program<Message, Command> for Docs {
     subs.resize(1, |width, height| Message.Resized { width: width, height: height })
     subs.keyBinding(2, "]", 0, || Message.WentBy { by: 1 })
     subs.keyBinding(3, "[", 0, || Message.WentBy { by: -1 })
+    subs.location(10, |path| Message.Went { section: sectionAt(path) })
     if model.section == PROGRAM {
       subs.keyBinding(4, "ArrowUp", 0, || Message.Incremented)
       subs.keyBinding(5, "ArrowDown", 0, || Message.Decremented)
+    }
+    if model.section == VIEWS && model.menu {
+      subs.keyBinding(12, "Escape", 0, || Message.ToggledMenu)
+    }
+    if model.section == COMMANDS {
+      subs.port(11, "answer", |text| Message.Answered { text: move text })
     }
     if model.section == SUBSCRIPTIONS {
       subs.keyBinding(6, "ArrowLeft", 0, || Message.Nudged { by: -1 })
@@ -344,7 +375,7 @@ fn mark<M>(h: &Document<M>, t: &Theme) -> Node {
               css.fontSize(px(17.0)),
               css.fontWeight(700.0),
               css.color(t.text),
-              raw(Property.LetterSpacing, b"-0.01em"),
+              css.raw(Property.LetterSpacing, "-0.01em"),
             ],
           ),
         ],
@@ -366,10 +397,9 @@ fn navItem(model: &Site, h: &Document<Message>, t: &Theme, section: u32, compact
       ],
     )
   }
-  return h.button(
+  return h.link(
+    sectionPath(section),
     &[
-      h.onClick(Message.Went { section: section }),
-      h.accessRole(Role.Tab),
       h.selected(selected),
       h.style(&[css.fontSize(px(14.0)), css.whiteSpace(WhiteSpace.NoWrap), round(8.0)]),
       h.style(
@@ -496,12 +526,20 @@ fn pager(model: &Site, h: &Document<Message>, t: &Theme) -> Node {
     ],
     &[
       if section > 0 {
-        press(h, t, Tone.Ghost, sectionName(section - 1), Message.Went { section: section - 1 })
+        h.link(
+          sectionPath(section - 1),
+          &[pressLook(h, t, Tone.Ghost)],
+          &[h.text(sectionName(section - 1))],
+        )
       } else {
         h.box(&[], &[])
       },
       if section + 1 < SECTIONS {
-        press(h, t, Tone.Plain, sectionName(section + 1), Message.Went { section: section + 1 })
+        h.link(
+          sectionPath(section + 1),
+          &[pressLook(h, t, Tone.Plain)],
+          &[h.text(sectionName(section + 1))],
+        )
       } else {
         h.box(&[], &[])
       },
@@ -531,7 +569,7 @@ fn content(model: &Site, h: &Document<Message>, t: &Theme, narrow: bool) -> Node
   let inner = h.box(
     &[
       h.style(
-        &[css.maxWidth(px(760.0)), css.width(percent(100.0)), raw(Property.Margin, b"0 auto")],
+        &[css.maxWidth(px(760.0)), css.width(percent(100.0)), css.raw(Property.Margin, "0 auto")],
       ),
       if narrow {
         h.style(&pad(28.0, 18.0))

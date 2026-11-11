@@ -9,6 +9,8 @@ const CALL_TICK = 3;
 const CALL_RESIZE = 4;
 const CALL_DEADLINE = 5;
 const CALL_FRAMES = 6;
+const CALL_LOCATION = 7;
+const CALL_POST = 8;
 
 const KIND_TEXT = 1;
 const KIND_IMAGE = 2;
@@ -45,16 +47,26 @@ const PREVENT_KEYS = 4;
 const STATES = [null, ":hover", ":active", ":focus", ":focus-visible"];
 const STATE_ORDER = [1, 3, 4, 2];
 
+// The same rules as `RESET` in `src/html.silk`, which a server render carries.
 const RESET = `
 [data-silk] { outline: none; border-width: 0; -webkit-tap-highlight-color: transparent; }
 [data-silk][role="button"] { user-select: none; -webkit-user-select: none; }
+a[data-silk] { display: block; color: inherit; text-decoration: none; }
 input[data-silk], textarea[data-silk] {
   font: inherit; color: inherit; background: transparent; border: 0 solid; margin: 0;
   padding: 0; min-width: 0; resize: none; appearance: none; border-radius: 0;
 }
+[data-silk-icon] {
+  display: inline-block; flex: none; width: 1em; height: 1em; background-color: currentColor;
+  -webkit-mask: var(--silk-icon) center / contain no-repeat;
+  mask: var(--silk-icon) center / contain no-repeat;
+}
 [data-silk]::selection { background: var(--silk-selection-color, highlight); }
 [data-silk]::placeholder { color: var(--silk-placeholder-color, gray); opacity: 1; }
 `;
+
+const FOCUSABLE =
+  '[tabindex]:not([tabindex="-1"]), input:not([tabindex="-1"]), textarea:not([tabindex="-1"]), a[href]:not([tabindex="-1"])';
 
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
@@ -84,6 +96,13 @@ class Reader {
   text() {
     const length = this.u32();
     const value = decoder.decode(this.bytes.subarray(this.at, this.at + length));
+    this.at += length;
+    return value;
+  }
+  // A copy: the program's memory moves.
+  data() {
+    const length = this.u32();
+    const value = this.bytes.slice(this.at, this.at + length);
     this.at += length;
     return value;
   }
@@ -129,12 +148,17 @@ class Writer {
  * Runs the program in `wasm` (a URL, a Response, bytes or a compiled module) inside `root`.
  *
  * `fonts` names the font families the program's `css.fontFamily(n)` numbers stand for, as CSS
- * `font-family` values: `{ 1: "Inter, sans-serif" }`. `imports` adds host modules the program
- * imports besides `dom` and `math`.
+ * `font-family` values: `{ 1: "Inter, sans-serif" }`. `images` and `icons` give the address of
+ * each image and icon resource number the same way. `base` is what comes before a link's path
+ * in its address when the site is not at the root of its origin (`"/docs"`). `imports` adds
+ * host modules the program imports besides `dom` and `math`.
+ *
+ * When `root` already holds the markup of a server render (`Html` in `src/html.silk`), the
+ * program adopts its nodes instead of making new ones.
  */
-export async function mount({ wasm, root, fonts = {}, imports = {} }) {
+export async function mount({ wasm, root, fonts = {}, images = {}, icons = {}, base = "", imports = {} }) {
   const module = await compile(wasm);
-  const page = new Page(root, fonts);
+  const page = new Page(root, { fonts, images, icons, base });
   const wanted = {};
   for (const entry of WebAssembly.Module.imports(module)) {
     const group = (wanted[entry.module] ??= {});
@@ -167,9 +191,15 @@ async function compile(wasm) {
 }
 
 class Page {
-  constructor(root, fonts) {
+  constructor(root, { fonts, images, icons, base }) {
     this.root = root;
+    this.base = base.replace(/\/$/, "");
     this.fonts = new Map(Object.entries(fonts).map(([id, names]) => [String(id), names]));
+    this.images = new Map(Object.entries(images).map(([id, address]) => [Number(id), address]));
+    this.icons = new Map(Object.entries(icons).map(([id, address]) => [Number(id), address]));
+    // Addresses this page made for resources the program defined, to revoke.
+    this.made = new Map();
+    this.anchored = new Set();
     this.nodes = new Map();
     this.meta = new Map();
     this.rootId = 0;
@@ -183,7 +213,12 @@ class Page {
     this.imports = {
       apply: (pointer, length) => this.apply(pointer, length),
       measure: (id, out) => this.measure(id, out),
+      navigate: (pointer, length) => {
+        const path = decoder.decode(new Uint8Array(this.exports.memory.buffer, pointer, length));
+        history.pushState(null, "", this.address(path));
+      },
     };
+    this.adopt = this.found();
 
     const reset = document.createElement("style");
     reset.textContent = RESET;
@@ -200,6 +235,67 @@ class Page {
         if (id) this.send(this.record(EVENT.layout, entry.target, [entry.target]));
       }
     });
+    this.canvases = new ResizeObserver((entries) => {
+      for (const entry of entries) this.paint(this.idOf(entry.target));
+    });
+  }
+
+  // The nodes of a server render, by id: elements carry theirs in `data-silk`, and a text
+  // follows a comment that holds its id.
+  found() {
+    const found = new Map();
+    const markers = [];
+    const walker = document.createTreeWalker(this.root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_COMMENT);
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      if (node.nodeType === 1) {
+        if (node.dataset.silk) found.set(Number(node.dataset.silk), node);
+      } else if (/^\d+$/.test(node.data)) markers.push(node);
+    }
+    for (const marker of markers) {
+      let text = marker.nextSibling;
+      if (!text || text.nodeType !== 3) {
+        text = document.createTextNode("");
+        marker.after(text);
+      }
+      found.set(Number(marker.data), text);
+      marker.remove();
+    }
+    return found;
+  }
+
+  // A link's address in this document: a path inside the app comes after the base.
+  address(path) {
+    return path.startsWith("/") ? this.base + path : path;
+  }
+
+  // Where the document is, as the program sees it: without the base.
+  where() {
+    let path = location.pathname;
+    if (this.base && path.startsWith(this.base)) path = path.slice(this.base.length);
+    path = path.replace(/index\.html$/, "");
+    if (!path.startsWith("/")) path = `/${path}`;
+    return path + location.search + location.hash;
+  }
+
+  /**
+   * Posts `text` to the program's port `name` (`subs.port`): how the page answers a command
+   * that started something slow, such as a request.
+   */
+  post(name, text = "") {
+    const port = encoder.encode(name);
+    const body = encoder.encode(String(text));
+    const at = this.call(CALL_SCRATCH, port.length + body.length);
+    const scratch = new Uint8Array(this.exports.memory.buffer, at, port.length + body.length);
+    scratch.set(port);
+    scratch.set(body, port.length);
+    this.call(CALL_POST, port.length, body.length);
+  }
+
+  locate() {
+    const bytes = encoder.encode(this.where());
+    const at = this.call(CALL_SCRATCH, bytes.length);
+    new Uint8Array(this.exports.memory.buffer, at, bytes.length).set(bytes);
+    this.call(CALL_LOCATION, bytes.length);
   }
 
   start(exports) {
@@ -208,7 +304,17 @@ class Page {
     if (!this.token) throw new Error("silk-ui: the program did not start");
     this.listen();
     const size = this.size();
+    this.locate();
     this.call(CALL_START, size.width, size.height, now());
+
+    // What the first render did not adopt was not the program's.
+    for (const node of this.adopt.values()) node.remove();
+    this.adopt.clear();
+    for (const [id, meta] of this.meta) {
+      const node = this.nodes.get(id);
+      if (node.tagName === "A" && !meta.href) this.swap(id, "div");
+      else if (node.tagName === "TEXTAREA" && !meta.multiline) this.swap(id, "input");
+    }
   }
 
   size() {
@@ -285,8 +391,10 @@ class Page {
         case 2: {
           const parent = this.nodes.get(r.u32());
           const child = this.nodes.get(r.u32());
-          const before = r.u32();
-          parent.insertBefore(child, before ? this.nodes.get(before) : null);
+          const before = r.u32() || 0;
+          const next = before ? this.nodes.get(before) : null;
+          // An adopted node is often where it belongs already.
+          if (child.parentNode !== parent || child.nextSibling !== next) parent.insertBefore(child, next);
           break;
         }
         case 3:
@@ -305,8 +413,10 @@ class Page {
         case 6: {
           const id = r.u32();
           const state = r.u8();
-          if (state === 0) this.nodes.get(id)?.removeAttribute?.("style");
-          else this.dropRule(id, state);
+          if (state === 0) {
+            this.nodes.get(id)?.removeAttribute?.("style");
+            this.refix(id);
+          } else this.dropRule(id, state);
           break;
         }
         case 7:
@@ -335,10 +445,14 @@ class Page {
           }
           break;
         }
-        case 11:
+        case 11: {
           this.rootId = r.u32();
-          this.root.replaceChildren(this.nodes.get(this.rootId));
+          const node = this.nodes.get(this.rootId);
+          if (node.parentNode === this.root) {
+            for (const other of [...this.root.childNodes]) if (other !== node) other.remove();
+          } else this.root.replaceChildren(node);
           break;
+        }
         case 12:
           this.nodes.get(r.u32())?.focus?.({ preventScroll: false });
           break;
@@ -372,21 +486,220 @@ class Page {
         case 18:
           this.fonts.set(String(r.u32()), r.text());
           break;
+        case 19: {
+          const id = r.u32();
+          const pairs = [];
+          for (const line of r.text().split(";")) {
+            const colon = line.indexOf(":");
+            if (colon > 0) pairs.push([line.slice(0, colon), line.slice(colon + 1).trim()]);
+          }
+          this.fix(id, "grid", pairs);
+          break;
+        }
+        case 20: {
+          const id = r.u32();
+          this.meta.get(id).source = r.u32();
+          this.show(id);
+          break;
+        }
+        case 21: {
+          const id = r.u32();
+          const commands = [];
+          for (let count = r.u32(); count > 0; count--) {
+            const code = r.u8();
+            const command = [code];
+            for (let floats = CANVAS_FLOATS[code]; floats > 0; floats--) command.push(r.f32());
+            commands.push(command);
+          }
+          this.meta.get(id).canvas = commands;
+          this.paint(id);
+          break;
+        }
+        case 22: {
+          const id = r.u32();
+          this.meta.get(id).anchor = {
+            target: r.u32(),
+            gap: r.f32(),
+            preferredHeight: r.f32(),
+            alignEnd: r.u8() === 1,
+            matchWidth: r.u8() === 1,
+          };
+          this.anchored.add(id);
+          break;
+        }
+        case 23: {
+          const id = r.u32();
+          this.anchored.delete(id);
+          const meta = this.meta.get(id);
+          if (meta) {
+            meta.anchor = undefined;
+            this.fix(id, "anchor", []);
+          }
+          break;
+        }
+        case 24:
+          this.define(this.images, r.u32(), new Blob([r.data()]));
+          break;
+        case 25:
+          this.define(this.icons, r.u32(), new Blob([r.data()], { type: "image/svg+xml" }));
+          break;
+        case 26: {
+          const resource = r.u32();
+          for (const key of [`image:${resource}`, `icon:${resource}`]) {
+            if (this.made.has(key)) URL.revokeObjectURL(this.made.get(key));
+            this.made.delete(key);
+          }
+          break;
+        }
         default:
           throw new Error(`silk-ui: unknown mutation ${op}`);
       }
     }
+    this.place();
+  }
+
+  // Inline properties the base look does not own (a cursor, a grid, a popup's place): set
+  // as group `group` of node `id`, in place of the group's earlier ones.
+  fix(id, group, pairs) {
+    const node = this.nodes.get(id);
+    const meta = this.meta.get(id);
+    if (!node?.style || !meta) return;
+    meta.fixed ??= new Map();
+    for (const [name] of meta.fixed.get(group) ?? []) node.style.removeProperty(name);
+    pairs = pairs.filter(([, value]) => value !== "");
+    if (pairs.length) meta.fixed.set(group, pairs);
+    else meta.fixed.delete(group);
+    for (const [name, value] of pairs) node.style.setProperty(name, value);
+  }
+
+  // Sets the fixed properties again, after the base look was cleared.
+  refix(id) {
+    const node = this.nodes.get(id);
+    const fixed = this.meta.get(id)?.fixed;
+    if (!node?.style || !fixed) return;
+    for (const pairs of fixed.values()) {
+      for (const [name, value] of pairs) node.style.setProperty(name, value);
+    }
+  }
+
+  // Shows the resource an image or icon node names.
+  show(id) {
+    const node = this.nodes.get(id);
+    const meta = this.meta.get(id);
+    if (meta.kind === KIND_IMAGE) {
+      const address = this.images.get(meta.source);
+      if (address) node.src = address;
+      else node.removeAttribute("src");
+    } else if (meta.kind === KIND_ICON) {
+      const address = this.icons.get(meta.source);
+      this.fix(id, "icon", address ? [["--silk-icon", `url("${address}")`]] : []);
+    }
+  }
+
+  define(map, resource, blob) {
+    const key = `${map === this.images ? "image" : "icon"}:${resource}`;
+    if (this.made.has(key)) URL.revokeObjectURL(this.made.get(key));
+    const address = URL.createObjectURL(blob);
+    this.made.set(key, address);
+    map.set(resource, address);
+    for (const [id, meta] of this.meta) if (meta.source === resource) this.show(id);
+  }
+
+  // Draws a canvas node's commands, in CSS pixels on a bitmap as sharp as the display.
+  paint(id) {
+    const node = this.nodes.get(id);
+    const commands = this.meta.get(id)?.canvas;
+    if (!node || !commands || !node.getContext) return;
+    const scale = window.devicePixelRatio || 1;
+    const width = Math.round(node.clientWidth * scale);
+    const height = Math.round(node.clientHeight * scale);
+    if (node.width !== width) node.width = width;
+    if (node.height !== height) node.height = height;
+    const context = node.getContext("2d");
+    context.setTransform(scale, 0, 0, scale, 0, 0);
+    context.clearRect(0, 0, node.clientWidth, node.clientHeight);
+    const color = (c, at) =>
+      `rgba(${Math.round(c[at] * 255)}, ${Math.round(c[at + 1] * 255)}, ${Math.round(c[at + 2] * 255)}, ${c[at + 3]})`;
+    let path = new Path2D();
+    for (const c of commands) {
+      switch (c[0]) {
+        case 0: {
+          const rect = new Path2D();
+          if (c[5] > 0) rect.roundRect(c[1], c[2], c[3], c[4], c[5]);
+          else rect.rect(c[1], c[2], c[3], c[4]);
+          context.fillStyle = color(c, 6);
+          context.fill(rect);
+          break;
+        }
+        case 1:
+          path.moveTo(c[1], c[2]);
+          break;
+        case 2:
+          path.lineTo(c[1], c[2]);
+          break;
+        case 3:
+          path.quadraticCurveTo(c[1], c[2], c[3], c[4]);
+          break;
+        case 4:
+          path.bezierCurveTo(c[1], c[2], c[3], c[4], c[5], c[6]);
+          break;
+        case 5:
+          path.closePath();
+          break;
+        case 6:
+          context.fillStyle = color(c, 1);
+          context.fill(path);
+          path = new Path2D();
+          break;
+        case 7:
+          context.strokeStyle = color(c, 1);
+          context.lineWidth = c[5];
+          context.stroke(path);
+          path = new Path2D();
+          break;
+      }
+    }
+  }
+
+  // Puts every anchored popup by its target: below it, or above when there is more room
+  // there, inside the viewport.
+  place() {
+    for (const id of this.anchored) {
+      const node = this.nodes.get(id);
+      const anchor = this.meta.get(id)?.anchor;
+      const target = anchor && this.nodes.get(anchor.target);
+      if (!node?.isConnected || !target?.isConnected) continue;
+      const by = target.getBoundingClientRect();
+      const first = [["position", "fixed"]];
+      if (anchor.matchWidth) first.push(["min-width", `${by.width}px`]);
+      this.fix(id, "anchor", [...first, ["left", "0px"], ["top", "0px"]]);
+      const box = node.getBoundingClientRect();
+      const below = window.innerHeight - by.bottom - anchor.gap;
+      const above = by.top - anchor.gap;
+      const needs = anchor.preferredHeight || box.height;
+      const under = below >= needs || below >= above;
+      let left = anchor.alignEnd ? by.right - box.width : by.left;
+      left = Math.max(0, Math.min(left, window.innerWidth - box.width));
+      const top = under ? by.bottom + anchor.gap : by.top - anchor.gap - box.height;
+      this.fix(id, "anchor", [...first, ["left", `${left}px`], ["top", `${Math.max(0, top)}px`]]);
+    }
   }
 
   create(id, kind) {
-    let node;
-    if (kind === KIND_TEXT) node = document.createTextNode("");
-    else if (kind === KIND_INPUT) node = document.createElement("input");
-    else if (kind === KIND_IMAGE) node = document.createElement("img");
-    else if (kind === KIND_CANVAS) node = document.createElement("canvas");
-    else if (kind === KIND_ICON) node = document.createElement("span");
-    else node = document.createElement("div");
+    let node = this.adopt.get(id);
+    if (node && TAGS[kind].includes(node.nodeName)) {
+      // A node of the server render: the program sets it up as it would a new one.
+      this.adopt.delete(id);
+      if (node.nodeType === 1) {
+        for (const name of node.getAttributeNames()) {
+          if (name !== "data-silk") node.removeAttribute(name);
+        }
+      }
+    } else if (kind === KIND_TEXT) node = document.createTextNode("");
+    else node = document.createElement(TAGS[kind][0].toLowerCase());
     if (node.nodeType === 1) node.dataset.silk = id;
+    if (kind === KIND_ICON) node.setAttribute("data-silk-icon", "");
+    if (kind === KIND_CANVAS) this.canvases.observe(node);
     this.nodes.set(id, node);
     this.meta.set(id, { kind, listeners: 0, prevent: 0 });
   }
@@ -394,10 +707,14 @@ class Page {
   destroy(id) {
     const node = this.nodes.get(id);
     if (!node) return;
-    if (node.nodeType === 1) this.layout.unobserve(node);
+    if (node.nodeType === 1) {
+      this.layout.unobserve(node);
+      this.canvases.unobserve(node);
+    }
     node.remove();
     this.nodes.delete(id);
     this.meta.delete(id);
+    this.anchored.delete(id);
     for (const state of STATE_ORDER) this.dropRule(id, state);
   }
 
@@ -479,7 +796,7 @@ class Page {
         break;
       }
       case 6:
-        node.style.cursor = r.text();
+        this.fix(id, "cursor", [["cursor", r.text()]]);
         break;
       case 7: {
         const on = r.u8() === 1;
@@ -491,7 +808,8 @@ class Page {
         meta.trap = r.u8() === 1;
         break;
       case 9:
-        if ((r.u8() === 1) !== (node.tagName === "TEXTAREA")) this.retag(id, node);
+        meta.multiline = r.u8() === 1;
+        if (meta.multiline !== (node.tagName === "TEXTAREA")) this.swap(id, meta.multiline ? "textarea" : "input");
         break;
       case 10:
         node.readOnly = r.u8() === 1;
@@ -511,18 +829,38 @@ class Page {
       case 15:
         meta.prevent = r.u32();
         break;
+      case 16: {
+        // A box with an address is an `a`, so the document treats it as the link it is.
+        meta.href = r.text();
+        let link = node;
+        if (meta.href && node.tagName === "DIV") link = this.swap(id, "a");
+        else if (!meta.href && node.tagName === "A") link = this.swap(id, "div");
+        if (meta.href) link.setAttribute("href", this.address(meta.href));
+        else link.removeAttribute("href");
+        break;
+      }
+      case 17:
+        this.fix(id, "transition", [["transition", r.text()]]);
+        break;
       default:
         throw new Error(`silk-ui: unknown attribute ${code}`);
     }
   }
 
-  // Swaps an input for a textarea, or back, keeping what was set on it.
-  retag(id, node) {
-    const next = document.createElement(node.tagName === "TEXTAREA" ? "input" : "textarea");
+  // Swaps the element of node `id` for a `tag` one, keeping what was set on it and in it.
+  swap(id, tag) {
+    const node = this.nodes.get(id);
+    const next = document.createElement(tag);
     for (const attribute of node.attributes) next.setAttribute(attribute.name, attribute.value);
-    next.value = node.value;
+    if ("value" in node) next.value = node.value;
+    else next.append(...node.childNodes);
+    if (this.meta.get(id).listeners & (1 << EVENT.layout)) {
+      this.layout.unobserve(node);
+      this.layout.observe(next);
+    }
     node.replaceWith(next);
     this.nodes.set(id, next);
+    return next;
   }
 
   measure(id, out) {
@@ -560,6 +898,32 @@ class Page {
   hears(path, kind) {
     const bit = 1 << kind;
     return path.some((node) => (this.meta.get(this.idOf(node))?.listeners ?? 0) & bit);
+  }
+
+  // Whether `path` is inside a link to a place in the app: the program follows a click on
+  // it, and says so by preventing the document's own navigation.
+  links(path) {
+    return path.some((node) => this.meta.get(this.idOf(node))?.href?.startsWith("/"));
+  }
+
+  // Keeps Tab inside the innermost focus trap around `target`. Returns whether it moved focus.
+  trap(target, backwards) {
+    let within = null;
+    for (let at = target; at && at !== this.root; at = at.parentNode) {
+      if (this.meta.get(this.idOf(at))?.trap) {
+        within = at;
+        break;
+      }
+    }
+    if (!within) return false;
+    const stops = [...within.querySelectorAll(FOCUSABLE)].filter(
+      (node) => !node.disabled && node.getClientRects().length,
+    );
+    if (!stops.length) return true;
+    const at = stops.indexOf(document.activeElement);
+    const next = backwards ? (at <= 0 ? stops.length - 1 : at - 1) : at < 0 || at === stops.length - 1 ? 0 : at + 1;
+    stops[next].focus();
+    return true;
   }
 
   prevents(path, action) {
@@ -601,7 +965,9 @@ class Page {
   // Sends `event` as a record of `kind` when a node on its path listens for it.
   forward(kind, event, target = event.target) {
     const path = this.pathTo(target);
-    if (!path.length || !this.hears(path, kind)) return { path, prevented: false };
+    if (!path.length || !(this.hears(path, kind) || (kind === EVENT.click && this.links(path)))) {
+      return { path, prevented: false };
+    }
     const element = path[path.length - 1];
     const prevented = this.send(this.record(kind, element, path, event));
     if (prevented && event.cancelable) event.preventDefault();
@@ -687,6 +1053,10 @@ class Page {
         event.preventDefault();
         return;
       }
+      if (inside && event.key === "Tab" && !event.ctrlKey && !event.metaKey && !event.altKey) {
+        if (this.trap(target, event.shiftKey)) event.preventDefault();
+        return;
+      }
       // A focused node that is not a native control is pressed with Enter and Space.
       const plain = !event.ctrlKey && !event.metaKey && !event.altKey;
       const native = /^(INPUT|TEXTAREA|BUTTON|SELECT|A)$/.test(target.tagName);
@@ -703,9 +1073,21 @@ class Page {
     new ResizeObserver(() => {
       const size = this.size();
       this.call(CALL_RESIZE, size.width, size.height);
+      this.place();
     }).observe(root);
+    window.addEventListener("scroll", () => this.place(), { capture: true, passive: true });
+    window.addEventListener("resize", () => this.place());
+
+    // Back and forward: the program goes where the document's history went.
+    window.addEventListener("popstate", () => this.locate());
   }
 }
+
+// The element names a node of each kind may have, the one a new node gets first.
+const TAGS = [["DIV", "A"], ["#text"], ["IMG"], ["SPAN"], ["INPUT", "TEXTAREA"], ["CANVAS"]];
+
+// How many floats follow each canvas command's code.
+const CANVAS_FLOATS = [9, 2, 2, 4, 6, 0, 4, 5];
 
 function now() {
   return performance.now() / 1000;
