@@ -9,11 +9,27 @@
 //! `--connect` it is `1`: the socket `silk-ui-inspect.sock` in the working directory. The app
 //! may start after the window; the status line says when it cannot be reached.
 //!
+//! It keeps one protocol 3 session with the app: a pump thread reads what the app pushes and
+//! wakes the window, which then sends the devtools [`Message.Pull`].
+//!
 //! The devtools are a ui-app app themselves, so a debug build of this window serves the
 //! inspector too when its own `SILK_UI_INSPECT` is set (to another address than the app's).
-import ui_devtools.lib { Devtools, Message, Command, Link }
+import ui_devtools.lib { Devtools, Message, Command, Link, Requests }
 import ui_app.runtime { Runtime }
-import ui_app_window.lib { Launched, launch, RunOptions, runWindowWith, startInspector }
+import ui_app_window.lib {
+  HostPlatform,
+  Launched,
+  WindowContent,
+  launch,
+  RunOptions,
+  runWindowHosted,
+  startInspector
+}
+import ui_tree_window.platform_thread { Nudge }
+import ui_tree_window.clock { Clock }
+import ui_tree.legacy { UiTree }
+import ui_inspect_server.channel { Channel, SocketChannel, Wake }
+import ui_inspect_server.client { openSession }
 import ui_inspect_server.server {
   Address,
   InspectorOptions,
@@ -21,7 +37,6 @@ import ui_inspect_server.server {
   resolved,
   describeAddress
 }
-import ui_inspect_server.client { request }
 import ui_fixtures.fixtures as fixtures
 import ui_tree.legacy { TreeError, Batch }
 import atlas.atlas { AtlasError }
@@ -29,10 +44,13 @@ import vector.geometry_error { GeometryError }
 import window.types { WindowError }
 import webgpu.runtime { GpuError }
 import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.concurrency.sync { Arc, Mutex }
+import silk.concurrency.thread { Transferable }
+import silk.concurrency.thread_native { SpawnError }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.core.result { Result }
-import silk.io.byte_duplex { ByteIoError }
 import silk.io.writer_native { StderrWriter }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.net.socket_native { NativeSocketError }
@@ -40,40 +58,283 @@ import silk.system.host_input { HostInput, HostInputError }
 import silk.system.monotonic_clock { MonotonicClock }
 import silk.system.monotonic_clock_native { OsMonotonicClock }
 import silk.text.string { String, InvalidUtf8 }
+import window.types { WindowId }
 
-/// The inspector socket of the app, one connection per request.
-struct SocketLink {
-  address: Address,
-  clock: OsMonotonicClock,
-  reply: Bytes,
+/// How long a request waits for its reply, in seconds.
+const REPLY_TIMEOUT: f64 = 10.0
+
+/// How long one wait for a reply sleeps before it looks at the clock, in nanoseconds.
+const REPLY_PAUSE: u64 = 50000000
+
+/// What the pump and the window share: whether lines came, and the window's nudge once it is
+/// open.
+struct Doorbell {
+  rung: bool,
+  nudge: Option<Nudge>,
 }
 
-impl Link for SocketLink {
-  effect fn request(self: &mut Self, line: string, reply: &mut String) -> bool
+impl Transferable for Doorbell {}
+
+/// Wakes the window when the app pushes a line (or the session ends).
+struct Bell {
+  shared: Arc<Mutex<Doorbell>>,
+}
+
+impl Bell {
+  effect fn make() -> Bell
     ! OutOfMemoryError
     ? &mut Allocator {
-    reply.clear()
-    let result = run Effect.result(request(&self.address, line, &mut self.reply))
+    let door = Doorbell { rung: false, nudge: Option<Nudge>.None }
+    return Bell { shared: run Arc<Mutex<Doorbell>>.make(run Mutex<Doorbell>.make(move door)) }
+  }
+
+  fn opened(self: &Self, nudge: Nudge) -> () {
+    let mut guard = self.shared.get().lock()
+    let state = guard.getMut()
+    state.nudge = Option<Nudge>.some(move nudge)
+  }
+
+  /// Whether it rang since the last look.
+  fn take(self: &Self) -> bool {
+    let mut guard = self.shared.get().lock()
+    let state = guard.getMut()
+    let rung = state.rung
+    state.rung = false
+    return rung
+  }
+}
+
+impl Wake for Bell {
+  fn wake(self: &Self) -> () {
+    let mut guard = self.shared.get().lock()
+    let state = guard.getMut()
+    state.rung = true
+    if let Option<Nudge>.Some { value } = &state.nudge {
+      value.nudge()
+    }
+  }
+
+  fn copy(self: &Self) -> Bell {
+    return Bell { shared: self.shared.clone() }
+  }
+}
+
+/// The app's inspector: one session, opened (again) when a request needs it.
+struct SessionLink {
+  address: Address,
+  clock: OsMonotonicClock,
+  seconds: Clock,
+  bell: Bell,
+  channel: Option<SocketChannel>,
+  numbering: Requests,
+  /// The last `subscribe` sent, sent again when the session opens again.
+  subscription: String,
+  /// The session ended since the devtools last took notifications.
+  ended: bool,
+}
+
+impl SessionLink {
+  /// The open session, or why there is none in `reply`.
+  effect fn ready(self: &mut Self, reply: &mut String) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if let Option<SocketChannel>.Some { value } = &self.channel {
+      if value.open() && !value.deserted() {
+        return true
+      }
+    }
+    run self.end()
+    let opened = run Effect.result(openSession(&self.address, self.bell.copy()))
       |> Effect.provideMut<MonotonicClock>(&mut self.clock)
-    match move result {
-      Result<(), NativeSocketError | ByteIoError | OutOfMemoryError>.Success { value: _ } => {}
-      Result<(), NativeSocketError | ByteIoError | OutOfMemoryError>.Failure { error } => {
+    match move opened {
+      Result<SocketChannel, NativeSocketError | SpawnError | OutOfMemoryError>.Success {
+        value
+      } => {
+        self.channel = Option<SocketChannel>.some(move value)
+      }
+      Result<SocketChannel, NativeSocketError | SpawnError | OutOfMemoryError>.Failure {
+        error
+      } => {
         drop error
+        reply.clear()
         run reply.append("nothing answers at ")
         run describeAddress(&self.address, &mut reply)
         return false
       }
     }
-    match String.fromUtf8(self.reply.asSlice()) {
-      Result<string, InvalidUtf8>.Success { value } => {
-        run reply.append(value)
+    self.numbering = Requests.make()
+    if !run self.exchange(
+      "{\"cmd\":\"hello\",\"protocol\":3,\"client\":\"devtools\"}",
+      &mut reply,
+    ) {
+      run self.end()
+      return false
+    }
+    if self.subscription.ownedByteLength() != 0 {
+      drop run self.send("{\"cmd\":\"unsubscribe\"}")
+      let line = run String.copy(String.view(&self.subscription))
+      drop run self.send(String.view(&line))
+
+      // A new session: what the devtools show may be stale, so they read it again.
+      run self.numbering.notes.append(run String.copy("{\"event\":\"tree\"}"))
+      run self.numbering.notes.append(run String.copy("{\"event\":\"events\"}"))
+      self.bell.wake()
+    }
+    self.ended = false
+    return true
+  }
+
+  /// Ends the session, if there is one.
+  effect fn end(self: &mut Self) -> () {
+    match move Intrinsic.replace(self.channel, Option<SocketChannel>.None) {
+      Option<SocketChannel>.Some { value } => {
+        let mut channel = move value
+        channel.close()
+        self.ended = true
       }
-      Result<string, InvalidUtf8>.Failure { error: _ } => {
-        run reply.append("the reply is not UTF-8")
-        return false
+      Option<SocketChannel>.None => {}
+    }
+  }
+
+  /// Sends `line` as a request and waits for its reply.
+  effect fn exchange(self: &mut Self, line: string, reply: &mut String) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match &mut self.channel {
+      Option<SocketChannel>.Some { value } => run exchange(
+        &mut self.numbering,
+        &mut self.seconds,
+        &mut value,
+        line,
+        &mut reply,
+      )
+      Option<SocketChannel>.None => false
+    }
+  }
+
+  effect fn send(self: &mut Self, line: string) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match &mut self.channel {
+      Option<SocketChannel>.Some { value } => run Channel.send(line)
+        |> Effect.provideMut<Channel>(&mut value)
+      Option<SocketChannel>.None => false
+    }
+  }
+}
+
+/// Sends `line` as a request on `channel` and waits for its reply, at most [`REPLY_TIMEOUT`].
+effect fn exchange(
+  numbering: &mut Requests,
+  seconds: &mut Clock,
+  channel: &mut SocketChannel,
+  line: string,
+  reply: &mut String,
+) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let id = run numbering.send(line) |> Effect.provideMut<Channel>(&mut channel.*)
+  if id == 0 {
+    reply.clear()
+    run reply.append("the app closed the session")
+    return false
+  }
+  let start = run seconds.seconds()
+  while true {
+    if run numbering.collect(id, &mut reply) |> Effect.provideMut<Channel>(&mut channel.*) {
+      return true
+    }
+    if !channel.open() {
+      reply.clear()
+      run reply.append("the app closed the session")
+      return false
+    }
+    if (run seconds.seconds()) - start > REPLY_TIMEOUT {
+      reply.clear()
+      run reply.append("the app did not answer")
+      return false
+    }
+    channel.wait(REPLY_PAUSE)
+  }
+  return false
+}
+
+impl Link for SessionLink {
+  effect fn request(self: &mut Self, line: string, reply: &mut String) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    reply.clear()
+    if !run self.ready(&mut reply) {
+      return false
+    }
+    if run self.exchange(line, &mut reply) {
+      return true
+    }
+    run self.end()
+    return false
+  }
+
+  effect fn notify(self: &mut Self, line: string) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if String.startsWith(line, "{\"cmd\":\"subscribe\"") {
+      self.subscription.clear()
+      run self.subscription.append(line)
+    }
+    let mut reason = String.make()
+    if !run self.ready(&mut reason) {
+      return false
+    }
+    return run self.send(line)
+  }
+
+  effect fn take(self: &mut Self, out: &mut List<String>) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut open = !self.ended
+    self.ended = false
+    if let Option<SocketChannel>.Some { value } = &mut self.channel {
+      let mut none = String.make()
+      drop run self.numbering.collect(0, &mut none) |> Effect.provideMut<Channel>(&mut value)
+      if !value.open() {
+        open = false
       }
     }
-    return true
+    run self.numbering.takeNotes(&mut out)
+    if !open {
+      run self.end()
+      self.ended = false
+    }
+    return open
+  }
+}
+
+/// The devtools' window: it hands the window's nudge to the bell, and sends the devtools
+/// [`Message.Pull`] when the bell rang.
+struct SessionContent {
+  bell: Bell,
+}
+
+impl WindowContent<Devtools, Message, Command> for SessionContent {
+  effect fn opened(self: &mut Self, platform: &mut HostPlatform, window: WindowId) -> ()
+    ! WindowError | OutOfMemoryError
+    ? &mut Allocator {
+    self.bell.opened(platform.nudge())
+  }
+
+  effect fn poll(
+    self: &mut Self,
+    app: &mut Runtime<Devtools, Message, Command>,
+    tree: &mut UiTree<'_>,
+    time: f64,
+  ) -> bool
+    ! WindowError | TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if self.bell.take() {
+      app.send(Message.Pull)
+      return true
+    }
+    return false
   }
 }
 
@@ -149,11 +410,18 @@ effect fn program(args: Launch, platform: Option<Launched>) -> i32
   run batch.fontFamily(1, "Noto Sans, sans-serif")
   let mut app = Runtime<Devtools, Message, Command>.make(run Devtools.make(String.view(&target)))
   app.send(Message.Refresh)
-  let mut link = SocketLink {
+  let bell = run Bell.make()
+  let mut link = SessionLink {
     address: move address,
     clock: OsMonotonicClock.make(),
-    reply: Bytes.make(),
+    seconds: Clock.make(),
+    bell: bell.copy(),
+    channel: Option<SocketChannel>.None,
+    numbering: Requests.make(),
+    subscription: String.make(),
+    ended: false,
   }
+  let mut content = SessionContent { bell: move bell }
   let options = RunOptions {
     title: "Silk devtools",
     width: 900.0,
@@ -165,8 +433,17 @@ effect fn program(args: Launch, platform: Option<Launched>) -> i32
     platform: move platform,
   }
   let inspector = run startInspector(InspectorOptions.make())
-  return run runWindowWith(&mut app, &collection, run batch.take(), move options, move inspector)
+  let status = run runWindowHosted(
+    &mut app,
+    &collection,
+    run batch.take(),
+    move options,
+    move inspector,
+    &mut content,
+  )
     |> Effect.provideMut<Link>(&mut link)
+  run link.end()
+  return status
 }
 
 effect fn windowFailed(error: WindowError) -> i32 {
