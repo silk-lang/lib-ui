@@ -91,7 +91,8 @@ How (`embedded.silk`, an `EmbeddedDevtools`):
 
 ### The layout
 
-The top bar, then the three columns, each scrolling on its own. From 1180 points wide the
+The top bar, then the three columns, each scrolling on its own. Their window (`ui-devtools`, or
+a window of the app's process) opens 1280 by 800. From 1180 points wide the
 element tree is 320 wide and the inspector 340 (the design's widths), the middle takes the rest;
 from 980, 280 and 320; from 820 (`STACKED_BELOW`), 240 and 300. Narrower than that the inspector
 becomes the first tab of the middle column (**Inspector**), beside a tree of 36% of the width
