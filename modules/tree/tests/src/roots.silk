@@ -29,6 +29,7 @@ import ui_tree.lib { RootOptions, RootEvent, RootEventKind, RootSupport }
 import ui_tree.mutation { FIRST_ROOT }
 import font_collection.lib { FontCollection }
 import silk.collections.list { List }
+import silk.color.rgba { Rgba }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.geometry.rect { Rect }
@@ -430,6 +431,125 @@ test effect fn closeRootDetachesItsNode() -> ()
   ! AssertionError<'static> | TreeError | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   run closeBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// What each root counts for itself.
+
+effect fn revisionBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run twoRoots(&collection)
+  let first = tree.revisionOf(FIRST_ROOT)
+  let second = tree.revisionOf(SECOND)
+  run Testing.expect(first != 0 && second != 0, "each root counts its own changes")
+
+  // A change in root 1, and its frame, are root 1's alone.
+  let mut batch = Batch.make()
+  run batch.style(12, &[css.width(percent(25.0))])
+  run tree.apply(run batch.take())
+  run tree.frameRoot(SECOND, narrow())
+  run Testing.expect(
+    tree.revisionOf(FIRST_ROOT) == first && tree.revisionOf(SECOND) > second,
+    "a change and a frame of root 1 leave root 0's revision as it was",
+  )
+  let framed = tree.stats.frame
+  run tree.frameRoot(FIRST_ROOT, wide())
+  run Testing.expect(
+    tree.stats.frame > framed && tree.revisionOf(FIRST_ROOT) == first,
+    "root 0's stats are its own frame's, and an idle frame changes nothing it publishes",
+  )
+  drop run tree.useRoot(SECOND)
+  run Testing.expect(tree.stats.frame == framed, "root 1 keeps the stats of its own last frame")
+  drop run tree.useRoot(FIRST_ROOT)
+
+  // New nodes are nobody's until they are inserted; a font family is everybody's.
+  let before = tree.revisionOf(SECOND)
+  let mut fresh = Batch.make()
+  run fresh.create(30, NodeKind.Box)
+  run tree.apply(run fresh.take())
+  run Testing.expect(
+    tree.revisionOf(FIRST_ROOT) == first && tree.revisionOf(SECOND) == before,
+    "a new node changes no root",
+  )
+  let mut inserted = Batch.make()
+  run inserted.append(11, 30)
+  run tree.apply(run inserted.take())
+  run Testing.expect(
+    tree.revisionOf(SECOND) > before && tree.revisionOf(FIRST_ROOT) == first,
+    "inserting it changes the root it goes into",
+  )
+  let mut family = Batch.make()
+  run family.fontFamily(9, "Noto Sans, sans-serif")
+  run tree.apply(run family.take())
+  run Testing.expect(
+    tree.revisionOf(FIRST_ROOT) > first && tree.revisionOf(SECOND) > before + 1,
+    "a font family changes every root",
+  )
+}
+
+test effect fn eachRootCountsItsOwnRevisionAndStats() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run revisionBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// A root set aside for a second client.
+
+effect fn asideBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run twoRoots(&collection)
+  let mut painted = Batch.make()
+  run painted.style(12, &[css.backgroundColor(Rgba<f32> { r: 0.0, g: 0.0, b: 1.0, a: 1.0 })])
+  run tree.apply(run painted.take())
+  run tree.frameRoot(SECOND, narrow())
+  run tree.frameRoot(FIRST_ROOT, wide())
+  drop run drain(&mut tree)
+  run tree.setAside(SECOND, true)
+  run click(&mut tree, SECOND, 10.0, 10.0)
+  run click(&mut tree, FIRST_ROOT, 150.0, 80.0)
+  run tree.reportRoot(SECOND, RootEventKind.CloseRequested)
+  run tree.reportRoot(FIRST_ROOT, RootEventKind.Blurred)
+  let events = run drain(&mut tree)
+  run Testing.expect(
+    firstIs(&events, EventKind.Click, 2, &[1, 2])
+      && !firstIs(&events, EventKind.Click, 12, &[11, 12]),
+    "takeEvents leaves the records of a root set aside",
+  )
+  let mut roots = List<RootEvent>.make()
+  run tree.takeRootEvents(&mut roots)
+  run Testing.expect(roots.length() == 1 && roots.get(0).root == FIRST_ROOT, "and its root events")
+  let mut mine = List<Event>.make()
+  run tree.takeEventsOf(SECOND, &mut mine)
+  run Testing.expect(
+    firstIs(&mine, EventKind.Click, 12, &[11, 12]) && tree.events.length() == 0,
+    "they wait for takeEventsOf",
+  )
+  roots.clear()
+  run tree.takeRootEventsOf(SECOND, &mut roots)
+  run Testing.expect(
+    roots.length() == 1 && roots.get(0).root == SECOND,
+    "as its root events wait for takeRootEventsOf",
+  )
+  run Testing.expect(
+    tree.sceneOf(SECOND).operationCount() != 0 && tree.current == FIRST_ROOT,
+    "the scene of a root that waits can be read without making it current",
+  )
+  run tree.setAside(SECOND, false)
+  run click(&mut tree, SECOND, 10.0, 10.0)
+  let back = run drain(&mut tree)
+  run Testing.expect(
+    firstIs(&back, EventKind.Click, 12, &[11, 12]),
+    "given back, its records are everybody's",
+  )
+}
+
+test effect fn aRootSetAsideKeepsItsRecordsForItsClient() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run asideBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
 // Hosts that show one root.
