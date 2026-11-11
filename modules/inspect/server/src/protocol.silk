@@ -6,13 +6,13 @@
 //! that pick a node take a target: `node` (a client id) or the query members `role`, `name`,
 //! `label`, `text`, `testId`, `within`, `exact` and `hidden`, alone or inside a `query` object.
 //! See the README for each command.
-import ui_inspect.query { Query, queryAll, queryFirst, hitPath, pick, accessibleName }
+import ui_inspect.query { Query, queryAll, queryFirst, hitPath, pick }
 import ui_inspect.overlay { BoxModel, Highlight, boxModels, compose, paintHighlight }
 import ui_inspect.view { InspectOptions, inspectNode }
 import ui_inspect.synth { pointOf, click, press }
 import ui_tree.engine { UiTree }
 import ui_tree.node { NONE, Event, EventKind }
-import ui_tree.mutation { Role }
+import ui_tree.mutation { Role, StyleState }
 import ui_tree.input { Input, MOD_SHIFT, MOD_CONTROL, MOD_ALT, MOD_META, BUTTON_PRIMARY }
 import ui_tree.inspect {
   CpuSnapshot,
@@ -23,7 +23,6 @@ import ui_tree.inspect {
   describeNodeById,
   encodePng,
   info,
-  kindName,
   roleName,
   writeInt,
   writeNumber
@@ -50,6 +49,9 @@ import reply {
 }
 import ui_scene.scene { Scene }
 import capture { reduced }
+import nodes { nodeObject, nodeMembers }
+import program { ProgramLog, Timeline }
+import tools { StyleEdits, audit, stateNamed, styles }
 import vector.geometry_error { GeometryError }
 import vector.pixmap { Pixmap }
 import codec.image { ImageError }
@@ -68,7 +70,7 @@ import silk.num.usize
 import silk.text.string { String }
 
 /// The protocol version `hello` reports.
-pub const VERSION: u32 = 1
+pub const VERSION: u32 = 2
 
 /// How long `wait` waits when the request names no `timeout`, in milliseconds.
 pub const DEFAULT_TIMEOUT: u64 = 5000
@@ -190,6 +192,17 @@ pub struct Protocol {
   pub log: List<LoggedEvent>,
   /// The number the next logged record gets.
   pub nextSeq: u64,
+  /// The program behind the tree, when the host reports one.
+  pub program: ProgramLog,
+  /// The frames the tree drew.
+  pub timeline: Timeline,
+  edits: StyleEdits,
+  /// The window's pointer picks a node instead of reaching the app (the `pickMode` command).
+  pub picking: bool,
+  /// The node the last pick chose, or NONE.
+  pub picked: u32,
+  /// The release of the press that picked is not the app's either.
+  swallowUp: bool,
 }
 
 impl Protocol {
@@ -207,6 +220,12 @@ impl Protocol {
       repaint: false,
       log: List<LoggedEvent>.make(),
       nextSeq: 1,
+      program: ProgramLog.make(),
+      timeline: Timeline.make(),
+      edits: StyleEdits.make(),
+      picking: false,
+      picked: NONE,
+      swallowUp: false,
     }
   }
 
@@ -337,6 +356,7 @@ impl Protocol {
     ! OutOfMemoryError
     ? &mut Allocator {
     run self.snapshot.copyUploads(tree)
+    run self.timeline.record(tree.stats)
     if self.highlight.nodes.length() != 0 {
       run self.composeOverlay(tree)
     }
@@ -422,6 +442,41 @@ impl Protocol {
       return run waitFor(&tree.*, request, waited, &mut out)
     } else if cmd == "stats" {
       run stats(&tree.*, request, &mut out)
+    } else if cmd == "program" {
+      run self.program.describe(request, &mut out)
+    } else if cmd == "messages" {
+      run self.program.messages(request, &mut out)
+    } else if cmd == "model" {
+      if !self.program.attached {
+        run failure(&mut out, request, "no program is attached")
+      } else if !run self.program.model(request, &mut out) {
+        run failure(&mut out, request, "no such step")
+      }
+    } else if cmd == "frames" {
+      run self.timeline.describe(request, &mut out)
+    } else if cmd == "styles" {
+      let id = run targetOf(&tree.*, request, &mut out)
+      if id != NONE {
+        run styles(&tree.*, request, id, &mut out)
+      }
+    } else if cmd == "setStyle" {
+      run self.setStyle(&mut tree, request, &mut out)
+    } else if cmd == "resetStyles" {
+      let restored = run self.edits.reset(&mut tree)
+      self.repaint = true
+      run begin(&mut out, request)
+      run putInt(&mut out, "restored", usize.toU64(restored))
+      run finish(&mut out)
+    } else if cmd == "pickMode" {
+      run self.pickMode(&tree.*, request, &mut out)
+    } else if cmd == "audit" {
+      let mut top = tree.rootId()
+      if run hasTarget(request) {
+        top = run targetOf(&tree.*, request, &mut out)
+      }
+      if top != NONE || !run hasTarget(request) {
+        run audit(&tree.*, request, top, &mut out)
+      }
     } else if cmd == "" {
       run failure(&mut out, request, "the request has no cmd")
     } else {
@@ -437,13 +492,145 @@ impl Protocol {
     run putInt(&mut out, "protocol", u32.toU64(VERSION))
     run putKey(&mut out, "commands")
     run out.append(
-      "[\"hello\",\"tree\",\"events\",\"snapshot\",\"query\",\"inspect\",\"pick\",\"highlight\",\"screenshot\",\"click\",\"hover\",\"scroll\",\"press\",\"pointer\",\"key\",\"type\",\"wait\",\"stats\"]",
+      "[\"hello\",\"tree\",\"events\",\"snapshot\",\"query\",\"inspect\",\"pick\",\"highlight\",\"screenshot\",\"click\",\"hover\",\"scroll\",\"press\",\"pointer\",\"key\",\"type\",\"wait\",\"stats\",\"program\",\"messages\",\"model\",\"frames\",\"styles\",\"setStyle\",\"resetStyles\",\"pickMode\",\"audit\"]",
     )
     run frameMembers(tree, &mut out)
     run putInt(&mut out, "root", u32.toU64(tree.rootId()))
     run putInt(&mut out, "nodes", usize.toU64(tree.nodeCount()))
     run putIds(&mut out, "highlight", &self.highlight.nodes)
+    run putFlag(&mut out, "program", self.program.attached)
     run finish(&mut out)
+  }
+
+  /// setStyle: sets the declarations of `style` (CSS text) on the target for `state` (`base`
+  /// without one), over what the node has or, with `replace`, instead of it. The edit lasts
+  /// until the app sets the same properties again or `resetStyles` takes it back.
+  effect fn setStyle(
+    self: &mut Self,
+    tree: &mut UiTree<'_>,
+    request: &Value,
+    out: &mut String,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let id = run targetOf(&tree.*, request, &mut out)
+    if id == NONE {
+      return ()
+    }
+    let state = match stateNamed(textField(request, "state")) {
+      Option<StyleState>.Some { value } => value
+      Option<StyleState>.None => {
+        run failure(&mut out, request, "unknown state")
+        return ()
+      }
+    }
+    if run self.edits.apply(
+      &mut tree,
+      request,
+      id,
+      state,
+      textField(request, "style"),
+      flagField(request, "replace", false),
+      &mut out,
+    ) {
+      self.repaint = true
+    }
+  }
+
+  /// pickMode: with `on`, turns picking on or off; either way says whether it is on and the
+  /// node the last pick chose. While it is on the window's pointer highlights what it is
+  /// over, and a press picks that node instead of reaching the app.
+  effect fn pickMode(self: &mut Self, tree: &UiTree<'_>, request: &Value, out: &mut String) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if has(request, "on") {
+      let on = flagField(request, "on", false)
+      if on && !self.picking {
+        self.picked = NONE
+      }
+      if !on && self.picking {
+        run self.point(tree, NONE)
+      }
+      self.picking = on
+    }
+    run begin(&mut out, request)
+    run putFlag(&mut out, "on", self.picking)
+    if self.picked != NONE && tree.contains(self.picked) {
+      let mut name = String.make()
+      run putKey(&mut out, "picked")
+      run nodeObject(tree, self.picked, &mut name, &mut out)
+    }
+    run finish(&mut out)
+  }
+
+  /// Highlights `id` alone, or nothing for NONE.
+  effect fn point(self: &mut Self, tree: &UiTree<'_>, id: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let now = self.highlight.nodes.asSlice()
+    if (id == NONE && now.length == 0) || (now.length == 1 && now[0] == id) {
+      return ()
+    }
+    self.highlight.nodes.clear()
+    if id != NONE {
+      run self.highlight.nodes.append(id)
+      run self.composeOverlay(tree)
+    }
+    self.repaint = true
+  }
+
+  /// Whether window input goes through [`Protocol.pickInput`] first.
+  pub fn intercepts(self: &Self) -> bool {
+    return self.picking || self.swallowUp
+  }
+
+  /// Takes window input while picking. True when the input was the picker's and must not
+  /// reach the app: a move highlights the node under the pointer, a press picks it and ends
+  /// picking, Escape ends picking without a pick.
+  pub effect fn pickInput(self: &mut Self, tree: &UiTree<'_>, input: &Input) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.picking {
+      match &input.* {
+        Input.PointerUp { .. } => {
+          let was = self.swallowUp
+          self.swallowUp = false
+          return was
+        }
+        _ => {
+          return false
+        }
+      }
+    }
+    match &input.* {
+      Input.PointerMove { x, y, .. } => {
+        run self.point(tree, pick(tree, x, y))
+        return true
+      }
+      Input.PointerDown { x, y, .. } => {
+        let chosen = pick(tree, x, y)
+        self.picked = chosen
+        run self.point(tree, chosen)
+        self.picking = false
+        self.swallowUp = true
+        return true
+      }
+      Input.PointerLeave => {
+        run self.point(tree, NONE)
+        return true
+      }
+      Input.KeyDown { key, .. } => {
+        if String.view(&key) == "Escape" {
+          run self.point(tree, NONE)
+          self.picking = false
+          return true
+        }
+        return false
+      }
+      _ => {
+        return false
+      }
+    }
   }
 
   effect fn query(self: &Self, tree: &UiTree<'_>, request: &Value, out: &mut String) -> ()
@@ -1184,63 +1371,6 @@ effect fn writeIntTo(out: &mut String, value: u64) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   run writeInt(&mut out, value)
-}
-
-/// `{"id":…,"kind":…,"role":…,"name":…,"x":…,"y":…,"width":…,"height":…}` for node `id`.
-effect fn nodeObject(tree: &UiTree<'_>, id: u32, name: &mut String, out: &mut String) -> ()
-  ! OutOfMemoryError
-  ? &mut Allocator {
-  run nodeMembers(tree, id, &mut name, &mut out)
-  run out.append("}")
-}
-
-/// `{"id":…,"kind":…,"role":…,"name":…,"x":…,"y":…,"width":…,"height":…` for node `id`, left open.
-effect fn nodeMembers(tree: &UiTree<'_>, id: u32, name: &mut String, out: &mut String) -> ()
-  ! OutOfMemoryError
-  ? &mut Allocator {
-  let slot = tree.slotOf(id)
-  run out.append("{\"id\":")
-  run writeIntTo(&mut out, u32.toU64(id))
-  if slot == NONE {
-    return ()
-  }
-  let node = tree.node(slot)
-  run out.append(",\"kind\":")
-  run writeString(&mut out, kindName(node.kind))
-  if node.accessRole != Role.None {
-    run out.append(",\"role\":")
-    run writeString(&mut out, roleName(node.accessRole))
-  }
-  name.clear()
-  run accessibleName(tree, id, &mut name)
-  if name.ownedByteLength() != 0 {
-    run out.append(",\"name\":")
-    run writeString(&mut out, String.view(&name))
-  }
-  if node.testId.ownedByteLength() != 0 {
-    run out.append(",\"testId\":")
-    run writeString(&mut out, String.view(&node.testId))
-  }
-  match run info(tree, id) {
-    Option<NodeInfo>.Some { value } => {
-      let b = value.bounds
-      run out.append(",\"x\":")
-      run writeNumber(&mut out, b.xMin)
-      run out.append(",\"y\":")
-      run writeNumber(&mut out, b.yMin)
-      run out.append(",\"width\":")
-      run writeNumber(&mut out, b.xMax - b.xMin)
-      run out.append(",\"height\":")
-      run writeNumber(&mut out, b.yMax - b.yMin)
-      if value.focused {
-        run out.append(",\"focused\":true")
-      }
-      if value.hovered {
-        run out.append(",\"hovered\":true")
-      }
-    }
-    Option<NodeInfo>.None => {}
-  }
 }
 
 /// Whether the request keeps its query members in a `query` object.

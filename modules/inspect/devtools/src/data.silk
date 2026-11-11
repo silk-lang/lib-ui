@@ -1,8 +1,9 @@
 //! What the devtools window shows, read out of the inspector protocol's JSON replies: the
 //! element tree (`tree`), a node's view and box model (`inspect`), the event log (`events`), the
-//! frame stats (`stats`) and the status line (`hello`). Display text is made here, once per
-//! reply, so the view only lays it out.
-import ui_inspect_server.reply { appendNumber, textField, numberField, idField, has }
+//! frame stats (`stats`), the status line (`hello`), the program's messages and models
+//! (`program`, `messages`, `model`), the frame timeline (`frames`) and the audit (`audit`).
+//! Display text is made here, once per reply, so the view only lays it out.
+import ui_inspect_server.reply { appendNumber, textField, numberField, idField, flagField, has }
 import ui_tree.inspect { writeInt, writeNumber }
 import silk.collections.list { List }
 import silk.core.option { Option }
@@ -92,6 +93,85 @@ pub struct Stat {
   pub value: String,
 }
 
+/// One message the program handled.
+pub struct StepRow {
+  pub seq: u64,
+  /// What sent the message: `click #12`, `timer`, `command Save`.
+  pub cause: String,
+  pub message: String,
+  /// The commands update returned, joined with commas.
+  pub commands: String,
+  /// Whether the step left the model different.
+  pub changed: bool,
+}
+
+/// A line of a model that the step kept.
+pub const KEPT: u8 = 0
+
+/// A line of a model that the step added.
+pub const ADDED: u8 = 1
+
+/// A line the model before the step had and the one after it has not.
+pub const REMOVED: u8 = 2
+
+/// One line of a model against the model before it.
+pub struct DiffLine {
+  /// [`KEPT`], [`ADDED`] or [`REMOVED`].
+  pub op: u8,
+  pub text: String,
+}
+
+/// The model after one step, as a diff against the model before.
+pub struct ModelView {
+  /// The step, or 0 when none is open.
+  pub seq: u64,
+  pub lines: List<DiffLine>,
+  /// How many lines the step added or removed.
+  pub changed: u64,
+}
+
+/// What the program panel shows besides the messages.
+pub struct ProgramView {
+  /// Whether the app reports a program at all.
+  pub attached: bool,
+  /// The counters in one line.
+  pub line: String,
+  pub subscriptions: List<String>,
+}
+
+/// One frame of the timeline.
+pub struct FrameBar {
+  pub frame: u64,
+  /// Milliseconds in layout and in paint; both zero when the host does not time frames.
+  pub layout: f32,
+  pub paint: f32,
+  pub fragments: f32,
+  pub skipped: bool,
+}
+
+impl Copy for FrameBar {}
+
+/// The frame timeline.
+pub struct FrameView {
+  pub bars: List<FrameBar>,
+  /// The summary under the bars.
+  pub line: String,
+  /// Whether the host times its frames; without it the bars show painted fragments.
+  pub timed: bool,
+  /// The value a full-height bar stands for: milliseconds when timed, fragments otherwise.
+  pub scale: f32,
+}
+
+/// One finding of the audit.
+pub struct Issue {
+  /// `unnamed`, `no-role`, `not-focusable`, `small-target` or `contrast`.
+  pub rule: String,
+  pub message: String,
+  pub node: u32,
+  /// The row label of the node.
+  pub label: String,
+}
+
 /// What one refresh read from the app.
 pub struct Snapshot {
   pub status: String,
@@ -102,7 +182,22 @@ pub struct Snapshot {
   pub next: u64,
   /// The inspected node again, when one was selected and still exists.
   pub detail: Option<Detail>,
+  /// The program's messages after the last one read.
+  pub steps: List<StepRow>,
+  /// The `seq` the next message will get.
+  pub stepNext: u64,
+  /// The program panel's header, when it was asked for.
+  pub program: Option<ProgramView>,
+  /// The timeline, when it was asked for.
+  pub frames: Option<FrameView>,
+  /// Whether the app is still waiting for a pick.
+  pub picking: bool,
+  /// The node picked in the app's window, or NO_PARENT.
+  pub picked: u32,
 }
+
+/// How long a frame may take at 60 frames a second, in milliseconds.
+pub const FRAME_BUDGET: f32 = 16.7
 
 fn zeroSides() -> Sides {
   return Sides { top: 0.0, right: 0.0, bottom: 0.0, left: 0.0 }
@@ -120,6 +215,19 @@ impl BoxNumbers {
       y: 0.0,
       fragments: 0,
     }
+  }
+}
+
+impl ModelView {
+  /// No step open.
+  pub fn none() -> ModelView {
+    return ModelView { seq: 0, lines: List<DiffLine>.make(), changed: 0 }
+  }
+}
+
+impl FrameView {
+  pub fn none() -> FrameView {
+    return FrameView { bars: List<FrameBar>.make(), line: String.make(), timed: false, scale: 1.0 }
   }
 }
 
@@ -450,4 +558,277 @@ pub effect fn parseStatus(reply: &Value, out: &mut String) -> ()
   run out.append("x  ·  ")
   run writeInt(&mut out, u64Field(reply, "nodes"))
   run out.append(" nodes")
+}
+
+/// The strings of array `value` joined with `, `.
+effect fn joined(value: Option<&Value>, out: &mut String) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match items(value) {
+    Option<&List<Value>>.Some { value: array } => {
+      let list = array.asSlice()
+      let mut i: usize = 0
+      while i < list.length {
+        match &list[i] {
+          Value.String { text } => {
+            if out.ownedByteLength() != 0 {
+              run out.append(", ")
+            }
+            run out.append(String.view(&text))
+          }
+          _ => {}
+        }
+        i = i + 1
+      }
+    }
+    Option<&List<Value>>.None => {}
+  }
+}
+
+/// The steps of a `messages` reply, appended to `out` oldest first. Returns the reply's `next`.
+pub effect fn parseSteps(reply: &Value, out: &mut List<StepRow>) -> u64
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match items(Json.field(reply, "messages")) {
+    Option<&List<Value>>.Some { value: array } => {
+      let list = array.asSlice()
+      let mut i: usize = 0
+      while i < list.length {
+        let step = &list[i]
+        let mut commands = String.make()
+        run joined(Json.field(step, "commands"), &mut commands)
+        run out.append(
+          StepRow {
+            seq: u64Field(step, "seq"),
+            cause: run String.copy(textField(step, "cause")),
+            message: run String.copy(textField(step, "message")),
+            commands: move commands,
+            changed: flagField(step, "changed", false),
+          },
+        )
+        i = i + 1
+      }
+    }
+    Option<&List<Value>>.None => {}
+  }
+  return u64Field(reply, "next")
+}
+
+effect fn counter(out: &mut String, stats: &Value, key: string, unit: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if out.ownedByteLength() != 0 {
+    run out.append("  ·  ")
+  }
+  run writeInt(&mut out, u64Field(stats, key))
+  run out.append(" ")
+  run out.append(unit)
+}
+
+/// The program panel's header out of a `program` reply.
+pub effect fn parseProgram(reply: &Value) -> ProgramView
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut view = ProgramView {
+    attached: flagField(reply, "attached", false),
+    line: String.make(),
+    subscriptions: List<String>.make(),
+  }
+  match Json.field(reply, "stats") {
+    Option<&Value>.Some { value: stats } => {
+      run counter(&mut view.line, stats, "messages", "messages")
+      run counter(&mut view.line, stats, "commands", "commands")
+      run counter(&mut view.line, stats, "renders", "renders")
+      run counter(&mut view.line, stats, "mutations", "mutations in the last")
+      run counter(&mut view.line, stats, "reused", "of")
+      run view.line.append(" ")
+      run writeInt(&mut view.line, u64Field(stats, "nodes"))
+      run view.line.append(" nodes reused")
+    }
+    Option<&Value>.None => {}
+  }
+  match items(Json.field(reply, "subscriptions")) {
+    Option<&List<Value>>.Some { value: array } => {
+      let list = array.asSlice()
+      let mut i: usize = 0
+      while i < list.length {
+        match &list[i] {
+          Value.String { text } => {
+            run view.subscriptions.append(run String.copy(String.view(&text)))
+          }
+          _ => {}
+        }
+        i = i + 1
+      }
+    }
+    Option<&List<Value>>.None => {}
+  }
+  return move view
+}
+
+/// The model of a `model` reply as diff lines.
+pub effect fn parseModel(reply: &Value) -> ModelView
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut view = ModelView.none()
+  view.seq = u64Field(reply, "seq")
+  view.changed = u64Field(reply, "changed")
+  match items(Json.field(reply, "diff")) {
+    Option<&List<Value>>.Some { value: array } => {
+      let list = array.asSlice()
+      let mut i: usize = 0
+      while i < list.length {
+        let op = textField(&list[i], "op")
+        run view.lines.append(
+          DiffLine {
+            op: if op == "+" {
+              ADDED
+            } else if op == "-" {
+              REMOVED
+            } else {
+              KEPT
+            },
+            text: run String.copy(textField(&list[i], "line")),
+          },
+        )
+        i = i + 1
+      }
+    }
+    Option<&List<Value>>.None => {}
+  }
+  return move view
+}
+
+/// The timeline out of a `frames` reply.
+pub effect fn parseFrames(reply: &Value) -> FrameView
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut view = FrameView.none()
+  let mut most: f32 = 1.0
+  match items(Json.field(reply, "frames")) {
+    Option<&List<Value>>.Some { value: array } => {
+      let list = array.asSlice()
+      let mut i: usize = 0
+      while i < list.length {
+        let f = &list[i]
+        let bar = FrameBar {
+          frame: u64Field(f, "frame"),
+          layout: numberField(f, "layoutMs", 0.0),
+          paint: numberField(f, "paintMs", 0.0),
+          fragments: numberField(f, "fragments", 0.0),
+          skipped: flagField(f, "layoutSkipped", false),
+        }
+        if bar.fragments > most {
+          most = bar.fragments
+        }
+        run view.bars.append(bar)
+        i = i + 1
+      }
+    }
+    Option<&List<Value>>.None => {}
+  }
+  let slowest = numberField(reply, "slowestMs", 0.0)
+  view.timed = slowest > 0.0
+  run writeInt(&mut view.line, usize.toU64(view.bars.length()))
+  run view.line.append(" frames  ·  ")
+  if view.timed {
+    view.scale = if slowest > FRAME_BUDGET {
+      slowest
+    } else {
+      FRAME_BUDGET
+    }
+    run view.line.append("slowest ")
+    run writeNumber(&mut view.line, f32.floor(slowest * 100.0 + 0.5) / 100.0)
+    run view.line.append(" ms  ·  average ")
+    run writeNumber(
+      &mut view.line,
+      f32.floor(numberField(reply, "averageMs", 0.0) * 100.0 + 0.5) / 100.0,
+    )
+    run view.line.append(" ms  ·  the full height is ")
+    run writeSize(&mut view.line, view.scale)
+    run view.line.append(" ms")
+  } else {
+    view.scale = most
+    run view.line.append("this host does not time frames, the bars are painted fragments (most ")
+    run writeSize(&mut view.line, most)
+    run view.line.append(")")
+  }
+  return move view
+}
+
+/// The issues of an `audit` reply; `line` gets the summary.
+pub effect fn parseIssues(reply: &Value, out: &mut List<Issue>, line: &mut String) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  line.clear()
+  match items(Json.field(reply, "issues")) {
+    Option<&List<Value>>.Some { value: array } => {
+      let list = array.asSlice()
+      let mut i: usize = 0
+      while i < list.length {
+        let issue = &list[i]
+        let mut label = String.make()
+        let mut id = NO_PARENT
+        match Json.field(issue, "node") {
+          Option<&Value>.Some { value: node } => {
+            id = u32Field(node, "id", NO_PARENT)
+            run labelOf(node, &mut label)
+          }
+          Option<&Value>.None => {}
+        }
+        run out.append(
+          Issue {
+            rule: run String.copy(textField(issue, "rule")),
+            message: run String.copy(textField(issue, "message")),
+            node: id,
+            label: move label,
+          },
+        )
+        i = i + 1
+      }
+    }
+    Option<&List<Value>>.None => {}
+  }
+  let count = u64Field(reply, "count")
+  if count == 0 {
+    run line.append("No issues")
+  } else {
+    run writeInt(&mut line, count)
+    run line.append(
+      if count == 1 {
+        " issue"
+      } else {
+        " issues"
+      },
+    )
+  }
+  run line.append(" in ")
+  run writeInt(&mut line, u64Field(reply, "checked"))
+  run line.append(" nodes")
+}
+
+fn lower(byte: u8) -> u8 {
+  if byte >= 65 && byte <= 90 {
+    return byte + 32
+  }
+  return byte
+}
+
+/// Whether `text` contains `wanted`, ASCII letters compared without case.
+pub fn matches(text: string, wanted: string) -> bool {
+  let a = String.utf8Bytes(text)
+  let b = String.utf8Bytes(wanted)
+  let mut at: usize = 0
+  while at + b.length <= a.length {
+    let mut i: usize = 0
+    while i < b.length && lower(a[at + i]) == lower(b[i]) {
+      i = i + 1
+    }
+    if i == b.length {
+      return true
+    }
+    at = at + 1
+  }
+  return false
 }

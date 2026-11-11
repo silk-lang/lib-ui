@@ -221,6 +221,17 @@ check counts and stats with these, and `modules/app/tests` renders golden scenes
 PNG) for the counter and the todo list. `silk task native demo modules/app/demo -- check` runs the todo list in a
 real window on X11 and Wayland, clicks Add and compares a frame.
 
+## What the inspector sees
+
+A program keeps a `Journal`: every message with what sent it (`click #12`, `port shell:menu`,
+`command Save`, `timer`), the commands `update` returned and the model afterwards. Nothing is
+written by hand: `show.show` and `show.showTree` print any value by reflection (`pub` fields of
+structs and unions, list items, numbers, strings), and a type reflection cannot open says how
+with `impl Shown`. The window host hands the journal to the inspector, where it is the
+`program`, `messages` and `model` commands and the devtools' Program tab
+([ui-inspect-devtools](../inspect/devtools)). The journal keeps the last 200 steps and is only
+filled while an inspector is attached.
+
 ## What depends on the tree
 
 Views, the diff and the element model (`ui`, `diff`, `equal`, `virtual_list`) import only

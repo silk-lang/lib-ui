@@ -68,6 +68,15 @@ match in tree order wins.
 | `ui_wait` | `wait` | until the target exists (or, with `gone`, does not); `timeout` in ms, default 5000 |
 | `ui_stats` | `stats` | the last frame's counters |
 | `ui_events` | `events` | the event records the app took (click, keydown, input, ...), with `since` and `limit` |
+| `ui_program` | `program` | the running program: counters, subscriptions and the model now |
+| `ui_messages` | `messages` | the steps the program took: message, what sent it, commands returned; `since`, `limit` |
+| `ui_model` | `model` | the model after step `seq` and its line diff against the step before |
+| `ui_frames` | `frames` | layout and paint time per frame, with the frame's counters |
+| `ui_styles` | `styles` | the target's style patches per state |
+| `ui_set_style` | `setStyle` | sets `style` declarations on the target for `state`; `replace` drops what it had |
+| `ui_reset_styles` | `resetStyles` | undoes every style edit |
+| `ui_pick_mode` | `pickMode` | lets the person point at a node in the app's window; ask again for `picked` |
+| `ui_audit` | `audit` | accessibility issues: unnamed controls, missing roles, unreachable or small targets, low contrast |
 
 Results are text: the snapshot or node view text, otherwise the protocol's reply line. A failed
 command (no node matches, a covered node, a timed out wait) is a tool result with `isError`, so
@@ -75,7 +84,9 @@ the agent sees the reason. Input waits for the app to draw its answer before the
 answers, so a snapshot right after a click shows the result.
 
 A typical agent session: `ui_snapshot` to read the tree, `ui_click` with `label: "New"` (or
-`role: "button", name: "New"`), `ui_wait` for the change, `ui_screenshot` to look at it.
+`role: "button", name: "New"`), `ui_wait` for the change, `ui_screenshot` to look at it. To
+find why the app did something, `ui_messages` and `ui_model` say which message changed which
+field; to try a fix, `ui_set_style` and a screenshot; before finishing, `ui_audit`.
 
 ## How it works
 
@@ -110,8 +121,8 @@ silk task native mcp       # an MCP client drives the demo in a window
 
 - One tool call at a time; a long `ui_wait` holds the session until it ends.
 - No MCP resources, prompts or progress notifications; cancellation is ignored.
-- Whatever the inspector protocol does not do (event log, session recording, GPU readback, IME
-  preedit) the tools do not do either.
+- Whatever the inspector protocol does not do (session recording, time travel, GPU readback,
+  IME preedit) the tools do not do either.
 
 ## Capturing a sequence
 

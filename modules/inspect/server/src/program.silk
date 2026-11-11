@@ -1,0 +1,523 @@
+//! What the inspector knows beyond the tree: the program that drives it (its messages, the
+//! model after each, its subscriptions) and the frames it drew.
+//!
+//! The tree cannot tell any of this. A host that runs a program hands it over as text
+//! (`Inspector.program`), and a host that times its frames says how long they took
+//! (`Inspector.timed`); `ui-app-window` does both.
+import reply { begin, finish, putKey, putText, putInt, putNumber, putFlag, writeString }
+import ui_tree.inspect { writeInt, writeNumber }
+import ui_tree.node { FrameStats }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.json.value { Json, Value }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f64
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.text.string { String }
+
+/// How many steps the log keeps; older ones are dropped.
+pub const STEP_LIMIT: usize = 200
+
+/// How many frames the timeline keeps.
+pub const FRAME_LIMIT: usize = 240
+
+/// The most cells the line comparison of two models fills. Past it, the lines between what
+/// the two share at their ends all count as changed.
+const DIFF_CELLS: usize = 1000000
+
+/// One message a program handled, and what came of it.
+pub struct ProgramStep {
+  /// The step's number, from 1.
+  pub seq: u64,
+  /// The program's time when it handled the message, in seconds.
+  pub time: f64,
+  /// Where the message came from: `"click #12"`, `"port menu"`, `"timer"`.
+  pub cause: String,
+  /// The message, on one line.
+  pub message: String,
+  /// The commands `update` returned, one line each.
+  pub commands: List<String>,
+  /// The model after `update`, one line per field.
+  pub model: String,
+}
+
+/// The counters of a program's runtime.
+pub struct ProgramStats {
+  pub renders: u64,
+  pub dispatches: u64,
+  pub messages: u64,
+  pub commands: u64,
+  /// Mutations the last render sent.
+  pub mutations: u64,
+  /// Nodes in the last render, and how many of them it copied from the one before.
+  pub nodes: u64,
+  pub reused: u64,
+}
+
+impl Copy for ProgramStats {}
+
+/// The program behind the tree, as its host reported it.
+pub struct ProgramLog {
+  /// A host reports a program. Without one, the program commands say so.
+  pub attached: bool,
+  pub steps: List<ProgramStep>,
+  /// The subscriptions the model asks for, one line each.
+  pub subscriptions: List<String>,
+  pub stats: ProgramStats,
+}
+
+impl ProgramLog {
+  pub fn make() -> ProgramLog {
+    return ProgramLog {
+      attached: false,
+      steps: List<ProgramStep>.make(),
+      subscriptions: List<String>.make(),
+      stats: ProgramStats {
+        renders: 0,
+        dispatches: 0,
+        messages: 0,
+        commands: 0,
+        mutations: 0,
+        nodes: 0,
+        reused: 0,
+      },
+    }
+  }
+
+  /// Adds a step and drops the oldest one past [`STEP_LIMIT`].
+  pub effect fn add(self: &mut Self, step: ProgramStep) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.steps.append(move step)
+    if self.steps.length() > STEP_LIMIT {
+      drop self.steps.remove(0)
+    }
+  }
+
+  /// program: whether a program is attached, its counters, its subscriptions and its model now.
+  pub effect fn describe(self: &Self, request: &Value, out: &mut String) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run begin(&mut out, request)
+    run putFlag(&mut out, "attached", self.attached)
+    let steps = self.steps.asSlice()
+    run putInt(&mut out, "steps", usize.toU64(steps.length))
+    if steps.length != 0 {
+      run putInt(&mut out, "first", steps[0].seq)
+      run putInt(&mut out, "last", steps[steps.length - 1].seq)
+      run putText(&mut out, "model", String.view(&steps[steps.length - 1].model))
+    }
+    run putKey(&mut out, "subscriptions")
+    run texts(&self.subscriptions, &mut out)
+    run putKey(&mut out, "stats")
+    run out.append("{\"renders\":")
+    run writeInt(&mut out, self.stats.renders)
+    run out.append(",\"dispatches\":")
+    run writeInt(&mut out, self.stats.dispatches)
+    run out.append(",\"messages\":")
+    run writeInt(&mut out, self.stats.messages)
+    run out.append(",\"commands\":")
+    run writeInt(&mut out, self.stats.commands)
+    run out.append(",\"mutations\":")
+    run writeInt(&mut out, self.stats.mutations)
+    run out.append(",\"nodes\":")
+    run writeInt(&mut out, self.stats.nodes)
+    run out.append(",\"reused\":")
+    run writeInt(&mut out, self.stats.reused)
+    run out.append("}")
+    run finish(&mut out)
+  }
+
+  /// messages: the steps after `since` (a `seq`, 0 for all), oldest first, at most `limit` of
+  /// the newest. `changed` says whether the step left the model different.
+  pub effect fn messages(self: &Self, request: &Value, out: &mut String) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let since = match Json.asU64(Json.field(request, "since")) {
+      Option<u64>.Some { value } => value
+      Option<u64>.None => 0
+    }
+    let steps = self.steps.asSlice()
+    let mut first: usize = 0
+    while first < steps.length && steps[first].seq <= since {
+      first = first + 1
+    }
+    match Json.asU64(Json.field(request, "limit")) {
+      Option<u64>.Some { value } => {
+        let limit = u64.toUsize(value)
+        if steps.length - first > limit {
+          first = steps.length - limit
+        }
+      }
+      Option<u64>.None => {}
+    }
+    run begin(&mut out, request)
+    run putFlag(&mut out, "attached", self.attached)
+    run putInt(
+      &mut out,
+      "next",
+      if steps.length == 0 {
+        1
+      } else {
+        steps[steps.length - 1].seq + 1
+      },
+    )
+    run putKey(&mut out, "messages")
+    run out.append("[")
+    let mut i = first
+    while i < steps.length {
+      if i > first {
+        run out.append(",")
+      }
+      let step = &steps[i]
+      run out.append("{\"seq\":")
+      run writeInt(&mut out, step.seq)
+      run out.append(",\"time\":")
+      run writeNumber(&mut out, f64.toF32(step.time))
+      run out.append(",\"cause\":")
+      run writeString(&mut out, String.view(&step.cause))
+      run out.append(",\"message\":")
+      run writeString(&mut out, String.view(&step.message))
+      run out.append(",\"commands\":")
+      run texts(&step.commands, &mut out)
+      run out.append(",\"changed\":")
+      run out.append(
+        if i == 0 || String.view(&steps[i - 1].model) != String.view(&step.model) {
+          "true"
+        } else {
+          "false"
+        },
+      )
+      run out.append("}")
+      i = i + 1
+    }
+    run out.append("]")
+    run finish(&mut out)
+  }
+
+  /// model: the model after step `seq` (the last one without it), and how it differs from the
+  /// model before, line by line: `diff` holds `{"op":" "|"+"|"-","line":…}` in order.
+  pub effect fn model(self: &Self, request: &Value, out: &mut String) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let steps = self.steps.asSlice()
+    if steps.length == 0 {
+      return false
+    }
+    let mut at = steps.length - 1
+    match Json.asU64(Json.field(request, "seq")) {
+      Option<u64>.Some { value } => {
+        let mut found = false
+        let mut i: usize = 0
+        while i < steps.length {
+          if steps[i].seq == value {
+            at = i
+            found = true
+          }
+          i = i + 1
+        }
+        if !found {
+          return false
+        }
+      }
+      Option<u64>.None => {}
+    }
+    let step = &steps[at]
+    run begin(&mut out, request)
+    run putInt(&mut out, "seq", step.seq)
+    run putText(&mut out, "cause", String.view(&step.cause))
+    run putText(&mut out, "message", String.view(&step.message))
+    run putKey(&mut out, "commands")
+    run texts(&step.commands, &mut out)
+    run putText(&mut out, "model", String.view(&step.model))
+    let before: string = if at == 0 {
+      String.view(&step.model)
+    } else {
+      String.view(&steps[at - 1].model)
+    }
+    run putKey(&mut out, "diff")
+    let changed = run diffLines(before, String.view(&step.model), &mut out)
+    run putInt(&mut out, "changed", usize.toU64(changed))
+    run finish(&mut out)
+    return true
+  }
+}
+
+effect fn texts(list: &List<String>, out: &mut String) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.append("[")
+  let items = list.asSlice()
+  let mut i: usize = 0
+  while i < items.length {
+    if i > 0 {
+      run out.append(",")
+    }
+    run writeString(&mut out, String.view(&items[i]))
+    i = i + 1
+  }
+  run out.append("]")
+}
+
+effect fn linesOf<'a>(text: string<'a>, out: &mut List<string<'a>>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let bytes = String.utf8Bytes(text)
+  let mut from: usize = 0
+  let mut i: usize = 0
+  while i < bytes.length {
+    if bytes[i] == 10 {
+      run out.append(String.slice(text, from, i - from))
+      from = i + 1
+    }
+    i = i + 1
+  }
+  run out.append(String.slice(text, from, bytes.length - from))
+}
+
+effect fn diffLine(out: &mut String, first: &mut bool, op: string, line: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !first.* {
+    run out.append(",")
+  }
+  first.* = false
+  run out.append("{\"op\":\"")
+  run out.append(op)
+  run out.append("\",\"line\":")
+  run writeString(&mut out, line)
+  run out.append("}")
+}
+
+/// Writes the lines of `after` and the ones of `before` it lost as a JSON array, each marked
+/// kept (`" "`), added (`"+"`) or removed (`"-"`). Returns how many are added or removed.
+pub effect fn diffLines(before: string, after: string, out: &mut String) -> usize
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut old = List<string>.make()
+  let mut new = List<string>.make()
+  run linesOf(before, &mut old)
+  run linesOf(after, &mut new)
+  let a = old.asSlice()
+  let b = new.asSlice()
+  let mut head: usize = 0
+  while head < a.length && head < b.length && a[head] == b[head] {
+    head = head + 1
+  }
+  let mut tail: usize = 0
+  while tail < a.length - head && tail < b.length - head
+    && a[a.length - 1 - tail] == b[b.length - 1 - tail] {
+    tail = tail + 1
+  }
+  let n = a.length - head - tail
+  let m = b.length - head - tail
+  let mut first = true
+  let mut changed: usize = 0
+  run out.append("[")
+  let mut i: usize = 0
+  while i < head {
+    run diffLine(&mut out, &mut first, " ", a[i])
+    i = i + 1
+  }
+  if n != 0 && m != 0 && n * m <= DIFF_CELLS {
+    // The longest common subsequence of the two middles, from the ends back.
+    let width = m + 1
+    let mut table = run List<u32>.makeWithCapacity((n + 1) * width)
+    let mut c: usize = 0
+    while c < (n + 1) * width {
+      run table.append(0)
+      c = c + 1
+    }
+    let mut x = n
+    while x > 0 {
+      x = x - 1
+      let mut y = m
+      while y > 0 {
+        y = y - 1
+        let value = if a[head + x] == b[head + y] {
+          table.get((x + 1) * width + y + 1) + 1
+        } else {
+          let down = table.get((x + 1) * width + y)
+          let across = table.get(x * width + y + 1)
+          if down > across {
+            down
+          } else {
+            across
+          }
+        }
+        table.set(x * width + y, value)
+      }
+    }
+    x = 0
+    let mut y: usize = 0
+    while x < n || y < m {
+      if x < n && y < m && a[head + x] == b[head + y] {
+        run diffLine(&mut out, &mut first, " ", a[head + x])
+        x = x + 1
+        y = y + 1
+      } else if x < n
+        && (y == m || table.get((x + 1) * width + y) >= table.get(x * width + y + 1)) {
+        run diffLine(&mut out, &mut first, "-", a[head + x])
+        changed = changed + 1
+        x = x + 1
+      } else {
+        run diffLine(&mut out, &mut first, "+", b[head + y])
+        changed = changed + 1
+        y = y + 1
+      }
+    }
+  } else {
+    let mut x: usize = 0
+    while x < n {
+      run diffLine(&mut out, &mut first, "-", a[head + x])
+      x = x + 1
+    }
+    let mut y: usize = 0
+    while y < m {
+      run diffLine(&mut out, &mut first, "+", b[head + y])
+      y = y + 1
+    }
+    changed = n + m
+  }
+  let mut k: usize = 0
+  while k < tail {
+    run diffLine(&mut out, &mut first, " ", a[a.length - tail + k])
+    k = k + 1
+  }
+  run out.append("]")
+  return changed
+}
+
+/// One frame the tree drew.
+pub struct FrameRecord {
+  pub stats: FrameStats,
+  /// How long layout and paint took, in milliseconds; zero when the host does not time them.
+  pub layout: f32,
+  pub paint: f32,
+}
+
+impl Copy for FrameRecord {}
+
+/// The last [`FRAME_LIMIT`] frames.
+pub struct Timeline {
+  pub frames: List<FrameRecord>,
+  layout: f32,
+  paint: f32,
+}
+
+impl Timeline {
+  pub fn make() -> Timeline {
+    return Timeline { frames: List<FrameRecord>.make(), layout: 0.0, paint: 0.0 }
+  }
+
+  /// How long the frame about to be recorded took.
+  pub fn timed(self: &mut Self, layout: f32, paint: f32) -> () {
+    self.layout = layout
+    self.paint = paint
+  }
+
+  /// Records the tree's last frame, once.
+  pub effect fn record(self: &mut Self, stats: FrameStats) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let count = self.frames.length()
+    if count != 0 && self.frames.get(count - 1).stats.frame == stats.frame {
+      return ()
+    }
+    run self.frames.append(FrameRecord { stats: stats, layout: self.layout, paint: self.paint })
+    self.layout = 0.0
+    self.paint = 0.0
+    if self.frames.length() > FRAME_LIMIT {
+      drop self.frames.remove(0)
+    }
+  }
+
+  /// frames: the frames after `since` (a frame number, 0 for all), oldest first, at most
+  /// `limit` of the newest.
+  pub effect fn describe(self: &Self, request: &Value, out: &mut String) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let since = match Json.asU64(Json.field(request, "since")) {
+      Option<u64>.Some { value } => value
+      Option<u64>.None => 0
+    }
+    let frames = self.frames.asSlice()
+    let mut first: usize = 0
+    while first < frames.length && frames[first].stats.frame <= since {
+      first = first + 1
+    }
+    match Json.asU64(Json.field(request, "limit")) {
+      Option<u64>.Some { value } => {
+        let limit = u64.toUsize(value)
+        if frames.length - first > limit {
+          first = frames.length - limit
+        }
+      }
+      Option<u64>.None => {}
+    }
+    run begin(&mut out, request)
+    run putKey(&mut out, "frames")
+    run out.append("[")
+    let mut slowest: f32 = 0.0
+    let mut total: f32 = 0.0
+    let mut i = first
+    while i < frames.length {
+      if i > first {
+        run out.append(",")
+      }
+      let f = frames[i]
+      let cost = f.layout + f.paint
+      total = total + cost
+      if cost > slowest {
+        slowest = cost
+      }
+      run out.append("{\"frame\":")
+      run writeInt(&mut out, f.stats.frame)
+      run out.append(",\"layoutMs\":")
+      run writeNumber(&mut out, f.layout)
+      run out.append(",\"paintMs\":")
+      run writeNumber(&mut out, f.paint)
+      run out.append(",\"layoutSkipped\":")
+      run out.append(
+        if f.stats.layoutSkipped {
+          "true"
+        } else {
+          "false"
+        },
+      )
+      run out.append(",\"layoutPasses\":")
+      run writeInt(&mut out, usize.toU64(f.stats.layout.passes))
+      run out.append(",\"repainted\":")
+      run writeInt(&mut out, usize.toU64(f.stats.repaintedSubtrees))
+      run out.append(",\"replayed\":")
+      run writeInt(&mut out, usize.toU64(f.stats.replayedSubtrees))
+      run out.append(",\"fragments\":")
+      run writeInt(&mut out, usize.toU64(f.stats.paintedFragments))
+      run out.append(",\"primitives\":")
+      run writeInt(&mut out, usize.toU64(f.stats.primitives))
+      run out.append(",\"glyphs\":")
+      run writeInt(&mut out, usize.toU64(f.stats.glyphs))
+      run out.append(",\"nodes\":")
+      run writeInt(&mut out, usize.toU64(f.stats.nodes))
+      run out.append("}")
+      i = i + 1
+    }
+    run out.append("]")
+    let count = frames.length - first
+    run putInt(&mut out, "count", usize.toU64(count))
+    run putNumber(&mut out, "slowestMs", slowest)
+    run putNumber(
+      &mut out,
+      "averageMs",
+      if count == 0 {
+        0.0
+      } else {
+        total / usize.toF32(count)
+      },
+    )
+    run finish(&mut out)
+  }
+}

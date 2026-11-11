@@ -1,0 +1,491 @@
+//! [`show`]: any value as text, by reflection. It is how the journal writes down a program's
+//! messages, commands and model without the program saying how.
+//!
+//! Structs and unions show their `pub` fields; lists show their items; numbers, booleans and
+//! strings show themselves. A type reflection cannot open (an enum, an array, a map) shows as
+//! its name in angle brackets.
+//!
+//! The pretty form is one line per field, indented by depth, so two of them compare line by
+//! line:
+//!
+//! ```text
+//! Notes
+//!   text: "hello"
+//!   dirty: true
+//!   todos: [1]
+//!     0: Todo
+//!       title: "milk"
+//! ```
+import silk.collections.list { List }
+import silk.core.reflect { Reflect, namedKind, unionKind }
+import silk.core.static_text { StaticText }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.num.i16
+import silk.num.i32
+import silk.num.i64
+import silk.num.i8
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+import silk.text.string { String }
+
+/// The most items of a list the pretty form shows.
+pub const MAX_ITEMS: usize = 100
+
+/// The most bytes of a string either form shows.
+pub const MAX_TEXT: usize = 240
+
+/// Where a value is being written.
+pub struct Printer {
+  pub out: String,
+  pub pretty: bool,
+  depth: u32,
+}
+
+impl Printer {
+  pub fn make(pretty: bool) -> Printer {
+    return Printer { out: String.make(), pretty: pretty, depth: 0 }
+  }
+
+  effect fn write(self: &mut Self, text: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.out.append(text)
+  }
+
+  /// Starts the line of a child in the pretty form.
+  effect fn line(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.out.append("\n")
+    let mut i: u32 = 0
+    while i < self.depth {
+      run self.out.append("  ")
+      i = i + 1
+    }
+  }
+
+  pub effect fn unsigned(self: &mut Self, value: u64) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut digits: [u8; 20] = [0; 20]
+    let mut at: usize = 20
+    let mut rest = value
+    while true {
+      at = at - 1
+      digits[at] = 48 + u64.toU8(rest % 10)
+      rest = rest / 10
+      if rest == 0 {
+        break
+      }
+    }
+    while at < 20 {
+      let one: [u8; 1] = [digits[at]]
+
+      // An ASCII digit is a whole character.
+      run self.out.append(unsafe String.fromUtf8Unchecked(&one))
+      at = at + 1
+    }
+  }
+
+  pub effect fn signed(self: &mut Self, value: i64) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if value < 0 {
+      run self.out.append("-")
+
+      // The least value has no positive counterpart.
+      run self.unsigned(i64.toU64(-(value + 1)) + 1)
+    } else {
+      run self.unsigned(i64.toU64(value))
+    }
+  }
+
+  /// At most four digits after the point, without trailing zeros.
+  pub effect fn real(self: &mut Self, value: f64) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if value != value {
+      return run self.out.append("NaN")
+    }
+    let mut rest = value
+    if rest < 0.0 {
+      run self.out.append("-")
+      rest = -rest
+    }
+    if rest > 9.0e15 {
+      return run self.out.append("∞")
+    }
+    let scaled = f64.toU64(rest * 10000.0 + 0.5)
+    run self.unsigned(scaled / 10000)
+    let mut fraction = scaled % 10000
+    if fraction == 0 {
+      return ()
+    }
+    run self.out.append(".")
+    let mut place: u64 = 1000
+    while fraction != 0 {
+      run self.unsigned(fraction / place)
+      fraction = fraction % place
+      place = place / 10
+    }
+  }
+
+  pub effect fn quoted(self: &mut Self, text: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let bytes = String.utf8Bytes(text)
+    let mut end = bytes.length
+    if end > MAX_TEXT {
+      end = MAX_TEXT
+
+      // Not in the middle of a character.
+      while end > 0 && (bytes[end] & 0xC0) == 0x80 {
+        end = end - 1
+      }
+    }
+    run self.out.append("\"")
+    let mut from: usize = 0
+    let mut i: usize = 0
+    while i < end {
+      let byte = bytes[i]
+      if byte == 10 || byte == 34 || byte == 92 || byte == 9 || byte == 13 {
+        run self.out.append(String.slice(text, from, i - from))
+        run self.out.append(
+          if byte == 10 {
+            "\\n"
+          } else if byte == 34 {
+            "\\\""
+          } else if byte == 9 {
+            "\\t"
+          } else if byte == 13 {
+            "\\r"
+          } else {
+            "\\\\"
+          },
+        )
+        from = i + 1
+      }
+      i = i + 1
+    }
+    run self.out.append(String.slice(text, from, end - from))
+    if end < bytes.length {
+      run self.out.append("…")
+    }
+    run self.out.append("\"")
+  }
+}
+
+/// A value that writes itself: the leaves of what [`show`] walks.
+pub interface Shown {
+  effect fn shown(self: &Self, to: &mut Printer) -> () ! OutOfMemoryError ? &mut Allocator
+}
+
+impl Shown for String {
+  effect fn shown(self: &Self, to: &mut Printer) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run to.quoted(String.view(self))
+  }
+}
+
+impl Shown for bool {
+  effect fn shown(self: &Self, to: &mut Printer) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run to.write(
+      if self.* {
+        "true"
+      } else {
+        "false"
+      },
+    )
+  }
+}
+
+impl Shown for u8 {
+  effect fn shown(self: &Self, to: &mut Printer) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run to.unsigned(u8.toU64(self.*))
+  }
+}
+
+impl Shown for u16 {
+  effect fn shown(self: &Self, to: &mut Printer) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run to.unsigned(u16.toU64(self.*))
+  }
+}
+
+impl Shown for u32 {
+  effect fn shown(self: &Self, to: &mut Printer) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run to.unsigned(u32.toU64(self.*))
+  }
+}
+
+impl Shown for u64 {
+  effect fn shown(self: &Self, to: &mut Printer) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run to.unsigned(self.*)
+  }
+}
+
+impl Shown for usize {
+  effect fn shown(self: &Self, to: &mut Printer) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run to.unsigned(usize.toU64(self.*))
+  }
+}
+
+impl Shown for i8 {
+  effect fn shown(self: &Self, to: &mut Printer) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run to.signed(i8.toI64(self.*))
+  }
+}
+
+impl Shown for i16 {
+  effect fn shown(self: &Self, to: &mut Printer) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run to.signed(i16.toI64(self.*))
+  }
+}
+
+impl Shown for i32 {
+  effect fn shown(self: &Self, to: &mut Printer) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run to.signed(i32.toI64(self.*))
+  }
+}
+
+impl Shown for i64 {
+  effect fn shown(self: &Self, to: &mut Printer) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run to.signed(self.*)
+  }
+}
+
+impl Shown for f32 {
+  effect fn shown(self: &Self, to: &mut Printer) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run to.real(f32.toF64(self.*))
+  }
+}
+
+impl Shown for f64 {
+  effect fn shown(self: &Self, to: &mut Printer) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run to.real(self.*)
+  }
+}
+
+static fn leaf<T>() -> bool {
+  let name = Reflect.typeName<T>()
+  return name == "String" || name == "bool" || name == "u8" || name == "u16" || name == "u32"
+    || name == "u64"
+    || name == "usize"
+    || name == "i8"
+    || name == "i16"
+    || name == "i32"
+    || name == "i64"
+    || name == "f32"
+    || name == "f64"
+}
+
+static fn isList<T>() -> bool {
+  let name = Reflect.typeName<T>()
+  return StaticText.byteLength(name) > 5 && StaticText.slice(name, 0, 5) == "List<"
+}
+
+/// The wrappers a runtime puts around a program's model and commands show as what they wrap.
+static fn wrapper<T>() -> bool {
+  let name = Reflect.typeName<T>()
+  return (StaticText.byteLength(name) > 7 && StaticText.slice(name, 0, 7) == "Hosted<")
+    || (StaticText.byteLength(name) > 4 && StaticText.slice(name, 0, 4) == "Run<")
+}
+
+static fn fieldCount<U>(variant: Intrinsic.Variant<U>) -> usize {
+  let mut count: usize = 0
+  static for _field in Reflect.variantFields(variant) {
+    count = count + 1
+  }
+  return count
+}
+
+static fn structFields<T>() -> usize {
+  let mut count: usize = 0
+  static for _field in Reflect.fields<T>() {
+    count = count + 1
+  }
+  return count
+}
+
+effect fn member<T: Shown>(value: &T, to: &mut Printer) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run Shown.shown(value, &mut to)
+}
+
+effect fn listOf<T>(list: &List<T>, to: &mut Printer) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let items = list.asSlice()
+  if !to.pretty {
+    run to.write("[")
+    let mut i: usize = 0
+    while i < items.length && i < 8 {
+      if i != 0 {
+        run to.write(", ")
+      }
+      run walk(&items[i], &mut to)
+      i = i + 1
+    }
+    if i < items.length {
+      run to.write(", …")
+    }
+    return run to.write("]")
+  }
+  run to.write("[")
+  run to.unsigned(usize.toU64(items.length))
+  run to.write("]")
+  to.depth = to.depth + 1
+  let mut i: usize = 0
+  while i < items.length && i < MAX_ITEMS {
+    run to.line()
+    run to.unsigned(usize.toU64(i))
+    run to.write(": ")
+    run walk(&items[i], &mut to)
+    i = i + 1
+  }
+  if i < items.length {
+    run to.line()
+    run to.write("… ")
+    run to.unsigned(usize.toU64(items.length - i))
+    run to.write(" more")
+  }
+  to.depth = to.depth - 1
+}
+
+struct Holder<'a, T> {
+  pub item: &'a T,
+}
+
+/// Writes `value` to `to`.
+pub effect fn walk<T>(value: &T, to: &mut Printer) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let holder = Holder<T> { item: value }
+
+  // The loop has one turn. Its body is checked with the type `T` is, not with the parameter,
+  // which is what lets one function treat a number, a list and a struct each in its own way.
+  static for held in Reflect.fields<Holder<T>>() {
+    let item = Reflect.borrowField(&holder, held).*
+    static if leaf<T>() {
+      run member(item, &mut to)
+    } else {
+      static if isList<T>() {
+        run listOf(item, &mut to)
+      } else {
+        static if wrapper<T>() {
+          static for field in Reflect.fields<T>() {
+            run walk(Reflect.borrowField(item, field), &mut to)
+          }
+        } else {
+          static if Reflect.typeKind(Reflect.typeOf<T>()) == namedKind {
+            run to.write(Reflect.typeName<T>())
+            static if structFields<T>() != 0 {
+              if !to.pretty {
+                run to.write(" { ")
+              }
+              to.depth = to.depth + 1
+              let mut first = true
+              static for field in Reflect.fields<T>() {
+                if to.pretty {
+                  run to.line()
+                } else if !first {
+                  run to.write(", ")
+                }
+                first = false
+                run to.write(Reflect.fieldLabel(field))
+                run to.write(": ")
+                run walk(Reflect.borrowField(item, field), &mut to)
+              }
+              to.depth = to.depth - 1
+              if !to.pretty {
+                run to.write(" }")
+              }
+            }
+          } else {
+            static if Reflect.typeKind(Reflect.typeOf<T>()) == unionKind {
+              static for variant in Reflect.variants<T>() {
+                if Reflect.isVariant(item, variant) {
+                  run to.write(Reflect.variantLabel(variant))
+                  static if fieldCount(variant) != 0 {
+                    if !to.pretty {
+                      run to.write(" { ")
+                    }
+                    to.depth = to.depth + 1
+                    let mut first = true
+                    static for field in Reflect.variantFields(variant) {
+                      if to.pretty {
+                        run to.line()
+                      } else if !first {
+                        run to.write(", ")
+                      }
+                      first = false
+                      run to.write(Reflect.fieldLabel(field))
+                      run to.write(": ")
+                      run walk(Reflect.borrowVariantField(item, variant, field), &mut to)
+                    }
+                    to.depth = to.depth - 1
+                    if !to.pretty {
+                      run to.write(" }")
+                    }
+                  }
+                }
+              }
+            } else {
+              run to.write("<")
+              run to.write(Reflect.typeName<T>())
+              run to.write(">")
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/// `value` on one line: `Chose { action: 3 }`.
+pub effect fn show<T>(value: &T) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut to = Printer.make(false)
+  run walk(value, &mut to)
+  return move to.out
+}
+
+/// `value` with one line per field, indented by depth.
+pub effect fn showTree<T>(value: &T) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut to = Printer.make(true)
+  run walk(value, &mut to)
+  return move to.out
+}

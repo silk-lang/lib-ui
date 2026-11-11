@@ -5,7 +5,7 @@
 import inspected { Inspected }
 import ui_devtools.lib { Devtools, Message, Command, Panel, Link, NO_PARENT }
 import ui_app.runtime { Runtime, drain }
-import ui_app.harness { click, press, snapshot }
+import ui_app.harness { click, press, snapshot, typeText }
 import ui_inspect.query { Query, queryFirst }
 import ui_fixtures.fixtures as fixtures
 import ui_tree.legacy { UiTree, TreeError, Batch, FrameInput, Role }
@@ -156,6 +156,103 @@ effect fn body() -> ()
   run Testing.expect(visible == 1, "folding the root leaves one row")
   drop run click(&mut devtools, &mut tree, viewport(), "+") |> Effect.provideMut<Link>(&mut app)
   run Testing.expect(devtools.model.rows.asSlice()[1].visible, "unfolding shows them again")
+
+  // The program's messages, with the model after one of them.
+  run app.reportProgram()
+  drop run click(&mut devtools, &mut tree, viewport(), "Program")
+    |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(devtools.model.panel == Panel.Program, "the program tab opens")
+  run Testing.expect(devtools.model.program.attached, "the program is attached")
+  run Testing.expect(devtools.model.steps.length() == 3, "its three messages are listed")
+  run Testing.expect(devtools.model.program.subscriptions.length() == 2, "with its subscriptions")
+  let program = run snapshot(&mut tree, viewport())
+  run Testing.expect(String.contains(String.view(&program), "click #12"), "a cause shows")
+  run Testing.expect(String.contains(String.view(&program), "Save { count: 4 }"), "and a command")
+  devtools.send(Message.OpenStep { seq: 3 })
+  run drain(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(devtools.model.opened.seq == 3, "a step opens")
+  run Testing.expect(devtools.model.opened.changed == 4, "two lines went and two came")
+  run Testing.expect(devtools.model.opened.lines.length() == 7, "the diff has every line")
+  let diff = run snapshot(&mut tree, viewport())
+  run Testing.expect(String.contains(String.view(&diff), "  items: 4"), "the model shows")
+  devtools.send(Message.OpenStep { seq: 3 })
+  run drain(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(devtools.model.opened.seq == 0, "and closes")
+  devtools.send(Message.Refresh)
+  run drain(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(devtools.model.steps.length() == 3, "messages are read once")
+
+  // The frame timeline.
+  drop run click(&mut devtools, &mut tree, viewport(), "Frames")
+    |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(devtools.model.frames.bars.length() > 3, "the frames are drawn")
+  run Testing.expect(!devtools.model.frames.timed, "untimed by a host that does not time them")
+
+  // The audit; an issue selects its node.
+  drop run click(&mut devtools, &mut tree, viewport(), "Audit") |> Effect.provideMut<Link>(&mut app)
+  drop run click(&mut devtools, &mut tree, viewport(), "Run audit")
+    |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(
+    String.contains(String.view(&devtools.model.auditLine), "nodes"),
+    "the audit ran",
+  )
+
+  // A style typed into the styles panel lands on the node in the app.
+  devtools.send(Message.Select { id: add })
+  run drain(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
+  drop run click(&mut devtools, &mut tree, viewport(), "Styles")
+    |> Effect.provideMut<Link>(&mut app)
+  let width = devtools.model.detail.box.width
+  run Testing.expect(
+    run click(&mut devtools, &mut tree, viewport(), "style-draft")
+      |> Effect.provideMut<Link>(&mut app),
+    "the styles panel has a field",
+  )
+  run typeText(&mut devtools, &mut tree, viewport(), "width: 200px")
+    |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(String.view(&devtools.model.draft) == "width: 200px", "typing fills it")
+  run press(&mut devtools, &mut tree, viewport(), "Enter", 0) |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(devtools.model.draft.ownedByteLength() == 0, "Enter applies it")
+  run Testing.expect(devtools.model.detail.box.width > width, "the node is wider")
+  run typeText(&mut devtools, &mut tree, viewport(), "no such thing")
+    |> Effect.provideMut<Link>(&mut app)
+  run press(&mut devtools, &mut tree, viewport(), "Enter", 0) |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(devtools.model.styleError.ownedByteLength() != 0, "a bad style says why")
+  drop run click(&mut devtools, &mut tree, viewport(), "Reset") |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(devtools.model.detail.box.width == width, "Reset takes the edit back")
+
+  // The filter hides the rows that do not match.
+  drop run click(&mut devtools, &mut tree, viewport(), "search")
+    |> Effect.provideMut<Link>(&mut app)
+  run typeText(&mut devtools, &mut tree, viewport(), "BUTTON") |> Effect.provideMut<Link>(&mut app)
+  let filtered = devtools.model.rows.asSlice()
+  let mut shown: usize = 0
+  let mut k: usize = 0
+  while k < filtered.length {
+    if filtered[k].visible {
+      shown = shown + 1
+      run Testing.expect(
+        String.contains(String.view(&filtered[k].label), "button"),
+        "only matching rows show",
+      )
+    }
+    k = k + 1
+  }
+  run Testing.expect(shown > 0 && shown < filtered.length, "some rows, not all")
+  devtools.send(Message.Search { value: String.make() })
+  run drain(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
+
+  // Pick: the press in the app's window selects here.
+  run press(&mut devtools, &mut tree, viewport(), "Escape", 0) |> Effect.provideMut<Link>(&mut app)
+  drop run click(&mut devtools, &mut tree, viewport(), "Pick") |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(devtools.model.picking && app.protocol.picking, "the app waits for a pick")
+  app.protocol.picked = add
+  app.protocol.picking = false
+  devtools.send(Message.Tick { time: 1.5 })
+  run drain(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(!devtools.model.picking, "the pick ends")
+  run Testing.expect(devtools.model.selected == add, "with the picked node selected")
+  run Testing.expect(devtools.model.detail.id == add, "and inspected")
 
   // Live refreshes stop when Live is off.
   let syncs = devtools.model.syncs
