@@ -381,3 +381,5 @@ silk task native inspect      # the CLI drives the demo in a window
   starts with none. Edits have no source location.
 - `edits` with `since` lists what changed after a seq, but not the entries that left the log
   (reverted or reset); read it whole to see those go.
+- An edit made with `replace` leaves the client's declarations in that state out until it is
+  reset: resolving one of its properties marks it done but keeps the replacement.
