@@ -1,0 +1,583 @@
+//! Notes: a native app. One note, a menu bar, open and save dialogs, the clipboard, the
+//! system's appearance, a close that asks before it loses work, and a sidebar dragged with a
+//! captured pointer.
+//!
+//! Everything it asks of the window goes through the [`Shell`] service, and the files through
+//! a [`Disk`] service the host provides, so the tests run it with no window at all.
+import ui_app.css
+import ui_app.css { px, percent, Align, BorderStyle, Overflow }
+import ui_app.lib {
+  CommandSet,
+  Cursor,
+  Document,
+  FileDialog,
+  Menu,
+  Node,
+  NoOutput,
+  Program,
+  Reply,
+  Shell,
+  StandardItem,
+  Subscriptions,
+  Update,
+  commandKey
+}
+import ui_app.keys { MOD_SHIFT }
+import look { SANS, press, rgb }
+import silk.collections.list { List }
+import silk.color.rgba { Rgba }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.usize
+import silk.text.string { String }
+
+// The menu's actions.
+pub const NEW: u32 = 1
+
+pub const OPEN: u32 = 2
+
+pub const SAVE: u32 = 3
+
+pub const COPY: u32 = 4
+
+pub const PASTE: u32 = 5
+
+// The dialogs.
+pub const OPENING: u32 = 1
+
+pub const SAVING: u32 = 2
+
+/// The port a worker thread posts to.
+pub const PORT_WORKER: string = "notes:worker"
+
+pub struct Notes {
+  pub text: String,
+  /// Where the note is saved; empty for a note that never was.
+  pub path: String,
+  pub dirty: bool,
+  pub dark: bool,
+  pub focused: bool,
+  /// The user asked to close a note with unsaved work.
+  pub asking: bool,
+  /// The sidebar's width, in CSS pixels.
+  pub sidebar: f32,
+  pub dragging: bool,
+  pub status: String,
+}
+
+pub union Message {
+  Typed { pub value: String },
+  Chose { pub action: u32 },
+  Picked { pub request: u32, pub paths: List<String> },
+  Loaded { pub path: String, pub text: String },
+  Saved { pub path: String },
+  Pasted { pub text: String },
+  AppearanceIs { pub dark: bool },
+  FocusIs { pub focused: bool },
+  CloseAsked,
+  Discarded,
+  KeptEditing,
+  Grabbed,
+  Dragged { pub x: f32 },
+  Released,
+  Said { pub text: String },
+  Done,
+}
+
+/// Where notes are kept. The host provides the file system; a test provides a map.
+pub service Disk {
+  /// The text of the file at `path`; empty when it cannot be read.
+  effect fn read(path: string) -> String ! OutOfMemoryError ? &mut Disk | &mut Allocator
+
+  /// Whether `text` was written to `path`.
+  effect fn write(path: string, text: string) -> bool
+    ! OutOfMemoryError
+    ? &mut Disk | &mut Allocator
+}
+
+pub union Command {
+  /// Installs the menu and asks for the appearance.
+  SetUp,
+  Title { pub text: String },
+  AskOpen,
+  AskSave,
+  Read { pub path: String },
+  Write { pub path: String, pub text: String },
+  Copy { pub text: String },
+  Paste,
+  Quit,
+}
+
+effect fn menu() -> Menu
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut menu = Menu.make()
+  run menu.begin("Notes")
+  run menu.standard(StandardItem.About)
+  run menu.separator()
+  run menu.standard(StandardItem.Hide)
+  run menu.standard(StandardItem.Quit)
+  run menu.end()
+  run menu.begin("File")
+  run menu.action("New", NEW, "n", commandKey())
+  run menu.action("Open…", OPEN, "o", commandKey())
+  run menu.separator()
+  run menu.action("Save As…", SAVE, "s", commandKey() | MOD_SHIFT)
+  run menu.standard(StandardItem.CloseWindow)
+  run menu.end()
+  run menu.begin("Edit")
+  run menu.action("Copy Note", COPY, "c", commandKey() | MOD_SHIFT)
+  run menu.action("Paste at End", PASTE, "v", commandKey() | MOD_SHIFT)
+  run menu.end()
+  run menu.begin("Window")
+  run menu.standard(StandardItem.Minimize)
+  run menu.standard(StandardItem.ToggleFullScreen)
+  run menu.end()
+  return move menu
+}
+
+impl CommandSet<Message ? &mut Shell | &mut Disk | &mut Allocator> for Command {
+  effect fn execute(self: Self) -> Message
+    ! OutOfMemoryError
+    ? &mut Shell | &mut Disk | &mut Allocator {
+    match move self {
+      Command.SetUp => {
+        run Shell.setMenu(run menu())
+        return Message.AppearanceIs { dark: run Shell.dark() }
+      }
+      Command.Title { text } => {
+        run Shell.setTitle(String.view(&text))
+        return Message.Done
+      }
+      Command.AskOpen => {
+        run Shell.openFile(OPENING, FileDialog.file("Open a note", "txt,md"))
+        return Message.Done
+      }
+      Command.AskSave => {
+        run Shell.saveFile(SAVING, FileDialog.saving("Save the note", "note.txt", "txt,md"))
+        return Message.Done
+      }
+      Command.Read { path } => {
+        let text = run Disk.read(String.view(&path))
+        return Message.Loaded { path: move path, text: move text }
+      }
+      Command.Write { path, text } => {
+        if run Disk.write(String.view(&path), String.view(&text)) {
+          return Message.Saved { path: move path }
+        }
+        return Message.Said { text: run String.copy("Could not save the note") }
+      }
+      Command.Copy { text } => {
+        run Shell.copy(String.view(&text))
+        return Message.Said { text: run String.copy("Copied") }
+      }
+      Command.Paste => {
+        return Message.Pasted { text: run Shell.paste() }
+      }
+      Command.Quit => {
+        run Shell.quit()
+        return Message.Done
+      }
+    }
+  }
+}
+
+type Next = Update<Notes, Command, NoOutput>
+
+/// The window's title: the file's name, with a mark while there is unsaved work.
+effect fn title(model: &Notes) -> Command
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = String.make()
+  if model.dirty {
+    run text.append("● ")
+  }
+  let path = String.view(&model.path)
+  if String.byteLength(path) == 0 {
+    run text.append("Untitled")
+  } else {
+    let start = match String.findLast(path, "/") {
+      Option<usize>.Some { value } => value + 1
+      Option<usize>.None => 0
+    }
+    run text.append(String.slice(path, start, String.byteLength(path) - start))
+  }
+  run text.append(" — Notes")
+  return Command.Title { text: move text }
+}
+
+effect fn say(model: &mut Notes, text: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  model.status = run String.copy(text)
+}
+
+/// How many words `text` has.
+pub fn words(text: string) -> usize {
+  let bytes = String.utf8Bytes(text)
+  let mut count: usize = 0
+  let mut inside = false
+  let mut i: usize = 0
+  while i < bytes.length {
+    let space = bytes[i] == 32 || bytes[i] == 10 || bytes[i] == 9 || bytes[i] == 13
+    if !space && !inside {
+      count = count + 1
+    }
+    inside = !space
+    i = i + 1
+  }
+  return count
+}
+
+impl Program<Message, Command> for Notes {
+  effect fn init() -> Next
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let model = Notes {
+      text: String.make(),
+      path: String.make(),
+      dirty: false,
+      dark: false,
+      focused: true,
+      asking: false,
+      sidebar: 180.0,
+      dragging: false,
+      status: run String.copy("Ready"),
+    }
+    let mut commands = List<Command>.make()
+    run commands.append(Command.SetUp)
+    run commands.append(run title(&model))
+    return Next.batch(move model, move commands)
+  }
+
+  effect fn update(notes: Notes, message: Message) -> Next
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut model = move notes
+    match move message {
+      Message.Typed { value } => {
+        let was = model.dirty
+        model.text = move value
+        model.dirty = true
+        if !was {
+          let command = run title(&model)
+          return run Next.with(move model, move command)
+        }
+      }
+      Message.Chose { action } => {
+        if action == NEW {
+          model.text = String.make()
+          model.path = String.make()
+          model.dirty = false
+          run say(&mut model, "New note")
+          let command = run title(&model)
+          return run Next.with(move model, move command)
+        }
+        if action == OPEN {
+          return run Next.with(move model, Command.AskOpen)
+        }
+        if action == SAVE {
+          return run Next.with(move model, Command.AskSave)
+        }
+        if action == COPY {
+          let text = run String.copy(String.view(&model.text))
+          return run Next.with(move model, Command.Copy { text: move text })
+        }
+        if action == PASTE {
+          return run Next.with(move model, Command.Paste)
+        }
+      }
+      Message.Picked { request, paths } => {
+        let mut chosen = move paths
+        if chosen.length() == 0 {
+          run say(&mut model, "Cancelled")
+          return Next.of(move model)
+        }
+        let path = chosen.remove(0)
+        if request == OPENING {
+          return run Next.with(move model, Command.Read { path: move path })
+        }
+        let text = run String.copy(String.view(&model.text))
+        return run Next.with(move model, Command.Write { path: move path, text: move text })
+      }
+      Message.Loaded { path, text } => {
+        model.text = move text
+        model.path = move path
+        model.dirty = false
+        run say(&mut model, "Opened")
+        let command = run title(&model)
+        return run Next.with(move model, move command)
+      }
+      Message.Saved { path } => {
+        model.path = move path
+        model.dirty = false
+        run say(&mut model, "Saved")
+        let command = run title(&model)
+        return run Next.with(move model, move command)
+      }
+      Message.Pasted { text } => {
+        if String.byteLength(String.view(&text)) != 0 {
+          run model.text.append(String.view(&text))
+          model.dirty = true
+          run say(&mut model, "Pasted")
+          let command = run title(&model)
+          return run Next.with(move model, move command)
+        }
+        run say(&mut model, "The clipboard holds no text")
+      }
+      Message.AppearanceIs { dark } => {
+        model.dark = dark
+      }
+      Message.FocusIs { focused } => {
+        model.focused = focused
+      }
+      Message.CloseAsked => {
+        if !model.dirty {
+          return run Next.with(move model, Command.Quit)
+        }
+        model.asking = true
+      }
+      Message.Discarded => {
+        return run Next.with(move model, Command.Quit)
+      }
+      Message.KeptEditing => {
+        model.asking = false
+      }
+      Message.Grabbed => {
+        model.dragging = true
+      }
+      Message.Dragged { x } => {
+        model.sidebar = if x < 120.0 {
+          120.0
+        } else if x > 420.0 {
+          420.0
+        } else {
+          x
+        }
+      }
+      Message.Released => {
+        model.dragging = false
+      }
+      Message.Said { text } => {
+        model.status = move text
+      }
+      Message.Done => {}
+    }
+    return Next.of(move model)
+  }
+
+  fn view(model: &Notes, h: &Document<Message>) -> Node {
+    let page = shade(model.dark, 0xFFFFFF, 0x16181D)
+    let side = shade(model.dark, 0xF3F4F6, 0x1E2128)
+    let line = shade(model.dark, 0xD1D5DB, 0x343944)
+    let ink = shade(model.dark, 0x1F2937, 0xE5E7EB)
+    let faint = shade(model.dark, 0x6B7280, 0x9CA3AF)
+    let text = String.view(&model.text)
+    return h.column(
+      &[
+        h.style(
+          &[
+            css.fontFamily(SANS),
+            css.fontSize(px(14.0)),
+            css.color(ink),
+            css.backgroundColor(page),
+            css.height(percent(100.0)),
+            // A window the user is not working in is drawn a little quieter.
+            css.opacity(
+              if model.focused {
+                1.0
+              } else {
+                0.8
+              },
+            ),
+          ],
+        ),
+      ],
+      &[
+        h.row(
+          &[
+            h.style(
+              &[
+                css.columnGap(px(8.0)),
+                css.padding(px(8.0)),
+                css.alignItems(Align.Center),
+                css.borderBottomWidth(px(1.0)),
+                css.borderStyle(BorderStyle.Solid),
+                css.borderColor(line),
+              ],
+            ),
+          ],
+          &[
+            tool(h, model.dark, "New", Message.Chose { action: NEW }),
+            tool(h, model.dark, "Open…", Message.Chose { action: OPEN }),
+            tool(h, model.dark, "Save As…", Message.Chose { action: SAVE }),
+            tool(h, model.dark, "Copy", Message.Chose { action: COPY }),
+            tool(h, model.dark, "Paste", Message.Chose { action: PASTE }),
+            h.box(
+              &[h.testId("status"), h.style(&[css.flexGrow(1.0), css.color(faint)])],
+              &[h.text(String.view(&model.status))],
+            ),
+          ],
+        ),
+        if model.asking {
+          h.row(
+            &[
+              h.testId("unsaved"),
+              h.style(
+                &[
+                  css.columnGap(px(8.0)),
+                  css.padding(px(8.0)),
+                  css.alignItems(Align.Center),
+                  css.backgroundColor(shade(model.dark, 0xFEF3C7, 0x453A14)),
+                ],
+              ),
+            ],
+            &[
+              h.box(&[h.style(&[css.flexGrow(1.0)])], &[h.text("This note has unsaved work.")]),
+              tool(h, model.dark, "Keep editing", Message.KeptEditing),
+              press(h, "Discard and close", true, Message.Discarded),
+            ],
+          )
+        } else {
+          h.empty()
+        },
+        h.row(
+          &[
+            h.style(&[css.flexGrow(1.0), css.minHeight(px(0.0))]),
+            // While the splitter is held the row hears the pointer wherever it goes.
+            if model.dragging {
+              h.attrs(
+                &[
+                  h.onPointerMove(
+                    |event| Reply<Message>.Emit { message: Message.Dragged { x: event.x } },
+                  ),
+                  h.onPointerUp(|event| Reply<Message>.Emit { message: Message.Released }),
+                  h.onPointerCancel(Message.Released),
+                ],
+              )
+            } else {
+              h.none()
+            },
+          ],
+          &[
+            h.column(
+              &[
+                h.testId("sidebar"),
+                h.style(
+                  &[
+                    css.width(px(model.sidebar)),
+                    css.flexShrink(0.0),
+                    css.padding(px(12.0)),
+                    css.rowGap(px(6.0)),
+                    css.backgroundColor(side),
+                    css.color(faint),
+                  ],
+                ),
+              ],
+              &[
+                h.row(
+                  &[h.style(&[css.columnGap(px(4.0))])],
+                  &[
+                    h.box(&[h.testId("words")], &[h.number(usize.toI64(words(text)))]),
+                    h.text("words"),
+                  ],
+                ),
+                h.row(
+                  &[h.style(&[css.columnGap(px(4.0))])],
+                  &[h.box(&[], &[h.number(usize.toI64(String.byteLength(text)))]), h.text("bytes")],
+                ),
+                h.text(
+                  if model.dark {
+                    "Dark appearance"
+                  } else {
+                    "Light appearance"
+                  },
+                ),
+              ],
+            ),
+            h.box(
+              &[
+                h.testId("splitter"),
+                h.label("Resize the sidebar"),
+                h.cursor(Cursor.ResizeHorizontal),
+                h.onPointerDown(|event| Reply<Message>.Emit { message: Message.Grabbed }),
+                if model.dragging {
+                  h.capturePointer()
+                } else {
+                  h.none()
+                },
+                h.style(&[css.width(px(5.0)), css.flexShrink(0.0), css.backgroundColor(line)]),
+                h.hover(&[css.backgroundColor(rgb(0x2563EB))]),
+              ],
+              &[],
+            ),
+            h.input(
+              text,
+              &[
+                h.testId("note"),
+                h.label("Note"),
+                h.multiline(true),
+                h.placeholder("Write something…"),
+                h.onInput(|value| Message.Typed { value: move value }),
+                h.style(
+                  &[
+                    css.flexGrow(1.0),
+                    css.padding(px(14.0)),
+                    css.fontSize(px(15.0)),
+                    css.lineHeight(px(22.0)),
+                    css.color(ink),
+                    css.overflowY(Overflow.Auto),
+                  ],
+                ),
+              ],
+            ),
+          ],
+        ),
+      ],
+    )
+  }
+
+  fn subscriptions(model: &Notes, subs: &mut Subscriptions<Message>) -> () {
+    subs.menuAction(1, |action| Message.Chose { action: action })
+    subs.files(2, |request, paths| Message.Picked { request: request, paths: move paths })
+    subs.appearance(3, |dark| Message.AppearanceIs { dark: dark })
+    subs.windowFocus(4, |focused| Message.FocusIs { focused: focused })
+    subs.closeRequested(5, || Message.CloseAsked)
+    subs.port(6, PORT_WORKER, |text| Message.Said { text: move text })
+  }
+}
+
+/// A toolbar button in the window's appearance.
+fn tool(h: &Document<Message>, dark: bool, label: string, message: Message) -> Node {
+  return h.button(
+    &[
+      h.onClick(move message),
+      h.style(
+        &[
+          css.paddingTop(px(4.0)),
+          css.paddingBottom(px(4.0)),
+          css.paddingLeft(px(10.0)),
+          css.paddingRight(px(10.0)),
+          css.borderWidth(px(1.0)),
+          css.borderStyle(BorderStyle.Solid),
+          css.borderColor(shade(dark, 0xD1D5DB, 0x3F4552)),
+          css.borderRadius(px(6.0)),
+          css.backgroundColor(shade(dark, 0xFFFFFF, 0x262A33)),
+          css.color(shade(dark, 0x1F2937, 0xE5E7EB)),
+        ],
+      ),
+      h.hover(&[css.backgroundColor(shade(dark, 0xF3F4F6, 0x303541))]),
+      h.active(&[css.backgroundColor(shade(dark, 0xE5E7EB, 0x3A4050))]),
+      h.focusVisible(&[css.borderColor(rgb(0x2563EB))]),
+    ],
+    &[h.text(label)],
+  )
+}
+
+fn shade(dark: bool, light: u32, night: u32) -> Rgba<f32> {
+  return if dark {
+    rgb(night)
+  } else {
+    rgb(light)
+  }
+}

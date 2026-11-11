@@ -1,0 +1,174 @@
+//! A native app with no window: the Notes example run against a [`ShellLog`] and a disk held
+//! in memory, with what a window would say posted to the shell's ports.
+import ui_app.lib { drain, post, Shell, ShellLog, TreeError }
+import ui_app.program as program
+import ui_app.shell { PORT_APPEARANCE, PORT_CLOSE, PORT_FILES, PORT_FOCUS, PORT_MENU }
+import ui_app.harness { drag, typeText, click }
+import ui_app_dom.html { Html }
+import ui_app_examples.look { SANS }
+import ui_fixtures.fixtures as fixtures
+import ui_tree.legacy { UiTree, Batch, FrameInput }
+import ui_app_examples.notes { Command, Disk, Message, Notes, PORT_WORKER, words }
+import silk.collections.bytes { Bytes }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+/// One file.
+struct OneFile {
+  path: String,
+  text: String,
+}
+
+impl Disk for OneFile {
+  effect fn read(self: &mut Self, path: string) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if String.view(&self.path) == path {
+      return run String.copy(String.view(&self.text))
+    }
+    return String.make()
+  }
+
+  effect fn write(self: &mut Self, path: string, text: string) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.path = run String.copy(path)
+    self.text = run String.copy(text)
+    return true
+  }
+}
+
+fn contains(text: &[u8], wanted: string) -> bool {
+  let token = String.utf8Bytes(wanted)
+  let mut at: usize = 0
+  while at + token.length <= text.length {
+    let mut i: usize = 0
+    while i < token.length && text[at + i] == token[i] {
+      i = i + 1
+    }
+    if i == token.length {
+      return true
+    }
+    at = at + 1
+  }
+  return false
+}
+
+effect fn notesBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Shell | &mut Disk | &mut Allocator {
+  let mut page = Html.make()
+  let mut app = run program.make<Notes, Message, Command>()
+  run app.start(&mut page, 0.0)
+  run drain(&mut app, &mut page)
+  run Testing.expect(app.listens(PORT_CLOSE), "a program that asks hears the close")
+  run Testing.expect(app.listens(PORT_WORKER), "and its own ports")
+  run Testing.expect(!app.listens("nobody"), "and no others")
+
+  // The window speaks through ports.
+  run post(&mut app, &mut page, PORT_APPEARANCE, "dark")
+  run Testing.expect(app.model.value.dark, "the appearance arrives")
+  run post(&mut app, &mut page, PORT_FOCUS, "0")
+  run Testing.expect(!app.model.value.focused, "and the focus")
+  run post(&mut app, &mut page, PORT_WORKER, "from a thread")
+  run Testing.expect(String.view(&app.model.value.status) == "from a thread", "and a worker's post")
+
+  // Typing dirties the note; closing then asks instead of quitting.
+  app.send(Message.Typed { value: run String.copy("two words") })
+  run drain(&mut app, &mut page)
+  run Testing.expect(app.model.value.dirty, "typing dirties the note")
+  run post(&mut app, &mut page, PORT_CLOSE, "")
+  run Testing.expect(app.model.value.asking, "a dirty note asks before it closes")
+  run Testing.expect(
+    contains(Bytes.asSlice(&run page.markup()), "This note has unsaved work."),
+    "in the view",
+  )
+  app.send(Message.KeptEditing)
+  run drain(&mut app, &mut page)
+
+  // Save through the menu and a dialog.
+  run post(&mut app, &mut page, PORT_MENU, "3")
+  run post(&mut app, &mut page, PORT_FILES, "2\n/tmp/a.txt")
+  run Testing.expect(!app.model.value.dirty, "a save cleans the note")
+  run Testing.expect(String.view(&app.model.value.path) == "/tmp/a.txt", "and names it")
+
+  // Copy, then paste at the end.
+  run post(&mut app, &mut page, PORT_MENU, "4")
+  run post(&mut app, &mut page, PORT_MENU, "5")
+  run Testing.expect(
+    String.view(&app.model.value.text) == "two wordstwo words",
+    "the clipboard goes around",
+  )
+
+  // A cancelled dialog changes nothing; an opened file replaces the note.
+  run post(&mut app, &mut page, PORT_MENU, "2")
+  run post(&mut app, &mut page, PORT_FILES, "1")
+  run Testing.expect(
+    String.view(&app.model.value.status) == "Cancelled",
+    "a dialog may be cancelled",
+  )
+  run post(&mut app, &mut page, PORT_FILES, "1\n/tmp/a.txt")
+  run Testing.expect(String.view(&app.model.value.text) == "two words", "a file opens")
+
+  // A clean note closes at once.
+  run post(&mut app, &mut page, PORT_CLOSE, "")
+  run Testing.expect(!app.model.value.asking, "a clean note does not ask")
+}
+
+test effect fn aNativeAppWithoutAWindow() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut shell = ShellLog.make()
+  let mut disk = OneFile { path: String.make(), text: String.make() }
+  run notesBody()
+    |> Effect.provideMut<Shell>(&mut shell)
+    |> Effect.provideMut<Disk>(&mut disk)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(shell.has("setMenu"), "the menu was installed")
+  run Testing.expect(shell.has("setTitle Untitled — Notes"), "the title was set")
+  run Testing.expect(shell.has("setTitle ● Untitled — Notes"), "and marked when dirty")
+  run Testing.expect(shell.has("setTitle a.txt — Notes"), "and named after the file")
+  run Testing.expect(shell.has("saveFile Save the note"), "the save dialog was asked for")
+  run Testing.expect(shell.has("copy two words"), "the note was copied")
+  run Testing.expect(shell.has("quit"), "and the window let go")
+  run Testing.expect(String.view(&disk.text) == "two words", "the disk has the note")
+  run Testing.expect(words("  a b\nc ") == 3, "words are counted")
+}
+
+effect fn windowBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Shell | &mut Disk | &mut Allocator {
+  let viewport = FrameInput { width: 760.0, height: 520.0, scale: 1.0, time: 0.0 }
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  let mut batch = Batch.make()
+  run batch.fontFamily(SANS, "Noto Sans, sans-serif")
+  run tree.apply(run batch.take())
+  let mut app = run program.make<Notes, Message, Command>()
+  run app.start(&mut tree, 0.0)
+  run drain(&mut app, &mut tree)
+
+  // The splitter keeps the pointer while it is held, past its own five pixels.
+  run drag(&mut app, &mut tree, viewport, 206.0, 200.0, 320.0, 260.0, 4)
+  run Testing.expect(app.model.value.sidebar == 320.0, "the sidebar follows the pointer")
+  run Testing.expect(!app.model.value.dragging, "until the button is released")
+  run drag(&mut app, &mut tree, viewport, 346.0, 200.0, 20.0, 200.0, 4)
+  run Testing.expect(app.model.value.sidebar == 120.0, "and no narrower than its least")
+
+  run Testing.expect(run click(&mut app, &mut tree, viewport, "note"), "the note is there")
+  run typeText(&mut app, &mut tree, viewport, "one two three")
+  run Testing.expect(words(String.view(&app.model.value.text)) == 3, "typing reaches the model")
+}
+
+test effect fn pointerCaptureDragsTheSplitter() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut shell = ShellLog.make()
+  let mut disk = OneFile { path: String.make(), text: String.make() }
+  run windowBody()
+    |> Effect.provideMut<Shell>(&mut shell)
+    |> Effect.provideMut<Disk>(&mut disk)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}

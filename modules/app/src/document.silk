@@ -29,6 +29,7 @@ import silk.core.ownership { Copy }
 import silk.core.result { Result }
 import silk.geometry.rect { Rect }
 import silk.mem.pointer { Pointer }
+import silk.num.f64
 import silk.num.i64
 import silk.num.u32
 import silk.num.u64
@@ -97,6 +98,8 @@ union Op {
   FocusTrap { value: bool },
   TakeFocus,
   Reveal,
+  Capture,
+  ScrollTo { x: f32, y: f32 },
   Prevent { flags: u32 },
   Multiline { value: bool },
   ReadOnly { value: bool },
@@ -446,6 +449,69 @@ impl<M> Document<M> {
     return tree.add(Shape.Text, span, &[], &[], &[])
   }
 
+  /// A text node with `value` in decimal with `places` digits after the point, rounded:
+  /// `h.decimal(3.14159, 2)` is "3.14". At most nine places.
+  pub fn decimal(self: &Self, value: f64, places: u32) -> Node {
+    let digits = if places > 9 {
+      9
+    } else {
+      places
+    }
+    let mut scale: f64 = 1.0
+    let mut p: u32 = 0
+    while p < digits {
+      scale = scale * 10.0
+      p = p + 1
+    }
+    let negative = value < 0.0
+    let magnitude = if negative {
+      0.0 - value
+    } else {
+      value
+    }
+    let scaled = f64.floor(magnitude * scale + 0.5)
+    let whole = f64.floor(scaled / scale)
+    let mut rest = f64.toU64(scaled - whole * scale)
+    let mut anchor: u8 = 0
+    let tree = unsafe Pointer.borrowMut(&mut anchor, self.tree)
+    let start = usize.toU32(tree.bytes.length())
+    if negative && scaled > 0.0 {
+      tree.heap.alloc(tree.bytes.append(45))
+    }
+    let mut left = f64.toU64(whole)
+    let mut buffer: [u8; 20] = [0; 20]
+    let mut at: usize = 20
+    while true {
+      at = at - 1
+      buffer[at] = u64.toU8(left % 10) + 48
+      left = left / 10
+      if left == 0 {
+        break
+      }
+    }
+    while at < 20 {
+      tree.heap.alloc(tree.bytes.append(buffer[at]))
+      at = at + 1
+    }
+    if digits > 0 {
+      tree.heap.alloc(tree.bytes.append(46))
+      let mut fraction: [u8; 9] = [48; 9]
+      let mut f: u32 = digits
+      while f > 0 {
+        f = f - 1
+        fraction[u32.toUsize(f)] = u64.toU8(rest % 10) + 48
+        rest = rest / 10
+      }
+      let mut k: u32 = 0
+      while k < digits {
+        tree.heap.alloc(tree.bytes.append(fraction[u32.toUsize(k)]))
+        k = k + 1
+      }
+    }
+    let span = Span { start: start, length: usize.toU32(tree.bytes.length()) - start }
+    return tree.add(Shape.Text, span, &[], &[], &[])
+  }
+
   /// An input node with value `value`. The view controls the value.
   pub fn input(self: &Self, value: string, attributes: &[Attr]) -> Node {
     let mut anchor: u8 = 0
@@ -675,6 +741,21 @@ impl<M> Document<M> {
     return self.op(Op.Reveal)
   }
 
+  /// Captures the pointer of the press in progress when a render asks and the last one did
+  /// not: the node gets the moves and the release wherever the pointer goes. A drag asks while
+  /// it lasts (`if model.dragging { h.capturePointer() } else { h.none() }`); the capture ends
+  /// with the press, or when the view stops asking.
+  pub fn capturePointer(self: &Self) -> Attr {
+    return self.op(Op.Capture)
+  }
+
+  /// Scrolls the node, a scroll container, to (`x`, `y`) CSS pixels when a render asks for
+  /// offsets the last one did not ask for, or the node is new. The user scrolls freely in
+  /// between; `onScroll` tells where they got to.
+  pub fn scrollTo(self: &Self, x: f32, y: f32) -> Attr {
+    return self.op(Op.ScrollTo { x: x, y: y })
+  }
+
   /// Turns default actions off for input aimed at the node or below it: what a handler that
   /// always prevents would do. The handlers still run.
   pub fn prevent(self: &Self, actions: &[DefaultAction]) -> Attr {
@@ -770,6 +851,64 @@ impl<M> Document<M> {
   /// Answers a pointer going down on the node or below it.
   pub fn onPointerDown(self: &Self, handler: fn(&Event) -> Reply<M>) -> Attr {
     return self.on(EventKind.PointerDown, handler)
+  }
+
+  /// Answers a pointer coming up on the node or below it, or anywhere while the node holds
+  /// the capture.
+  pub fn onPointerUp(self: &Self, handler: fn(&Event) -> Reply<M>) -> Attr {
+    return self.on(EventKind.PointerUp, handler)
+  }
+
+  /// Answers the pointer moving over the node or below it, or anywhere while the node holds
+  /// the capture. `event.x` and `event.y` are CSS pixels of the viewport.
+  pub fn onPointerMove(self: &Self, handler: fn(&Event) -> Reply<M>) -> Attr {
+    return self.on(EventKind.PointerMove, handler)
+  }
+
+  /// Sends `message` when the pointer comes onto the node.
+  pub fn onPointerEnter(self: &Self, message: M) -> Attr {
+    return self.send(EventKind.PointerEnter, move message)
+  }
+
+  /// Sends `message` when the pointer leaves the node.
+  pub fn onPointerLeave(self: &Self, message: M) -> Attr {
+    return self.send(EventKind.PointerLeave, move message)
+  }
+
+  /// Sends `message` when a press on the node ends without a release (the window lost the
+  /// pointer): what a drag listens for next to `onPointerUp`.
+  pub fn onPointerCancel(self: &Self, message: M) -> Attr {
+    return self.send(EventKind.PointerCancel, move message)
+  }
+
+  /// Sends `message` on the second click of a double click on the node or below it.
+  pub fn onDoubleClick(self: &Self, message: M) -> Attr {
+    if !self.hears(EventKind.Click) {
+      return self.listen(EventKind.Click)
+    }
+    let anchor: u8 = 0
+    let event = unsafe Pointer.borrow(&anchor, self.event)
+    if event.detail == 2 {
+      return self.answer(EventKind.Click, Reply<M>.Emit { message: move message })
+    }
+    return self.answer(EventKind.Click, Reply<M>.Pass)
+  }
+
+  /// Answers a key coming up in the node or below it.
+  pub fn onKeyUp(self: &Self, handler: fn(&Event) -> Reply<M>) -> Attr {
+    return self.on(EventKind.KeyUp, handler)
+  }
+
+  /// Answers the wheel turning over the node or below it. `event.deltaX` and `event.deltaY`
+  /// are CSS pixels, positive down and right; `Reply.Prevent` keeps the page from scrolling.
+  pub fn onWheel(self: &Self, handler: fn(&Event) -> Reply<M>) -> Attr {
+    return self.on(EventKind.Wheel, handler)
+  }
+
+  /// Sends `handler(x, y)` when the node, a scroll container, scrolls: its new offsets in CSS
+  /// pixels.
+  pub fn onScroll(self: &Self, handler: fn(f32, f32) -> M) -> Attr {
+    return self.on(EventKind.Scroll, |event| Reply<M>.Emit { message: handler(event.x, event.y) })
   }
 
   /// Sends `handler(box)` when the node's border box, in CSS pixels of the viewport, changes.
@@ -869,6 +1008,12 @@ fn apply<M>(ui: &mut Ui<M>, tree: &Tree, slots: *mut Slots<M>, start: u32, count
       }
       Op.Reveal => {
         ui.reveal()
+      }
+      Op.Capture => {
+        ui.capturePointer()
+      }
+      Op.ScrollTo { x, y } => {
+        ui.scrollTo(x, y)
       }
       Op.Prevent { flags } => {
         ui.preventMask(flags)

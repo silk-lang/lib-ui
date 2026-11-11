@@ -21,6 +21,8 @@ Packages:
   `SILK_UI_INSPECT` set), so ui-inspect-cli, ui-inspect-mcp and the
   [devtools window](../inspect/devtools) can look at the app.
 - `modules/app/examples`: a counter and a todo list. `modules/app/demo` runs the todo list in a window.
+- `modules/app/notes` (`ui-app-notes`): the Notes example in a window: menus, dialogs, the clipboard,
+  a worker thread.
 - [`examples/scroll-demo`](https://github.com/silk-lang/nonstd/tree/7d6c3693a9ad1fec24127985626ab4224f9f1995/examples/scroll-demo): a fully mounted mixed-document scroll stress app,
   with native controls and repeatable CPU benchmarks of the shared libraries.
 - `modules/app/tests`: unit tests and the golden scenes.
@@ -169,6 +171,44 @@ unless a view handler stops the key first) and `resize`. The runtime asks after 
 starts the new keys and stops the missing ones. Handlers are delivered the way view handlers
 are: by asking again and calling the one that matches. `runtime.nextDeadline()` tells a loop how
 long it can wait.
+
+## Native apps
+
+`ui_app_window.program` runs a `Program` in a native window with nothing else to write:
+
+```silk
+effect fn app(platform: Option<Launched>) -> i32 ? &mut Allocator {
+  let mut window = run Window.make("Notes", 760.0, 520.0)
+  run window.font(SANS, "system-ui, sans-serif")
+  let fonts = run systemFonts()
+  let mut shell = window.shell()
+  return run show<Notes, Message, Command, &mut Shell | &mut Allocator>(move window, &fonts, move platform)
+    |> Effect.provideMut<Shell>(&mut shell)
+}
+
+fn main() -> i32 {
+  return launch(app)
+}
+```
+
+- `Window`: the title and size, `font`, `image`, `icon`, `lowLatency`, `uninspected`. `open` is
+  `show` with the failures typed instead of printed.
+- `Shell` (a service, so commands call `run Shell.copy(text)`): `setTitle`, `setSize`,
+  `minimize`, `toggleFullScreen`, `quit`, `copy`, `paste`, `dark`, `setMenu(Menu)`, `openFile`
+  and `saveFile`. `window.shell()` is the real one; `ShellLog` writes down what was asked, for
+  tests.
+- Subscriptions for what the window says: `menuAction`, `files` (a closed dialog),
+  `appearance`, `windowFocus` and `closeRequested`. A program that subscribes to
+  `closeRequested` keeps the window until a command calls `Shell.quit`.
+- `window.poster()` is a `Poster` any thread may post to; the text arrives through
+  `subs.port(key, name, handler)` on the UI thread.
+- Views: `onPointerUp/Move/Enter/Leave/Cancel`, `onDoubleClick`, `onKeyUp`, `onWheel`,
+  `onScroll`, `capturePointer()` (the node keeps the pointer while a button is held) and
+  `scrollTo(x, y)`.
+
+[examples/src/notes.silk](examples/src/notes.silk) uses all of it and `modules/app/notes` runs
+it; [tests/src/native.silk](tests/src/native.silk) tests it with no window. The host posts to
+the `PORT_*` names in `ui_app.shell`, which is also how a test speaks for the window.
 
 ## Testing and driving
 

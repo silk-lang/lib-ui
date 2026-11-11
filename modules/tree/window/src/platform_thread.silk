@@ -130,6 +130,8 @@ struct Link {
   fastScrolls: List<FastScrolled>,
   /// Events a [`Driver`] made, handled as if the OS had sent them, oldest first.
   synthetic: List<Event>,
+  /// A [`Nudge`] asked the UI thread's wait to end.
+  nudged: bool,
 }
 
 // The raw surface handles in a reply belong to the window, which outlives both threads' use
@@ -151,6 +153,38 @@ impl Launched {
   /// A handle that feeds made-up input to the platform thread, for tests and benchmarks.
   pub fn driver(self: &Self) -> Driver {
     return Driver { link: self.link.clone(), waker: self.waker }
+  }
+}
+
+/// Ends the UI thread's wait for the next event, from any thread: the window host then asks
+/// its client for background work (`WindowClient.poll`). This is how a worker thread says it
+/// has a result.
+pub union Nudge {
+  Direct { waker: Waker },
+  Proxied { link: Arc<Mutex<Link>>, wake: Unparker },
+}
+
+impl Transferable for Nudge {}
+
+impl Nudge {
+  pub fn nudge(self: &Self) -> () {
+    match &self.* {
+      Nudge.Direct { waker } => waker.wake()
+      Nudge.Proxied { link, wake } => {
+        let mut guard = link.get().lock()
+        let state = guard.getMut()
+        state.nudged = true
+        drop guard
+        wake.unpark()
+      }
+    }
+  }
+
+  pub fn clone(self: &Self) -> Nudge {
+    return match &self.* {
+      Nudge.Direct { .. } => Nudge.Direct { waker: Waker.make() }
+      Nudge.Proxied { link, wake } => Nudge.Proxied { link: link.clone(), wake: wake.clone() }
+    }
   }
 }
 
@@ -340,6 +374,7 @@ effect fn makeLink(appearance: Appearance) -> Arc<Mutex<Link>>
     compositor: Option<Compositor>.None,
     fastScrolls: List<FastScrolled>.make(),
     synthetic: List<Event>.make(),
+    nudged: false,
   }
   return run Arc<Mutex<Link>>.make(run Mutex<Link>.make(move link))
 }
@@ -758,7 +793,19 @@ impl PlatformProxy {
   fn hasSideWork(self: &Self) -> bool {
     let guard = self.link.get().lock()
     let state = guard.get()
-    return state.fastScrolls.length() != 0 || state.actions.length() != 0
+    return state.fastScrolls.length() != 0 || state.actions.length() != 0 || state.nudged
+  }
+
+  fn nudge(self: &Self) -> Nudge {
+    return Nudge.Proxied { link: self.link.clone(), wake: self.parker.unparker() }
+  }
+
+  fn takeNudged(self: &Self) -> bool {
+    let mut guard = self.link.get().lock()
+    let state = guard.getMut()
+    let nudged = state.nudged
+    state.nudged = false
+    return nudged
   }
 
   fn popEvent(self: &Self) -> Option<Event> {
@@ -819,6 +866,9 @@ impl Platform for PlatformProxy {
       let next = self.popEvent()
       if next.isSome() {
         return move next
+      }
+      if self.takeNudged() {
+        return Option<Event>.None
       }
       match wait {
         Wait.Poll => {
@@ -1036,6 +1086,14 @@ impl HostPlatform {
   /// The platform thread of a launched app.
   pub fn proxied(launched: Launched) -> HostPlatform {
     return HostPlatform.Proxied { proxy: PlatformProxy.make(move launched) }
+  }
+
+  /// A handle that ends this thread's wait in `nextEvent` from any thread.
+  pub fn nudge(self: &Self) -> Nudge {
+    return match &self.* {
+      HostPlatform.Proxied { proxy } => proxy.nudge()
+      _ => Nudge.Direct { waker: Waker.make() }
+    }
   }
 
   /// Whether calls go to a platform thread.

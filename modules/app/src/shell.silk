@@ -1,0 +1,361 @@
+//! [`Shell`]: what a program asks of the window it runs in and the desktop around it.
+//!
+//! A command reaches the shell as it reaches any service: `run Shell.copy(text)`. The host
+//! that opens the window provides the real one (`ui_app_window.program` for a native window),
+//! and a test provides [`ShellLog`], which writes down what was asked.
+//!
+//! What the shell has to say comes back through subscriptions: `subs.menuAction`,
+//! `subs.files`, `subs.appearance`, `subs.windowFocus` and `subs.closeRequested`.
+import ui_protocol.input { MOD_CONTROL, MOD_META }
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.string { String }
+
+/// An item the system implements itself. A platform with no counterpart leaves it out.
+pub enum StandardItem {
+  About,
+  Services,
+  Hide,
+  HideOthers,
+  ShowAll,
+  /// Asks the app to quit: `subs.closeRequested` hears it first.
+  Quit,
+  CloseWindow,
+  Minimize,
+  Zoom,
+  ToggleFullScreen,
+  BringAllToFront,
+}
+
+/// One step of a menu's description, in order.
+pub union MenuEntry {
+  /// Opens a menu, or a submenu inside the open one, until the matching `End`.
+  Begin { pub title: String },
+  End,
+  /// `subs.menuAction` hears `action` when the item is chosen.
+  Action {
+    pub title: String,
+    pub action: u32,
+    /// The UI Events `key` of the shortcut, lowercase (`"o"`); empty for none.
+    pub key: String,
+    /// The `MOD_*` bits of the shortcut.
+    pub modifiers: u32,
+    pub enabled: bool,
+    pub checked: bool,
+  },
+  Separator,
+  Standard { pub item: StandardItem },
+}
+
+/// The modifier of a platform's menu shortcuts: Command on macOS, Control elsewhere.
+pub fn commandKey() -> u32 {
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    return MOD_META
+  } else {
+    return MOD_CONTROL
+  }
+}
+
+/// The app's menu, built in order. On macOS it is the menu bar, and its first menu is the app
+/// menu, whose title the system replaces with the app's name.
+///
+/// ```silk,ignore
+/// let mut menu = Menu.make()
+/// run menu.begin("App")
+/// run menu.standard(StandardItem.Quit)
+/// run menu.end()
+/// run menu.begin("File")
+/// run menu.action("Open…", OPEN, "o", commandKey())
+/// run menu.end()
+/// run Shell.setMenu(move menu)
+/// ```
+pub struct Menu {
+  pub entries: List<MenuEntry>,
+  depth: u32,
+}
+
+impl Menu {
+  pub fn make() -> Menu {
+    return Menu { entries: List<MenuEntry>.make(), depth: 0 }
+  }
+
+  pub effect fn begin(self: &mut Self, title: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let owned = run String.copy(title)
+    run self.entries.append(MenuEntry.Begin { title: move owned })
+    self.depth = self.depth + 1
+  }
+
+  /// Closes the innermost open menu. Extra calls are ignored.
+  pub effect fn end(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.depth == 0 {
+      return ()
+    }
+    run self.entries.append(MenuEntry.End)
+    self.depth = self.depth - 1
+  }
+
+  /// An enabled, unchecked item with the shortcut `modifiers` + `key`; an empty `key` is no
+  /// shortcut.
+  pub effect fn action(
+    self: &mut Self,
+    title: string,
+    action: u32,
+    key: string,
+    modifiers: u32,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.item(title, action, key, modifiers, true, false)
+  }
+
+  pub effect fn item(
+    self: &mut Self,
+    title: string,
+    action: u32,
+    key: string,
+    modifiers: u32,
+    enabled: bool,
+    checked: bool,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let owned = run String.copy(title)
+    let shortcut = run String.copy(key)
+    run self.entries.append(
+      MenuEntry.Action {
+        title: move owned,
+        action: action,
+        key: move shortcut,
+        modifiers: modifiers,
+        enabled: enabled,
+        checked: checked,
+      },
+    )
+  }
+
+  pub effect fn separator(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.entries.append(MenuEntry.Separator)
+  }
+
+  pub effect fn standard(self: &mut Self, item: StandardItem) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.entries.append(MenuEntry.Standard { item: item })
+  }
+}
+
+/// What a file dialog asks for.
+pub struct FileDialog<'a> {
+  pub title: string<'a>,
+  /// File name extensions without dots, separated by commas: `"png,jpg"`. Empty allows every
+  /// file.
+  pub extensions: string<'a>,
+  /// The file name a save dialog fills in at first.
+  pub name: string<'a>,
+  /// Whether an open dialog lets several files be chosen.
+  pub multiple: bool,
+  /// Whether an open dialog chooses directories instead of files.
+  pub directories: bool,
+}
+
+impl<'a> FileDialog<'a> {
+  /// One file with one of `extensions`.
+  pub fn file(title: string<'a>, extensions: string<'a>) -> FileDialog<'a> {
+    return FileDialog {
+      title: title,
+      extensions: extensions,
+      name: "",
+      multiple: false,
+      directories: false,
+    }
+  }
+
+  /// Any number of files with one of `extensions`.
+  pub fn files(title: string<'a>, extensions: string<'a>) -> FileDialog<'a> {
+    return FileDialog {
+      title: title,
+      extensions: extensions,
+      name: "",
+      multiple: true,
+      directories: false,
+    }
+  }
+
+  /// One directory.
+  pub fn directory(title: string<'a>) -> FileDialog<'a> {
+    return FileDialog { title: title, extensions: "", name: "", multiple: false, directories: true }
+  }
+
+  /// Where to save a file first named `name`.
+  pub fn saving(title: string<'a>, name: string<'a>, extensions: string<'a>) -> FileDialog<'a> {
+    return FileDialog {
+      title: title,
+      extensions: extensions,
+      name: name,
+      multiple: false,
+      directories: false,
+    }
+  }
+}
+
+/// The window a program runs in, and the desktop around it. Every method can be called from a
+/// command, the ones `init` starts with included: a host that has no window yet does what was
+/// asked once it has one.
+pub service Shell {
+  effect fn setTitle(title: string) -> () ! OutOfMemoryError ? &mut Shell | &mut Allocator
+
+  /// Sets the size of the window's content, in CSS pixels.
+  effect fn setSize(width: f64, height: f64) -> () ! OutOfMemoryError ? &mut Shell | &mut Allocator
+
+  effect fn minimize() -> () ! OutOfMemoryError ? &mut Shell | &mut Allocator
+
+  effect fn toggleFullScreen() -> () ! OutOfMemoryError ? &mut Shell | &mut Allocator
+
+  /// Closes the window and ends the program. This is also how a program that subscribes to
+  /// `subs.closeRequested` lets the window go.
+  effect fn quit() -> () ! OutOfMemoryError ? &mut Shell | &mut Allocator
+
+  /// Puts `text` on the clipboard.
+  effect fn copy(text: string) -> () ! OutOfMemoryError ? &mut Shell | &mut Allocator
+
+  /// The text on the clipboard; empty when it holds none.
+  effect fn paste() -> String ! OutOfMemoryError ? &mut Shell | &mut Allocator
+
+  /// Whether the system asks for a dark appearance. `subs.appearance` tells when it changes.
+  effect fn dark() -> bool ? &mut Shell
+
+  /// Installs `menu`, in place of the one before.
+  effect fn setMenu(menu: Menu) -> () ! OutOfMemoryError ? &mut Shell | &mut Allocator
+
+  /// Opens a dialog that chooses files to open. `subs.files` hears `request` and the paths
+  /// chosen, none when the dialog was cancelled.
+  effect fn openFile(request: u32, dialog: FileDialog<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Shell | &mut Allocator
+
+  /// Opens a dialog that chooses where to save, answered as `openFile` is.
+  effect fn saveFile(request: u32, dialog: FileDialog<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Shell | &mut Allocator
+}
+
+/// A [`Shell`] for tests: it writes down what was asked, one line each, and keeps a clipboard
+/// of its own. Post what a real shell would say with `post` and the `PORT_*` names.
+pub struct ShellLog {
+  pub asked: List<String>,
+  pub clipboard: String,
+  pub isDark: bool,
+  pub menu: Menu,
+}
+
+impl ShellLog {
+  pub fn make() -> ShellLog {
+    return ShellLog {
+      asked: List<String>.make(),
+      clipboard: String.make(),
+      isDark: false,
+      menu: Menu.make(),
+    }
+  }
+
+  effect fn note(self: &mut Self, what: string, detail: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut line = run String.copy(what)
+    if String.byteLength(detail) != 0 {
+      run line.append(" ")
+      run line.append(detail)
+    }
+    run self.asked.append(move line)
+  }
+
+  /// Whether a line of `asked` is `line`.
+  pub fn has(self: &Self, line: string) -> bool {
+    let list = self.asked.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      if String.view(&list[i]) == line {
+        return true
+      }
+      i = i + 1
+    }
+    return false
+  }
+}
+
+impl Shell for ShellLog {
+  effect fn setTitle(self: &mut Self, title: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.note("setTitle", title)
+  }
+
+  effect fn setSize(self: &mut Self, width: f64, height: f64) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.note("setSize", "")
+  }
+
+  effect fn minimize(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.note("minimize", "")
+  }
+
+  effect fn toggleFullScreen(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.note("toggleFullScreen", "")
+  }
+
+  effect fn quit(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.note("quit", "")
+  }
+
+  effect fn copy(self: &mut Self, text: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.clipboard = run String.copy(text)
+    run self.note("copy", text)
+  }
+
+  effect fn paste(self: &mut Self) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run String.copy(String.view(&self.clipboard))
+  }
+
+  effect fn dark(self: &mut Self) -> bool {
+    return self.isDark
+  }
+
+  effect fn setMenu(self: &mut Self, menu: Menu) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.menu = move menu
+    run self.note("setMenu", "")
+  }
+
+  effect fn openFile(self: &mut Self, request: u32, dialog: FileDialog<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.note("openFile", dialog.title)
+  }
+
+  effect fn saveFile(self: &mut Self, request: u32, dialog: FileDialog<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.note("saveFile", dialog.title)
+  }
+}
+
+// The ports a host posts what the shell says to (see the `Subscriptions` methods).
+pub import app { PORT_APPEARANCE, PORT_CLOSE, PORT_FILES, PORT_FOCUS, PORT_MENU }
