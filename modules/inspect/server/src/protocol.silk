@@ -13,6 +13,7 @@ import ui_inspect.synth { pointOf, click, press }
 import ui_tree.engine { UiTree }
 import ui_tree.node { NONE, Event, EventKind }
 import ui_tree.mutation { Role, StyleState }
+import ui_tree.css { Declaration }
 import ui_tree.input { Input, MOD_SHIFT, MOD_CONTROL, MOD_ALT, MOD_META, BUTTON_PRIMARY }
 import ui_tree.inspect {
   CpuSnapshot,
@@ -66,7 +67,17 @@ import topics {
   TOPIC_COUNT,
   TOPIC_NAMES
 }
-import tools { StyleEdits, audit, stateNamed, styles }
+import tools {
+  audit,
+  stateNamed,
+  stateName,
+  styles,
+  shown,
+  parseStyle,
+  layOver,
+  resetAll,
+  declarationTexts
+}
 import vector.geometry_error { GeometryError }
 import vector.pixmap { Pixmap }
 import codec.image { ImageError }
@@ -149,7 +160,6 @@ pub struct Protocol {
   pub nextSeq: u64,
   /// The frames the tree drew.
   pub timeline: Timeline,
-  edits: StyleEdits,
   /// The window's pointer picks a node instead of reaching the app (the `pickMode` command).
   pub picking: bool,
   /// The node the last pick chose, or NONE.
@@ -181,7 +191,6 @@ impl Protocol {
       log: List<LoggedEvent>.make(),
       nextSeq: 1,
       timeline: Timeline.make(),
-      edits: StyleEdits.make(),
       picking: false,
       picked: NONE,
       swallowUp: false,
@@ -488,7 +497,7 @@ impl Protocol {
     } else if cmd == "setStyle" {
       run self.setStyle(&mut tree, request, &mut out)
     } else if cmd == "resetStyles" {
-      let restored = run self.edits.reset(&mut tree)
+      let restored = run resetAll(&mut tree)
       self.repaint = true
       run begin(&mut out, request)
       run putInt(&mut out, "restored", usize.toU64(restored))
@@ -663,9 +672,10 @@ impl Protocol {
     run finish(&mut out)
   }
 
-  /// setStyle: sets the declarations of `style` (CSS text) on the target for `state` (`base`
-  /// without one), over what the node has or, with `replace`, instead of it. The edit lasts
-  /// until the app sets the same properties again or `resetStyles` takes it back.
+  /// setStyle: lays the declarations of `style` (CSS text) over the target for `state` (`base`
+  /// without one), through the tree's override layer: over what the client set or, with
+  /// `replace`, instead of it. The edit outlasts the client restyling the node, until
+  /// `resetStyles` takes it back.
   effect fn setStyle(
     self: &mut Self,
     tree: &mut UiTree<'_>,
@@ -685,17 +695,30 @@ impl Protocol {
         return ()
       }
     }
-    if run self.edits.apply(
-      &mut tree,
-      request,
-      id,
-      state,
+    let replace = flagField(request, "replace", false)
+    let declarations = match run parseStyle(
       textField(request, "style"),
-      flagField(request, "replace", false),
+      replace,
+      request,
       &mut out,
     ) {
-      self.repaint = true
+      Option<List<Declaration>>.Some { value } => move value
+      Option<List<Declaration>>.None => {
+        return ()
+      }
     }
+    if !run layOver(&mut tree, id, state, &declarations, replace) {
+      run failure(&mut out, request, "the tree refused the style")
+      return ()
+    }
+    self.repaint = true
+    run begin(&mut out, request)
+    run putInt(&mut out, "node", u32.toU64(id))
+    run putText(&mut out, "state", stateName(state))
+    run putKey(&mut out, "style")
+    run declarationTexts(&run shown(&tree.*, id, state), &mut out)
+    run putInt(&mut out, "edited", usize.toU64(tree.styleOverrides().length))
+    run finish(&mut out)
   }
 
   /// pickMode: with `on`, turns picking on or off; either way says whether it is on and the

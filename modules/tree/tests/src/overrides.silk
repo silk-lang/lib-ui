@@ -1,0 +1,190 @@
+//! Style overrides (`UiTree.setOverride`): declarations a second party lays over what the client
+//! set. They survive the client restyling the node, leave the client's own declarations as the
+//! client set them (so clearing the override shows the client's last value, even one it set
+//! while overridden), go when the node is destroyed, change only the root that holds the node,
+//! cost no frame once drawn, and follow the node's state (hover).
+//!
+//! Root 0 holds box 1 with box 2 inside, root 1 holds box 11 with box 12 inside, each outer box
+//! filling its viewport (800 by 600, and 200 by 100) and each inner one half of it.
+import ui_tree.css
+import ui_tree.css { percent }
+import ui_fixtures.fixtures as fixtures
+import ui_tree.legacy {
+  UiTree,
+  TreeError,
+  Batch,
+  FrameInput,
+  NodeInfo,
+  NodeKind,
+  StyleState,
+  Mutation,
+  Declaration,
+  Input,
+  info
+}
+import ui_tree.lib { RootOptions }
+import ui_tree.mutation { FIRST_ROOT }
+import font_collection.lib { FontCollection }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+
+const SECOND: u32 = 1
+
+fn wide() -> FrameInput {
+  return FrameInput { width: 800.0, height: 600.0, scale: 1.0, time: 0.0 }
+}
+
+fn narrow() -> FrameInput {
+  return FrameInput { width: 200.0, height: 100.0, scale: 1.0, time: 0.0 }
+}
+
+effect fn pair(batch: &mut Batch, outer: u32, inner: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run batch.create(outer, NodeKind.Box)
+  run batch.style(outer, &[css.width(percent(100.0)), css.height(percent(100.0))])
+  run batch.box(outer, inner, &[css.width(percent(50.0)), css.height(percent(50.0))])
+}
+
+effect fn twoRoots(collection: &FontCollection) -> UiTree<'_>
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut tree = run UiTree.make(collection)
+  let mut batch = Batch.make()
+  run pair(&mut batch, 1, 2)
+  run pair(&mut batch, 11, 12)
+  run batch.root(1)
+  run batch.openRoot(SECOND, 11, RootOptions.default())
+  run tree.apply(run batch.take())
+  run tree.frameRoot(SECOND, narrow())
+  run tree.frameRoot(FIRST_ROOT, wide())
+  return move tree
+}
+
+effect fn widthOf(tree: &UiTree<'_>, id: u32) -> f32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match run info(tree, id) {
+    Option<NodeInfo>.Some { value } => value.bounds.width()
+    Option<NodeInfo>.None => -1.0
+  }
+}
+
+effect fn widths(percent: f32) -> List<Declaration>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut list = List<Declaration>.make()
+  run list.append(css.width(css.percent(percent)))
+  return move list
+}
+
+effect fn overrideBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run twoRoots(&collection)
+  run Testing.expect((run widthOf(&tree, 2)) == 400.0, "the client's width at first")
+  run Testing.expect(!tree.needsFrameOf(FIRST_ROOT), "nothing to draw before the override")
+  let first = tree.revisionOf(FIRST_ROOT)
+  let second = tree.revisionOf(SECOND)
+
+  // Laid over the client's width: root 0 styles again, root 1 is not touched.
+  run Testing.expect(
+    run tree.setOverride(2, StyleState.Base, run widths(25.0), false),
+    "a live node takes an override",
+  )
+  run Testing.expect(
+    tree.revisionOf(FIRST_ROOT) > first && tree.revisionOf(SECOND) == second,
+    "the override is a change of the root that holds the node alone",
+  )
+  run Testing.expect(!tree.needsFrameOf(SECOND), "the other root has nothing to draw")
+  run tree.frameRoot(FIRST_ROOT, wide())
+  run Testing.expect((run widthOf(&tree, 2)) == 200.0, "the override wins over the client's width")
+  run Testing.expect(!tree.needsFrameOf(FIRST_ROOT), "an override drawn once costs no more frames")
+
+  // The client restyles the node: the override stays over what it set.
+  let mut batch = Batch.make()
+  run batch.style(2, &[css.width(percent(75.0)), css.height(percent(10.0))])
+  run tree.apply(run batch.take())
+  run tree.frameRoot(FIRST_ROOT, wide())
+  run Testing.expect((run widthOf(&tree, 2)) == 200.0, "the override survives the client's restyle")
+  let client = tree.node(tree.slotOf(2)).base.asSlice()
+  run Testing.expect(
+    client.length == 2,
+    "the client's declarations are its own, without the override",
+  )
+  let mut cleared = Batch.make()
+  run cleared.push(Mutation.ClearStyle { id: 2, state: StyleState.Base })
+  run cleared.style(2, &[css.width(percent(90.0)), css.height(percent(10.0))])
+  run tree.apply(run cleared.take())
+  run tree.frameRoot(FIRST_ROOT, wide())
+  run Testing.expect((run widthOf(&tree, 2)) == 200.0, "and its ClearStyle")
+
+  // Taking it away shows what the client set last, while it was overridden.
+  run Testing.expect(tree.clearOverride(2, StyleState.Base), "the override is cleared")
+  run Testing.expect(!tree.clearOverride(2, StyleState.Base), "only once")
+  run tree.frameRoot(FIRST_ROOT, wide())
+  run Testing.expect((run widthOf(&tree, 2)) == 720.0, "the client's last width shows again")
+
+  // Replace leaves the client's declarations in that state out.
+  run Testing.expect(
+    run tree.setOverride(2, StyleState.Base, List<Declaration>.make(), true),
+    "an empty replacing override",
+  )
+  run tree.frameRoot(FIRST_ROOT, wide())
+  run Testing.expect((run widthOf(&tree, 2)) == 800.0, "the client's width is left out")
+  drop run tree.setOverride(2, StyleState.Base, List<Declaration>.make(), false)
+  run Testing.expect(tree.styleOverrides().length == 0, "no declarations and no replace clear it")
+
+  // A destroyed node's overrides go, and a node made later with its id has none.
+  drop run tree.setOverride(12, StyleState.Base, run widths(10.0), false)
+  drop run tree.setOverride(12, StyleState.Hover, run widths(20.0), false)
+  run Testing.expect(tree.styleOverrides().length == 2, "two overrides of node 12")
+  let mut destroy = Batch.make()
+  run destroy.push(Mutation.Destroy { id: 12 })
+  run tree.apply(run destroy.take())
+  run Testing.expect(tree.styleOverrides().length == 0, "destroying the node drops its overrides")
+  let mut again = Batch.make()
+  run again.box(11, 12, &[css.width(percent(50.0))])
+  run tree.apply(run again.take())
+  run tree.frameRoot(SECOND, narrow())
+  run Testing.expect(
+    !tree.overridden(12, StyleState.Base) && (run widthOf(&tree, 12)) == 100.0,
+    "a new node with the id has no override",
+  )
+  run Testing.expect(
+    !(run tree.setOverride(99, StyleState.Base, run widths(10.0), false)),
+    "no override for a node that does not exist",
+  )
+}
+
+test effect fn overridesSurviveTheClient() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run overrideBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn hoverBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run twoRoots(&collection)
+
+  // Node 2 has no hover style of its own: the override alone makes hovering it a restyle.
+  drop run tree.setOverride(2, StyleState.Hover, run widths(10.0), false)
+  run tree.frameRoot(FIRST_ROOT, wide())
+  run Testing.expect((run widthOf(&tree, 2)) == 400.0, "a hover override waits for the hover")
+  run tree.dispatchTo(FIRST_ROOT, Input.PointerMove { x: 10.0, y: 10.0, modifiers: 0 })
+  run Testing.expect(tree.needsFrameOf(FIRST_ROOT), "hovering the node restyles it")
+  run tree.frameRoot(FIRST_ROOT, wide())
+  run Testing.expect((run widthOf(&tree, 2)) == 80.0, "the hover override applies while hovered")
+}
+
+test effect fn overridesFollowTheState() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run hoverBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
