@@ -1,0 +1,221 @@
+//! A program that declares a second window from its model (the mirror example), on the
+//! headless tree: declaring it opens a root with the window's view, a click there reaches that
+//! view, a request to close it reaches the model, a model change closes it, and a backend that
+//! shows one root (a `UiTree` told so, the server-side document) answers `Failed` while the
+//! first window keeps working.
+import ui_app_examples.mirror { Mirror, Message }
+import ui_app_examples.look { SANS }
+import ui_app.app { NoCommand }
+import ui_app.program as program
+import ui_app.harness { click, clickIn }
+import ui_app.runtime { pump, drain }
+import ui_app_dom.html { Html }
+import silk.collections.bytes { Bytes }
+import ui_fixtures.fixtures as fixtures
+import ui_tree.inspect { findAll }
+import ui_tree.legacy { UiTree, TreeError, Batch, FrameInput, NONE }
+import ui_tree.lib { RootEventKind, RootSupport, RootOptions }
+import ui_tree.mutation { FIRST_ROOT }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+fn first() -> FrameInput {
+  return FrameInput { width: 360.0, height: 360.0, scale: 1.0, time: 0.0 }
+}
+
+fn small() -> FrameInput {
+  return FrameInput { width: 320.0, height: 200.0, scale: 1.0, time: 0.0 }
+}
+
+effect fn started(tree: &mut UiTree<'_>) -> program.Host<Mirror, Message, NoCommand>
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut batch = Batch.make()
+  run batch.fontFamily(SANS, "Noto Sans, sans-serif")
+  run tree.apply(run batch.take())
+  let mut app = run program.make<Mirror, Message, NoCommand>()
+  run app.start(&mut tree, 0.0)
+  return move app
+}
+
+effect fn roots(tree: &UiTree<'_>) -> List<u32>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut ids = List<u32>.make()
+  run tree.openRoots(&mut ids)
+  return move ids
+}
+
+/// The one open root past the first, or NONE.
+effect fn second(tree: &UiTree<'_>) -> u32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let ids = run roots(tree)
+  if ids.length() != 2 {
+    return NONE
+  }
+  return if ids.get(0) == FIRST_ROOT {
+    ids.get(1)
+  } else {
+    ids.get(0)
+  }
+}
+
+/// Whether root `root` shows a node named `value`.
+effect fn shows(tree: &mut UiTree<'_>, root: u32, value: string) -> bool
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let before = tree.current
+  drop run tree.useRoot(root)
+  let mut found = List<u32>.make()
+  run findAll(&tree, value, &mut found)
+  drop run tree.useRoot(before)
+  return found.length() != 0
+}
+
+effect fn openBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  let mut app = run started(&mut tree)
+  run Testing.expect((run roots(&tree)).length() == 1, "a model without the window opens one root")
+
+  // Declaring the window opens a root with its options and its view.
+  run Testing.expect(
+    run click(&mut app, &mut tree, first(), "Open second window"),
+    "the first window has the button",
+  )
+  let root = run second(&tree)
+  run Testing.expect(app.model.value.open && root != NONE, "opening declares a second root")
+  let titled = match tree.rootOptions(root) {
+    Option<&RootOptions>.Some { value } => String.view(&value.title) == "Second window"
+      && match value.size {
+        Option.Some { value: size } => size.width == 320.0 && size.height == 200.0
+        Option.None => false
+      }
+    Option<&RootOptions>.None => false
+  }
+  run Testing.expect(titled, "the root has the window's title and size")
+  run tree.frameRoot(root, small())
+  run Testing.expect(
+    run shows(&mut tree, root, "The same count, in another window"),
+    "the root shows the window's view",
+  )
+  run Testing.expect(tree.current == root, "framing it makes it current")
+
+  // A click in the second window reaches its view; both windows show the new count.
+  run Testing.expect(
+    run clickIn(&mut app, &mut tree, root, small(), "+"),
+    "the second window has its own + button",
+  )
+  run Testing.expect(app.model.value.count == 1, "its click reached the model")
+  run tree.frameRoot(root, small())
+  run tree.frameRoot(FIRST_ROOT, first())
+  let there = run shows(&mut tree, root, "1")
+  let here = run shows(&mut tree, FIRST_ROOT, "1")
+  run Testing.expect(there && here, "both windows show the count")
+
+  // A request to close it is the model's to answer.
+  run tree.reportRoot(root, RootEventKind.CloseRequested)
+  drop run pump(&mut app, &mut tree)
+  run Testing.expect(
+    app.model.value.closeRequests == 1 && !app.model.value.open,
+    "the close request reached the model, which closed it",
+  )
+  run Testing.expect(
+    (run roots(&tree)).length() == 1 && !tree.rootOpen(root),
+    "the window's root closed when the model stopped declaring it",
+  )
+
+  // Opened again, it closes from the first window's button and from its own.
+  drop run click(&mut app, &mut tree, first(), "Open second window")
+  let again = run second(&tree)
+  run Testing.expect(again != NONE && again != root, "it opens again as a new root")
+  drop run click(&mut app, &mut tree, first(), "Close second window")
+  run Testing.expect((run roots(&tree)).length() == 1, "the first window's button closes it")
+  drop run click(&mut app, &mut tree, first(), "Open second window")
+  let third = run second(&tree)
+  run tree.frameRoot(third, small())
+  run Testing.expect(
+    run clickIn(&mut app, &mut tree, third, small(), "Close"),
+    "its own Close button is there",
+  )
+  run Testing.expect(!app.model.value.open && (run roots(&tree)).length() == 1, "and closes it")
+}
+
+test effect fn declaredWindowsOpenDispatchAndClose() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run openBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn singleBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  tree.rootSupport = RootSupport.single()
+  let mut app = run started(&mut tree)
+  drop run click(&mut app, &mut tree, first(), "Open second window")
+  run Testing.expect(
+    !app.model.value.open && (run roots(&tree)).length() == 1,
+    "a backend that shows one root fails the window, and the model hears it",
+  )
+  drop run click(&mut app, &mut tree, first(), "+")
+  run Testing.expect(app.model.value.count == 1, "the first window keeps working")
+}
+
+test effect fn aBackendWithOneRootFailsDeclaredWindows() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run singleBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// Whether `text` holds `part`.
+fn holds(text: &[u8], part: string) -> bool {
+  let wanted = String.utf8Bytes(part)
+  let mut at: usize = 0
+  while at + wanted.length <= text.length {
+    let mut i: usize = 0
+    while i < wanted.length && text[at + i] == wanted[i] {
+      i = i + 1
+    }
+    if i == wanted.length {
+      return true
+    }
+    at = at + 1
+  }
+  return false
+}
+
+effect fn documentBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut page = Html.make()
+  let mut app = run program.make<Mirror, Message, NoCommand>()
+  run app.start(&mut page, 0.0)
+  app.send(Message.Open)
+  run drain(&mut app, &mut page)
+  drop run pump(&mut app, &mut page)
+  run Testing.expect(!app.model.value.open, "a document cannot show the window, and says so")
+  app.send(Message.Increment)
+  run drain(&mut app, &mut page)
+  let markup = run page.markup()
+  run Testing.expect(
+    holds(Bytes.asSlice(&markup), "Open second window")
+      && !holds(Bytes.asSlice(&markup), "in another window"),
+    "the page shows the first window only",
+  )
+  run Testing.expect(app.model.value.count == 1, "which keeps working")
+}
+
+test effect fn aDocumentFailsDeclaredWindows() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run documentBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}

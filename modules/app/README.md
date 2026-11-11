@@ -13,7 +13,8 @@ example app. [modules/README.md](../README.md) is the overview of the whole UI s
 Packages:
 
 - `modules/app` (`ui-app`): the builder (`ui.silk`), the diff (`diff.silk`), the app contract
-  (`app.silk`), the runtime (`runtime.silk`), headless driving for tests (`harness.silk`) and
+  (`app.silk`), declared windows (`windows.silk`), the runtime (`runtime.silk`), headless
+  driving for tests (`harness.silk`) and
   loop helpers (`seq.silk`), and commands on fibers (`tasks.silk`).
 - `modules/app/window` (`ui-app-window`): `runWindow`, the loop that runs an app in a native window
   through [modules/platform/window](https://github.com/silk-lang/lib-native/tree/main/modules/platform/window) and [ui_renderer](https://github.com/silk-lang/lib-graphics/tree/main/modules/ui_renderer).
@@ -23,6 +24,8 @@ Packages:
 - `modules/app/examples`: a counter and a todo list. `modules/app/demo` runs the todo list in a window.
 - `modules/app/notes` (`ui-app-notes`): the Notes example in a window: menus, dialogs, the clipboard,
   a worker thread.
+- `modules/app/mirror` (`ui-app-mirror`): the mirror example, one count in two native windows
+  (see [Windows](#windows)).
 - [`examples/scroll-demo`](https://github.com/silk-lang/nonstd/tree/7d6c3693a9ad1fec24127985626ab4224f9f1995/examples/scroll-demo): a fully mounted mixed-document scroll stress app,
   with native controls and repeatable CPU benchmarks of the shared libraries.
 - `modules/app/tests`: unit tests and the golden scenes.
@@ -59,7 +62,7 @@ run pump(&mut runtime, &mut tree)            // after each tree.dispatch: events
 run tick(&mut runtime, &mut tree, now, true) // timers and frames due at `now`
 ```
 
-`App<M, C>` has `view`, `update` and `subscriptions` (empty by default). The command type
+`App<M, C>` has `view`, `update`, and `subscriptions` and `windows` (both empty by default). The command type
 implements `Perform<M, E, ? R>`: `perform` is the only effectful code in an app, and its
 failures `E` and requirements `R` (a store, the network, a clock) are provided once where the app
 runs, so a test swaps them. `examples/src/todo.silk` saves through a `Store` service this way,
@@ -172,6 +175,43 @@ starts the new keys and stops the missing ones. Handlers are delivered the way v
 are: by asking again and calling the one that matches. `runtime.nextDeadline()` tells a loop how
 long it can wait.
 
+## Windows
+
+`windows(model, w)` (on `Program`, and `windows(self, w)` on `App`, both empty by default)
+declares the windows the model wants besides the first, in the spirit of `view` and
+`subscriptions`: each under a key, with a `WindowSpec` (title, size, resizable), its own view,
+and the message for a request to close it.
+
+```silk
+fn windows(model: &Mirror, w: &mut Windows<Message>) -> () {
+  if model.open {
+    w.window(
+      SECOND,
+      WindowSpec.titled("Second window").sized(320.0, 200.0),
+      |h| second(model, h),
+      || Message.CloseRequested,
+    )
+    w.listen(SECOND, |event| Message.SecondChanged { event: event })
+  }
+}
+```
+
+The runtime asks after every update and compares the answer with the windows it opened, by key,
+in the render's batch: a new key opens a root (`OpenRoot`) with a root box and the window's view
+in it, a key that is gone closes it (`CloseRoot`) and destroys its nodes, and a new title or size
+updates it (`UpdateRoot`). Every window's view renders again with the first one, from the one
+model, so windows share state with no wire between them. A record whose path starts at a window's
+root box dispatches through that window's view. A request to close a window is only a message:
+the window stays while the model declares it. `w.listen(key, handler)` hears the window's size,
+focus, and `Failed` from a backend that cannot show it; a failed window is not opened again until
+the model stops declaring it. `w.windowWith` takes a view written with `Ui`, as an `App`'s. A
+program that declares no windows renders and sends exactly what it did before.
+
+`harness.clickIn(runtime, tree, root, viewport, "Close")` clicks in a window's root.
+[examples/src/mirror.silk](examples/src/mirror.silk) is a counter in two windows,
+`modules/app/mirror` runs it natively, and [tests/src/windows.silk](tests/src/windows.silk) tests
+it on the headless tree and on the server-side document.
+
 ## Native apps
 
 `ui_app_window.program` runs a `Program` in a native window with nothing else to write:
@@ -247,8 +287,11 @@ backend says what roots it shows with `roots()` (a `RootSupport`: how many, and 
 the first becomes), gives each root's viewport with `viewport(root)`, and hands out root events
 with `rootEvents`. `UiTree` shows any number of roots, one under the native window host; `Dom`
 and `Html` show the first only and answer an `OpenRoot` for another with a `Failed` root event.
-A program renders into the first root: `Runtime.start` opens it with the runtime's root box,
-records whose path starts elsewhere are dropped, and root events are taken and dropped.
+A program renders into the first root: `Runtime.start` opens it with the runtime's root box.
+The windows a program declares are the other roots (see [Windows](#windows)): their records and
+root events go to their views and handlers; the first root's root events are the host's (resize,
+the shell's ports), and records from a root nobody declared are dropped. On `Dom` and `Html` a
+declared window fails and the first one works as before.
 
 ## Limits
 
@@ -264,6 +307,9 @@ records whose path starts elsewhere are dropped, and root events are taken and d
   its button sits where the button was.
 - Two items with the same key under one parent: the second gets a new node each render.
 - Running out of memory traps.
+- `UiTree` measures nodes in its current root only, so `ui.anchorRect` in a declared window is
+  empty unless that window's root is current while the runtime renders (as it is while its own
+  frame runs). Virtual lists in a declared window get no ranges.
 - `view` and `update` are plain functions that allocate through `ui.alloc` and `cx.alloc`, so
   running out of memory traps instead of failing with a typed error. Effect builders would need
   `run` on every call (`run ui.row(effect |ui| {...})`, with bodies typed
