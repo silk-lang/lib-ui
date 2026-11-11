@@ -23,9 +23,12 @@
 //! the same time.
 //!
 //! Ids: the devtools' root is [`DEVTOOLS_ROOT`] and their nodes count up from [`FIRST_ID`], at
-//! the top of the id space, far from the ids clients choose (which count up from 1).
+//! the top of the id space, far from the ids clients choose (which count up from 1). The nodes
+//! of an extension panel's view, which the app renders (`remote.silk`), are replayed into the
+//! devtools' root with ids from `REMOTE_FIRST` up, and their records go back to the app.
 import devtools { Devtools, Message, Command }
 import link { Link, Requests }
+import remote { ViewHost, isViewBatch }
 import ui_app.app { Perform }
 import ui_app.runtime { Runtime, pump, drain, tick, frameRoot }
 import ui_app.backend { Backend, Measured }
@@ -46,6 +49,9 @@ import ui_inspect_server.channel { Channel, MemoryChannel }
 import silk.collections.list { List }
 import silk.color.rgba { Rgba }
 import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.json.scanner { JsonError }
+import silk.json.value { Json, Value }
 import silk.core.option { Option }
 import silk.geometry.rect { Rect }
 import silk.geometry.size { Size2 }
@@ -100,6 +106,8 @@ pub struct EmbeddedDevtools {
   held: String,
   /// The host time of the last `pump`, which the devtools' clock starts from when they open.
   now: f64,
+  /// The extension panel's view the app renders, replayed in their root.
+  views: ViewHost,
 }
 
 impl EmbeddedDevtools {
@@ -117,6 +125,7 @@ impl EmbeddedDevtools {
       font: false,
       held: String.make(),
       now: 0.0,
+      views: ViewHost.make(),
     }
   }
 
@@ -193,7 +202,8 @@ impl EmbeddedDevtools {
     let mut runtime = Runtime<Devtools, Message, Command>.make(move model)
     runtime.placeAt(DEVTOOLS_ROOT, FIRST_ID)
     runtime.deferCommands()
-    let mut aside = Aside { tree: &mut tree, root: DEVTOOLS_ROOT }
+    self.views = ViewHost.make()
+    let mut aside = Aside { tree: &mut tree, root: DEVTOOLS_ROOT, views: &mut self.views }
     run runtime.start(&mut aside, time)
 
     // The window it gets when it is not docked.
@@ -254,7 +264,7 @@ impl EmbeddedDevtools {
         let mut none = NoLink {}
         let mut rounds: u32 = 0
         while rounds < 16 {
-          let mut aside = Aside { tree: &mut tree, root: DEVTOOLS_ROOT }
+          let mut aside = Aside { tree: &mut tree, root: DEVTOOLS_ROOT, views: &mut self.views }
           run drain(&mut runtime, &mut aside) |> Effect.provideMut<Link>(&mut none)
           if runtime.deferred() == 0 {
             break
@@ -266,6 +276,7 @@ impl EmbeddedDevtools {
               inspector: &mut inspector,
               client: &mut client,
               numbering: &mut self.numbering,
+              views: &mut self.views,
             }
             let message = run Perform<
               Message,
@@ -279,6 +290,25 @@ impl EmbeddedDevtools {
         }
       }
     }
+    run self.flush(&mut tree, &mut inspector)
+  }
+
+  /// Sends what the replayed view has for the app: its event records, or a request to send it
+  /// again. They are served at once, the app's answer comes with the app's next turn.
+  effect fn flush(self: &mut Self, tree: &mut UiTree<'_>, inspector: &mut Inspector) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.views.outbox.length() == 0 {
+      return ()
+    }
+    if let Option<MemoryChannel>.Some { value: client } = &mut self.client {
+      while self.views.outbox.length() != 0 {
+        let line = self.views.outbox.remove(0)
+        drop run Channel.send(String.view(&line)) |> Effect.provideMut<Channel>(&mut client)
+      }
+    }
+    self.views.outbox.clear()
+    run serveFirst(&mut tree, &mut inspector)
   }
 
   /// Places the root box in the dock's `area` of a window, or (an empty `area`) fills a window
@@ -472,7 +502,7 @@ impl Companion for EmbeddedDevtools {
         runtime.send(Message.Pull)
       }
       let mut none = NoLink {}
-      let mut aside = Aside { tree: &mut tree, root: DEVTOOLS_ROOT }
+      let mut aside = Aside { tree: &mut tree, root: DEVTOOLS_ROOT, views: &mut self.views }
       drop run pump(&mut runtime, &mut aside) |> Effect.provideMut<Link>(&mut none)
       if time >= 0.0 {
         run tick(&mut runtime, &mut aside, time, false) |> Effect.provideMut<Link>(&mut none)
@@ -527,10 +557,12 @@ impl Companion for EmbeddedDevtools {
 }
 
 /// The app's tree as the devtools' backend: their batches apply with their root current, and
-/// they take only their root's records and root events.
+/// they take only their root's records and root events, but those of a replayed view's nodes,
+/// which go back to the app.
 struct Aside<'t, 'f> {
   tree: &'t mut UiTree<'f>,
   root: u32,
+  views: &'t mut ViewHost,
 }
 
 impl<'t, 'f> Backend for Aside<'t, 'f> {
@@ -545,6 +577,7 @@ impl<'t, 'f> Backend for Aside<'t, 'f> {
     ! OutOfMemoryError
     ? &mut Allocator {
     run self.tree.takeEventsOf(self.root, &mut out)
+    run self.views.intercept(&mut out)
   }
 
   effect fn rootEvents(self: &mut Self, out: &mut List<RootEvent>) -> ()
@@ -591,6 +624,7 @@ struct LocalLink<'t, 'f> {
   inspector: &'t mut Inspector,
   client: &'t mut MemoryChannel,
   numbering: &'t mut Requests,
+  views: &'t mut ViewHost,
 }
 
 impl<'t, 'f> Link for LocalLink<'t, 'f> {
@@ -639,7 +673,38 @@ impl<'t, 'f> Link for LocalLink<'t, 'f> {
     ? &mut Allocator {
     let mut none = String.make()
     drop run self.numbering.collect(0, &mut none) |> Effect.provideMut<Channel>(&mut self.client.*)
-    run self.numbering.takeNotes(&mut out)
+    let mut notes = List<String>.make()
+    run self.numbering.takeNotes(&mut notes)
+
+    // A view's batches are replayed here, in the devtools' root; the rest is the devtools'.
+    while notes.length() != 0 {
+      let line = notes.remove(0)
+      let parsed = run Effect.result(Json.parse(line.ownedUtf8Bytes()))
+      let batch = match move parsed {
+        Result<Value, JsonError | OutOfMemoryError>.Success { value } => {
+          if isViewBatch(&value) {
+            drop run self.views.apply(&mut self.tree.*, DEVTOOLS_ROOT, FIRST_ID, &value)
+            true
+          } else {
+            false
+          }
+        }
+        Result<Value, JsonError | OutOfMemoryError>.Failure { error } => {
+          drop error
+          false
+        }
+      }
+      if !batch {
+        run out.append(move line)
+      }
+    }
+    if self.views.outbox.length() != 0 {
+      while self.views.outbox.length() != 0 {
+        let line = self.views.outbox.remove(0)
+        drop run Channel.send(String.view(&line)) |> Effect.provideMut<Channel>(&mut self.client.*)
+      }
+      run serveFirst(&mut self.tree.*, &mut self.inspector.*)
+    }
     return self.client.open()
   }
 }

@@ -9,14 +9,24 @@
 //! | `silk-ui.messages` | The messages it handled after `since`, at most `limit` of the newest |
 //! | `silk-ui.model` | The model after step `seq` (the last without it) and its line diff |
 //! | topic `silk-ui.message` | The program handled messages; `next` is the seq the next one gets |
+//! | panel `program` | The Program panel: data `silk-ui.program`, and a view on `silk-ui.view.program` |
+//!
+//! The Program panel's view is a silk-ui program of its own (`panel.silk`), which runs only while
+//! a client has the panel open: its batches go to that client, its events come back from it.
 //!
 //! The steps come from the runtime's journal ([`SilkUi.record`]), which the runtime keeps only
 //! once something asks for it.
 import program { ProgramLog, ProgramStep, ProgramStats }
+import panel { ProgramPanel, PanelMessage, ViewBackend }
 import ui_app.app { App }
 import ui_app.journal { Step }
-import ui_app.runtime { Runtime }
-import ui_inspect_server.extension { Extension, ExtensionHandler, News }
+import ui_app.runtime { Runtime, pump }
+import ui_app.backend { TreeError }
+import ui_app.app { NoCommand }
+import ui_app.program { Hosted, Run, make }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import ui_inspect_server.extension { Extension, ExtensionHandler, News, View }
 import ui_inspect_server.reply { failure }
 import ui_tree.inspect { writeInt }
 import silk.json.value { Value }
@@ -30,16 +40,45 @@ pub const ID: string = "silk-ui"
 
 pub const VERSION: string = "0.1.0"
 
-/// The extension's state: the program log and what its topic last said.
+/// The Program panel's id.
+pub const PROGRAM_PANEL: string = "program"
+
+/// The runtime of the Program panel's view.
+type PanelRuntime = Runtime<Hosted<ProgramPanel>, PanelMessage, Run<NoCommand>>
+
+/// The extension's state: the program log, what its topic last said, and the Program panel's
+/// view while a client has it open.
 pub struct SilkUi {
   pub log: ProgramLog,
   /// The seq of the last step the `message` topic announced.
   announced: u64,
+  panel: Option<PanelRuntime>,
+  /// How many times the panel's view started from nothing, for tests.
+  pub panelStarts: u64,
+}
+
+effect fn treeFailed(error: TreeError) -> () {
+  drop error
+}
+
+effect fn pumpFailed(error: TreeError) -> bool {
+  drop error
+  return false
 }
 
 impl SilkUi {
   pub fn make() -> SilkUi {
-    return SilkUi { log: ProgramLog.make(), announced: 0 }
+    return SilkUi {
+      log: ProgramLog.make(),
+      announced: 0,
+      panel: Option<PanelRuntime>.None,
+      panelStarts: 0,
+    }
+  }
+
+  /// Whether the Program panel's view runs: a client has it open.
+  pub fn panelRunning(self: &Self) -> bool {
+    return self.panel.isSome()
   }
 
   /// What it adds to the inspector, for `Inspector.extend`.
@@ -51,6 +90,7 @@ impl SilkUi {
     run info.command("messages")
     run info.command("model")
     run info.topic("message")
+    run info.panel(PROGRAM_PANEL, "Program", "program", "message", true)
     run info.tool(
       "program",
       "The program",
@@ -160,5 +200,37 @@ impl ExtensionHandler for SilkUi {
     run writeInt(&mut members, last + 1)
     run members.append("}")
     run news.post("message", String.view(&members))
+  }
+
+  effect fn view(self: &mut Self, panel: string, view: &mut View) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if panel != PROGRAM_PANEL {
+      return ()
+    }
+    if !view.open {
+      // Nobody looks: the panel's program goes, and costs nothing until it is opened again.
+      self.panel = Option<PanelRuntime>.None
+      return ()
+    }
+    if view.fresh || self.panel.isNone() {
+      let mut runtime = run make<ProgramPanel, PanelMessage, NoCommand>()
+      drop run runtime.model.value.sync(&self.log)
+      let mut backend = ViewBackend { view: &mut view }
+      run Effect.catch<TreeError>(runtime.start(&mut backend, 0.0), treeFailed)
+      self.panel = Option<PanelRuntime>.some(move runtime)
+      self.panelStarts = self.panelStarts + 1
+      return ()
+    }
+    if let Option<PanelRuntime>.Some { value: runtime } = &mut self.panel {
+      let events = view.hasEvents()
+      let mut backend = ViewBackend { view: &mut view }
+      if events {
+        drop run Effect.catch<TreeError>(pump(&mut runtime, &mut backend), pumpFailed)
+      }
+      if run runtime.model.value.sync(&self.log) {
+        run Effect.catch<TreeError>(runtime.render(&mut backend), treeFailed)
+      }
+    }
   }
 }

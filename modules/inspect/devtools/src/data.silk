@@ -1,7 +1,7 @@
 //! What the devtools window shows, read out of the inspector protocol's JSON replies: the
 //! element tree (`tree`), a node's view and box model (`inspect`), the event log (`events`), the
-//! frame stats (`stats`), the status line (`hello`), the program's messages and models
-//! (`program`, `messages`, `model`), the frame timeline (`frames`) and the audit (`audit`).
+//! frame stats (`stats`), the status line and the app's extensions (`hello`), the frame timeline
+//! (`frames`), the audit (`audit`) and an extension panel's data (its command's reply).
 //! Display text is made here, once per reply, so the view only lays it out.
 import ui_inspect_server.reply { appendNumber, textField, numberField, idField, flagField, has }
 import ui_tree.inspect { writeInt, writeNumber }
@@ -93,52 +93,6 @@ pub struct Stat {
   pub value: String,
 }
 
-/// One message the program handled.
-pub struct StepRow {
-  pub seq: u64,
-  /// What sent the message: `click #12`, `timer`, `command Save`.
-  pub cause: String,
-  pub message: String,
-  /// The commands update returned, joined with commas.
-  pub commands: String,
-  /// Whether the step left the model different.
-  pub changed: bool,
-}
-
-/// A line of a model that the step kept.
-pub const KEPT: u8 = 0
-
-/// A line of a model that the step added.
-pub const ADDED: u8 = 1
-
-/// A line the model before the step had and the one after it has not.
-pub const REMOVED: u8 = 2
-
-/// One line of a model against the model before it.
-pub struct DiffLine {
-  /// [`KEPT`], [`ADDED`] or [`REMOVED`].
-  pub op: u8,
-  pub text: String,
-}
-
-/// The model after one step, as a diff against the model before.
-pub struct ModelView {
-  /// The step, or 0 when none is open.
-  pub seq: u64,
-  pub lines: List<DiffLine>,
-  /// How many lines the step added or removed.
-  pub changed: u64,
-}
-
-/// What the program panel shows besides the messages.
-pub struct ProgramView {
-  /// Whether the app reports a program at all.
-  pub attached: bool,
-  /// The counters in one line.
-  pub line: String,
-  pub subscriptions: List<String>,
-}
-
 /// One frame of the timeline.
 pub struct FrameBar {
   pub frame: u64,
@@ -184,12 +138,10 @@ pub const PART_EVENTS: u32 = 8
 
 pub const PART_DETAIL: u32 = 16
 
-pub const PART_STEPS: u32 = 32
-
-pub const PART_PICK: u32 = 64
+pub const PART_PICK: u32 = 32
 
 /// Every part: a whole refresh.
-pub const PART_ALL: u32 = 127
+pub const PART_ALL: u32 = 63
 
 /// A panel an extension of the app adds (`hello`'s `extensions`), names in full.
 pub struct PanelInfo {
@@ -229,21 +181,12 @@ pub struct Asked {
 
 impl Copy for Asked {}
 
-/// The program's messages after the last one read.
-pub const ASK_STEPS: u32 = 1
-
-/// The program panel's header.
-pub const ASK_PROGRAM: u32 = 2
-
-/// The model after a step.
-pub const ASK_MODEL: u32 = 3
-
 /// An extension panel's data.
-pub const ASK_DATA: u32 = 4
+pub const ASK_DATA: u32 = 1
 
 /// What one refresh read from the app.
 pub struct Snapshot {
-  /// What was read, as `PART_*` bits; the program and frames are there when they are Some.
+  /// What was read, as `PART_*` bits; the frames are there when they are Some.
   pub parts: u32,
   pub status: String,
   pub rows: List<Row>,
@@ -287,13 +230,6 @@ impl BoxNumbers {
       y: 0.0,
       fragments: 0,
     }
-  }
-}
-
-impl ModelView {
-  /// No step open.
-  pub fn none() -> ModelView {
-    return ModelView { seq: 0, lines: List<DiffLine>.make(), changed: 0 }
   }
 }
 
@@ -767,145 +703,6 @@ pub effect fn parseData(reply: &Value, out: &mut List<DataRow>) -> ()
   ? &mut Allocator {
   out.clear()
   run dataRows(reply, "", 0, &mut out)
-}
-
-/// The strings of array `value` joined with `, `.
-effect fn joined(value: Option<&Value>, out: &mut String) -> ()
-  ! OutOfMemoryError
-  ? &mut Allocator {
-  match items(value) {
-    Option<&List<Value>>.Some { value: array } => {
-      let list = array.asSlice()
-      let mut i: usize = 0
-      while i < list.length {
-        match &list[i] {
-          Value.String { text } => {
-            if out.ownedByteLength() != 0 {
-              run out.append(", ")
-            }
-            run out.append(String.view(&text))
-          }
-          _ => {}
-        }
-        i = i + 1
-      }
-    }
-    Option<&List<Value>>.None => {}
-  }
-}
-
-/// The steps of a `messages` reply, appended to `out` oldest first. Returns the reply's `next`.
-pub effect fn parseSteps(reply: &Value, out: &mut List<StepRow>) -> u64
-  ! OutOfMemoryError
-  ? &mut Allocator {
-  match items(Json.field(reply, "messages")) {
-    Option<&List<Value>>.Some { value: array } => {
-      let list = array.asSlice()
-      let mut i: usize = 0
-      while i < list.length {
-        let step = &list[i]
-        let mut commands = String.make()
-        run joined(Json.field(step, "commands"), &mut commands)
-        run out.append(
-          StepRow {
-            seq: u64Field(step, "seq"),
-            cause: run String.copy(textField(step, "cause")),
-            message: run String.copy(textField(step, "message")),
-            commands: move commands,
-            changed: flagField(step, "changed", false),
-          },
-        )
-        i = i + 1
-      }
-    }
-    Option<&List<Value>>.None => {}
-  }
-  return u64Field(reply, "next")
-}
-
-effect fn counter(out: &mut String, stats: &Value, key: string, unit: string) -> ()
-  ! OutOfMemoryError
-  ? &mut Allocator {
-  if out.ownedByteLength() != 0 {
-    run out.append("  ·  ")
-  }
-  run writeInt(&mut out, u64Field(stats, key))
-  run out.append(" ")
-  run out.append(unit)
-}
-
-/// The program panel's header out of a `program` reply.
-pub effect fn parseProgram(reply: &Value) -> ProgramView
-  ! OutOfMemoryError
-  ? &mut Allocator {
-  let mut view = ProgramView {
-    attached: flagField(reply, "attached", false),
-    line: String.make(),
-    subscriptions: List<String>.make(),
-  }
-  match Json.field(reply, "stats") {
-    Option<&Value>.Some { value: stats } => {
-      run counter(&mut view.line, stats, "messages", "messages")
-      run counter(&mut view.line, stats, "commands", "commands")
-      run counter(&mut view.line, stats, "renders", "renders")
-      run counter(&mut view.line, stats, "mutations", "mutations in the last")
-      run counter(&mut view.line, stats, "reused", "of")
-      run view.line.append(" ")
-      run writeInt(&mut view.line, u64Field(stats, "nodes"))
-      run view.line.append(" nodes reused")
-    }
-    Option<&Value>.None => {}
-  }
-  match items(Json.field(reply, "subscriptions")) {
-    Option<&List<Value>>.Some { value: array } => {
-      let list = array.asSlice()
-      let mut i: usize = 0
-      while i < list.length {
-        match &list[i] {
-          Value.String { text } => {
-            run view.subscriptions.append(run String.copy(String.view(&text)))
-          }
-          _ => {}
-        }
-        i = i + 1
-      }
-    }
-    Option<&List<Value>>.None => {}
-  }
-  return move view
-}
-
-/// The model of a `model` reply as diff lines.
-pub effect fn parseModel(reply: &Value) -> ModelView
-  ! OutOfMemoryError
-  ? &mut Allocator {
-  let mut view = ModelView.none()
-  view.seq = u64Field(reply, "seq")
-  view.changed = u64Field(reply, "changed")
-  match items(Json.field(reply, "diff")) {
-    Option<&List<Value>>.Some { value: array } => {
-      let list = array.asSlice()
-      let mut i: usize = 0
-      while i < list.length {
-        let op = textField(&list[i], "op")
-        run view.lines.append(
-          DiffLine {
-            op: if op == "+" {
-              ADDED
-            } else if op == "-" {
-              REMOVED
-            } else {
-              KEPT
-            },
-            text: run String.copy(textField(&list[i], "line")),
-          },
-        )
-        i = i + 1
-      }
-    }
-    Option<&List<Value>>.None => {}
-  }
-  return move view
 }
 
 /// The timeline out of a `frames` reply.

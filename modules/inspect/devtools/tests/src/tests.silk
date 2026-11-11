@@ -3,9 +3,19 @@
 //! socket). Clicks on the devtools go through the tree's real input path. Run from the
 //! repository root (the fixtures read fonts from there).
 import inspected { Inspected }
+import replay { pullViews, clickView }
 // Imported only to register the module's tests with this root.
 import embedded as _embedded
-import ui_devtools.lib { Devtools, Message, Command, Panel, Link, NO_PARENT }
+import ui_devtools.lib {
+  Devtools,
+  Message,
+  Command,
+  Panel,
+  Link,
+  NO_PARENT,
+  ViewHost,
+  REMOTE_FIRST
+}
 import ui_app.runtime { Runtime, drain }
 import ui_app.harness { click, hover, moveTo, press, snapshot, typeText }
 import ui_inspect.query { Query, queryFirst }
@@ -180,38 +190,44 @@ effect fn body() -> ()
   drop run click(&mut devtools, &mut tree, viewport(), "+") |> Effect.provideMut<Link>(&mut app)
   run Testing.expect(devtools.model.rows.asSlice()[1].visible, "unfolding shows them again")
 
-  // The program's messages, with the model after one of them.
+  // silk-ui's Program panel: a view the app renders, replayed in the devtools' tree with ids
+  // of their own, its clicks going back to the app.
   run app.reportProgram()
   drop run click(&mut devtools, &mut tree, viewport(), "Program")
     |> Effect.provideMut<Link>(&mut app)
-
-  // The replies of the silk-ui extension come with the notifications.
-  devtools.send(Message.Pull)
-  run drain(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
-  run Testing.expect(devtools.model.panel == Panel.Program, "the program tab opens")
-  run Testing.expect(devtools.model.program.attached, "the program is attached")
-  run Testing.expect(devtools.model.steps.length() == 3, "its three messages are listed")
-  run Testing.expect(devtools.model.program.subscriptions.length() == 2, "with its subscriptions")
+  run Testing.expect(devtools.model.panel == Panel.Extension, "the Program tab is the app's panel")
+  run Testing.expect(app.silkUi.panelRunning(), "the app renders it while it is open")
+  let mut views = ViewHost.make()
+  run pullViews(&mut devtools, &mut tree, &mut views, &mut app)
+  run Testing.expect(
+    views.count() > 20 && views.applied == 2,
+    "its nodes are replayed (the root, then the view)",
+  )
+  run Testing.expect(views.local(1) >= REMOTE_FIRST, "with ids of the devtools' own")
   let program = run snapshot(&mut tree, viewport())
   run Testing.expect(String.contains(String.view(&program), "click #12"), "a cause shows")
   run Testing.expect(String.contains(String.view(&program), "Save { count: 4 }"), "and a command")
-  devtools.send(Message.OpenStep { seq: 3 })
-  run drain(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
-  devtools.send(Message.Pull)
-  run drain(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
-  run Testing.expect(devtools.model.opened.seq == 3, "a step opens")
-  run Testing.expect(devtools.model.opened.changed == 4, "two lines went and two came")
-  run Testing.expect(devtools.model.opened.lines.length() == 7, "the diff has every line")
+  run Testing.expect(
+    run clickView(&mut devtools, &mut tree, viewport(), &mut views, &mut app, "Added"),
+    "a message row is clicked",
+  )
+  run pullViews(&mut devtools, &mut tree, &mut views, &mut app)
   let diff = run snapshot(&mut tree, viewport())
-  run Testing.expect(String.contains(String.view(&diff), "  items: 4"), "the model shows")
-  devtools.send(Message.OpenStep { seq: 3 })
-  run drain(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
-  run Testing.expect(devtools.model.opened.seq == 0, "and closes")
-  devtools.send(Message.Refresh)
-  run drain(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
-  devtools.send(Message.Pull)
-  run drain(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
-  run Testing.expect(devtools.model.steps.length() == 3, "messages are read once")
+  run Testing.expect(String.contains(String.view(&diff), "  items: 4"), "the app opened its model")
+  run Testing.expect(views.applied == 3, "and sent what changed")
+  drop run clickView(&mut devtools, &mut tree, viewport(), &mut views, &mut app, "Added")
+  run pullViews(&mut devtools, &mut tree, &mut views, &mut app)
+  let closed = run snapshot(&mut tree, viewport())
+  run Testing.expect(!String.contains(String.view(&closed), "  items: 4"), "and closes it")
+
+  // Another tab closes the view: the app stops rendering it, and nothing more comes.
+  drop run click(&mut devtools, &mut tree, viewport(), "Events")
+    |> Effect.provideMut<Link>(&mut app)
+  run Testing.expect(!app.silkUi.panelRunning(), "the panel's program is gone")
+  run app.reportProgram()
+  run app.serveExtension()
+  run pullViews(&mut devtools, &mut tree, &mut views, &mut app)
+  run Testing.expect(views.applied == 4 && app.viewNotes.length() == 0, "no batches while closed")
 
   // The frame timeline.
   drop run click(&mut devtools, &mut tree, viewport(), "Frames")
@@ -349,7 +365,7 @@ effect fn dataPanelBody() -> ()
   run drain(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
 
   // The tab bar comes from hello: the extension's panel is a tab.
-  run Testing.expect(devtools.model.panels.length() == 1, "hello lists the panel")
+  run Testing.expect(devtools.model.panels.length() == 2, "hello lists the panel, after silk-ui's")
   let bar = run snapshot(&mut tree, viewport())
   run Testing.expect(String.contains(String.view(&bar), "\"Notes\""), "a tab for it")
   run Testing.expect(

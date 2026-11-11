@@ -10,11 +10,17 @@
 //! may start after the window; the status line says when it cannot be reached.
 //!
 //! It keeps one protocol 3 session with the app: a pump thread reads what the app pushes and
-//! wakes the window, which then sends the devtools [`Message.Pull`].
+//! wakes the window, which then sends the devtools [`Message.Pull`]. The batches of an extension
+//! panel's view go to the window instead ([`Relay`]), which replays them in its tree, and the
+//! records of their nodes go back to the app (`ui_devtools.remote`).
 //!
 //! The devtools are a ui-app app themselves, so a debug build of this window serves the
 //! inspector too when its own `SILK_UI_INSPECT` is set (to another address than the app's).
-import ui_devtools.lib { Devtools, Message, Command, Link, Requests }
+import ui_devtools.lib { Devtools, Message, Command, Link, Requests, ViewHost, isViewBatch }
+import ui_app.ui { ROOT_ID }
+import ui_tree.mutation { FIRST_ROOT }
+import silk.json.scanner { JsonError }
+import silk.json.value { Json, Value }
 import ui_app.runtime { Runtime }
 import ui_app_window.lib {
   HostPlatform,
@@ -119,8 +125,25 @@ impl Wake for Bell {
   }
 }
 
+/// What the session and the window pass each other about a remote view: the batches the app
+/// pushed, for the window to replay, and the lines the window has for the app.
+struct Relay {
+  batches: List<String>,
+  outbox: List<String>,
+}
+
+impl Transferable for Relay {}
+
+effect fn makeRelay() -> Arc<Mutex<Relay>>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let relay = Relay { batches: List<String>.make(), outbox: List<String>.make() }
+  return run Arc<Mutex<Relay>>.make(run Mutex<Relay>.make(move relay))
+}
+
 /// The app's inspector: one session, opened (again) when a request needs it.
 struct SessionLink {
+  relay: Arc<Mutex<Relay>>,
   address: Address,
   clock: OsMonotonicClock,
   seconds: Clock,
@@ -307,6 +330,19 @@ impl Link for SessionLink {
     ? &mut Allocator {
     let mut open = !self.ended
     self.ended = false
+
+    // What the window has for the app goes first.
+    let mut lines = List<String>.make()
+    let mut guard = self.relay.get().lock()
+    let state = guard.getMut()
+    while state.outbox.length() != 0 {
+      run lines.append(state.outbox.remove(0))
+    }
+    drop guard
+    while lines.length() != 0 {
+      let line = lines.remove(0)
+      drop run self.send(String.view(&line))
+    }
     if let Option<SocketChannel>.Some { value } = &mut self.channel {
       let mut none = String.make()
       drop run self.numbering.collect(0, &mut none) |> Effect.provideMut<Channel>(&mut value)
@@ -314,7 +350,30 @@ impl Link for SessionLink {
         open = false
       }
     }
-    run self.numbering.takeNotes(&mut out)
+    let mut notes = List<String>.make()
+    run self.numbering.takeNotes(&mut notes)
+    let mut batches = false
+    while notes.length() != 0 {
+      let line = notes.remove(0)
+      let parsed = run Effect.result(Json.parse(line.ownedUtf8Bytes()))
+      let batch = match move parsed {
+        Result<Value, JsonError | OutOfMemoryError>.Success { value } => isViewBatch(&value)
+        Result<Value, JsonError | OutOfMemoryError>.Failure { error } => {
+          drop error
+          false
+        }
+      }
+      if batch {
+        let mut guard = self.relay.get().lock()
+        run guard.getMut().batches.append(move line)
+        batches = true
+      } else {
+        run out.append(move line)
+      }
+    }
+    if batches {
+      self.bell.wake()
+    }
     if !open {
       run self.end()
       self.ended = false
@@ -324,9 +383,31 @@ impl Link for SessionLink {
 }
 
 /// The devtools' window: it hands the window's nudge to the bell, and sends the devtools
-/// [`Message.Pull`] when the bell rang.
+/// [`Message.Pull`] when the bell rang. It replays the view batches the session passed on, and
+/// takes the records of their nodes for the app.
 struct SessionContent {
   bell: Bell,
+  relay: Arc<Mutex<Relay>>,
+  views: ViewHost,
+}
+
+impl SessionContent {
+  /// Hands what the view has for the app to the session, which sends it when the devtools next
+  /// take what came.
+  effect fn hand(self: &mut Self, app: &mut Runtime<Devtools, Message, Command>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.views.outbox.length() == 0 {
+      return ()
+    }
+    let mut guard = self.relay.get().lock()
+    let state = guard.getMut()
+    while self.views.outbox.length() != 0 {
+      run state.outbox.append(self.views.outbox.remove(0))
+    }
+    drop guard
+    app.send(Message.Pull)
+  }
 }
 
 impl WindowContent<Devtools, Message, Command> for SessionContent {
@@ -344,11 +425,40 @@ impl WindowContent<Devtools, Message, Command> for SessionContent {
   ) -> bool
     ! WindowError | TreeError | OutOfMemoryError
     ? &mut Allocator {
+    let mut batches = List<String>.make()
+    let mut guard = self.relay.get().lock()
+    let state = guard.getMut()
+    while state.batches.length() != 0 {
+      run batches.append(state.batches.remove(0))
+    }
+    drop guard
+    let mut replayed = false
+    while batches.length() != 0 {
+      let line = batches.remove(0)
+      let parsed = run Effect.result(Json.parse(line.ownedUtf8Bytes()))
+      if let Result<Value, JsonError | OutOfMemoryError>.Success { value } = move parsed {
+        if run self.views.apply(&mut tree, FIRST_ROOT, ROOT_ID, &value) {
+          replayed = true
+        }
+      }
+    }
+    run self.hand(&mut app)
     if self.bell.take() {
       app.send(Message.Pull)
       return true
     }
-    return false
+    return replayed
+  }
+
+  effect fn intercept(
+    self: &mut Self,
+    app: &mut Runtime<Devtools, Message, Command>,
+    tree: &mut UiTree<'_>,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.views.intercept(&mut tree.events)
+    run self.hand(&mut app)
   }
 }
 
@@ -425,7 +535,9 @@ effect fn program(args: Launch, platform: Option<Launched>) -> i32
   let mut app = Runtime<Devtools, Message, Command>.make(run Devtools.make(String.view(&target)))
   app.send(Message.Refresh)
   let bell = run Bell.make()
+  let relay = run makeRelay()
   let mut link = SessionLink {
+    relay: relay.clone(),
     address: move address,
     clock: OsMonotonicClock.make(),
     seconds: Clock.make(),
@@ -435,7 +547,7 @@ effect fn program(args: Launch, platform: Option<Launched>) -> i32
     subscription: String.make(),
     ended: false,
   }
-  let mut content = SessionContent { bell: move bell }
+  let mut content = SessionContent { bell: move bell, relay: move relay, views: ViewHost.make() }
   let options = RunOptions {
     title: "Silk devtools",
     width: 900.0,

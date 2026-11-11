@@ -1,8 +1,13 @@
 //! The devtools window as a ui-app app: the inspected app's element tree on the left, and on
-//! the right the selected node's styles (which can be edited), its box model, the program's
-//! messages with the model after each, the event log, the frame timeline, an accessibility
-//! audit and the frame stats. It talks to the app only through the inspector protocol (the
-//! same requests ui-inspect-cli and ui-inspect-mcp send), over a [`Link`] the host provides.
+//! the right the selected node's styles (which can be edited), its box model, the event log,
+//! the frame timeline, an accessibility audit and the frame stats, then a tab for each panel the
+//! app's extensions add (`hello` lists them). It talks to the app only through the inspector
+//! protocol (the same requests ui-inspect-cli and ui-inspect-mcp send), over a [`Link`] the host
+//! provides.
+//!
+//! An extension panel shows its data with a generic view of rows, or, when the panel has a
+//! view, what the app renders for it: the app's mutation batches, replayed by the host under the
+//! panel's box (see `remote.silk`). Devtools know no extension by name.
 //!
 //! Hovering a row highlights its node in the app's window; selecting a row inspects that node
 //! and keeps it highlighted; Pick selects the node pressed in the app's window instead. While
@@ -26,9 +31,6 @@ import data {
   parseEvents,
   parseStats,
   parseStatus,
-  parseSteps,
-  parseProgram,
-  parseModel,
   parseFrames,
   parseIssues,
   parseExtensions,
@@ -38,17 +40,9 @@ import data {
   DataRow,
   ASK_DATA,
   Asked,
-  ASK_STEPS,
-  ASK_PROGRAM,
-  ASK_MODEL,
   writeSize,
-  StepRow,
-  ModelView,
-  ProgramView,
   FrameView,
   Issue,
-  ADDED,
-  REMOVED,
   FRAME_BUDGET,
   PART_STATUS,
   PART_ROWS,
@@ -59,6 +53,7 @@ import data {
   PART_ALL
 }
 import link { Link }
+import remote { VIEW_HOST }
 import ui_inspect_server.topics {
   TOPIC_TREE,
   TOPIC_FRAME,
@@ -102,8 +97,6 @@ pub const FONT: u32 = 1
 pub enum Panel {
   Styles,
   BoxModel,
-  /// The program's messages and the model after each.
-  Program,
   Events,
   /// The frame timeline.
   Frames,
@@ -157,11 +150,8 @@ pub union Message {
   /// The app took the edit; `detail` is the node after it.
   Styled { pub detail: Detail },
   StyleRefused { pub error: String },
-  /// Open the model after message `seq`, or close it when it is open.
-  OpenStep { pub seq: u64 },
   /// A request went out whose reply comes with the notifications.
   Asked { pub asked: Asked },
-  ClearSteps,
   RunAudit,
   Audited { pub issues: List<Issue>, pub line: String },
   Synced { pub snapshot: Snapshot },
@@ -231,13 +221,6 @@ pub struct Devtools {
   pub draft: String,
   /// Why the app refused the last style edit, or empty.
   pub styleError: String,
-  pub program: ProgramView,
-  /// The newest [`MAX_LOG`] messages the program handled, oldest first.
-  pub steps: List<StepRow>,
-  /// The `seq` of the last message read.
-  pub sinceStep: u64,
-  /// The model of the open step.
-  pub opened: ModelView,
   pub frames: FrameView,
   pub issues: List<Issue>,
   /// The audit's summary, or empty before the first one.
@@ -284,14 +267,6 @@ impl Devtools {
       picking: false,
       draft: String.make(),
       styleError: String.make(),
-      program: ProgramView {
-        attached: false,
-        line: String.make(),
-        subscriptions: List<String>.make(),
-      },
-      steps: List<StepRow>.make(),
-      sinceStep: 0,
-      opened: ModelView.none(),
       frames: FrameView.none(),
       issues: List<Issue>.make(),
       auditLine: String.make(),
@@ -328,25 +303,18 @@ impl Devtools {
     return false
   }
 
-  /// Whether the Program panel can show: the app runs a silk-ui program.
-  pub fn hasProgram(self: &Self) -> bool {
-    return self.hasExtension("silk-ui")
-  }
-
-  /// The extension topics to subscribe to: while live, the program's messages while its panel
-  /// shows.
+  /// The extension topics to subscribe to: the view of the extension panel that shows, or
+  /// while live the topic that says its data changed.
   effect fn wantedNames(self: &Self) -> List<String>
     ! OutOfMemoryError
     ? &mut Allocator {
     let mut names = List<String>.make()
-    if self.live && self.panel == Panel.Program && self.hasProgram() {
-      run names.append(run String.copy("silk-ui.message"))
-    }
-    if self.live {
-      if let Option<&PanelInfo>.Some { value: panel } = self.shownPanel() {
-        if panel.topic.ownedByteLength() != 0 {
-          run names.append(run String.copy(String.view(&panel.topic)))
-        }
+    if let Option<&PanelInfo>.Some { value: panel } = self.shownPanel() {
+      if panel.view.ownedByteLength() != 0 {
+        // A view shows what it shows, live or not, while it is open.
+        run names.append(run String.copy(String.view(&panel.view)))
+      } else if self.live && panel.topic.ownedByteLength() != 0 {
+        run names.append(run String.copy(String.view(&panel.topic)))
       }
     }
     return move names
@@ -356,7 +324,7 @@ impl Devtools {
   fn readPanel(self: &mut Self, cx: &mut Context<Command>) -> () {
     let mut line = String.make()
     if let Option<&PanelInfo>.Some { value: panel } = self.shownPanel() {
-      if panel.data.ownedByteLength() != 0 {
+      if panel.data.ownedByteLength() != 0 && panel.view.ownedByteLength() == 0 {
         line = cx.alloc(String.copy("{\"cmd\":"))
         cx.alloc(writeString(&mut line, String.view(&panel.data)))
         cx.alloc(line.append("}"))
@@ -396,16 +364,6 @@ impl Devtools {
     cx.command(Command.Ask { line: move copied, purpose: purpose, index: index })
   }
 
-  /// Reads what the Program panel shows, when it shows.
-  fn readProgram(self: &mut Self, cx: &mut Context<Command>) -> () {
-    if self.panel != Panel.Program || !self.hasProgram() {
-      return ()
-    }
-    let messages = cx.alloc(requestLine("silk-ui.messages", "since", self.sinceStep))
-    self.ask(&mut cx, String.view(&messages), ASK_STEPS, 0)
-    self.ask(&mut cx, "{\"cmd\":\"silk-ui.program\"}", ASK_PROGRAM, 0)
-  }
-
   /// Takes the reply `line` to a request sent with `ask`.
   fn answered(self: &mut Self, line: &String, cx: &mut Context<Command>) -> () {
     let parsed = cx.alloc(Effect.result(Json.parse(line.ownedUtf8Bytes())))
@@ -433,47 +391,8 @@ impl Devtools {
     if !ok(&reply) {
       return ()
     }
-    if asked.purpose == ASK_STEPS {
-      let mut steps = List<StepRow>.make()
-      let next = cx.alloc(parseSteps(&reply, &mut steps))
-      self.addSteps(move steps, next, &mut cx)
-    } else if asked.purpose == ASK_PROGRAM {
-      self.program = cx.alloc(parseProgram(&reply))
-    } else if asked.purpose == ASK_MODEL {
-      self.opened = cx.alloc(parseModel(&reply))
-    } else if asked.purpose == ASK_DATA && self.panel == Panel.Extension
-      && asked.index == self.shown {
+    if asked.purpose == ASK_DATA && self.panel == Panel.Extension && asked.index == self.shown {
       cx.alloc(parseData(&reply, &mut self.data))
-    }
-  }
-
-  /// Adds the messages read after the last one, `next` the seq the next one gets.
-  fn addSteps(self: &mut Self, steps: List<StepRow>, next: u64, cx: &mut Context<Command>) -> () {
-    let mut list = move steps
-
-    // A program that started again counts from one: what was read is another run's.
-    if next <= self.sinceStep {
-      self.steps.clear()
-      self.opened = ModelView.none()
-    }
-    let mut held: u64 = 0
-    if self.steps.length() != 0 {
-      held = self.steps.asSlice()[self.steps.length() - 1].seq
-    }
-    while list.length() != 0 {
-      let step = list.remove(0)
-      if step.seq > held {
-        held = step.seq
-        cx.alloc(self.steps.append(move step))
-      }
-    }
-    while self.steps.length() > MAX_LOG {
-      drop self.steps.remove(0)
-    }
-    self.sinceStep = if next > 0 {
-      next - 1
-    } else {
-      0
     }
   }
 
@@ -911,8 +830,8 @@ fn pickedOf(reply: &Value) -> u32 {
 
 /// Takes the app's notifications and reads again what they say changed: the element tree and
 /// the selected node after `tree` or `roots`, the event log after `events`, what `panel` shows
-/// after `frame` (or `tree`, for the program), the picker after `pick`. The status line comes
-/// with `tree` and `frame` notifications themselves.
+/// after `frame`, the picker after `pick`. The status line comes with `tree` and `frame`
+/// notifications themselves; extension topics and the replies to `ask` go into the snapshot.
 effect fn pull(since: u64, selected: u32, panel: Panel) -> Message
   ! OutOfMemoryError
   ? &mut Link | &mut Allocator {
@@ -1203,10 +1122,6 @@ const BORDER: u32 = 0xFDDD9B
 const PADDING: u32 = 0xC3D08B
 
 const CONTENT: u32 = 0x8CB6C0
-
-const ADDED_LINE: u32 = 0xDCFCE7
-
-const REMOVED_LINE: u32 = 0xFEE2E2
 
 const LAYOUT_BAR: u32 = 0xF59E0B
 
@@ -1708,14 +1623,6 @@ impl Devtools {
               self.panel == Panel.BoxModel,
               || Message.Show { panel: Panel.BoxModel },
             )
-            if self.hasProgram() {
-              barButton(
-                &mut ui,
-                "Program",
-                self.panel == Panel.Program,
-                || Message.Show { panel: Panel.Program },
-              )
-            }
             barButton(
               &mut ui,
               "Events",
@@ -1766,7 +1673,6 @@ impl Devtools {
             match self.panel {
               Panel.Styles => self.styles(&mut ui)
               Panel.BoxModel => self.boxModel(&mut ui)
-              Panel.Program => self.programPanel(&mut ui)
               Panel.Events => self.eventLog(&mut ui)
               Panel.Frames => self.framesPanel(&mut ui)
               Panel.Audit => self.auditPanel(&mut ui)
@@ -2001,203 +1907,6 @@ impl Devtools {
     )
   }
 
-  fn programPanel(self: &Self, ui: &mut Ui<Message>) -> () {
-    if !self.program.attached && self.steps.length() == 0 {
-      muted(
-        &mut ui,
-        "This app reports no program. A silk-ui program in a window does: every message it handles shows here with what caused it, the commands it returned and the model after it.",
-      )
-      return ()
-    }
-    ui.box(
-      |ui| {
-        ui.testId("program-line")
-        ui.color(rgb(MUTED))
-        ui.text(String.view(&self.program.line))
-      },
-    )
-    ui.row(
-      |ui| {
-        ui.testId("subscriptions")
-        ui.style(&[css.alignItems(Align.Center), css.marginTop(px(2.0)), css.marginBottom(px(4.0))])
-        ui.gap(6.0)
-        ui.box(
-          |ui| {
-            ui.grow(1.0)
-            ui.color(rgb(MUTED))
-            if self.program.subscriptions.length() == 0 {
-              ui.text("No subscriptions")
-            } else {
-              ui.text("Subscribed to ")
-              ui.enumerate(
-                self.program.subscriptions.asSlice(),
-                |line| 0,
-                |ui, index, line| {
-                  if index > 0 {
-                    ui.text(", ")
-                  }
-                  ui.text(String.view(&line))
-                },
-              )
-            }
-          },
-        )
-        barButton(&mut ui, "Clear", false, || Message.ClearSteps)
-      },
-    )
-    if self.steps.length() == 0 {
-      muted(&mut ui, "No messages yet. Use the app, then look here.")
-      return ()
-    }
-    ui.column(
-      |ui| {
-        ui.testId("messages")
-        ui.accessRole(Role.List)
-        let rows = self.steps.asSlice()
-        let mut i = rows.length
-        while i > 0 {
-          i = i - 1
-          let step = &rows[i]
-          let open = self.opened.seq == step.seq
-          ui.key(step.seq)
-          ui.column(
-            |ui| {
-              ui.accessRole(Role.ListItem)
-              border(&mut ui, Property.BorderBottomWidth, BAR)
-              ui.row(
-                |ui| {
-                  ui.accessRole(Role.Button)
-                  ui.tabIndex(0)
-                  ui.cursor(Cursor.Pointer)
-                  ui.onClick(|| Message.OpenStep { seq: step.seq })
-                  ui.onEnter(|| Message.OpenStep { seq: step.seq })
-                  ui.gap(8.0)
-                  paddings(&mut ui, 2.0, 0.0)
-                  if open {
-                    ui.background(rgb(SELECTED))
-                  } else {
-                    ui.hover(&[css.backgroundColor(rgb(HOVER))])
-                  }
-                  ui.focusVisible(&[css.backgroundColor(rgb(SELECTED))])
-                  ui.box(
-                    |ui| {
-                      ui.style(&[css.width(px(36.0)), css.flexShrink(0.0)])
-                      ui.color(rgb(MUTED))
-                      let seq = ui.alloc(seqText(step.seq))
-                      ui.text(String.view(&seq))
-                    },
-                  )
-                  ui.box(
-                    |ui| {
-                      ui.label(
-                        if step.changed {
-                          "changed the model"
-                        } else {
-                          ""
-                        },
-                      )
-                      ui.style(
-                        &[
-                          css.width(px(6.0)),
-                          css.height(px(6.0)),
-                          css.marginTop(px(5.0)),
-                          css.flexShrink(0.0),
-                        ],
-                      )
-                      if step.changed {
-                        ui.background(rgb(ACCENT))
-                      }
-                    },
-                  )
-                  ui.column(
-                    |ui| {
-                      ui.grow(1.0)
-                      ui.style(&[css.flexBasis(px(0.0)), css.minWidth(px(0.0))])
-                      ui.box(
-                        |ui| {
-                          ui.color(rgb(TAG))
-                          ui.text(String.view(&step.message))
-                        },
-                      )
-                      ui.box(
-                        |ui| {
-                          ui.color(rgb(MUTED))
-                          ui.text("from ")
-                          ui.text(String.view(&step.cause))
-                        },
-                      )
-                      if step.commands.ownedByteLength() != 0 {
-                        ui.box(
-                          |ui| {
-                            ui.color(rgb(ACCENT))
-                            ui.text("returned ")
-                            ui.text(String.view(&step.commands))
-                          },
-                        )
-                      }
-                    },
-                  )
-                },
-              )
-              if open {
-                self.modelDiff(&mut ui)
-              }
-            },
-          )
-        }
-      },
-    )
-  }
-
-  /// The open step's model, the lines the step changed marked.
-  fn modelDiff(self: &Self, ui: &mut Ui<Message>) -> () {
-    ui.column(
-      |ui| {
-        ui.testId("model")
-        ui.background(rgb(0xF9FAFB))
-        ui.style(
-          &[
-            css.whiteSpace(WhiteSpace.Pre),
-            css.marginBottom(px(4.0)),
-            css.overflowX(Overflow.Hidden),
-          ],
-        )
-        paddings(&mut ui, 4.0, 0.0)
-        if self.opened.changed == 0 {
-          ui.box(
-            |ui| {
-              paddings(&mut ui, 0.0, 8.0)
-              muted(&mut ui, "The model did not change.")
-            },
-          )
-        }
-        ui.enumerate(
-          self.opened.lines.asSlice(),
-          |line| 0,
-          |ui, index, line| {
-            ui.key(usize.toU64(index))
-            ui.row(
-              |ui| {
-                paddings(&mut ui, 0.0, 8.0)
-                if line.op == ADDED {
-                  ui.background(rgb(ADDED_LINE))
-                  ui.text("+ ")
-                } else if line.op == REMOVED {
-                  ui.background(rgb(REMOVED_LINE))
-                  ui.text("- ")
-                } else {
-                  ui.color(rgb(MUTED))
-                  ui.text("  ")
-                }
-                ui.text(String.view(&line.text))
-              },
-            )
-          },
-        )
-      },
-    )
-  }
-
   fn framesPanel(self: &Self, ui: &mut Ui<Message>) -> () {
     if self.frames.bars.length() == 0 {
       muted(&mut ui, "No frames yet.")
@@ -2383,6 +2092,20 @@ impl Devtools {
 
   /// An extension's panel: its data, members and elements in rows, nested ones indented.
   fn extensionPanel(self: &Self, ui: &mut Ui<Message>) -> () {
+    if let Option<&PanelInfo>.Some { value: panel } = self.shownPanel() {
+      if panel.view.ownedByteLength() != 0 {
+        // The app renders the panel: its batches are replayed under this box (see `remote`).
+        ui.key(1)
+        ui.column(
+          |ui| {
+            ui.testId(VIEW_HOST)
+            ui.grow(1.0)
+            ui.style(&[css.minHeight(px(0.0))])
+          },
+        )
+        return ()
+      }
+    }
     if self.data.length() == 0 {
       muted(&mut ui, "No data yet.")
       return ()
@@ -2577,20 +2300,8 @@ impl App<Message, Command> for Devtools {
       Message.StyleRefused { error } => {
         self.styleError = move error
       }
-      Message.OpenStep { seq } => {
-        if self.opened.seq == seq {
-          self.opened = ModelView.none()
-        } else {
-          let line = cx.alloc(requestLine("silk-ui.model", "seq", seq))
-          self.ask(&mut cx, String.view(&line), ASK_MODEL, 0)
-        }
-      }
       Message.Asked { asked } => {
         cx.alloc(self.asked.append(asked))
-      }
-      Message.ClearSteps => {
-        self.steps.clear()
-        self.opened = ModelView.none()
       }
       Message.RunAudit => {
         cx.command(Command.Audit)
@@ -2628,23 +2339,10 @@ impl App<Message, Command> for Devtools {
         ) {
           self.extensions = move value
           self.panels = Intrinsic.replace(s.panels, List<PanelInfo>.make())
-          if (self.panel == Panel.Program && !self.hasProgram())
-            || (self.panel == Panel.Extension && self.shown >= self.panels.length()) {
+          if self.panel == Panel.Extension && self.shown >= self.panels.length() {
             self.panel = Panel.Styles
           }
           self.resubscribe(&mut cx)
-        }
-        let mut news = false
-        let names = s.news.asSlice()
-        let mut n: usize = 0
-        while n < names.length {
-          if String.view(&names[n]) == "silk-ui.message" {
-            news = true
-          }
-          n = n + 1
-        }
-        if full || news {
-          self.readProgram(&mut cx)
         }
         if full || self.panelNews(&s.news) {
           self.readPanel(&mut cx)

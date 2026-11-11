@@ -1,0 +1,579 @@
+//! The Program panel: a silk-ui program, written with its own builder, that shows another
+//! program's messages and the model after each. It runs in the inspected app and renders into a
+//! [`View`] (see `ui_inspect_server.extension`): its mutation batches go to the client that has
+//! the panel open, which draws them with its own fonts and look, and the client's event records
+//! for its nodes come back. Nothing of it runs while no client looks.
+import program { ProgramLog, DiffRow, ADDED, REMOVED, diffRows }
+import ui_app.css
+import ui_app.css { px, Align, BorderStyle, Overflow, WhiteSpace }
+import ui_app.backend { Backend, Measured, TreeError }
+import ui_app.lib { Document, Heap, Node, NoCommand, NoOutput, Program, Role, Update }
+import ui_inspect_server.extension { View }
+import ui_protocol.mutation { Mutation }
+import ui_protocol.record { Event }
+import ui_protocol.root { RootEvent, RootSupport }
+import ui_tree.inspect { writeInt }
+import silk.collections.list { List }
+import silk.color.rgba { Rgba }
+import silk.core.option { Option }
+import silk.geometry.rect { Rect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.text.string { String }
+
+/// One message the program handled, as the panel shows it.
+pub struct PanelStep {
+  pub seq: u64,
+  pub cause: String,
+  pub message: String,
+  /// The commands update returned, joined with commas.
+  pub commands: String,
+  /// Whether the step left the model different.
+  pub changed: bool,
+  /// The model after the step.
+  pub model: String,
+}
+
+/// The panel's model: a copy of what the log holds, and the step that is open.
+pub struct ProgramPanel {
+  pub attached: bool,
+  /// The counters in one line.
+  pub line: String,
+  pub subscriptions: List<String>,
+  /// The subscriptions in one line, `, ` between them.
+  pub subscribed: String,
+  pub steps: List<PanelStep>,
+  /// The step whose model shows, or 0.
+  pub opened: u64,
+  pub diff: List<DiffRow>,
+  pub changedLines: usize,
+  /// Steps up to this one are cleared from the list.
+  pub cleared: u64,
+}
+
+pub union PanelMessage {
+  /// Open the model after step `seq`, or close it when it is open.
+  OpenStep { pub seq: u64 },
+  /// Hide the steps so far.
+  Clear,
+}
+
+type Next = Update<ProgramPanel, NoCommand, NoOutput>
+
+impl ProgramPanel {
+  pub fn make() -> ProgramPanel {
+    return ProgramPanel {
+      attached: false,
+      line: String.make(),
+      subscriptions: List<String>.make(),
+      subscribed: String.make(),
+      steps: List<PanelStep>.make(),
+      opened: 0,
+      diff: List<DiffRow>.make(),
+      changedLines: 0,
+      cleared: 0,
+    }
+  }
+
+  fn last(self: &Self) -> u64 {
+    let steps = self.steps.asSlice()
+    if steps.length == 0 {
+      return 0
+    }
+    return steps[steps.length - 1].seq
+  }
+
+  /// Takes what changed in `log` since the last call: new steps, the counters and the
+  /// subscriptions. Returns whether anything did.
+  pub effect fn sync(self: &mut Self, log: &ProgramLog) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut changed = self.attached != log.attached
+    self.attached = log.attached
+    let steps = log.steps.asSlice()
+    let first = if steps.length == 0 {
+      0
+    } else {
+      steps[0].seq
+    }
+
+    // A program that started again counts from one: what was copied is another run's.
+    if steps.length != 0 && steps[steps.length - 1].seq < self.last() {
+      self.steps.clear()
+      self.opened = 0
+      self.diff.clear()
+      self.cleared = 0
+      changed = true
+    }
+    while self.steps.length() != 0 && self.steps.asSlice()[0].seq < first {
+      drop self.steps.remove(0)
+      changed = true
+    }
+    let last = self.last()
+    let mut i: usize = 0
+    while i < steps.length {
+      if steps[i].seq > last {
+        let mut commands = String.make()
+        let list = steps[i].commands.asSlice()
+        let mut k: usize = 0
+        while k < list.length {
+          if k > 0 {
+            run commands.append(", ")
+          }
+          run commands.append(String.view(&list[k]))
+          k = k + 1
+        }
+        let before = if i == 0 {
+          String.view(&steps[i].model)
+        } else {
+          String.view(&steps[i - 1].model)
+        }
+        run self.steps.append(
+          PanelStep {
+            seq: steps[i].seq,
+            cause: run String.copy(String.view(&steps[i].cause)),
+            message: run String.copy(String.view(&steps[i].message)),
+            commands: move commands,
+            changed: i == 0 || before != String.view(&steps[i].model),
+            model: run String.copy(String.view(&steps[i].model)),
+          },
+        )
+        changed = true
+      }
+      i = i + 1
+    }
+    let mut line = String.make()
+    run counter(&mut line, log.stats.messages, "messages")
+    run counter(&mut line, log.stats.commands, "commands")
+    run counter(&mut line, log.stats.renders, "renders")
+    run counter(&mut line, log.stats.mutations, "mutations in the last")
+    run counter(&mut line, log.stats.reused, "of")
+    run line.append(" ")
+    run writeInt(&mut line, log.stats.nodes)
+    run line.append(" nodes reused")
+    if String.view(&line) != String.view(&self.line) {
+      self.line = move line
+      changed = true
+    }
+    if !sameLines(&self.subscriptions, &log.subscriptions) {
+      self.subscriptions.clear()
+      self.subscribed.clear()
+      let subs = log.subscriptions.asSlice()
+      let mut s: usize = 0
+      while s < subs.length {
+        run self.subscriptions.append(run String.copy(String.view(&subs[s])))
+        if s > 0 {
+          run self.subscribed.append(", ")
+        }
+        run self.subscribed.append(String.view(&subs[s]))
+        s = s + 1
+      }
+      changed = true
+    }
+    return changed
+  }
+
+  /// Opens step `seq`: its model, compared with the model before it.
+  effect fn open(self: &mut Self, seq: u64) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.diff.clear()
+    self.changedLines = 0
+    self.opened = 0
+    let steps = self.steps.asSlice()
+    let mut i: usize = 0
+    while i < steps.length {
+      if steps[i].seq == seq {
+        let before = if i == 0 {
+          String.view(&steps[i].model)
+        } else {
+          String.view(&steps[i - 1].model)
+        }
+        self.changedLines = run diffRows(before, String.view(&steps[i].model), &mut self.diff)
+        self.opened = seq
+      }
+      i = i + 1
+    }
+  }
+}
+
+effect fn counter(out: &mut String, value: u64, unit: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if out.ownedByteLength() != 0 {
+    run out.append("  ·  ")
+  }
+  run writeInt(&mut out, value)
+  run out.append(" ")
+  run out.append(unit)
+}
+
+fn sameLines(a: &List<String>, b: &List<String>) -> bool {
+  if a.length() != b.length() {
+    return false
+  }
+  let x = a.asSlice()
+  let y = b.asSlice()
+  let mut i: usize = 0
+  while i < x.length {
+    if String.view(&x[i]) != String.view(&y[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn rgb(hex: u32) -> Rgba<f32> {
+  let r = u32.toF32(u32.bitAnd(u32.shiftRight(hex, 16), 255)) / 255.0
+  let g = u32.toF32(u32.bitAnd(u32.shiftRight(hex, 8), 255)) / 255.0
+  let b = u32.toF32(u32.bitAnd(hex, 255)) / 255.0
+  return Rgba<f32> { r: r, g: g, b: b, a: 1.0 }
+}
+
+const MUTED: u32 = 0x6B7280
+
+const TAG: u32 = 0x881280
+
+const ACCENT: u32 = 0x2563EB
+
+const RULE: u32 = 0xF3F4F6
+
+const HOVER: u32 = 0xEEF2FF
+
+const SELECTED: u32 = 0xDBEAFE
+
+const ADDED_LINE: u32 = 0xDCFCE7
+
+const REMOVED_LINE: u32 = 0xFEE2E2
+
+fn muted(h: &Document<PanelMessage>, text: string) -> Node {
+  return h.box(&[h.style(&[css.color(rgb(MUTED))])], &[h.text(text)])
+}
+
+/// The step's number.
+fn seqText(h: &Document<PanelMessage>, seq: u64) -> Node {
+  return h.number(u64.toI64(seq))
+}
+
+fn stepView(model: &ProgramPanel, h: &Document<PanelMessage>, step: &PanelStep) -> Node {
+  let open = model.opened == step.seq
+  return h.keyed(
+    step.seq,
+    h.column(
+      &[
+        h.accessRole(Role.ListItem),
+        h.style(
+          &[
+            css.borderBottomWidth(px(1.0)),
+            css.borderStyle(BorderStyle.Solid),
+            css.borderColor(rgb(RULE)),
+          ],
+        ),
+      ],
+      &[
+        h.button(
+          &[
+            h.onClick(PanelMessage.OpenStep { seq: step.seq }),
+            h.style(
+              &[
+                css.paddingTop(px(2.0)),
+                css.paddingBottom(px(2.0)),
+                css.backgroundColor(
+                  if open {
+                    rgb(SELECTED)
+                  } else {
+                    Rgba<f32> { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }
+                  },
+                ),
+              ],
+            ),
+            if open {
+              h.none()
+            } else {
+              h.hover(&[css.backgroundColor(rgb(HOVER))])
+            },
+            h.focusVisible(&[css.backgroundColor(rgb(SELECTED))]),
+          ],
+          &[
+            h.row(
+              &[h.style(&[css.columnGap(px(8.0))])],
+              &[
+                h.box(
+                  &[h.style(&[css.width(px(36.0)), css.flexShrink(0.0), css.color(rgb(MUTED))])],
+                  &[seqText(h, step.seq)],
+                ),
+                h.box(
+                  &[
+                    h.label(
+                      if step.changed {
+                        "changed the model"
+                      } else {
+                        ""
+                      },
+                    ),
+                    h.style(
+                      &[
+                        css.width(px(6.0)),
+                        css.height(px(6.0)),
+                        css.marginTop(px(5.0)),
+                        css.flexShrink(0.0),
+                        css.backgroundColor(
+                          if step.changed {
+                            rgb(ACCENT)
+                          } else {
+                            Rgba<f32> { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }
+                          },
+                        ),
+                      ],
+                    ),
+                  ],
+                  &[],
+                ),
+                h.column(
+                  &[h.style(&[css.flexGrow(1.0), css.flexBasis(px(0.0)), css.minWidth(px(0.0))])],
+                  &[
+                    h.box(
+                      &[h.style(&[css.color(rgb(TAG))])],
+                      &[h.text(String.view(&step.message))],
+                    ),
+                    h.box(
+                      &[h.style(&[css.color(rgb(MUTED))])],
+                      &[h.text("from "), h.text(String.view(&step.cause))],
+                    ),
+                    if step.commands.ownedByteLength() != 0 {
+                      h.box(
+                        &[h.style(&[css.color(rgb(ACCENT))])],
+                        &[h.text("returned "), h.text(String.view(&step.commands))],
+                      )
+                    } else {
+                      h.empty()
+                    },
+                  ],
+                ),
+              ],
+            ),
+          ],
+        ),
+        if open {
+          diffView(model, h)
+        } else {
+          h.empty()
+        },
+      ],
+    ),
+  )
+}
+
+fn diffView(model: &ProgramPanel, h: &Document<PanelMessage>) -> Node {
+  return h.column(
+    &[
+      h.testId("model"),
+      h.style(
+        &[
+          css.backgroundColor(rgb(0xF9FAFB)),
+          css.whiteSpace(WhiteSpace.Pre),
+          css.marginBottom(px(4.0)),
+          css.overflowX(Overflow.Hidden),
+          css.paddingTop(px(4.0)),
+          css.paddingBottom(px(4.0)),
+        ],
+      ),
+    ],
+    &[
+      if model.changedLines == 0 {
+        h.box(
+          &[h.style(&[css.paddingLeft(px(8.0)), css.paddingRight(px(8.0))])],
+          &[muted(h, "The model did not change.")],
+        )
+      } else {
+        h.empty()
+      },
+      h.each(
+        model.diff.asSlice(),
+        |row| h.row(
+          &[
+            h.style(
+              &[
+                css.paddingLeft(px(8.0)),
+                css.paddingRight(px(8.0)),
+                if row.op == ADDED {
+                  css.backgroundColor(rgb(ADDED_LINE))
+                } else if row.op == REMOVED {
+                  css.backgroundColor(rgb(REMOVED_LINE))
+                } else {
+                  css.color(rgb(MUTED))
+                },
+              ],
+            ),
+          ],
+          &[
+            h.text(
+              if row.op == ADDED {
+                "+ "
+              } else if row.op == REMOVED {
+                "- "
+              } else {
+                "  "
+              },
+            ),
+            h.text(String.view(&row.line)),
+          ],
+        ),
+      ),
+    ],
+  )
+}
+
+/// The steps that are not cleared, newest first.
+fn newestFirst(model: &ProgramPanel, h: &Document<PanelMessage>) -> Node {
+  let mut heap = Heap.make()
+  let mut nodes = List<Node>.make()
+  let steps = model.steps.asSlice()
+  let mut i = steps.length
+  while i > 0 {
+    i = i - 1
+    if steps[i].seq > model.cleared {
+      heap.alloc(nodes.append(stepView(model, h, &steps[i])))
+    }
+  }
+  return h.fragment(nodes.asSlice())
+}
+
+impl Program<PanelMessage, NoCommand> for ProgramPanel {
+  effect fn init() -> Next
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return Next.of(ProgramPanel.make())
+  }
+
+  effect fn update(mut model: ProgramPanel, message: PanelMessage) -> Next
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match move message {
+      PanelMessage.OpenStep { seq } => {
+        if model.opened == seq {
+          model.opened = 0
+          model.diff.clear()
+        } else {
+          run model.open(seq)
+        }
+      }
+      PanelMessage.Clear => {
+        model.cleared = model.last()
+        model.opened = 0
+        model.diff.clear()
+      }
+    }
+    return Next.of(move model)
+  }
+
+  fn view(model: &ProgramPanel, h: &Document<PanelMessage>) -> Node {
+    if !model.attached && model.steps.length() == 0 {
+      return h.column(&[h.testId("program")], &[muted(h, "No program is attached yet.")])
+    }
+    let mut shown: usize = 0
+    let steps = model.steps.asSlice()
+    let mut i: usize = 0
+    while i < steps.length {
+      if steps[i].seq > model.cleared {
+        shown = shown + 1
+      }
+      i = i + 1
+    }
+    return h.column(
+      &[h.testId("program")],
+      &[
+        h.box(
+          &[h.testId("program-line"), h.style(&[css.color(rgb(MUTED))])],
+          &[h.text(String.view(&model.line))],
+        ),
+        h.row(
+          &[
+            h.testId("subscriptions"),
+            h.style(
+              &[
+                css.alignItems(Align.Center),
+                css.marginTop(px(2.0)),
+                css.marginBottom(px(4.0)),
+                css.columnGap(px(6.0)),
+              ],
+            ),
+          ],
+          &[
+            h.box(
+              &[h.style(&[css.flexGrow(1.0), css.color(rgb(MUTED))])],
+              &[
+                if model.subscriptions.length() == 0 {
+                  h.text("No subscriptions")
+                } else {
+                  h.fragment(&[h.text("Subscribed to "), h.text(String.view(&model.subscribed))])
+                },
+              ],
+            ),
+            h.button(
+              &[
+                h.onClick(PanelMessage.Clear),
+                h.style(
+                  &[
+                    css.paddingTop(px(4.0)),
+                    css.paddingBottom(px(4.0)),
+                    css.paddingLeft(px(10.0)),
+                    css.paddingRight(px(10.0)),
+                  ],
+                ),
+                h.hover(&[css.backgroundColor(rgb(0xE5E7EB))]),
+              ],
+              &[h.text("Clear")],
+            ),
+          ],
+        ),
+        if shown == 0 {
+          muted(h, "No messages yet. Use the app, then look here.")
+        } else {
+          h.column(&[h.testId("messages"), h.accessRole(Role.List)], &[newestFirst(model, h)])
+        },
+      ],
+    )
+  }
+}
+
+/// The app's side of the panel's view as a [`Backend`]: batches go out, event records come in.
+/// A client's view has no viewport or layout here.
+pub struct ViewBackend<'v> {
+  pub view: &'v mut View,
+}
+
+impl<'v> Backend for ViewBackend<'v> {
+  effect fn mutate(self: &mut Self, batch: List<Mutation>) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    run self.view.send(batch.asSlice())
+  }
+
+  effect fn events(self: &mut Self, out: &mut List<Event>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.view.takeEvents(&mut out)
+  }
+
+  effect fn rootEvents(self: &mut Self, out: &mut List<RootEvent>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {}
+
+  fn viewport(self: &Self, root: u32) -> Rect<f32> {
+    return Rect<f32>.new(0.0, 0.0, 0.0, 0.0)
+  }
+
+  fn roots(self: &Self) -> RootSupport {
+    return RootSupport.single()
+  }
+
+  effect fn measure(self: &Self, id: u32) -> Option<Measured>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return Option<Measured>.None
+  }
+}
