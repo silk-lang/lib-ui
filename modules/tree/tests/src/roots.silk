@@ -190,6 +190,71 @@ test effect fn rootsLayOutInTheirOwnViewports() -> ()
   run layoutBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
+// What a frame costs.
+
+/// Whether the last frame laid out nothing and painted nothing again: it replayed its scene.
+fn idle(tree: &UiTree<'_>) -> bool {
+  return tree.stats.layoutSkipped && tree.stats.repaintedSubtrees == 0
+    && tree.stats.replayedSubtrees != 0
+}
+
+effect fn costBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run twoRoots(&collection)
+  run Testing.expect(
+    !tree.needsFrameOf(FIRST_ROOT) && !tree.needsFrameOf(SECOND),
+    "after a frame each, neither root needs another",
+  )
+  run tree.frameRoot(SECOND, narrow())
+  run Testing.expect(idle(&tree), "framing root 1 after root 0 lays out and paints nothing")
+  run tree.frameRoot(FIRST_ROOT, wide())
+  run Testing.expect(idle(&tree), "nor does framing root 0 after root 1")
+
+  // A change in the root that waits is that root's: the current root stays current and its
+  // next frame is as idle as before.
+  let mut batch = Batch.make()
+  run batch.style(12, &[css.width(percent(25.0))])
+  run tree.apply(run batch.take())
+  run Testing.expect(tree.current == FIRST_ROOT, "a batch for root 1 leaves root 0 current")
+  run Testing.expect(
+    tree.needsFrameOf(SECOND) && !tree.needsFrameOf(FIRST_ROOT),
+    "only root 1 needs a frame",
+  )
+  run tree.frameRoot(FIRST_ROOT, wide())
+  run Testing.expect(idle(&tree), "root 0's frame is undisturbed")
+  run tree.frameRoot(SECOND, narrow())
+  run Testing.expect(
+    !tree.stats.layoutSkipped && sized(run boundsOf(&tree, 12), 50.0, 50.0),
+    "root 1 lays out its change",
+  )
+  run tree.frameRoot(FIRST_ROOT, wide())
+  run Testing.expect(idle(&tree), "and root 0 still has nothing to do")
+
+  // A node that moves from root 1 to root 0 changes both.
+  let mut moving = Batch.make()
+  run moving.append(1, 12)
+  run tree.apply(run moving.take())
+  run Testing.expect(
+    tree.needsFrameOf(SECOND) && tree.needsFrameOf(FIRST_ROOT),
+    "a node moved between roots changes both",
+  )
+  run tree.frameRoot(SECOND, narrow())
+  run Testing.expect(!tree.stats.layoutSkipped, "root 1 lays out without it")
+  run tree.frameRoot(FIRST_ROOT, wide())
+  run Testing.expect(
+    tree.current == FIRST_ROOT && tree.hitTest(10.0, 310.0) == 12,
+    "root 0 lays it out after its own box",
+  )
+}
+
+test effect fn aFrameOfOneRootLeavesTheOthersAlone() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run costBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
 // Pointer input and hit testing.
 
 effect fn pointerBody() -> ()
@@ -274,13 +339,16 @@ effect fn focusBody() -> ()
   drop run tree.useRoot(FIRST_ROOT)
   run Testing.expect(tree.focused == tree.slotOf(2), "root 0's focus did not move")
 
-  // Blur takes focus from the key root.
+  // Blur takes focus from the key root; the batch leaves root 0 current, as it found it.
   let mut blur = Batch.make()
   run blur.push(Mutation.Blur)
   run tree.apply(run blur.take())
-  run Testing.expect(tree.current == SECOND && tree.focused == NONE, "blur clears root 1's focus")
-  drop run tree.useRoot(FIRST_ROOT)
-  run Testing.expect(tree.focused == tree.slotOf(2), "and leaves root 0's")
+  run Testing.expect(
+    tree.current == FIRST_ROOT && tree.focused == tree.slotOf(2),
+    "blur leaves root 0 current, with its focus",
+  )
+  drop run tree.useRoot(SECOND)
+  run Testing.expect(tree.focused == NONE, "and clears root 1's")
 }
 
 test effect fn focusIsPerRootAndKeysGoToTheKeyRoot() -> ()
