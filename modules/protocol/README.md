@@ -7,11 +7,16 @@ build these values on one side of a wire and a host can read them on the other.
   `EventRecord` and `HostRequest` coming out, node handles (`NodeId`, `BoxNode`, ...), and
   `Propagation` for walking an event's path with capture, target and bubble phases.
 - `ui_protocol.mutation`, `ui_protocol.batch`: every change a client can make, as plain data
-  with client-chosen ids, and the builder that collects them.
+  with client-chosen ids, and the builder that collects them. `OpenRoot`, `UpdateRoot` and
+  `CloseRoot` open and close roots, top-level trees with client-chosen ids; `FIRST_ROOT` (0) is
+  the one every backend shows.
+- `ui_protocol.root`: what comes back about a root (`RootEvent`: close requested, resized,
+  focused, blurred, scale or appearance changed, failed) and what a backend can show
+  (`RootSupport`: how many roots, and what one past the first becomes).
 - `ui_protocol.css`: the CSS vocabulary styles are written in (`css.width(px(100.0))`), from
   css-properties.
 - `ui_protocol.grid`, `ui_protocol.options`: grid templates and the option structs mutations
-  carry.
+  carry, `RootOptions` among them.
 - `ui_protocol.input`, `ui_protocol.record`, `ui_protocol.request`: the flat forms that travel
   as they are.
 

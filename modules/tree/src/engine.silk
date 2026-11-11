@@ -10,8 +10,11 @@ import cssom_view
 import cssom_view { ScrollAnimation }
 import svg_css.cssom_view_window { ScrollState, ViewTarget, ViewTargetKind }
 import svg_css.cssom_error { CssomError }
+import ui_protocol.options { RootOptions }
+import ui_protocol.root { RootEvent, RootEventKind, RootSupport, ExtraRoot }
 import mutation {
   Mutation,
+  FIRST_ROOT,
   NodeKind,
   StyleState,
   Declaration,
@@ -114,6 +117,110 @@ pub union TreeError {
 
 impl Copy for TreeError {}
 
+/// An open root other than the current one: its share of the tree's state, kept while the
+/// current root is laid out, painted and given input. [`UiTree.useRoot`] swaps it in. The
+/// fields mean what the `UiTree` fields of the same names mean for the current root.
+pub struct RootState {
+  pub id: u32,
+  pub options: RootOptions,
+  /// The slot of the root node, or NONE.
+  pub root: u32,
+  /// The focused slot, or NONE.
+  pub focused: u32,
+  pub focusVisible: bool,
+  /// The input of the root's last frame: its viewport.
+  pub input: FrameInput,
+  output: LayoutTree,
+  sceneA: Scene,
+  sceneB: Scene,
+  flipped: bool,
+  paintOrder: List<u32>,
+  fragmentHashes: List<u64>,
+  fragmentInk: List<Rect<f32>>,
+  fragmentScrollers: List<bool>,
+  fragmentOf: List<usize>,
+  nextSourceFragment: List<usize>,
+  paintIndexOf: List<u32>,
+  scrolled: bool,
+  hoverChain: List<u64>,
+  pressChain: List<u64>,
+  capture: u32,
+  captureId: u32,
+  captureMode: u32,
+  captureTo: u32,
+  captureToId: u32,
+  suppressText: bool,
+  pendingTarget: u32,
+  pendingTargetId: u32,
+  pressCount: u32,
+  thumbSlot: u32,
+  thumbVertical: bool,
+  thumbStart: f32,
+  thumbOffset: f32,
+  pointerX: f32,
+  pointerY: f32,
+  pointerInside: bool,
+  reveal: List<u64>,
+}
+
+impl RootState {
+  /// A root that was never framed, with root node `slot`.
+  fn fresh(id: u32, options: RootOptions, slot: u32) -> RootState {
+    return RootState {
+      id: id,
+      options: move options,
+      root: slot,
+      focused: NONE,
+      focusVisible: false,
+      input: FrameInput { width: 0.0, height: 0.0, scale: 1.0, time: 0.0 },
+      output: LayoutTree.make(),
+      sceneA: Scene.make(),
+      sceneB: Scene.make(),
+      flipped: false,
+      paintOrder: List<u32>.make(),
+      fragmentHashes: List<u64>.make(),
+      fragmentInk: List<Rect<f32>>.make(),
+      fragmentScrollers: List<bool>.make(),
+      fragmentOf: List<usize>.make(),
+      nextSourceFragment: List<usize>.make(),
+      paintIndexOf: List<u32>.make(),
+      scrolled: false,
+      hoverChain: List<u64>.make(),
+      pressChain: List<u64>.make(),
+      capture: NONE,
+      captureId: NONE,
+      captureMode: 0,
+      captureTo: NONE,
+      captureToId: NONE,
+      suppressText: false,
+      pendingTarget: NONE,
+      pendingTargetId: NONE,
+      pressCount: 0,
+      thumbSlot: NONE,
+      thumbVertical: true,
+      thumbStart: 0.0,
+      thumbOffset: 0.0,
+      pointerX: 0.0,
+      pointerY: 0.0,
+      pointerInside: false,
+      reveal: List<u64>.make(),
+    }
+  }
+}
+
+/// Whether `input` goes to the root that has the keyboard rather than the one under the
+/// pointer.
+fn keyboardInput(input: &Input) -> bool {
+  return match &input.* {
+    Input.KeyDown { .. } => true
+    Input.KeyUp { .. } => true
+    Input.TextInput { .. } => true
+    Input.ImePreedit { .. } => true
+    Input.Paste { .. } => true
+    _ => false
+  }
+}
+
 struct FontKeyEntry {
   family: u32,
   size: f32,
@@ -170,6 +277,14 @@ fn applyAll(computed: &mut Computed, list: &List<Declaration>) -> () {
 /// It borrows the fonts it draws with. Each frame: [`UiTree.apply`] the client's batches, call
 /// [`UiTree.frame`], hand [`UiTree.scene`] and [`UiTree.uploads`] to a renderer, and drain
 /// [`UiTree.takeEvents`].
+///
+/// It holds several roots (`Mutation.OpenRoot`), each laid out in its own viewport, in one id
+/// space and with one glyph atlas. One root at a time is current: `frame`, `scene`, hit testing,
+/// the geometry queries and pointer input are about it, and the per-root fields below (`root`,
+/// `focused`, `input`, `output`, the scenes, hover, press and capture) are its state. The other
+/// open roots wait in `parked`. [`UiTree.useRoot`] and [`UiTree.frameRoot`] change the current
+/// root; key and text input go to `keyRoot`. Changing roots lays out and paints the new one
+/// in full at its next frame.
 pub struct UiTree<'a> {
   /// Tree-owned virtualization controllers. Use mutations and `virtualRange` to access them.
   pub virtualLists: List<VirtualList>,
@@ -283,6 +398,22 @@ pub struct UiTree<'a> {
   pub requests: List<HostRequest>,
   /// The modifier keys editing shortcuts use; the compilation target's by default.
   pub keymap: Keymap,
+  /// The id of the current root, and whether it is open. Before any root opens, the current
+  /// root is the first one, closed.
+  pub current: u32,
+  pub currentOpen: bool,
+  pub currentOptions: RootOptions,
+  /// The open roots other than the current one.
+  pub parked: List<RootState>,
+  /// The root key and text input go to: the last one a host reported `Focused`, the first
+  /// root until then.
+  pub keyRoot: u32,
+  /// The root of the input `begin` started, for `finish`.
+  pendingRoot: u32,
+  /// What roots this tree shows: any number of headless surfaces unless a host says less.
+  pub rootSupport: RootSupport,
+  /// Root events for the client, oldest first.
+  pub rootEvents: List<RootEvent>,
 }
 
 impl<'a> UiTree<'a> {
@@ -375,6 +506,14 @@ impl<'a> UiTree<'a> {
       paintDirty: false,
       requests: List<HostRequest>.make(),
       keymap: NATIVE_KEYMAP,
+      current: FIRST_ROOT,
+      currentOpen: false,
+      currentOptions: RootOptions.default(),
+      parked: List<RootState>.make(),
+      keyRoot: FIRST_ROOT,
+      pendingRoot: FIRST_ROOT,
+      rootSupport: RootSupport { count: u32.MAX, extra: ExtraRoot.Surface },
+      rootEvents: List<RootEvent>.make(),
     }
   }
 
@@ -517,10 +656,12 @@ impl<'a> UiTree<'a> {
       }
       Mutation.Remove { id } => {
         let slot = run self.require(index, id)
+        run self.useRootOf(slot)
         run self.detach(index, slot)
       }
       Mutation.Destroy { id } => {
         let slot = run self.require(index, id)
+        run self.useRootOf(slot)
         run self.destroy(index, slot)
       }
       Mutation.SetStyle { id, state, declarations } => {
@@ -668,19 +809,39 @@ impl<'a> UiTree<'a> {
         node.listeners = flags
         self.layoutObserversDirty = true
       }
-      Mutation.SetRoot { id } => {
-        let slot = run self.require(index, id)
-        run self.setRoot(index, slot)
+      Mutation.OpenRoot { root, node, options } => {
+        let slot = run self.require(index, node)
+        run self.openRoot(index, root, slot, move options)
+      }
+      Mutation.UpdateRoot { root, options } => {
+        if root == self.current {
+          if self.currentOpen {
+            self.currentOptions = move options
+          }
+        } else {
+          let at = self.parkedIndex(root)
+          if at != usize.MAX {
+            let parked = self.parked.asMutSlice()
+            parked[at].options = move options
+          }
+        }
+      }
+      Mutation.CloseRoot { root } => {
+        run self.closeRoot(index, root)
       }
       Mutation.Focus { id } => {
         let slot = run self.require(index, id)
+        run self.useRootOf(slot)
         run self.focusSlot(slot)
       }
       Mutation.Blur => {
+        let keyed = self.keyTarget()
+        drop run self.useRoot(keyed)
         run self.focusSlot(NONE)
       }
       Mutation.SetPointerCapture { id } => {
         let slot = run self.require(index, id)
+        run self.useRootOf(slot)
         drop run interact.setCapture(&mut self, slot)
       }
       Mutation.ReleasePointerCapture => {
@@ -695,6 +856,7 @@ impl<'a> UiTree<'a> {
       }
       Mutation.ScrollIntoView { id } => {
         let slot = run self.require(index, id)
+        run self.useRootOf(slot)
         self.viewScrollState.interruptAll()
         self.viewScrollAnimations.clear()
         run self.reveal.append(interact.pair(slot, id))
@@ -929,7 +1091,7 @@ impl<'a> UiTree<'a> {
     if !UiTree.canHaveChildren(self.node(parentSlot).kind) {
       fail TreeError.WrongKind { index: index, id: parent }
     }
-    if childSlot == self.root || self.within(parentSlot, childSlot) {
+    if self.isRootNode(childSlot) || self.within(parentSlot, childSlot) {
       fail TreeError.BadMove { index: index, id: child }
     }
     let mut beforeCss = Option<NodeId>.None
@@ -996,6 +1158,16 @@ impl<'a> UiTree<'a> {
     }
     let css = self.node(slot).css
     run Effect.catchAll(self.layout.destroy(NodeId { index: css }), layoutFailed)
+
+    // A node moved here from another root can still be that root's focus.
+    let parked = self.parked.asMutSlice()
+    let mut p: usize = 0
+    while p < parked.length {
+      if parked[p].focused != NONE && contains(&doomed, parked[p].focused) {
+        parked[p].focused = NONE
+      }
+      p = p + 1
+    }
     let mut i: usize = 0
     while i < doomed.length() {
       let gone = doomed.get(i)
@@ -1023,11 +1195,446 @@ impl<'a> UiTree<'a> {
     }
   }
 
-  effect fn setRoot(self: &mut Self, index: usize, slot: u32) -> ()
+  // Roots.
+
+  /// The index of open root `root` in `parked`, or `usize.MAX`.
+  fn parkedIndex(self: &Self, root: u32) -> usize {
+    let parked = self.parked.asSlice()
+    let mut i: usize = 0
+    while i < parked.length {
+      if parked[i].id == root {
+        return i
+      }
+      i = i + 1
+    }
+    return usize.MAX
+  }
+
+  /// Whether root `root` is open.
+  pub fn rootOpen(self: &Self, root: u32) -> bool {
+    if root == self.current {
+      return self.currentOpen
+    }
+    return self.parkedIndex(root) != usize.MAX
+  }
+
+  /// The ids of the open roots: the current one first, then the others in the order they
+  /// were parked.
+  pub effect fn openRoots(self: &Self, out: &mut List<u32>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    out.clear()
+    if self.currentOpen {
+      run out.append(self.current)
+    }
+    let parked = self.parked.asSlice()
+    let mut i: usize = 0
+    while i < parked.length {
+      run out.append(parked[i].id)
+      i = i + 1
+    }
+  }
+
+  /// The id of the root node of root `root`, or NONE when it is not open or has none.
+  pub fn rootNode(self: &Self, root: u32) -> u32 {
+    let mut slot = NONE
+    if root == self.current {
+      slot = self.root
+    } else {
+      let at = self.parkedIndex(root)
+      if at != usize.MAX {
+        slot = self.parked.asSlice()[at].root
+      }
+    }
+    if slot == NONE {
+      return NONE
+    }
+    return self.node(slot).id
+  }
+
+  /// The viewport of root `root`'s last frame, in CSS pixels; empty for a root that is not
+  /// open.
+  pub fn rootViewport(self: &Self, root: u32) -> Rect<f32> {
+    if root == self.current {
+      return Rect<f32>.new(0.0, 0.0, self.input.width, self.input.height)
+    }
+    let at = self.parkedIndex(root)
+    if at == usize.MAX {
+      return Rect<f32>.new(0.0, 0.0, 0.0, 0.0)
+    }
+    let input = self.parked.asSlice()[at].input
+    return Rect<f32>.new(0.0, 0.0, input.width, input.height)
+  }
+
+  /// The slot at the top of `slot`'s ancestors: a root node, or the top of a detached subtree.
+  fn topOf(self: &Self, slot: u32) -> u32 {
+    let mut at = slot
+    while self.node(at).parent != NONE {
+      at = self.node(at).parent
+    }
+    return at
+  }
+
+  /// Whether `slot` is the root node of an open root.
+  pub fn isRootNode(self: &Self, slot: u32) -> bool {
+    if slot == self.root {
+      return true
+    }
+    let parked = self.parked.asSlice()
+    let mut i: usize = 0
+    while i < parked.length {
+      if parked[i].root == slot {
+        return true
+      }
+      i = i + 1
+    }
+    return false
+  }
+
+  /// Whether `slot` is in a root other than the current one. The current root's layout says
+  /// nothing about such a node, so per-frame work leaves it alone.
+  pub fn inParkedRoot(self: &Self, slot: u32) -> bool {
+    if self.parked.length() == 0 {
+      return false
+    }
+    let top = self.topOf(slot)
+    let parked = self.parked.asSlice()
+    let mut i: usize = 0
+    while i < parked.length {
+      if parked[i].root == top {
+        return true
+      }
+      i = i + 1
+    }
+    return false
+  }
+
+  /// The root key input goes to: `keyRoot` while it is open, else the current root.
+  pub fn keyTarget(self: &Self) -> u32 {
+    if self.rootOpen(self.keyRoot) {
+      return self.keyRoot
+    }
+    return self.current
+  }
+
+  /// Moves the per-root state out of the tree, leaving that of a root never framed.
+  fn park(self: &mut Self) -> RootState {
+    return RootState {
+      id: self.current,
+      options: Intrinsic.replace(self.currentOptions, RootOptions.default()),
+      root: Intrinsic.replace(self.root, NONE),
+      focused: Intrinsic.replace(self.focused, NONE),
+      focusVisible: Intrinsic.replace(self.focusVisible, false),
+      input: Intrinsic.replace(
+        self.input,
+        FrameInput { width: 0.0, height: 0.0, scale: 1.0, time: 0.0 },
+      ),
+      output: Intrinsic.replace(self.output, LayoutTree.make()),
+      sceneA: Intrinsic.replace(self.sceneA, Scene.make()),
+      sceneB: Intrinsic.replace(self.sceneB, Scene.make()),
+      flipped: Intrinsic.replace(self.flipped, false),
+      paintOrder: Intrinsic.replace(self.paintOrder, List<u32>.make()),
+      fragmentHashes: Intrinsic.replace(self.fragmentHashes, List<u64>.make()),
+      fragmentInk: Intrinsic.replace(self.fragmentInk, List<Rect<f32>>.make()),
+      fragmentScrollers: Intrinsic.replace(self.fragmentScrollers, List<bool>.make()),
+      fragmentOf: Intrinsic.replace(self.fragmentOf, List<usize>.make()),
+      nextSourceFragment: Intrinsic.replace(self.nextSourceFragment, List<usize>.make()),
+      paintIndexOf: Intrinsic.replace(self.paintIndexOf, List<u32>.make()),
+      scrolled: Intrinsic.replace(self.scrolled, false),
+      hoverChain: Intrinsic.replace(self.hoverChain, List<u64>.make()),
+      pressChain: Intrinsic.replace(self.pressChain, List<u64>.make()),
+      capture: Intrinsic.replace(self.capture, NONE),
+      captureId: Intrinsic.replace(self.captureId, NONE),
+      captureMode: Intrinsic.replace(self.captureMode, 0),
+      captureTo: Intrinsic.replace(self.captureTo, NONE),
+      captureToId: Intrinsic.replace(self.captureToId, NONE),
+      suppressText: Intrinsic.replace(self.suppressText, false),
+      pendingTarget: Intrinsic.replace(self.pendingTarget, NONE),
+      pendingTargetId: Intrinsic.replace(self.pendingTargetId, NONE),
+      pressCount: Intrinsic.replace(self.pressCount, 0),
+      thumbSlot: Intrinsic.replace(self.thumbSlot, NONE),
+      thumbVertical: Intrinsic.replace(self.thumbVertical, true),
+      thumbStart: Intrinsic.replace(self.thumbStart, 0.0),
+      thumbOffset: Intrinsic.replace(self.thumbOffset, 0.0),
+      pointerX: Intrinsic.replace(self.pointerX, 0.0),
+      pointerY: Intrinsic.replace(self.pointerY, 0.0),
+      pointerInside: Intrinsic.replace(self.pointerInside, false),
+      reveal: Intrinsic.replace(self.reveal, List<u64>.make()),
+    }
+  }
+
+  /// Makes `state` the current root's. The css-layout tree, the viewport and the scenes the
+  /// caches refer to were another root's, so its next frame lays out, styles and paints anew.
+  fn unpark(self: &mut Self, state: RootState) -> () {
+    let mut s = move state
+    self.current = s.id
+    self.currentOpen = true
+    self.currentOptions = Intrinsic.replace(s.options, RootOptions.default())
+    self.root = s.root
+    self.focused = s.focused
+    self.focusVisible = s.focusVisible
+    self.input = s.input
+    self.output = Intrinsic.replace(s.output, LayoutTree.make())
+    self.sceneA = Intrinsic.replace(s.sceneA, Scene.make())
+    self.sceneB = Intrinsic.replace(s.sceneB, Scene.make())
+    self.flipped = s.flipped
+    self.paintOrder = Intrinsic.replace(s.paintOrder, List<u32>.make())
+    self.fragmentHashes = Intrinsic.replace(s.fragmentHashes, List<u64>.make())
+    self.fragmentInk = Intrinsic.replace(s.fragmentInk, List<Rect<f32>>.make())
+    self.fragmentScrollers = Intrinsic.replace(s.fragmentScrollers, List<bool>.make())
+    self.fragmentOf = Intrinsic.replace(s.fragmentOf, List<usize>.make())
+    self.nextSourceFragment = Intrinsic.replace(s.nextSourceFragment, List<usize>.make())
+    self.paintIndexOf = Intrinsic.replace(s.paintIndexOf, List<u32>.make())
+    self.scrolled = s.scrolled
+    self.hoverChain = Intrinsic.replace(s.hoverChain, List<u64>.make())
+    self.pressChain = Intrinsic.replace(s.pressChain, List<u64>.make())
+    self.capture = s.capture
+    self.captureId = s.captureId
+    self.captureMode = s.captureMode
+    self.captureTo = s.captureTo
+    self.captureToId = s.captureToId
+    self.suppressText = s.suppressText
+    self.pendingTarget = s.pendingTarget
+    self.pendingTargetId = s.pendingTargetId
+    self.pressCount = s.pressCount
+    self.thumbSlot = s.thumbSlot
+    self.thumbVertical = s.thumbVertical
+    self.thumbStart = s.thumbStart
+    self.thumbOffset = s.thumbOffset
+    self.pointerX = s.pointerX
+    self.pointerY = s.pointerY
+    self.pointerInside = s.pointerInside
+    self.reveal = Intrinsic.replace(s.reveal, List<u64>.make())
+    drop s
+    self.restart()
+  }
+
+  /// Forgets what the last layout and paint left behind, for state that belongs to another
+  /// root now.
+  fn restart(self: &mut Self) -> () {
+    self.laidOut = FrameInput { width: -1.0, height: -1.0, scale: 0.0, time: 0.0 }
+    self.laidOutRevision = usize.MAX
+    self.laidOutScrolls = usize.MAX
+    self.replayable = false
+    self.paintCachesStale = true
+    self.stylesDirty = true
+    self.layoutObserversDirty = true
+  }
+
+  /// Puts the current root's node in css-layout's viewport, or takes it out.
+  effect fn mountCurrent(self: &mut Self, mounted: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.root == NONE {
+      return ()
+    }
+    let css = NodeId { index: self.node(self.root).css }
+    if mounted {
+      let viewport = self.layout.root()
+      run Effect.catchAll(
+        self.layout.insertBefore(viewport, css, Option<NodeId>.None),
+        ignoreInvalid,
+      )
+    } else {
+      run Effect.catchAll(self.layout.remove(css), ignoreInvalid)
+    }
+  }
+
+  /// Makes open root `root` the current one: the one `frame`, `scene`, hit testing, the
+  /// geometry queries and pointer input are about. Returns whether `root` is open.
+  pub effect fn useRoot(self: &mut Self, root: u32) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if root == self.current {
+      return self.currentOpen
+    }
+    let at = self.parkedIndex(root)
+    if at == usize.MAX {
+      return false
+    }
+    run self.mountCurrent(false)
+    let next = self.parked.remove(at)
+    let previous = self.park()
+    if self.currentOpen {
+      run self.parked.append(move previous)
+    } else {
+      drop previous
+    }
+    self.unpark(move next)
+    run self.mountCurrent(true)
+    return true
+  }
+
+  /// Makes the root that holds `slot` current, when that is another open root.
+  effect fn useRootOf(self: &mut Self, slot: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.parked.length() == 0 {
+      return ()
+    }
+    let top = self.topOf(slot)
+    let parked = self.parked.asSlice()
+    let mut i: usize = 0
+    while i < parked.length {
+      if parked[i].root == top {
+        let id = parked[i].id
+        drop run self.useRoot(id)
+        return ()
+      }
+      i = i + 1
+    }
+  }
+
+  effect fn openRoot(
+    self: &mut Self,
+    index: usize,
+    root: u32,
+    slot: u32,
+    options: RootOptions,
+  ) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if root != self.current && self.parkedIndex(root) != usize.MAX {
+      drop run self.useRoot(root)
+    }
+    if root == self.current {
+      run self.setRootNode(index, slot)
+      self.currentOpen = true
+      self.currentOptions = move options
+      return ()
+    }
+    let mut open = usize.toU32(self.parked.length())
+    if self.currentOpen {
+      open = open + 1
+    }
+    if root != FIRST_ROOT && !self.rootSupport.admits(open) {
+      run self.reportRoot(root, RootEventKind.Failed)
+      return ()
+    }
+    if !self.currentOpen {
+      // No open root owns the current state: the new root starts from a fresh one.
+      drop self.park()
+      self.restart()
+      self.current = root
+      run self.setRootNode(index, slot)
+      self.currentOpen = true
+      self.currentOptions = move options
+      return ()
+    }
+
+    // Another root is current: the new one waits for its first frame.
+    if self.isRootNode(slot) {
+      fail TreeError.BadMove { index: index, id: self.node(slot).id }
+    }
+    if self.node(slot).kind == NodeKind.Text {
+      fail TreeError.WrongKind { index: index, id: self.node(slot).id }
+    }
+    if self.node(slot).parent != NONE {
+      run self.detach(index, slot)
+    }
+    run self.parked.append(RootState.fresh(root, move options, slot))
+  }
+
+  effect fn closeRoot(self: &mut Self, index: usize, root: u32) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if !(run self.useRoot(root)) {
+      return ()
+    }
+    let node = self.root
+    if node != NONE {
+      run self.detach(index, node)
+    }
+    self.currentOpen = false
+    self.currentOptions = RootOptions.default()
+    if self.parked.length() != 0 {
+      let next = if self.parkedIndex(self.keyRoot) != usize.MAX {
+        self.keyRoot
+      } else {
+        self.parked.asSlice()[0].id
+      }
+      drop run self.useRoot(next)
+    }
+    if self.keyRoot == root {
+      self.keyRoot = self.current
+    }
+  }
+
+  /// Frames root `root` (see `frame`), making it current. Nothing happens for a root that is
+  /// not open, unless it is current already.
+  pub effect fn frameRoot(self: &mut Self, root: u32, input: FrameInput) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if !(run self.useRoot(root)) && root != self.current {
+      return ()
+    }
+    run self.frame(input)
+  }
+
+  /// `dispatch` with pointer input aimed at root `root`. Key and text input go to `keyRoot`
+  /// either way.
+  pub effect fn dispatchTo(self: &mut Self, root: u32, input: Input) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !keyboardInput(&input) {
+      drop run self.useRoot(root)
+    }
+    run self.dispatch(move input)
+  }
+
+  /// `begin` with pointer input aimed at root `root`.
+  pub effect fn beginAt(self: &mut Self, root: u32, input: &Input) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !keyboardInput(input) {
+      drop run self.useRoot(root)
+    }
+    run self.begin(input)
+  }
+
+  /// A host tells the tree what the system did with root `root`, and the client hears it as
+  /// a root event. `Focused` also makes the root `keyRoot`. A root event that waits is
+  /// replaced by a later one of the same kind for the same root (see `RootEvent.replacedBy`),
+  /// so the queue stays short when nobody drains it.
+  pub effect fn reportRoot(self: &mut Self, root: u32, kind: RootEventKind) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match kind {
+      RootEventKind.Focused => {
+        self.keyRoot = root
+      }
+      _ => {}
+    }
+    let event = RootEvent { root: root, kind: kind }
+    let mut i: usize = 0
+    while i < self.rootEvents.length() {
+      let waiting = self.rootEvents.get(i)
+      if waiting.replacedBy(&event) {
+        drop self.rootEvents.remove(i)
+      } else {
+        i = i + 1
+      }
+    }
+    run self.rootEvents.append(event)
+  }
+
+  /// Moves the queued root events to `out`, oldest first.
+  pub effect fn takeRootEvents(self: &mut Self, out: &mut List<RootEvent>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run out.appendSlice(self.rootEvents.asSlice())
+    self.rootEvents.clear()
+  }
+
+  /// Makes `slot` the current root's node. The previous one is detached.
+  effect fn setRootNode(self: &mut Self, index: usize, slot: u32) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
     if slot == self.root {
       return ()
+    }
+    if self.parked.length() != 0 && self.isRootNode(slot) {
+      fail TreeError.BadMove { index: index, id: self.node(slot).id }
     }
     let previous = self.root
     if previous != NONE {
@@ -1130,10 +1737,15 @@ impl<'a> UiTree<'a> {
 
   /// Feeds one input record to the tree: hit testing against the last frame, hover and active
   /// states, pointer capture, focus, tab order, keyboard clicks and scrolling, and the event
-  /// records for listeners. State changes show at the next frame.
+  /// records for listeners. State changes show at the next frame. Pointer input goes to the
+  /// current root, key and text input to `keyRoot` (see `dispatchTo`).
   pub effect fn dispatch(self: &mut Self, input: Input) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
+    if keyboardInput(&input) {
+      let keyed = self.keyTarget()
+      drop run self.useRoot(keyed)
+    }
     let interruptsScroll = match &input {
       Input.Wheel { .. } => true
       Input.PointerDown { .. } => true
@@ -1154,6 +1766,11 @@ impl<'a> UiTree<'a> {
   pub effect fn begin(self: &mut Self, input: &Input) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
+    if keyboardInput(input) {
+      let keyed = self.keyTarget()
+      drop run self.useRoot(keyed)
+    }
+    self.pendingRoot = self.current
     let interruptsScroll = match &input.* {
       Input.Wheel { .. } => true
       Input.PointerDown { .. } => true
@@ -1172,6 +1789,8 @@ impl<'a> UiTree<'a> {
   pub effect fn finish(self: &mut Self, input: Input, prevented: bool) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
+    let started = self.pendingRoot
+    drop run self.useRoot(started)
     run interact.finish(&mut self, move input, prevented)
   }
 
@@ -1738,7 +2357,8 @@ impl<'a> UiTree<'a> {
     let mut i: usize = 0
     while i < self.nodes.length() {
       let node = &self.nodes.asSlice()[i]
-      if node.live && u32.bitAnd(node.listeners, LISTEN_LAYOUT) != 0 {
+      if node.live && u32.bitAnd(node.listeners, LISTEN_LAYOUT) != 0
+        && !self.inParkedRoot(usize.toU32(i)) {
         let id = node.id
         let before = node.reportedBounds
         let reported = node.layoutReported
@@ -2088,6 +2708,18 @@ impl<'a> UiTree<'a> {
 
 effect fn ignoreInvalid(error: InvalidNode) -> () {
   drop error
+}
+
+fn contains(list: &List<u32>, value: u32) -> bool {
+  let values = list.asSlice()
+  let mut i: usize = 0
+  while i < values.length {
+    if values[i] == value {
+      return true
+    }
+    i = i + 1
+  }
+  return false
 }
 
 fn sameNatural(a: NaturalDimensions, b: NaturalDimensions) -> bool {

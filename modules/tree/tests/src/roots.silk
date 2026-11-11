@@ -1,0 +1,430 @@
+//! Several roots in one tree: each lays out in its own viewport, takes its own pointer input
+//! and keeps its own focus; key input goes to the key root, closing a root detaches its node,
+//! and a tree that shows one root answers another with `Failed`.
+//!
+//! Root 0 holds box 1 with box 2 inside, root 1 holds box 11 with box 12 inside. The outer
+//! boxes fill their viewport, the inner ones half of it; every box listens for everything and
+//! the inner ones are focusable.
+import ui_tree.css
+import ui_tree.css { percent }
+import ui_fixtures.fixtures as fixtures
+import ui_tree.legacy {
+  UiTree,
+  TreeError,
+  Batch,
+  FrameInput,
+  NodeInfo,
+  NodeKind,
+  Attribute,
+  Mutation,
+  Event,
+  EventKind,
+  Input,
+  NONE,
+  BUTTON_PRIMARY,
+  LISTEN_ALL,
+  info
+}
+import ui_tree.lib { RootOptions, RootEvent, RootEventKind, RootSupport }
+import ui_tree.mutation { FIRST_ROOT }
+import font_collection.lib { FontCollection }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.geometry.rect { Rect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+const SECOND: u32 = 1
+
+fn wide() -> FrameInput {
+  return FrameInput { width: 800.0, height: 600.0, scale: 1.0, time: 0.0 }
+}
+
+fn narrow() -> FrameInput {
+  return FrameInput { width: 200.0, height: 100.0, scale: 1.0, time: 0.0 }
+}
+
+/// Outer box `outer` filling its viewport, holding focusable box `inner` over half of it.
+effect fn pair(batch: &mut Batch, outer: u32, inner: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run batch.create(outer, NodeKind.Box)
+  run batch.style(outer, &[css.width(percent(100.0)), css.height(percent(100.0))])
+  run batch.listen(outer, LISTEN_ALL)
+  run batch.box(outer, inner, &[css.width(percent(50.0)), css.height(percent(50.0))])
+  run batch.listen(inner, LISTEN_ALL)
+  run batch.attribute(inner, Attribute.TabIndex { value: 0 })
+}
+
+/// Both roots, each after a frame in its own viewport: root 0 wide, root 1 narrow.
+effect fn twoRoots(collection: &FontCollection) -> UiTree<'_>
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut tree = run UiTree.make(collection)
+  let mut batch = Batch.make()
+  run pair(&mut batch, 1, 2)
+  run pair(&mut batch, 11, 12)
+  run batch.root(1)
+  run batch.openRoot(SECOND, 11, RootOptions.default())
+  run tree.apply(run batch.take())
+  run tree.frameRoot(SECOND, narrow())
+  run tree.frameRoot(FIRST_ROOT, wide())
+  return move tree
+}
+
+effect fn boundsOf(tree: &UiTree<'_>, id: u32) -> Rect<f32>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match run info(tree, id) {
+    Option<NodeInfo>.Some { value } => if value.laidOut {
+      value.bounds
+    } else {
+      Rect<f32>.new(-1.0, -1.0, -1.0, -1.0)
+    }
+    Option<NodeInfo>.None => Rect<f32>.new(-1.0, -1.0, -1.0, -1.0)
+  }
+}
+
+fn sized(bounds: Rect<f32>, width: f32, height: f32) -> bool {
+  return bounds.xMin == 0.0 && bounds.yMin == 0.0 && bounds.width() == width
+    && bounds.height() == height
+}
+
+effect fn drain(tree: &mut UiTree<'_>) -> List<Event>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut events = List<Event>.make()
+  run tree.takeEvents(&mut events)
+  return move events
+}
+
+/// Whether the first record of `kind` is for `target`, along `path`.
+fn firstIs(events: &List<Event>, kind: EventKind, target: u32, path: &[u32]) -> bool {
+  let values = events.asSlice()
+  let mut i: usize = 0
+  while i < values.length {
+    if values[i].kind == kind {
+      return values[i].target == target && samePath(&values[i].path, path)
+    }
+    i = i + 1
+  }
+  return false
+}
+
+fn samePath(path: &List<u32>, expected: &[u32]) -> bool {
+  let values = path.asSlice()
+  if values.length != expected.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < values.length {
+    if values[i] != expected[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+effect fn click(tree: &mut UiTree<'_>, root: u32, x: f32, y: f32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run tree.dispatchTo(
+    root,
+    Input.PointerDown { x: x, y: y, button: BUTTON_PRIMARY, modifiers: 0, clickCount: 1 },
+  )
+  run tree.dispatchTo(root, Input.PointerUp { x: x, y: y, button: BUTTON_PRIMARY, modifiers: 0 })
+}
+
+effect fn key(tree: &mut UiTree<'_>, name: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run tree.dispatch(
+    Input.KeyDown {
+      key: run String.copy(name),
+      code: run String.copy(name),
+      modifiers: 0,
+      repeat: false,
+    },
+  )
+}
+
+effect fn rootIds(tree: &UiTree<'_>) -> List<u32>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut ids = List<u32>.make()
+  run tree.openRoots(&mut ids)
+  return move ids
+}
+
+// Layout.
+
+effect fn layoutBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run twoRoots(&collection)
+  let ids = run rootIds(&tree)
+  run Testing.expect(
+    samePath(&ids, &[FIRST_ROOT, SECOND]) && tree.rootNode(SECOND) == 11,
+    "both roots are open, each with its node",
+  )
+  run Testing.expect(tree.current == FIRST_ROOT, "the last root framed is current")
+  run Testing.expect(sized(run boundsOf(&tree, 2), 400.0, 300.0), "root 0 lays out at 800 by 600")
+  run Testing.expect(
+    tree.rootViewport(SECOND).width() == 200.0 && tree.rootViewport(SECOND).height() == 100.0,
+    "root 1 keeps its own viewport while root 0 is current",
+  )
+  run tree.frameRoot(SECOND, narrow())
+  run Testing.expect(sized(run boundsOf(&tree, 12), 100.0, 50.0), "root 1 lays out at 200 by 100")
+  run tree.frameRoot(FIRST_ROOT, wide())
+  run Testing.expect(sized(run boundsOf(&tree, 2), 400.0, 300.0), "root 0 is laid out again")
+  run Testing.expect(sized(run boundsOf(&tree, 1), 800.0, 600.0), "its node fills its viewport")
+}
+
+test effect fn rootsLayOutInTheirOwnViewports() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run layoutBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Pointer input and hit testing.
+
+effect fn pointerBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run twoRoots(&collection)
+  drop run drain(&mut tree)
+
+  // (150, 80) is outside root 1's inner box, inside root 0's.
+  run Testing.expect(tree.hitTest(150.0, 80.0) == 2, "root 0 is hit tested at its own layout")
+  drop run tree.useRoot(SECOND)
+  run Testing.expect(tree.hitTest(150.0, 80.0) == 11, "root 1 is hit tested at its own layout")
+  run Testing.expect(tree.hitTest(10.0, 10.0) == 12, "and finds its own nodes")
+
+  run click(&mut tree, FIRST_ROOT, 150.0, 80.0)
+  let mut events = run drain(&mut tree)
+  run Testing.expect(
+    firstIs(&events, EventKind.Click, 2, &[1, 2]),
+    "a click in root 0 reaches its node, the path starting at root 0's node",
+  )
+  run click(&mut tree, SECOND, 150.0, 80.0)
+  events = run drain(&mut tree)
+  run Testing.expect(
+    firstIs(&events, EventKind.Click, 11, &[11]),
+    "the same point in root 1 reaches root 1's node",
+  )
+  run click(&mut tree, SECOND, 10.0, 10.0)
+  events = run drain(&mut tree)
+  run Testing.expect(
+    firstIs(&events, EventKind.Click, 12, &[11, 12]),
+    "a path in root 1 starts at root 1's node",
+  )
+}
+
+test effect fn pointerInputGoesToItsRoot() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run pointerBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Focus and keys.
+
+effect fn focusBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run twoRoots(&collection)
+  let mut batch = Batch.make()
+  run batch.focus(12)
+  run batch.focus(2)
+  run tree.apply(run batch.take())
+  drop run drain(&mut tree)
+  drop run tree.useRoot(SECOND)
+  run Testing.expect(tree.focused == tree.slotOf(12), "root 1 keeps its focus")
+  drop run tree.useRoot(FIRST_ROOT)
+  run Testing.expect(tree.focused == tree.slotOf(2), "root 0 has its own")
+
+  // Keys go to the key root, the first one until a host says another has the keyboard.
+  drop run tree.useRoot(SECOND)
+  run key(&mut tree, "a")
+  let mut events = run drain(&mut tree)
+  run Testing.expect(
+    firstIs(&events, EventKind.KeyDown, 2, &[1, 2]),
+    "keys go to the focus of root 0",
+  )
+  run tree.reportRoot(SECOND, RootEventKind.Focused)
+  run Testing.expect(tree.keyRoot == SECOND, "a focused window makes its root the key root")
+  run key(&mut tree, "b")
+  events = run drain(&mut tree)
+  run Testing.expect(
+    firstIs(&events, EventKind.KeyDown, 12, &[11, 12]),
+    "then keys go to the focus of root 1",
+  )
+
+  // Tab moves focus inside the key root only.
+  run key(&mut tree, "Tab")
+  run Testing.expect(
+    tree.current == SECOND && tree.focused == tree.slotOf(12),
+    "Tab stays in root 1: its one focusable node keeps focus",
+  )
+  drop run tree.useRoot(FIRST_ROOT)
+  run Testing.expect(tree.focused == tree.slotOf(2), "root 0's focus did not move")
+
+  // Blur takes focus from the key root.
+  let mut blur = Batch.make()
+  run blur.push(Mutation.Blur)
+  run tree.apply(run blur.take())
+  run Testing.expect(tree.current == SECOND && tree.focused == NONE, "blur clears root 1's focus")
+  drop run tree.useRoot(FIRST_ROOT)
+  run Testing.expect(tree.focused == tree.slotOf(2), "and leaves root 0's")
+}
+
+test effect fn focusIsPerRootAndKeysGoToTheKeyRoot() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run focusBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Opening and closing.
+
+effect fn closeBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run twoRoots(&collection)
+
+  // The tree never closes a root by itself.
+  run tree.reportRoot(SECOND, RootEventKind.CloseRequested)
+  run Testing.expect(tree.rootOpen(SECOND), "a close request leaves the root open")
+
+  let mut batch = Batch.make()
+  run batch.closeRoot(SECOND)
+  run batch.closeRoot(7)
+  run tree.apply(run batch.take())
+  let ids = run rootIds(&tree)
+  run Testing.expect(
+    samePath(&ids, &[FIRST_ROOT]),
+    "CloseRoot removes root 1; closing 7 does nothing",
+  )
+  run Testing.expect(
+    tree.rootNode(SECOND) == NONE && tree.contains(11) && tree.node(tree.slotOf(11)).parent == NONE
+      && !tree.isRootNode(tree.slotOf(11)),
+    "its node stays, detached",
+  )
+  run tree.frame(wide())
+  run Testing.expect(sized(run boundsOf(&tree, 2), 400.0, 300.0), "root 0 is unaffected")
+  run click(&mut tree, SECOND, 10.0, 10.0)
+  let events = run drain(&mut tree)
+  run Testing.expect(
+    firstIs(&events, EventKind.Click, 2, &[1, 2]),
+    "input for a closed root goes to the current one",
+  )
+
+  // A node that is a root cannot be moved into another root, and can open again once closed.
+  let mut moving = Batch.make()
+  run moving.append(1, 11)
+  let moved = run moving.take()
+  run Testing.expect(
+    run Effect.catch<TreeError>(applied(&mut tree, move moved), failed),
+    "a closed root's node can be appended elsewhere",
+  )
+  let mut again = Batch.make()
+  run again.push(Mutation.Remove { id: 11 })
+  run again.openRoot(SECOND, 11, RootOptions.default())
+  run tree.apply(run again.take())
+  run Testing.expect(tree.rootOpen(SECOND) && tree.rootNode(SECOND) == 11, "the root opens again")
+  let mut steal = Batch.make()
+  run steal.append(1, 11)
+  let stolen = run steal.take()
+  run Testing.expect(
+    !(run Effect.catch<TreeError>(applied(&mut tree, move stolen), failed)),
+    "an open root's node cannot be appended into another root",
+  )
+}
+
+effect fn applied(tree: &mut UiTree<'_>, batch: List<Mutation>) -> bool
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  run tree.apply(move batch)
+  return true
+}
+
+effect fn failed(error: TreeError) -> bool {
+  drop error
+  return false
+}
+
+test effect fn closeRootDetachesItsNode() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run closeBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Hosts that show one root.
+
+effect fn singleBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  tree.rootSupport = RootSupport.single()
+  let mut batch = Batch.make()
+  run pair(&mut batch, 1, 2)
+  run pair(&mut batch, 11, 12)
+  run batch.root(1)
+  run batch.openRoot(SECOND, 11, RootOptions.default())
+  run tree.apply(run batch.take())
+  run tree.frame(wide())
+  let ids = run rootIds(&tree)
+  run Testing.expect(samePath(&ids, &[FIRST_ROOT]), "only the first root opens")
+  let mut events = List<RootEvent>.make()
+  run tree.takeRootEvents(&mut events)
+  run Testing.expect(
+    events.length() == 1 && events.get(0).root == SECOND && isFailed(events.get(0).kind),
+    "the second root fails",
+  )
+  run Testing.expect(sized(run boundsOf(&tree, 2), 400.0, 300.0), "the first root works as before")
+
+  // Root events that wait are replaced by later ones of the same kind.
+  run tree.reportRoot(FIRST_ROOT, RootEventKind.Resized { width: 10.0, height: 10.0 })
+  run tree.reportRoot(FIRST_ROOT, RootEventKind.Blurred)
+  run tree.reportRoot(FIRST_ROOT, RootEventKind.Resized { width: 20.0, height: 30.0 })
+  run tree.reportRoot(FIRST_ROOT, RootEventKind.Focused)
+  events.clear()
+  run tree.takeRootEvents(&mut events)
+  run Testing.expect(
+    events.length() == 2 && width(events.get(0).kind) == 20.0 && isFocused(events.get(1).kind),
+    "a resize and the focus state, the latest of each",
+  )
+}
+
+fn isFailed(kind: RootEventKind) -> bool {
+  return match kind {
+    RootEventKind.Failed => true
+    _ => false
+  }
+}
+
+fn isFocused(kind: RootEventKind) -> bool {
+  return match kind {
+    RootEventKind.Focused => true
+    _ => false
+  }
+}
+
+fn width(kind: RootEventKind) -> f32 {
+  return match kind {
+    RootEventKind.Resized { width, .. } => width
+    _ => -1.0
+  }
+}
+
+test effect fn aTreeThatShowsOneRootFailsTheOthers() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run singleBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
