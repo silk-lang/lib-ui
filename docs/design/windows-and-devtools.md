@@ -1,6 +1,7 @@
 # Windows, inspector transports, custom panels, style edits
 
-Status: draft for review. Nothing here is implemented.
+Status: steps 1–4 of the [order of work](#order-of-work) are implemented; the rest is a draft
+for review.
 Code sketches show shape only, not final names or syntax.
 
 ## Summary
@@ -24,7 +25,7 @@ Code sketches show shape only, not final names or syntax.
 | Tree | `ui-protocol`, `ui-tree`, `ui-tree-window` | Nodes, styles, events, roots. Roots are opened imperatively. |
 | Inspector | `ui-inspect`, `ui-inspect-server`, cli, mcp | The tree layer only: tree, roots, styles, events, input, highlight, pick, screenshots, frames, audit, edits. Plus the extension API. |
 | Framework | `ui-app` (silk-ui), or any other | Model, messages, commands. Wraps roots however it likes. Registers its own inspector extension. |
-| Devtools UI | `ui-inspect-devtools` | An inspector client. Built with silk-ui, which is an implementation choice and leaks nothing into the protocol. |
+| Devtools UI | `ui-inspect-devtools` | An inspector client. Built with silk-ui, which is an implementation choice and leaks nothing into the protocol. In the app's process it is a window-host companion (`ui-tree-window`), so it also needs that host. |
 
 Two things in the code break this today:
 
@@ -53,6 +54,10 @@ Frame timings stay in the inspector: the window host produces them.
 | Inspector | The host loop wakes every 20 ms while the inspector is on | `modules/inspect/server/src/server.silk:366` |
 | Inspector | `Protocol.handle` has no socket code; devtools already has a `Link` service with socket and in-process implementations | `protocol.silk:378`, `devtools/src/link.silk:8` |
 | Inspector | Everything is typed against `UiTree`, not `Backend` | `protocol.silk:378` |
+| Inspector | Hidden roots: left out of replies, queries, the event log and topics | `protocol.silk` (`Protocol.hide`) |
+| Inspector | A session in the same process: `openLocal`, served on the spot by `serveLocal` | `server.silk` |
+| Native | A companion beside the client: input, records and frames of its roots, every key first; its root in a window or docked in the first | `modules/tree/window/src/companion.silk` |
+| Devtools | Run in the app's process as that companion, on a hidden root set aside in the tree | `modules/inspect/devtools/src/embedded.silk` |
 | Inspector | Commands are an if/else chain; the MCP tool list is a fixed array | `protocol.silk:417`, `mcp.silk:404` |
 | Inspector | `highlight` exists; devtools only calls it on click | `protocol.silk:784`, `devtools.silk:1128` |
 | Styles | `setStyle` keeps originals per (node, state); no record of the edit; the app's next render of that style wins | `server/src/tools.silk:94` |
@@ -201,9 +206,19 @@ Devtools' existing `Link` becomes the client end of the same pair.
 
 | Mode | How |
 |---|---|
-| Docked in the app window | Devtools root embedded beside the app root |
+| Docked in the app window | Devtools root drawn over the bottom of the app's window; the app's root is laid out in the rest, as its whole window |
 | Own window, same process | Devtools root as an extra root, `MemoryChannel` |
 | Own process | Today's app, `SocketChannel` |
+
+The two same-process modes are one window-host companion (`embedded.silk`): the devtools'
+silk-ui runtime placed in a root and an id range of its own (`Runtime.placeAt`, ids from
+`0xF0000000`), the root set aside in the tree (`UiTree.setAside`) so the app never hears of
+its records, and hidden from the inspector (`Protocol.hide`) so the devtools never inspect
+themselves. A docked root is laid out at the window's size with its content in the dock; the
+host draws its scene over the app's. Each root counts its own revision (`UiTree.revisionOf`),
+so the devtools drawing is no `tree` news. `SILK_UI_DEVTOOLS=window|dock|1` opens them, F12
+toggles them. ui-app-window runs every silk-ui app with them; a tree client calls
+`host.runWindowWith` with them.
 
 **Inspecting other backends.** `Protocol` takes `UiTree`. To inspect a DOM
 program it needs a small interface (tree snapshot, box, styles, highlight) that
@@ -323,7 +338,7 @@ the css package's own property and value tables; arrows step numbers.
 | 1 | Roots in protocol and engine; existing programs unchanged | 3, 4, 5 |
 | 2 | Protocol 3 sessions, `Channel` with memory and socket, pushed topics, hover highlight | Snappy devtools; 4, 5, 6 |
 | 3 | Native host with several windows; `windows` in silk-ui | Multi-window apps |
-| 4 | Embedded and same-process windowed devtools | — |
+| 4 | Embedded and same-process windowed devtools (done) | — |
 | 5 | Extension API; move the program log out of the inspector into `ui-app`; panels with data, then remote views | Framework tabs |
 | 6 | Override layer, edit log, comments, MCP tools | Agent workflow |
 | 7 | Tokens, TOML file, two-way editing | Theme editing |

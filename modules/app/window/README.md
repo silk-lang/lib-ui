@@ -149,5 +149,11 @@ its app-facing `runWindow`, `runWindowHosted`, and `WindowContent` API as an ada
 Direct tree clients can use the same host without creating an app runtime; see
 [the direct-tree example](../../tree/window/demo/src/main.silk).
 
+`runWindowHosted` (and so `runWindow`, `runWindowWith` and `program.show`) runs the host with
+the in-process devtools as its companion (`ui_devtools.embedded.EmbeddedDevtools`, read from the
+environment): in a debug build, `SILK_UI_DEVTOOLS=window`, `dock` or `1` opens them at start and
+F12 toggles them, with no change to the app. They are inert in release builds and in check
+mode. See [ui-inspect-devtools](../../inspect/devtools/README.md#in-the-apps-own-process).
+
 Image loading and native workers are implemented in `ui-tree-window.images` and
 `ui-tree-window.background`. Existing imports from this package remain compatible.

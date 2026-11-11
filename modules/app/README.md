@@ -208,6 +208,12 @@ the model stops declaring it. `w.windowWith` takes a view written with `Ui`, as 
 program that declares no windows renders and sends exactly what it did before.
 
 `harness.clickIn(runtime, tree, root, viewport, "Close")` clicks in a window's root.
+
+A runtime shows its app in the first root with root box `ROOT_ID` (1). `runtime.placeAt(root,
+node)`, before `start`, puts it in root `root` with root box `node` instead; its nodes take the
+ids after `node` and its windows the roots after `root`. That is how a second program shares a
+tree with the first: the devtools in the app's own process are placed at the top of the id
+space ([ui-inspect-devtools](../inspect/devtools/README.md#in-the-apps-own-process)).
 [examples/src/mirror.silk](examples/src/mirror.silk) is a counter in two windows,
 `modules/app/mirror` runs it natively, and [tests/src/windows.silk](tests/src/windows.silk) tests
 it on the headless tree and on the server-side document.
@@ -271,6 +277,10 @@ with `impl Shown`. The window host hands the journal to the inspector, where it 
 `program`, `messages` and `model` commands and the devtools' Program tab
 ([ui-inspect-devtools](../inspect/devtools)). The journal keeps the last 200 steps and is only
 filled while an inspector is attached.
+
+A native app also shows those devtools in its own process, in a window or docked in its own
+(`SILK_UI_DEVTOOLS=window|dock|1`, or F12 in a debug build with `SILK_UI_INSPECT` set); see
+[ui-inspect-devtools](../inspect/devtools/README.md#in-the-apps-own-process).
 
 ## What depends on the tree
 

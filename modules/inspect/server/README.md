@@ -22,6 +22,29 @@ It is off unless both hold:
 When it starts it prints `ui-inspect: listening on ...` to stderr. A socket file left by a crash
 is removed when nothing answers on it.
 
+A client in the app's own process needs neither: `inspector.openLocal()` opens a session over a
+`MemoryChannel`, open from the start, and returns the client's end. It turns the inspector on
+(even one that is `off`) until the client closes its end, and `serveLocal(&mut tree)` serves its
+lines on the spot, so the client can wait for a reply on the same thread. The socket, if there
+is one, keeps serving its clients beside it. The in-process devtools (ui-inspect-devtools'
+`embedded`) are such a client.
+
+### Hidden roots
+
+`inspector.hide(root, true)` leaves a root out of everything the inspector serves, for a client
+that draws in the inspected tree and must not inspect itself:
+
+- `tree`, `hello`, `roots` and the `roots` topic do not list it (`hello` names it in `hidden`),
+  and the `nodes` counts of `hello`, `stats` and the topics leave its nodes out;
+- no query, target (`node` too), `within`, `wait` or `highlight` finds its nodes;
+- its records are not logged (`events`);
+- its changes and frames are no news: the `tree` topic follows the revisions of the roots shown
+  (`UiTree.revisionOf`), and `frame` the frames of the current root, so a client drawing in a
+  hidden root is not woken by its own drawing.
+
+Requests are served with a root that is not hidden current (the window host keeps the first one
+current), as `pick` and screenshots are about the current root.
+
 ## In the app's frame loop
 
 A thread accepts clients, and each connection gets a pump (`channel.bridge`, two threads: one
@@ -111,8 +134,8 @@ topic per frame:
 
 | topic | when | members |
 | --- | --- | --- |
-| `tree` | nodes, text, styles or geometry changed (the tree's `semanticRevision`) | `width`, `height`, `scale`, `nodes` (count), `revision` |
-| `frame` | a frame was drawn | `width`, `height`, `scale`, `nodes` |
+| `tree` | nodes, text, styles or geometry of a root shown changed (the sum of their `revisionOf`) | `width`, `height`, `scale`, `nodes` (count), `revision` |
+| `frame` | a frame of the current root was drawn | `width`, `height`, `scale`, `nodes` |
 | `events` | the event log has new records | `next`: the `seq` the next record gets |
 | `roots` | a root opened or closed | `roots`, as `tree` lists them |
 | `highlight` | the highlight changed | `nodes` |
@@ -130,7 +153,7 @@ Node objects in replies are `{"id", "kind", "role", "name", "testId", "x", "y", 
 
 | cmd | members | reply |
 | --- | --- | --- |
-| `hello` | `protocol` (3 opens a session), `client`, `wants` (topics) | `protocol` (3), `commands`, `capabilities` (`commands`, `topics`, `sessions`), `extensions` (none yet), `width`, `height`, `scale`, `frame`, `root`, `roots`, `nodes`, `highlight` |
+| `hello` | `protocol` (3 opens a session), `client`, `wants` (topics) | `protocol` (3), `commands`, `capabilities` (`commands`, `topics`, `sessions`), `extensions` (none yet), `width`, `height`, `scale`, `frame`, `root`, `roots`, `hidden` (roots left out), `nodes`, `highlight` |
 | `subscribe` | `topics` | `topics`: subscribed now (sessions only) |
 | `unsubscribe` | `topics` | `topics`: subscribed now (sessions only) |
 | `snapshot` | target (optional, a subtree), `styles` | `text`: `describe` output, `frame` |
@@ -214,6 +237,10 @@ silk task native inspect      # the CLI drives the demo in a window
   query that waits for the app's frame, a pending wait, bad JSON, `close` removing the socket
   file), and a protocol 3 session: several requests on one connection, a pushed topic, a
   one-shot client beside it, and the session ending with its connection.
+- A hidden root beside the inbox, with a local session on an inspector that is off: hello,
+  tree, query (within the root too), inspect and highlight leave its nodes out, its records are
+  not logged, five changes and frames of it push nothing while a change to the app pushes
+  `tree`, and the inspector is off again once the client closes its end.
 - The MCP bridge over the same fixture (see [ui-inspect-mcp](../mcp/README.md#tests)).
 - `demo inspect` (CI job `demo` in ui-inspect.yml): snapshot, click New by role and name, wait
   for the new row, highlight Archive, inspect it, screenshot to a PNG.

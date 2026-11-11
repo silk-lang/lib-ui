@@ -128,8 +128,23 @@ root's node is the viewport's child, and a root that comes back after another wa
 skips layout unless its own nodes or size changed. A change that reaches a waiting root from
 outside (a node moved out of it, a font family or resource redefined) marks it `touched`, and
 its next frame styles and lays out again. `needsFrameOf(root)` answers `needsFrame` for any
-root, so a host with a window per root frames only the windows that need it. With one root
+root, so a host with a window per root frames only the windows that need it, and `sceneOf(root)`
+gives any root's last scene, for a host that draws two roots on one surface. With one root
 nothing changes.
+
+Each root also counts its own changes: `revisionOf(root)` moves when its nodes, their text,
+styles, focus or geometry change (a mutation counts for the root that holds its node; a new,
+detached node for none; a font family or resource for every root), and `stats` is the current
+root's last frame's. So a client that watches some roots, such as the inspector, is not woken
+by the others. `semanticRevision` still counts every change.
+
+A root can be set aside for a second client that shares the tree (`setAside(root, true)`): the
+records whose path starts at its node and its root events wait for `takeEventsOf(root)` and
+`takeRootEventsOf(root)`, and `takeEvents` and `takeRootEvents` leave them, so the client that
+owns the rest of the tree never hears of it. Devtools drawn in the app's own process are such a
+client (`ui-inspect-devtools`' `embedded`). The second client applies its batches with its root
+current, so the nodes it makes count for its root and the first client's root needs no frame
+for them.
 
 Element events need no root: the first id of their path is the root's node. What happens to a
 root itself comes as a `RootEvent` (`ui_protocol.root`): `CloseRequested`, `Resized`, `Focused`,
