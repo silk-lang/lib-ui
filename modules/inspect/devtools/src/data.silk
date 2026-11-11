@@ -205,6 +205,19 @@ pub struct PanelInfo {
   pub view: String,
 }
 
+/// One line of a panel's data as the generic view shows it: a member or an element, indented
+/// by depth, with its value when that is not an object or an array.
+pub struct DataRow {
+  pub depth: u32,
+  /// The member's name, or the element's index.
+  pub key: String,
+  /// The value as JSON text; empty for an object or an array, whose members follow.
+  pub value: String,
+}
+
+/// The most rows the generic view shows of a panel's data.
+pub const DATA_LIMIT: usize = 400
+
 /// A request sent with `Link.ask` whose reply did not come yet, and what it is for.
 pub struct Asked {
   pub id: u64,
@@ -675,6 +688,85 @@ pub effect fn parseExtensions(
     }
     Option<&List<Value>>.None => {}
   }
+}
+
+/// Appends the rows of `value` at `depth`, under `key`, up to [`DATA_LIMIT`] rows.
+effect fn dataRows(value: &Value, key: string, depth: u32, out: &mut List<DataRow>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if out.length() >= DATA_LIMIT {
+    return ()
+  }
+  let mut text = String.make()
+  match &value.* {
+    Value.Object { entries } => {
+      if key != "" {
+        run out.append(DataRow { depth: depth, key: run String.copy(key), value: String.make() })
+      }
+      let members = entries.asSlice()
+      let inner = if key == "" {
+        depth
+      } else {
+        depth + 1
+      }
+      let mut i: usize = 0
+      while i < members.length {
+        let name = String.view(&members[i].key)
+        if !(depth == 0 && key == "" && (name == "ok" || name == "id")) {
+          run dataRows(&members[i].value, name, inner, &mut out)
+        }
+        i = i + 1
+      }
+      return ()
+    }
+    Value.Array { values } => {
+      let list = values.asSlice()
+      let empty = if list.length == 0 {
+        run String.copy("[]")
+      } else {
+        String.make()
+      }
+      run out.append(DataRow { depth: depth, key: run String.copy(key), value: move empty })
+      let mut i: usize = 0
+      while i < list.length {
+        let mut index = String.make()
+        run writeInt(&mut index, usize.toU64(i))
+        run dataRows(&list[i], String.view(&index), depth + 1, &mut out)
+        i = i + 1
+      }
+      return ()
+    }
+    Value.String { text: s } => {
+      run text.append("\"")
+      run text.append(String.view(&s))
+      run text.append("\"")
+    }
+    Value.Number { value: number } => {
+      run appendNumber(&mut text, &number)
+    }
+    Value.Bool { value: b } => {
+      run text.append(
+        if b {
+          "true"
+        } else {
+          "false"
+        },
+      )
+    }
+    Value.Null => {
+      run text.append("null")
+    }
+  }
+  run out.append(DataRow { depth: depth, key: run String.copy(key), value: move text })
+}
+
+/// A panel's data (the reply of its command, without `ok` and `id`) as rows for the generic
+/// view: an object's members and an array's elements, nested ones indented.
+pub effect fn parseData(reply: &Value, out: &mut List<DataRow>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  run dataRows(reply, "", 0, &mut out)
 }
 
 /// The strings of array `value` joined with `, `.

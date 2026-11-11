@@ -32,8 +32,11 @@ import data {
   parseFrames,
   parseIssues,
   parseExtensions,
+  parseData,
   matches,
   PanelInfo,
+  DataRow,
+  ASK_DATA,
   Asked,
   ASK_STEPS,
   ASK_PROGRAM,
@@ -106,6 +109,8 @@ pub enum Panel {
   Frames,
   Audit,
   Stats,
+  /// A panel an extension of the app adds (`Devtools.shown` says which).
+  Extension,
 }
 
 /// How many frames the timeline shows.
@@ -132,6 +137,8 @@ pub union Message {
   /// Fold or unfold the children of node `id`.
   Collapse { pub id: u32 },
   Show { pub panel: Panel },
+  /// Show the extension panel at `index` of `Devtools.panels`.
+  ShowPanel { pub index: usize },
   SelectNext,
   SelectPrevious,
   ClearSelection,
@@ -248,6 +255,10 @@ pub struct Devtools {
   pub names: List<String>,
   /// The requests whose replies come with the notifications.
   pub asked: List<Asked>,
+  /// The extension panel shown while `panel` is `Extension`, and its data as the generic view
+  /// shows it.
+  pub shown: usize,
+  pub data: List<DataRow>,
 }
 
 impl Devtools {
@@ -291,7 +302,17 @@ impl Devtools {
       panels: List<PanelInfo>.make(),
       names: List<String>.make(),
       asked: List<Asked>.make(),
+      shown: 0,
+      data: List<DataRow>.make(),
     }
+  }
+
+  /// The extension panel that shows, if one does.
+  pub fn shownPanel(self: &Self) -> Option<&PanelInfo> {
+    if self.panel != Panel.Extension || self.shown >= self.panels.length() {
+      return Option<&PanelInfo>.None
+    }
+    return Option<&PanelInfo>.some(&self.panels.asSlice()[self.shown])
   }
 
   /// Whether the app has extension `id`.
@@ -321,7 +342,46 @@ impl Devtools {
     if self.live && self.panel == Panel.Program && self.hasProgram() {
       run names.append(run String.copy("silk-ui.message"))
     }
+    if self.live {
+      if let Option<&PanelInfo>.Some { value: panel } = self.shownPanel() {
+        if panel.topic.ownedByteLength() != 0 {
+          run names.append(run String.copy(String.view(&panel.topic)))
+        }
+      }
+    }
     return move names
+  }
+
+  /// Reads the data of the extension panel that shows, when it has data.
+  fn readPanel(self: &mut Self, cx: &mut Context<Command>) -> () {
+    let mut line = String.make()
+    if let Option<&PanelInfo>.Some { value: panel } = self.shownPanel() {
+      if panel.data.ownedByteLength() != 0 {
+        line = cx.alloc(String.copy("{\"cmd\":"))
+        cx.alloc(writeString(&mut line, String.view(&panel.data)))
+        cx.alloc(line.append("}"))
+      }
+    }
+    if line.ownedByteLength() != 0 {
+      let index = self.shown
+      self.ask(&mut cx, String.view(&line), ASK_DATA, index)
+    }
+  }
+
+  /// Whether `names` has the topic of the extension panel that shows.
+  fn panelNews(self: &Self, names: &List<String>) -> bool {
+    if let Option<&PanelInfo>.Some { value: panel } = self.shownPanel() {
+      let list = names.asSlice()
+      let mut i: usize = 0
+      while i < list.length {
+        if panel.topic.ownedByteLength() != 0
+          && String.view(&list[i]) == String.view(&panel.topic) {
+          return true
+        }
+        i = i + 1
+      }
+    }
+    return false
   }
 
   /// Sends request `line` for `purpose` without waiting.
@@ -381,6 +441,9 @@ impl Devtools {
       self.program = cx.alloc(parseProgram(&reply))
     } else if asked.purpose == ASK_MODEL {
       self.opened = cx.alloc(parseModel(&reply))
+    } else if asked.purpose == ASK_DATA && self.panel == Panel.Extension
+      && asked.index == self.shown {
+      cx.alloc(parseData(&reply, &mut self.data))
     }
   }
 
@@ -1677,6 +1740,21 @@ impl Devtools {
               self.panel == Panel.Stats,
               || Message.Show { panel: Panel.Stats },
             )
+
+            // The tabs of the app's extensions, as `hello` lists them.
+            ui.enumerate(
+              self.panels.asSlice(),
+              |panel| 0,
+              |ui, index, panel| {
+                ui.key(usize.toU64(index) + 1)
+                barButton(
+                  &mut ui,
+                  String.view(&panel.title),
+                  self.panel == Panel.Extension && self.shown == index,
+                  || Message.ShowPanel { index: index },
+                )
+              },
+            )
           },
         )
         ui.column(
@@ -1693,6 +1771,7 @@ impl Devtools {
               Panel.Frames => self.framesPanel(&mut ui)
               Panel.Audit => self.auditPanel(&mut ui)
               Panel.Stats => self.statsPanel(&mut ui)
+              Panel.Extension => self.extensionPanel(&mut ui)
             }
           },
         )
@@ -2302,6 +2381,52 @@ impl Devtools {
     )
   }
 
+  /// An extension's panel: its data, members and elements in rows, nested ones indented.
+  fn extensionPanel(self: &Self, ui: &mut Ui<Message>) -> () {
+    if self.data.length() == 0 {
+      muted(&mut ui, "No data yet.")
+      return ()
+    }
+    ui.column(
+      |ui| {
+        ui.testId("panel-data")
+        ui.accessRole(Role.List)
+        ui.enumerate(
+          self.data.asSlice(),
+          |row| 0,
+          |ui, index, row| {
+            ui.key(usize.toU64(index))
+            ui.row(
+              |ui| {
+                ui.accessRole(Role.ListItem)
+                ui.style(
+                  &[
+                    css.whiteSpace(WhiteSpace.NoWrap),
+                    css.paddingLeft(px(u32.toF32(row.depth) * 12.0)),
+                    css.columnGap(px(6.0)),
+                  ],
+                )
+                border(&mut ui, Property.BorderBottomWidth, BAR)
+                ui.box(
+                  |ui| {
+                    ui.color(rgb(ATTRIBUTE))
+                    ui.text(String.view(&row.key))
+                  },
+                )
+                ui.box(
+                  |ui| {
+                    ui.color(rgb(TEXT))
+                    ui.text(String.view(&row.value))
+                  },
+                )
+              },
+            )
+          },
+        )
+      },
+    )
+  }
+
   fn statsPanel(self: &Self, ui: &mut Ui<Message>) -> () {
     if self.stats.length() == 0 {
       muted(&mut ui, "No frame stats yet.")
@@ -2413,6 +2538,12 @@ impl App<Message, Command> for Devtools {
         self.panel = panel
         self.sync(&mut cx)
       }
+      Message.ShowPanel { index } => {
+        self.panel = Panel.Extension
+        self.shown = index
+        self.data.clear()
+        self.sync(&mut cx)
+      }
       Message.Search { value } => {
         self.search = move value
         self.updateVisibility()
@@ -2497,7 +2628,8 @@ impl App<Message, Command> for Devtools {
         ) {
           self.extensions = move value
           self.panels = Intrinsic.replace(s.panels, List<PanelInfo>.make())
-          if self.panel == Panel.Program && !self.hasProgram() {
+          if (self.panel == Panel.Program && !self.hasProgram())
+            || (self.panel == Panel.Extension && self.shown >= self.panels.length()) {
             self.panel = Panel.Styles
           }
           self.resubscribe(&mut cx)
@@ -2513,6 +2645,9 @@ impl App<Message, Command> for Devtools {
         }
         if full || news {
           self.readProgram(&mut cx)
+        }
+        if full || self.panelNews(&s.news) {
+          self.readPanel(&mut cx)
         }
         if s.parts == 0 && s.frames.isNone() {
           return ()

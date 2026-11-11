@@ -322,3 +322,59 @@ test effect fn devtoolsInspectTheTodoApp() -> ()
   let mut allocator = Allocator.systemAllocatorProvider()
   run body() |> Effect.provideMut<Allocator>(&mut allocator)
 }
+
+/// Takes what the app pushed and the replies that came, as the window does when the app wakes it.
+effect fn pull(
+  devtools: &mut Runtime<Devtools, Message, Command>,
+  tree: &mut UiTree<'_>,
+  app: &mut Inspected<'_>,
+) -> ()
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  devtools.send(Message.Pull)
+  run drain(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
+}
+
+effect fn dataPanelBody() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut app = run Inspected.make(&collection)
+  run app.addNotes()
+  run app.notes.add("milk")
+  let mut tree = run devtoolsTree(&collection)
+  let mut devtools = Runtime<Devtools, Message, Command>.make(run Devtools.make("notes (test)"))
+  run devtools.start(&mut tree, 0.0)
+  devtools.send(Message.Refresh)
+  run drain(&mut devtools, &mut tree) |> Effect.provideMut<Link>(&mut app)
+
+  // The tab bar comes from hello: the extension's panel is a tab.
+  run Testing.expect(devtools.model.panels.length() == 1, "hello lists the panel")
+  let bar = run snapshot(&mut tree, viewport())
+  run Testing.expect(String.contains(String.view(&bar), "\"Notes\""), "a tab for it")
+  run Testing.expect(
+    run click(&mut devtools, &mut tree, viewport(), "Notes") |> Effect.provideMut<Link>(&mut app),
+    "the tab opens",
+  )
+  run Testing.expect(devtools.model.panel == Panel.Extension, "the extension's panel shows")
+
+  // Its data comes when the app serves the extension, shown in rows.
+  run pull(&mut devtools, &mut tree, &mut app)
+  let shown = run snapshot(&mut tree, viewport())
+  run Testing.expect(String.contains(String.view(&shown), "\"\\\"milk\\\"\""), "the data shows")
+  run Testing.expect(String.contains(String.view(&shown), "\"done\""), "member by member")
+
+  // The panel's topic says the data changed: it is read again.
+  run app.notes.add("eggs")
+  run app.serveExtension()
+  run pull(&mut devtools, &mut tree, &mut app)
+  run pull(&mut devtools, &mut tree, &mut app)
+  let again = run snapshot(&mut tree, viewport())
+  run Testing.expect(String.contains(String.view(&again), "\"\\\"eggs\\\"\""), "read again")
+}
+
+test effect fn devtoolsShowAnExtensionsDataPanel() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run dataPanelBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
