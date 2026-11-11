@@ -130,6 +130,10 @@ pub struct RootState {
   pub focusVisible: bool,
   /// The input of the root's last frame: its viewport.
   pub input: FrameInput,
+  /// What the root's last frame did.
+  pub stats: FrameStats,
+  /// Changes to the root's published semantics or geometry (see `UiTree.revisionOf`).
+  pub revision: u64,
   /// What the root's last layout and paint left behind, and what changed since, so a root
   /// nothing reached while it waited is neither laid out nor painted again when it is current.
   laidOut: FrameInput,
@@ -190,6 +194,8 @@ impl RootState {
       focused: NONE,
       focusVisible: false,
       input: FrameInput { width: 0.0, height: 0.0, scale: 1.0, time: 0.0 },
+      stats: FrameStats.zero(),
+      revision: 0,
       laidOut: FrameInput { width: -1.0, height: -1.0, scale: 0.0, time: 0.0 },
       laidOutRevision: usize.MAX,
       laidOutScrolls: usize.MAX,
@@ -279,6 +285,18 @@ fn nodeOf(mutation: &Mutation) -> u32 {
   }
 }
 
+/// Whether a mutation that names no node changes every root: a resource, a font family. A new
+/// node is nobody's yet, and a root mutation changes its own root.
+fn reachesEveryRoot(mutation: &Mutation) -> bool {
+  return match &mutation.* {
+    Mutation.Create { .. } => false
+    Mutation.OpenRoot { .. } => false
+    Mutation.UpdateRoot { .. } => false
+    Mutation.CloseRoot { .. } => false
+    _ => true
+  }
+}
+
 struct FontKeyEntry {
   family: u32,
   size: f32,
@@ -339,11 +357,15 @@ fn applyAll(computed: &mut Computed, list: &List<Declaration>) -> () {
 /// It holds several roots (`Mutation.OpenRoot`), each laid out in its own viewport, in one id
 /// space and with one glyph atlas. One root at a time is current: `frame`, `scene`, hit testing,
 /// the geometry queries and pointer input are about it, and the per-root fields below (`root`,
-/// `focused`, `input`, `output`, the scenes, hover, press and capture) are its state. The other
-/// open roots wait in `parked`. [`UiTree.useRoot`] and [`UiTree.frameRoot`] change the current
-/// root; key and text input go to `keyRoot`. A root keeps what its last layout and paint left
-/// with its state, so changing roots costs no layout or paint of its own: a root is laid out
-/// and painted again only for what changed in it. `apply` leaves the current root as it was.
+/// `focused`, `input`, `stats`, `revision`, `output`, the scenes, hover, press and capture) are
+/// its state. The other open roots wait in `parked`. [`UiTree.useRoot`] and
+/// [`UiTree.frameRoot`] change the current root; key and text input go to `keyRoot`. A root
+/// keeps what its last layout and paint left with its state, so changing roots costs no layout
+/// or paint of its own: a root is laid out and painted again only for what changed in it.
+/// `apply` leaves the current root as it was.
+///
+/// A root can be set aside for a second client that shares the tree, such as devtools running
+/// in the app's process (`setAside`): its records and root events wait for that client.
 pub struct UiTree<'a> {
   /// Tree-owned virtualization controllers. Use mutations and `virtualRange` to access them.
   pub virtualLists: List<VirtualList>,
@@ -380,6 +402,8 @@ pub struct UiTree<'a> {
   pub frameNumber: u64,
   /// Changes to published semantics or allocated geometry.
   pub semanticRevision: u64,
+  /// The changes of `semanticRevision` that reached the current root (see `revisionOf`).
+  pub revision: u64,
   pub input: FrameInput,
   laidOut: FrameInput,
   laidOutRevision: usize,
@@ -477,6 +501,10 @@ pub struct UiTree<'a> {
   pub rootSupport: RootSupport,
   /// Root events for the client, oldest first.
   pub rootEvents: List<RootEvent>,
+  /// The roots set aside for a second client in the same tree (see `setAside`).
+  pub aside: List<u32>,
+  /// What `sceneOf` gives for a root that is not open.
+  empty: Scene,
 }
 
 impl<'a> UiTree<'a> {
@@ -523,6 +551,7 @@ impl<'a> UiTree<'a> {
       stylesDirty: true,
       frameNumber: 0,
       semanticRevision: 0,
+      revision: 0,
       input: FrameInput { width: 0.0, height: 0.0, scale: 1.0, time: 0.0 },
       laidOut: FrameInput { width: -1.0, height: -1.0, scale: 0.0, time: 0.0 },
       laidOutRevision: usize.MAX,
@@ -579,6 +608,8 @@ impl<'a> UiTree<'a> {
       pendingRoot: FIRST_ROOT,
       rootSupport: RootSupport { count: u32.MAX, extra: ExtraRoot.Surface },
       rootEvents: List<RootEvent>.make(),
+      aside: List<u32>.make(),
+      empty: Scene.make(),
     }
   }
 
@@ -711,11 +742,20 @@ impl<'a> UiTree<'a> {
     ? &mut Allocator {
     self.semanticRevision = self.semanticRevision + 1
     let about = nodeOf(&mutation)
-    if about != NONE && self.parked.length() != 0 {
+    if self.parked.length() == 0 {
+      self.revision = self.revision + 1
+    } else if about != NONE {
+      // The change is the root's that holds the node; one to a detached node is nobody's yet.
       let slot = self.slotOf(about)
       if slot != NONE {
-        run self.useRootOf(slot)
+        let holder = self.rootOfTop(self.topOf(slot))
+        if holder != NONE {
+          drop run self.useRoot(holder)
+          self.revision = self.revision + 1
+        }
       }
+    } else if reachesEveryRoot(&mutation) {
+      self.changedEveryRoot()
     }
     self.applied = true
     match move mutation {
@@ -897,11 +937,13 @@ impl<'a> UiTree<'a> {
         let slot = run self.require(index, node)
         let owner = self.rootHolding(slot)
         run self.openRoot(index, root, slot, move options)
+        self.changedRoot(root)
         if owner != NONE && owner != root {
           self.touchRoot(owner)
         }
       }
       Mutation.UpdateRoot { root, options } => {
+        self.changedRoot(root)
         if root == self.current {
           if self.currentOpen {
             self.currentOptions = move options
@@ -1381,7 +1423,11 @@ impl<'a> UiTree<'a> {
 
   /// The id of the open root `slot` is in, or NONE for a node in none.
   pub fn rootHolding(self: &Self, slot: u32) -> u32 {
-    let top = self.topOf(slot)
+    return self.rootOfTop(self.topOf(slot))
+  }
+
+  /// The id of the open root whose node is `top`, or NONE.
+  fn rootOfTop(self: &Self, top: u32) -> u32 {
     if top == self.root && self.currentOpen {
       return self.current
     }
@@ -1396,9 +1442,48 @@ impl<'a> UiTree<'a> {
     return NONE
   }
 
+  /// How often what root `root` publishes changed: its nodes, their text, styles, focus or
+  /// geometry. A change to one root leaves the others' revisions alone, so a client that
+  /// watches some roots is not woken by the rest. 0 for a root that is not open.
+  pub fn revisionOf(self: &Self, root: u32) -> u64 {
+    if root == self.current {
+      return self.revision
+    }
+    let at = self.parkedIndex(root)
+    if at == usize.MAX {
+      return 0
+    }
+    return self.parked.asSlice()[at].revision
+  }
+
+  /// Counts a change to root `root` in its revision.
+  fn changedRoot(self: &mut Self, root: u32) -> () {
+    if root == self.current {
+      self.revision = self.revision + 1
+      return ()
+    }
+    let at = self.parkedIndex(root)
+    if at != usize.MAX {
+      let parked = self.parked.asMutSlice()
+      parked[at].revision = parked[at].revision + 1
+    }
+  }
+
+  /// Counts a change to every root in their revisions.
+  fn changedEveryRoot(self: &mut Self) -> () {
+    self.revision = self.revision + 1
+    let parked = self.parked.asMutSlice()
+    let mut i: usize = 0
+    while i < parked.length {
+      parked[i].revision = parked[i].revision + 1
+      i = i + 1
+    }
+  }
+
   /// Says that something reached open root `root`'s nodes from outside it, so its next frame
   /// styles and lays out again (see `RootState.touched`).
   fn touchRoot(self: &mut Self, root: u32) -> () {
+    self.changedRoot(root)
     if root == self.current {
       self.stylesDirty = true
       self.applied = true
@@ -1493,6 +1578,8 @@ impl<'a> UiTree<'a> {
         self.input,
         FrameInput { width: 0.0, height: 0.0, scale: 1.0, time: 0.0 },
       ),
+      stats: Intrinsic.replace(self.stats, FrameStats.zero()),
+      revision: Intrinsic.replace(self.revision, 0),
       laidOut: Intrinsic.replace(
         self.laidOut,
         FrameInput { width: -1.0, height: -1.0, scale: 0.0, time: 0.0 },
@@ -1552,6 +1639,8 @@ impl<'a> UiTree<'a> {
     self.focused = s.focused
     self.focusVisible = s.focusVisible
     self.input = s.input
+    self.stats = s.stats
+    self.revision = s.revision
     self.laidOut = s.laidOut
     self.laidOutRevision = s.laidOutRevision
     self.laidOutScrolls = s.laidOutScrolls
@@ -1683,16 +1772,9 @@ impl<'a> UiTree<'a> {
     if self.parked.length() == 0 {
       return ()
     }
-    let top = self.topOf(slot)
-    let parked = self.parked.asSlice()
-    let mut i: usize = 0
-    while i < parked.length {
-      if parked[i].root == top {
-        let id = parked[i].id
-        drop run self.useRoot(id)
-        return ()
-      }
-      i = i + 1
+    let holder = self.rootOfTop(self.topOf(slot))
+    if holder != NONE {
+      drop run self.useRoot(holder)
     }
   }
 
@@ -1829,12 +1911,102 @@ impl<'a> UiTree<'a> {
     run self.rootEvents.append(event)
   }
 
-  /// Moves the queued root events to `out`, oldest first.
+  /// Moves the queued root events to `out`, oldest first, but those of roots set aside.
   pub effect fn takeRootEvents(self: &mut Self, out: &mut List<RootEvent>) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
-    run out.appendSlice(self.rootEvents.asSlice())
-    self.rootEvents.clear()
+    if self.aside.length() == 0 {
+      run out.appendSlice(self.rootEvents.asSlice())
+      self.rootEvents.clear()
+      return ()
+    }
+    let mut i: usize = 0
+    while i < self.rootEvents.length() {
+      if self.isAside(self.rootEvents.get(i).root) {
+        i = i + 1
+      } else {
+        run out.append(self.rootEvents.remove(i))
+      }
+    }
+  }
+
+  /// Moves the queued root events of root `root` to `out`, oldest first.
+  pub effect fn takeRootEventsOf(self: &mut Self, root: u32, out: &mut List<RootEvent>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut i: usize = 0
+    while i < self.rootEvents.length() {
+      if self.rootEvents.get(i).root == root {
+        run out.append(self.rootEvents.remove(i))
+      } else {
+        i = i + 1
+      }
+    }
+  }
+
+  /// Sets root `root` aside for a second client that shares the tree, or gives it back: the
+  /// records whose path starts at its node and its root events wait for `takeEventsOf` and
+  /// `takeRootEventsOf`, and `takeEvents` and `takeRootEvents` leave them. The client that
+  /// owns the rest of the tree then never hears of it. The root need not be open yet.
+  pub effect fn setAside(self: &mut Self, root: u32, aside: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut i: usize = 0
+    while i < self.aside.length() {
+      if self.aside.get(i) == root {
+        drop self.aside.remove(i)
+      } else {
+        i = i + 1
+      }
+    }
+    if aside {
+      run self.aside.append(root)
+    }
+  }
+
+  /// Whether root `root` is set aside (see `setAside`).
+  pub fn isAside(self: &Self, root: u32) -> bool {
+    let list = self.aside.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      if list[i] == root {
+        return true
+      }
+      i = i + 1
+    }
+    return false
+  }
+
+  /// Whether a record whose path starts at node `first` belongs to a root set aside.
+  fn asideRecord(self: &Self, first: u32) -> bool {
+    let list = self.aside.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      let node = self.rootNode(list[i])
+      if node != NONE && node == first {
+        return true
+      }
+      i = i + 1
+    }
+    return false
+  }
+
+  /// The scene of root `root`'s last frame, current or not, finished and ready to draw. A host
+  /// that draws several roots on one surface composes them from these. Empty for a root that
+  /// is not open.
+  pub fn sceneOf(self: &Self, root: u32) -> &Scene {
+    if root == self.current {
+      return self.scene()
+    }
+    let at = self.parkedIndex(root)
+    if at == usize.MAX {
+      return &self.empty
+    }
+    let state = &self.parked.asSlice()[at]
+    if state.flipped {
+      return &state.sceneB
+    }
+    return &state.sceneA
   }
 
   /// Makes `slot` the current root's node. The previous one is detached.
@@ -1895,6 +2067,7 @@ impl<'a> UiTree<'a> {
       return ()
     }
     self.semanticRevision = self.semanticRevision + 1
+    self.revision = self.revision + 1
     let previous = self.focused
     self.focused = slot
     run edit.focusChanged(&mut self, previous, slot)
@@ -2109,10 +2282,14 @@ impl<'a> UiTree<'a> {
     return run edit.caretRectOf(self, slot)
   }
 
-  /// Moves the queued event records to `out`, oldest first.
+  /// Moves the queued event records to `out`, oldest first, but those of roots set aside.
   pub effect fn takeEvents(self: &mut Self, out: &mut List<Event>) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
+    if self.aside.length() != 0 {
+      run self.takeWhere(NONE, &mut out)
+      return ()
+    }
     let mut reversed = List<Event>.make()
     while true {
       match self.events.pop() {
@@ -2134,6 +2311,65 @@ impl<'a> UiTree<'a> {
         }
       }
     }
+  }
+
+  /// Moves the queued records whose path starts at root `root`'s node to `out`, oldest first:
+  /// what a client that owns a root set aside takes (see `setAside`).
+  pub effect fn takeEventsOf(self: &mut Self, root: u32, out: &mut List<Event>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.rootNode(root) == NONE {
+      return ()
+    }
+    run self.takeWhere(root, &mut out)
+  }
+
+  /// Moves the records of root `root` to `out`, or with NONE, every record of no root set aside.
+  effect fn takeWhere(self: &mut Self, root: u32, out: &mut List<Event>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let node = if root == NONE {
+      NONE
+    } else {
+      self.rootNode(root)
+    }
+    let mut kept = List<Event>.make()
+    let mut reversed = List<Event>.make()
+    while true {
+      match self.events.pop() {
+        Option<Event>.Some { value } => {
+          run reversed.append(move value)
+        }
+        Option<Event>.None => {
+          break
+        }
+      }
+    }
+    while true {
+      match reversed.pop() {
+        Option<Event>.Some { value } => {
+          let first = if value.path.length() == 0 {
+            NONE
+          } else {
+            value.path.get(0)
+          }
+          let taken = if root == NONE {
+            first == NONE || !self.asideRecord(first)
+          } else {
+            first == node
+          }
+          if taken {
+            run out.append(move value)
+          } else {
+            run kept.append(move value)
+          }
+        }
+        Option<Event>.None => {
+          break
+        }
+      }
+    }
+    self.events = move kept
   }
 
   effect fn refreshSources(self: &mut Self, resource: u32) -> ()
@@ -2470,6 +2706,7 @@ impl<'a> UiTree<'a> {
     self.output.fragments.resolveLocations()
     self.paintCachesStale = true
     self.semanticRevision = self.semanticRevision + 1
+    self.revision = self.revision + 1
     self.laidOutRevision = usize.MAX
     self.stats.layout = self.output.stats
     self.stats.layoutSkipped = false
@@ -2557,6 +2794,7 @@ impl<'a> UiTree<'a> {
     self.output.fragments.resolveLocations()
     self.paintCachesStale = true
     self.semanticRevision = self.semanticRevision + 1
+    self.revision = self.revision + 1
     self.laidOut = self.input
     self.laidOutRevision = self.layout.revision()
     self.laidOutScrolls = self.layout.scrollRevision()

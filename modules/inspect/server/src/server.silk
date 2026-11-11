@@ -16,6 +16,11 @@
 //!
 //! A connection whose first line is `hello` with `"protocol": 3` stays open; any other gets one
 //! reply and is closed, as in protocol 2.
+//!
+//! A client in the same process, such as devtools drawn in the app's own tree, needs no socket:
+//! [`Inspector.openLocal`] gives it the other end of a [`MemoryChannel`] session, served on the
+//! spot by [`Inspector.serveLocal`]. The inspector is on while such a session is open, socket or
+//! not, and that client's roots can be left out of everything it serves ([`Inspector.hide`]).
 import protocol { Protocol }
 import program { ProgramLog }
 import channel { Channel, MemoryChannel, MemoryPair, Wake, NoWake }
@@ -215,6 +220,8 @@ pub struct Inspector {
 struct Served {
   session: Session,
   channel: MemoryChannel,
+  /// The client is in this process (`openLocal`).
+  local: bool,
 }
 
 /// What the accept thread and the UI thread share.
@@ -339,9 +346,68 @@ impl Inspector {
     }
   }
 
-  /// Whether the server is listening.
+  /// Whether the server is on: listening, or serving a client in this process.
   pub fn enabled(self: &Self) -> bool {
-    return self.listener.isSome() || self.acceptor.isSome()
+    return self.listener.isSome() || self.acceptor.isSome() || self.hasLocal()
+  }
+
+  /// Whether a session opened with `openLocal` is open.
+  fn hasLocal(self: &Self) -> bool {
+    let list = self.sessions.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      if list[i].local {
+        return true
+      }
+      i = i + 1
+    }
+    return false
+  }
+
+  /// Opens a session for a client in this process and returns the client's end of its channel:
+  /// the session is open from the start (no `hello` needed), its lines are served by
+  /// `serveLocal`, and it hears the topics it subscribes to as a socket client does. It turns
+  /// the inspector on, socket or not, until the client closes its end. Works on an inspector
+  /// that is `off`.
+  pub effect fn openLocal(self: &mut Self) -> MemoryChannel
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let pair = run MemoryChannel.pair()
+    let MemoryPair { first, second } = move pair
+    run self.sessions.append(Served { session: Session.open(), channel: move first, local: true })
+    return move second
+  }
+
+  /// Serves every line the clients in this process sent, at once, against `tree`: their
+  /// requests are answered before this returns, so such a client can wait for a reply on the
+  /// same thread. Input a request dispatches waits for the host, as from `poll`. Returns
+  /// whether a line was served.
+  pub effect fn serveLocal(self: &mut Self, tree: &mut UiTree<'_>) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut any = false
+    let mut i: usize = 0
+    while i < self.sessions.length() {
+      if self.sessions.asSlice()[i].local {
+        let served = &mut self.sessions.asMutSlice()[i]
+        while run served.session.serveNext(&mut self.protocol, &mut tree)
+          |> Effect.provideMut<Channel>(&mut served.channel) {
+          self.served = self.served + 1
+          any = true
+        }
+      }
+      i = i + 1
+    }
+    self.release()
+    return any
+  }
+
+  /// Leaves root `root` out of everything the inspector serves, or shows it again (see
+  /// `Protocol.hide`): for the roots of a client in this process that draws in the tree.
+  pub effect fn hide(self: &mut Self, root: u32, on: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.protocol.hide(root, on)
   }
 
   /// Where it listens (TCP with the port the system chose).
@@ -403,7 +469,8 @@ impl Inspector {
   /// served. None when the inspector is off, or when it wakes the loop itself (`wakeWith`) and
   /// no request waits: wait as usual. 0 while requests wait, 0.02 without a wake.
   pub fn pollInterval(self: &Self) -> Option<f64> {
-    if !self.enabled() {
+    if !self.enabled() || (self.listener.isNone() && self.acceptor.isNone()) {
+      // Off, or serving only clients in this process, which are served on the spot.
       return Option<f64>.None
     }
     if !self.woken {
@@ -501,7 +568,9 @@ impl Inspector {
     let state = guard.getMut()
     while state.arrived.length() != 0 {
       let channel = state.arrived.remove(0)
-      run self.sessions.append(Served { session: Session.make(), channel: move channel })
+      run self.sessions.append(
+        Served { session: Session.make(), channel: move channel, local: false },
+      )
     }
   }
 
@@ -665,6 +734,9 @@ impl Inspector {
   /// Whether the app should draw [`Inspector.scene`] after a highlight change or input, or
   /// because a subscribed topic changed again in a frame that already told it.
   pub fn wantsFrame(self: &Self) -> bool {
+    if !self.enabled() {
+      return false
+    }
     return self.protocol.dispatched || self.protocol.repaint || self.protocol.changes.held != 0
   }
 

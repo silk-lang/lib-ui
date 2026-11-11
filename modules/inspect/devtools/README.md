@@ -18,7 +18,7 @@ Packages:
 - `modules/inspect/devtools` (`ui-inspect-devtools`): the app (`devtools.silk`), what it reads out of
   the protocol's replies (`data.silk`) and the `Link` service it talks through (`link.silk`):
   requests numbered by `Requests` over the client end of a `Channel`, notifications, and what
-  the app pushed.
+  the app pushed. `embedded.silk` runs the same app in the inspected app's own process.
 - `modules/inspect/devtools/app` (`ui-devtools`): the window, with a `Link` over a
   `SocketChannel` session. The pump thread rings a bell that wakes the window, which sends the
   devtools `Message.Pull`.
@@ -39,7 +39,42 @@ SILK_UI_INSPECT=1 ui-app-demo &                            # or any app, then:
 silk task native devtools run --connect 1   # 1, tcp:<port> or a socket path
 ```
 
-`ui-devtools [--connect ADDRESS]` takes the address in the syntax of `SILK_UI_INSPECT` (default
+### In the app's own process
+
+Every app the native window host runs with the devtools as its companion can show them in its
+own process, with no second program and no socket: every silk-ui app that runs through
+ui-app-window, and a tree client that calls `host.runWindowWith` with
+`EmbeddedDevtools.fromEnvironment()` (the direct-tree counter does). The app's code does not
+change. In a debug build:
+
+```sh
+SILK_UI_DEVTOOLS=window ui-app-demo   # the todo demo, devtools in a window of their own
+SILK_UI_DEVTOOLS=dock ui-app-demo     # docked at the bottom of the app's window
+SILK_UI_DEVTOOLS=1 ui-app-demo        # a window where the host has windows, else the dock
+SILK_UI_INSPECT=1 ui-app-demo         # closed at start; F12 opens them
+silk task native devtools embedded    # the native check of both
+```
+
+F12 (Cmd+Option+I on macOS, Ctrl+Shift+I elsewhere) opens and closes them, with either variable
+set; the app sees neither the press nor the release. Closing their window closes the devtools,
+not the app. `SILK_UI_DEVTOOLS=0` keeps them closed and the shortcut off.
+
+How (`embedded.silk`, an `EmbeddedDevtools`):
+
+- They are a window host `Companion` (see [ui-tree-window](../../tree/window/README.md)): the
+  devtools app runs in the app's tree, on root `DEVTOOLS_ROOT`, with ids counting up from
+  `FIRST_ID` (`0xF0000000`), far above the ids clients choose, and a font family of their own.
+  Their `Runtime` is placed there with `placeAt`, and their root is set aside in the tree, so
+  the app's `takeEvents` never returns their records.
+- They talk to the app's inspector over a local session (`Inspector.openLocal`), served on the
+  spot: their commands are kept by the runtime (`deferCommands`) and performed between its
+  passes, with a `Link` that serves each request before it returns. The socket inspector
+  serves other clients at the same time.
+- Their root is hidden from the inspector (`Inspector.hide`): their nodes are in no reply and
+  their changes and frames push nothing, so they never inspect themselves or wake themselves up.
+- Docked, they cover the bottom 45% of the window (160 to 420 points); the app is laid out above
+  as if that were its window. The split is fixed.
+ in the syntax of `SILK_UI_INSPECT` (default
 `1`, the socket `silk-ui-inspect.sock` in the working directory). The app may start later or
 restart: the status line says when it cannot be reached, and the devtools try again every
 second until it answers.
@@ -124,6 +159,15 @@ silk task native devtools check
 - Goldens (`describe` text and PNG, tolerance 2 per channel): the styles panel, the box model
   panel, the event log, the program, frames and audit panels, and the todo app with the
   highlight the devtools asked for.
+- The devtools in the todo example's own tree, driven as the window host drives them
+  (`embedded.silk`): they list the app's nodes and none of theirs; another local client's
+  `tree`, `query` and `hello` leave them out and `pick` finds the app's nodes; once settled,
+  ten idle turns draw nothing and ask nothing; clicking the Add button's row highlights it in the
+  app; adding a task shows its rows, then all is quiet again; F12 closes them (their highlight
+  goes, the inspector turns off) and opens them again. Docked: the app's viewport is what the
+  dock leaves, pointer input goes to the side it is on (a press keeps its side), the app's
+  coordinates keep their origin and the devtools are hit only in the dock, and a click on a row
+  in the dock highlights in the app, which draws again.
 - `check` is the exit test in real windows: it starts the owned todo demo and devtools,
   under Xvfb on Linux, and drives the tools through their own inspector with ui-inspect-cli.
   It discovers and selects Add, checks highlighting and `padding-left: 10px`, opens the
@@ -132,6 +176,11 @@ silk task native devtools check
   application-specific devtools checks remain in the application repository.
 
 ## Limits
+
+- In the app's process: the dock has a fixed size and sits at the bottom; a small window leaves
+  the app little room. The docked devtools publish no accessibility tree. Their root box is
+  placed with a style set on it after the runtime made it; a view whose root style changed would
+  lose that until the next resize. The browser host has no inspector, so no devtools.
 
 - A full refresh (start, Refresh, a new tab, Live on, after the app was away) is still six to
   eight requests, on the one session. The Program tab's messages are read with `tree` and

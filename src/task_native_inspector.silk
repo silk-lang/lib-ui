@@ -181,6 +181,72 @@ pub effect fn inspect() -> ()
   if let Result<(), TaskError | FileError | HostInputError | OutOfMemoryError | WriterError>.Failure {error} = move result { fail move error }
 }
 
+/// The todo demo with the devtools in its own process: the socket inspector still sees the app
+/// alone, with the devtools' root hidden, in a window of their own and docked.
+effect fn embeddedWith(binary: string, cli: string, display: &Display) -> ()
+! TaskError | FileError | HostInputError | OutOfMemoryError | WriterError
+? &mut HostInput | &mut Allocator | &mut FileSystem {
+  let environment = run views(&display.environment)
+  let mut windowed = List<string>.make()
+  let mut docked = List<string>.make()
+  let mut at: usize = 0
+  while at < environment.length() {
+    run windowed.append(environment.get(at))
+    run docked.append(environment.get(at))
+    at = at + 1
+  }
+  run windowed.append("SILK_UI_DEVTOOLS=window")
+  run docked.append("SILK_UI_DEVTOOLS=dock")
+  let env = environment.asSlice()
+  let app = run program("embedded", binary, &[], windowed.asSlice(), cli)
+  let hello = run commandJson(cli, &app, &["hello"], env)
+  let roots = run array(run field(&hello, "roots"))
+  run expect(roots.length == 1, "embedded devtools: the app's root alone is listed")
+  let hidden = run array(run field(&hello, "hidden"))
+  run expect(hidden.length == 1, "embedded devtools: their root is open and hidden")
+  let snapshot = run command(cli, &app.socket, &["snapshot"], env)
+  let text = run utf8(Bytes.asSlice(&snapshot.output))
+  run expect(String.contains(text, "role=button label=\"Add\"") || String.contains(text, "\"Add\""), "embedded devtools: the app's tree is the todo")
+  run expect(!String.contains(text, "Silk devtools") && !String.contains(text, "element-"), "embedded devtools: none of their nodes")
+  let rows = run commandJson(cli, &app, &["query", "--test-id", "element-1"], env)
+  run expect(number(&rows, "count") == 0, "embedded devtools: no query finds their rows")
+  let add = run command(cli, &app.socket, &["click", "--role", "button", "--name", "Add", "--exact"], env)
+  run expect(add.code == 0, "embedded devtools: click Add in todo")
+  let task = run command(cli, &app.socket, &["wait", "--text", "Task 4", "--timeout", "10000"], env)
+  run expect(task.code == 0, "embedded devtools: todo displays the new task")
+  run waitMilliseconds(500)
+  let quiet = run commandJson(cli, &app, &["hello"], env)
+  run waitMilliseconds(1000)
+  let later = run commandJson(cli, &app, &["hello"], env)
+  run expect(number(&quiet, "frame") == number(&later, "frame"), "embedded devtools: an idle app draws no frames")
+  drop app
+  let dock = run program("embedded-dock", binary, &[], docked.asSlice(), cli)
+  let narrow = run commandJson(cli, &dock, &["hello"], env)
+  run expect(number(&narrow, "height") > 0 && number(&narrow, "height") < 300, "docked devtools: the app lays out above the dock")
+  let aside = run array(run field(&narrow, "hidden"))
+  run expect(aside.length == 1, "docked devtools: their root is hidden")
+  let shot = run rootPath(".cache/ui-inspect/embedded-dock.png")
+  let image = run command(cli, &dock.socket, &["screenshot", pathText(&shot)], env)
+  run expect(image.code == 0, "docked devtools: the app's screenshot")
+  run picture(&shot)
+}
+
+effect fn waitMilliseconds(span: i64) -> () {
+  let start = milliseconds()
+  while milliseconds() - start < span { pause() }
+}
+
+pub effect fn embedded() -> ()
+! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  let binary = run build("modules/app/demo", false, false)
+  let cli = run build("modules/inspect/cli", false, false)
+  let display = run openDisplay("x11")
+  let result = run Effect.result(embeddedWith(String.view(&binary), String.view(&cli), &display))
+  run closeDisplay(move display)
+  if let Result<(), TaskError | FileError | HostInputError | OutOfMemoryError | WriterError>.Failure {error} = move result { fail move error }
+}
+
 effect fn devtoolsCheck(app: &App, tools: &App, cli: string, env: &[string]) -> ()
 ! TaskError | FileError | HostInputError | OutOfMemoryError | WriterError
 ? &mut HostInput | &mut Allocator | &mut FileSystem {
@@ -266,7 +332,8 @@ effect fn launchDevtools(toolsBinary: string, appBinary: string, args: &[string]
 pub effect fn devtools(mode: string, connect: string, appBinary: string, appArgs: &[string], buildOnly: bool) -> ()
 ! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
 ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
-  run require(mode == "run" || mode == "todo" || mode == "external" || mode == "check", "Unknown devtools mode")
+  run require(mode == "run" || mode == "todo" || mode == "external" || mode == "check" || mode == "embedded", "Unknown devtools mode")
+  if mode == "embedded" { return run embedded() }
   let tools = run build("modules/inspect/devtools/app", false, false)
   if buildOnly { return run say(String.view(&tools)) }
   if mode == "run" {

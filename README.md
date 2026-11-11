@@ -46,6 +46,7 @@ by [silk#3034](https://github.com/silk-lang/silk/issues/3034), with no legacy-sc
 | Retained tree editor | `silk task native demo modules/tree/demo -- --editor` |
 | Small window/counter | `silk task native demo modules/tree/window/demo` |
 | Todo with inspector/devtools | `silk task native devtools todo` |
+| Todo with devtools in its own process | `silk build --manifest-path modules/app/demo/silk.toml`, then `SILK_UI_DEVTOOLS=window` (or `dock`) `build/llvm/<target>/debug/ui-app-demo`; F12 toggles them |
 
 Close the window to return to the terminal. The first build fetches pinned dependencies
 and prepares native libraries through Silk's manifest hooks.
@@ -155,7 +156,7 @@ silk task generate-browser-exports --check
 
 Windows managed-process tasks are blocked by [silk#3034](https://github.com/silk-lang/silk/issues/3034): the standard library does not expose live child pipes, exit observation, and termination there. These tasks report the unsupported capability; duplicate Python/Node implementations are not retained.
 
-`check` checks every workspace package, all ten UI unit-test roots, the loopback HTTP image test, five describe/PNG golden runners, the text/inspector/MCP CLIs, portable wasm APIs, and generated-file freshness. It does not update goldens. `native check` runs five rendering/input scenarios (the mirror example opens a second window) plus socket inspector, MCP, and devtools interactions. Linux runs X11 and Wayland (`--backend x11` or `--backend wayland` selects one). `browser check` compares Chrome text, browser fixture trees, and the counter's real input.
+`check` checks every workspace package, all ten UI unit-test roots, the loopback HTTP image test, five describe/PNG golden runners, the text/inspector/MCP CLIs, portable wasm APIs, and generated-file freshness. It does not update goldens. `native check` runs five rendering/input scenarios (the mirror example opens a second window) plus socket inspector, MCP, devtools and same-process devtools interactions. Linux runs X11 and Wayland (`--backend x11` or `--backend wayland` selects one). `browser check` compares Chrome text, browser fixture trees, and the counter's real input.
 
 Individual entrypoints remain available:
 
@@ -168,12 +169,13 @@ silk task native mcp
 silk task native demo modules/tree/window/demo -- --check
 silk task native devtools todo
 silk task native devtools check
+silk task native devtools embedded
 silk task native devtools --connect 1
 silk task browser serve
 silk task browser test --width 400 --height 250 --click --click-x 90 --click-y 35
 ```
 
-The devtools check drives the owned todo demo: live element discovery, selection/highlighting, style declarations, box model, input/event logging, changed tree content, and screenshots of both windows. Notes-specific persistence remains an application-repository check. Use `silk task native devtools external --app-binary PATH [--app-args ARG ...]` for an already-built application, or `--connect ADDRESS` for an existing process.
+The devtools check drives the owned todo demo: live element discovery, selection/highlighting, style declarations, box model, input/event logging, changed tree content, and screenshots of both windows. Notes-specific persistence remains an application-repository check. Use `silk task native devtools external --app-binary PATH [--app-args ARG ...]` for an already-built application, or `--connect ADDRESS` for an existing process. `devtools embedded` (part of `native check`) opens the devtools in the todo demo's own process, in a window and then docked, and checks through the socket inspector that it still sees the app alone, with the devtools' root hidden.
 
 ## Runtime resources and published browser payloads
 

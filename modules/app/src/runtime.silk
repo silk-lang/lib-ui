@@ -14,6 +14,10 @@
 //! windows open goes in the same batch: `OpenRoot`, `UpdateRoot` and `CloseRoot`. A record whose
 //! path starts at a window's root node dispatches through that window's view, and the root
 //! events of a window reach the model through the window's handlers.
+//!
+//! A runtime shows its app in the first root, with root box `ROOT_ID`, unless it is placed
+//! elsewhere (`placeAt`): a second program in the same tree, such as devtools drawn in the
+//! app's own process, takes a root and an id range of its own.
 import ui_protocol.css
 import ui_protocol.css { percent, Keyword, Declaration }
 import app { App, Perform, Context, Subscriptions, SubscriptionKind, Delivery }
@@ -134,6 +138,9 @@ pub struct Runtime<A, M, C> {
   /// then (see `enter`).
   inWindow: bool,
   windowKey: u64,
+  /// The root the app's view shows in, and its root box (see `placeAt`).
+  pub root: u32,
+  pub rootNode: u32,
 }
 
 impl<A: App<M, C>, M, C> Runtime<A, M, C> {
@@ -176,7 +183,22 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
       nextRoot: FIRST_ROOT + 1,
       inWindow: false,
       windowKey: 0,
+      root: FIRST_ROOT,
+      rootNode: ROOT_ID,
     }
+  }
+
+  /// Shows the app in root `root` with root box `node` instead of the first root and
+  /// `ROOT_ID`, for a program that shares its tree with another one. The nodes it makes take
+  /// the ids after `node`, and the windows it declares the roots after `root`, so pick both
+  /// past what the other program uses (devtools in the app's process count down from the top of
+  /// the id space). Call it before `start`.
+  pub fn placeAt(self: &mut Self, root: u32, node: u32) -> () {
+    self.root = root
+    self.rootNode = node
+    self.ui.rootId = node
+    self.diffState.nextId = node + 1
+    self.nextRoot = root + 1
   }
 
   /// From now on, every message is written down in `journal` with the model it led to. The
@@ -311,7 +333,7 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
     return self.held.remove(0)
   }
 
-  /// Creates the root box, opens the first root with it, renders the first view into `tree`
+  /// Creates the root box, opens the first root (or the one `placeAt` named) with it, renders the first view into `tree`
   /// and collects the first subscriptions. `time` is the clock the timers count from, in
   /// seconds.
   pub effect fn start<B: Backend>(self: &mut Self, tree: &mut B, time: f64) -> ()
@@ -319,12 +341,13 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
     ? &mut Allocator {
     self.time = time
     let mut batch = List<Mutation>.make()
-    run batch.append(Mutation.Create { id: ROOT_ID, kind: NodeKind.Box })
+    let node = self.rootNode
+    run batch.append(Mutation.Create { id: node, kind: NodeKind.Box })
     run batch.append(
-      Mutation.SetStyle { id: ROOT_ID, state: StyleState.Base, declarations: run rootStyle() },
+      Mutation.SetStyle { id: node, state: StyleState.Base, declarations: run rootStyle() },
     )
     run batch.append(
-      Mutation.OpenRoot { root: FIRST_ROOT, node: ROOT_ID, options: RootOptions.default() },
+      Mutation.OpenRoot { root: self.root, node: node, options: RootOptions.default() },
     )
     run Backend.mutate(&mut tree, move batch)
     self.started = true
@@ -353,7 +376,8 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
     ? &mut Allocator {
     run self.collectSubscriptions()
     self.batch.clear()
-    run self.renderView(&mut tree, FIRST_ROOT)
+    let root = self.root
+    run self.renderView(&mut tree, root)
     let nodes = self.ui.arena.entries.length()
     let reused = self.ui.reused
     run self.renderWindows(&mut tree)
@@ -625,7 +649,7 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
 
   /// Hands the root events of the declared windows to their handlers; their messages join
   /// the queue. A window the backend could not show is not opened again while the model
-  /// declares it, and its nodes go. The first root's events are the host's (resize, ports).
+  /// declares it, and its nodes go. The app's own root's events are the host's (resize, ports).
   pub effect fn rootEvents<B: Backend>(
     self: &mut Self,
     tree: &mut B,
@@ -638,7 +662,7 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
     while i < list.length {
       let event = list[i]
       i = i + 1
-      if event.root == FIRST_ROOT {
+      if event.root == self.root {
         continue
       }
       let at = self.windowWhere(1, 0, event.root)
@@ -731,7 +755,8 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
   pub effect fn readAnchors<B: Backend>(self: &mut Self, tree: &mut B) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
-    run self.readAnchorsIn(&mut tree, FIRST_ROOT)
+    let root = self.root
+    run self.readAnchorsIn(&mut tree, root)
   }
 
   /// `readAnchors` for the view in `self.ui`, whose root is `root`.
@@ -1053,7 +1078,7 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
     } else {
       record.path.get(0)
     }
-    if first == ROOT_ID {
+    if first == self.rootNode {
       run self.dispatchView(move record)
       return ()
     }
@@ -1479,7 +1504,8 @@ pub effect fn frame<A: App<M, C>, M, C: Perform<M, E, R>, E, ? R>(
 ) -> ()
   ! E | TreeError | OutOfMemoryError
   ? R | &mut Allocator {
-  run frameRoot(&mut runtime, &mut tree, FIRST_ROOT, input)
+  let root = runtime.root
+  run frameRoot(&mut runtime, &mut tree, root, input)
 }
 
 /// [`frame`] for root `root`: the first window's, or a declared window's in its own window.

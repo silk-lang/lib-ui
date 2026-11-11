@@ -35,10 +35,15 @@ import ui_inspect_server.lib {
 }
 import ui_tree.input { Input }
 import ui_inspect.lib { InspectOptions, inspectNode }
+import ui_tree.css
+import ui_tree.css { px }
+import ui_tree.lib { RootOptions }
+import ui_tree.mutation { FIRST_ROOT }
 import ui_tree.legacy {
   UiTree,
   TreeError,
   Batch,
+  NodeKind,
   FrameInput,
   DescribeOptions,
   Role,
@@ -65,6 +70,7 @@ import silk.io.writer_native { StderrWriter }
 import silk.json.scanner { JsonError }
 import silk.json.value { Json, Value }
 import silk.num.usize
+import silk.num.u32
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.net.socket_native { ConnectOptions, Connection, NativeSocketError, connectUnixOwned }
 import silk.num.u64
@@ -959,6 +965,211 @@ test effect fn sessionsOverAMemoryChannel() -> ()
   ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   run memoryBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// A hidden root: a client in this process (devtools) draws in the inspected tree.
+
+/// The root the tools draw in, its box and its button.
+const TOOLS_ROOT: u32 = 7
+
+const TOOLS_BOX: u32 = 900
+
+const TOOLS_BUTTON: u32 = 901
+
+fn toolsViewport() -> FrameInput {
+  return FrameInput { width: 300.0, height: 200.0, scale: 2.0, time: 0.0 }
+}
+
+fn appViewport(time: f64) -> FrameInput {
+  return FrameInput { width: 360.0, height: 440.0, scale: 2.0, time: time }
+}
+
+/// Draws the tools' root, then the app's, which stays current, as the window host does.
+effect fn frameBoth(tree: &mut UiTree<'_>, inspector: &mut Inspector, time: f64) -> ()
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  run tree.frameRoot(TOOLS_ROOT, toolsViewport())
+  run tree.frameRoot(FIRST_ROOT, appViewport(time))
+  run inspector.afterFrame(&tree.*)
+}
+
+/// Every line the local client got, as text.
+effect fn lines(client: &mut MemoryChannel) -> List<String>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = List<String>.make()
+  let mut line = String.make()
+  while run Channel.receive(&mut line) |> Effect.provideMut<Channel>(&mut client) {
+    run out.append(run String.copy(String.view(&line)))
+  }
+  return move out
+}
+
+/// Sends `line` from the local client, serves it at once and parses the reply.
+effect fn local(
+  inspector: &mut Inspector,
+  tree: &mut UiTree<'_>,
+  client: &mut MemoryChannel,
+  line: string,
+) -> Value
+  ! JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  run put(&mut client, line)
+  drop run inspector.serveLocal(&mut tree)
+  return run take(&mut client)
+}
+
+effect fn hiddenBody() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run inbox(&collection)
+  let mut batch = Batch.make()
+  run batch.create(TOOLS_BOX, NodeKind.Box)
+  run fixtures.button(&mut batch, TOOLS_BOX, TOOLS_BUTTON, "Tools", false)
+  run batch.listen(TOOLS_BUTTON, LISTEN_ALL)
+  run batch.openRoot(TOOLS_ROOT, TOOLS_BOX, RootOptions.default())
+  run tree.apply(run batch.take())
+  run tree.setAside(TOOLS_ROOT, true)
+
+  // An inspector that is off serves a client in this process, with no socket.
+  let mut inspector = Inspector.off()
+  run Testing.expect(!inspector.enabled(), "the inspector starts off")
+  let mut client = run inspector.openLocal()
+  run Testing.expect(inspector.enabled(), "a local session turns it on")
+  run Testing.expect(inspector.pollInterval().isNone(), "and needs no polling")
+  run inspector.hide(TOOLS_ROOT, true)
+  run frameBoth(&mut tree, &mut inspector, 0.0)
+
+  let hello = run local(&mut inspector, &mut tree, &mut client, "{\"id\":1,\"cmd\":\"hello\"}")
+  let roots = run array(&hello, "roots")
+  let hidden = run array(&hello, "hidden")
+  run Testing.expect(
+    roots.length == 1 && hidden.length == 1 && int(&hello, "id") == 1,
+    "hello lists the app's root, and the hidden one apart",
+  )
+  let listed = run local(&mut inspector, &mut tree, &mut client, "{\"id\":2,\"cmd\":\"tree\"}")
+  let nodes = run array(&listed, "nodes")
+  let mut i: usize = 0
+  let mut seen = false
+  while i < nodes.length {
+    let id = int(&nodes[i], "id")
+    if id == u32.toI64(TOOLS_BOX) || id == u32.toI64(TOOLS_BUTTON) {
+      seen = true
+    }
+    i = i + 1
+  }
+  run Testing.expect(nodes.length > 10 && !seen, "the tree leaves the hidden root's nodes out")
+  let found = run local(
+    &mut inspector,
+    &mut tree,
+    &mut client,
+    "{\"id\":3,\"cmd\":\"query\",\"name\":\"Tools\",\"within\":900}",
+  )
+  run Testing.expect(int(&found, "count") == 0, "no query finds them, even within their root")
+  let inspected = run local(
+    &mut inspector,
+    &mut tree,
+    &mut client,
+    "{\"id\":4,\"cmd\":\"inspect\",\"node\":901}",
+  )
+  run Testing.expect(!ok(&inspected), "no target names them")
+  let lit = run local(
+    &mut inspector,
+    &mut tree,
+    &mut client,
+    "{\"id\":5,\"cmd\":\"highlight\",\"nodes\":[901,10]}",
+  )
+  let highlighted = run array(&lit, "nodes")
+  run Testing.expect(highlighted.length == 1, "nor highlights them")
+
+  // Their records are not logged; the app's are.
+  drop run tree.useRoot(TOOLS_ROOT)
+  run tree.dispatchTo(
+    TOOLS_ROOT,
+    Input.PointerDown { x: 20.0, y: 10.0, button: 0, modifiers: 0, clickCount: 1 },
+  )
+  drop run tree.useRoot(FIRST_ROOT)
+  run inspector.observe(&tree)
+  let logged = inspector.state().log.asSlice()
+  let mut toolsLogged = false
+  let mut e: usize = 0
+  while e < logged.length {
+    if logged[e].target == TOOLS_BUTTON || logged[e].target == TOOLS_BOX {
+      toolsLogged = true
+    }
+    e = e + 1
+  }
+  run Testing.expect(!toolsLogged, "the hidden root's records are not logged")
+  let mut tools = List<Event>.make()
+  run tree.takeEventsOf(TOOLS_ROOT, &mut tools)
+  run Testing.expect(tools.length() != 0, "they wait for the tools")
+
+  // Subscribed to everything, the client hears nothing of the hidden root's changes and frames.
+  let subscribed = run local(
+    &mut inspector,
+    &mut tree,
+    &mut client,
+    "{\"id\":6,\"cmd\":\"subscribe\"}",
+  )
+  run Testing.expect(int(&subscribed, "id") == 6, "subscribed")
+  run frameBoth(&mut tree, &mut inspector, 0.1)
+  drop run inspector.poll(&mut tree)
+  drop run lines(&mut client)
+  let mut frame: u64 = 0
+  while frame < 5 {
+    // The tools apply their batches with their root current, so their new nodes are theirs.
+    drop run tree.useRoot(TOOLS_ROOT)
+    let mut change = Batch.make()
+    run change.text(TOOLS_BOX, 950 + u64.toU32(frame), "more")
+    run tree.apply(run change.take())
+    run tree.frameRoot(TOOLS_ROOT, toolsViewport())
+    drop run tree.useRoot(FIRST_ROOT)
+    drop run inspector.poll(&mut tree)
+    frame = frame + 1
+  }
+  let quiet = run lines(&mut client)
+  run Testing.expect(quiet.length() == 0, "the tools' own changes and frames push nothing")
+  run Testing.expect(!tree.needsFrameOf(FIRST_ROOT), "nor ask the app for a frame")
+
+  // A change in the app is news.
+  let mut app = Batch.make()
+  run app.style(fixtures.NEW_BUTTON, &[css.width(px(90.0))])
+  run tree.apply(run app.take())
+  run frameBoth(&mut tree, &mut inspector, 0.2)
+  let news = run lines(&mut client)
+  let mut tree0 = false
+  let mut k: usize = 0
+  while k < news.length() {
+    if String.contains(String.view(&news.asSlice()[k]), "\"event\":\"tree\"") {
+      tree0 = true
+    }
+    k = k + 1
+  }
+  run Testing.expect(tree0, "a change in the app's root is")
+
+  // The local client leaves: the inspector is off again.
+  client.close()
+  drop run inspector.serveLocal(&mut tree)
+  run Testing.expect(!inspector.enabled(), "it turns off when the client closes its end")
+}
+
+effect fn array<'a>(reply: &'a Value, key: string) -> &'a [Value]
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match Json.field(reply, key) {
+    Option<&Value>.Some { value } => match &value.* {
+      Value.Array { values } => values.asSlice()
+      _ => &[]
+    }
+    Option<&Value>.None => &[]
+  }
+}
+
+test effect fn hiddenRootsAreLeftOut() -> ()
+  ! AssertionError<'static> | TreeError | JsonError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run hiddenBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
 // The MCP bridge: tool calls become protocol requests, run here with `Protocol.handle`.

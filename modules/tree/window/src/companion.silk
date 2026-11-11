@@ -1,0 +1,176 @@
+//! A companion: a second client the window host runs beside its own, in the same tree, on roots
+//! of its own. Devtools in the app's process are one (ui-inspect-devtools' `embedded`); a
+//! companion needs no framework, and the client never hears of it.
+//!
+//! The host gives a companion what concerns its roots and nothing else: the input that lands in
+//! them, their records and root events (the companion sets its roots aside, `UiTree.setAside`,
+//! so the client's `takeEvents` leaves them), their frames, and every key first, so it can take
+//! a shortcut before the client sees it. It also hands the companion the inspector, so it can
+//! be an inspector client without a socket (`Inspector.openLocal`) and hide its roots from it.
+//!
+//! A companion root is shown one of two ways:
+//!
+//! - **In a window of its own**, as any root past the first: the host opens an OS window for it
+//!   and frames it when it needs it.
+//! - **Docked** in the first window (`Companion.dock`): the host lays the client's first root out
+//!   in the rest of the window, as if that were the whole window (its viewport, its `Resized`
+//!   root event, hit testing and pointer coordinates, which keep their origin since the dock is
+//!   at the right or bottom edge), lays the companion's root out at the size of the whole window
+//!   (the companion places its content in the dock's area), and draws the companion's scene over
+//!   the client's on the one surface. Pointer input in the dock's area goes to the companion's
+//!   root, the rest to the client's.
+//!
+//! The companion applies its batches with its own root current (`UiTree.useRoot`), so the nodes
+//! it makes count as its root's and the client's root needs no frame for them.
+import ui_tree.legacy { UiTree, TreeError, FrameInput }
+import ui_tree.input { Input }
+import ui_tree.mutation { FIRST_ROOT }
+import ui_tree.node { NONE }
+import ui_inspect_server.lib { Inspector }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.geometry.rect { Rect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+
+/// A companion root drawn in the first window.
+pub struct Dock {
+  /// The companion's root.
+  pub root: u32,
+  /// What it covers of the first window, in logical points, at the right or bottom edge. The
+  /// client's first root has the rest.
+  pub area: Rect<f32>,
+}
+
+impl Copy for Dock {}
+
+/// What the window host runs beside its client. See the module documentation; every method
+/// has a default that does nothing, as [`NoCompanion`] does.
+pub interface Companion {
+  /// Starts, once the client did: the tree holds the client's first nodes and says what a root
+  /// past the first becomes here (`UiTree.rootSupport`).
+  effect fn attach(self: &mut Self, tree: &mut UiTree<'_>, inspector: &mut Inspector) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {}
+
+  /// Sees each key press and release before the client does, in every window. True takes it:
+  /// neither the tree nor the client sees it.
+  effect fn key(
+    self: &mut Self,
+    tree: &mut UiTree<'_>,
+    inspector: &mut Inspector,
+    input: &Input,
+  ) -> bool
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    return false
+  }
+
+  /// Whether root `root` is the companion's: its input, records and frames go to the companion.
+  fn owns(self: &Self, root: u32) -> bool {
+    return false
+  }
+
+  /// The companion root docked in a first window of `width` by `height` points, if there is
+  /// one. A docked root gets no window of its own.
+  fn dock(self: &Self, width: f32, height: f32) -> Option<Dock> {
+    return Option<Dock>.None
+  }
+
+  /// Takes the records and root events of its roots and answers them, and whatever else came
+  /// for it (lines the inspector pushed, timers due at `time`, host seconds). Returns whether
+  /// it changed the tree.
+  effect fn pump(
+    self: &mut Self,
+    tree: &mut UiTree<'_>,
+    inspector: &mut Inspector,
+    time: f64,
+  ) -> bool
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    return false
+  }
+
+  /// Takes the records of an input that landed in its root before the tree's default action,
+  /// as `WindowClient.decide` does for the client, and returns whether a handler prevented it.
+  effect fn decide(self: &mut Self, tree: &mut UiTree<'_>, inspector: &mut Inspector) -> bool
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    drop run self.pump(&mut tree, &mut inspector, -1.0)
+    return false
+  }
+
+  /// Lays out and paints its root `root` with `input`: its window's size, or for a docked root
+  /// the first window's.
+  effect fn layout(
+    self: &mut Self,
+    tree: &mut UiTree<'_>,
+    inspector: &mut Inspector,
+    root: u32,
+    input: FrameInput,
+  ) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    run tree.frameRoot(root, input)
+  }
+
+  /// The next time `pump` has work, in host seconds, or None.
+  fn nextDeadline(self: &Self) -> Option<f64> {
+    return Option<f64>.None
+  }
+}
+
+/// The root of the first window an input is for, with `dock` drawn in it: the dock's root for
+/// pointer input in its area, the first root for the rest; a pointer input after a press
+/// (`pressIn`, or NONE) goes where the press went, until the release; input at no point (the
+/// pointer leaving, a cancel) goes where the pointer is (`pointerIn`). Key input is the tree's
+/// to route, to its key root: it gets the first root here.
+pub fn dockTarget(input: &Input, dock: &Option<Dock>, pressIn: u32, pointerIn: u32) -> u32 {
+  let docked = match &dock.* {
+    Option<Dock>.Some { value } => value
+    Option<Dock>.None => {
+      return FIRST_ROOT
+    }
+  }
+  let inDock = match &input.* {
+    Input.PointerMove { x, y, .. } => within(docked.area, x, y)
+    Input.PointerDown { x, y, .. } => within(docked.area, x, y)
+    Input.PointerUp { x, y, .. } => within(docked.area, x, y)
+    Input.Wheel { x, y, .. } => within(docked.area, x, y)
+    Input.PointerLeave => {
+      return pointerIn
+    }
+    Input.PointerCancel => {
+      return pointerIn
+    }
+    _ => {
+      return FIRST_ROOT
+    }
+  }
+  if pressIn != NONE {
+    return pressIn
+  }
+  if inDock {
+    return docked.root
+  }
+  return FIRST_ROOT
+}
+
+/// Whether `input` is at a point: pointer moves, presses, releases and wheels.
+pub fn pointed(input: &Input) -> bool {
+  return match &input.* {
+    Input.PointerMove { .. } => true
+    Input.PointerDown { .. } => true
+    Input.PointerUp { .. } => true
+    Input.Wheel { .. } => true
+    _ => false
+  }
+}
+
+fn within(area: Rect<f32>, x: f32, y: f32) -> bool {
+  return x >= area.xMin && x < area.xMax && y >= area.yMin && y < area.yMax
+}
+
+/// No companion: what `host.runWindow` runs with.
+pub struct NoCompanion {}
+
+impl Companion for NoCompanion {}

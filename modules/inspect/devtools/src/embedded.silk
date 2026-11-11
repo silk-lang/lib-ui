@@ -1,0 +1,658 @@
+//! Devtools in the app's own process: the devtools app runs in the app's tree, on a root of its
+//! own, beside whatever drives the rest of the tree (a ui-app program, or a client that applies
+//! mutations itself). It is a window host [`Companion`]: the host hands it the input, records
+//! and frames of its root, and every key first.
+//!
+//! It is an inspector client like any other, over a session that needs no socket
+//! (`Inspector.openLocal`), served on the spot when it asks. Its root is hidden from the
+//! inspector (`Inspector.hide`), so it never inspects itself, and set aside in the tree
+//! (`UiTree.setAside`), so the app never hears of its records.
+//!
+//! Its root shows in a window of its own, or docked at the bottom of the app's window, the app
+//! laid out in the rest. Turn it on in a debug build (or a build that asks for the inspector in
+//! release builds) with [`VARIABLE`]:
+//!
+//! - `SILK_UI_DEVTOOLS=window`: open the devtools in a window of their own at start.
+//! - `SILK_UI_DEVTOOLS=dock`: open them docked in the app's window.
+//! - `SILK_UI_DEVTOOLS=1`: a window where the host shows several windows, the dock otherwise.
+//!
+//! F12 (and Cmd+Option+I on macOS, Ctrl+Shift+I elsewhere) opens and closes them; the app does
+//! not see that key. With only `SILK_UI_INSPECT` set the shortcut works too, and the devtools
+//! open where `1` would. Closing their window closes the devtools, not the app. The socket
+//! inspector keeps serving other clients (CLI, MCP, the devtools window of another process) at
+//! the same time.
+//!
+//! Ids: the devtools' root is [`DEVTOOLS_ROOT`] and their nodes count up from [`FIRST_ID`], at
+//! the top of the id space, far from the ids clients choose (which count up from 1).
+import devtools { Devtools, Message, Command }
+import link { Link, Requests }
+import ui_app.app { Perform }
+import ui_app.runtime { Runtime, pump, drain, tick, frameRoot }
+import ui_app.backend { Backend, Measured }
+import ui_tree.css
+import ui_tree.css { px, percent, Declaration }
+import ui_tree.legacy { UiTree, TreeError, FrameInput, Mutation, StyleState, BorderStyle, Batch }
+import ui_tree.lib { RootOptions, RootEvent, RootEventKind, RootSupport, ExtraRoot }
+import ui_tree.mutation { FIRST_ROOT }
+import ui_tree.node { Event }
+import ui_tree.input { Input, MOD_META, MOD_ALT, MOD_CONTROL, MOD_SHIFT }
+import ui_tree.inspect { NodeInfo, info }
+import ui_tree.virtual_list { VirtualRange }
+import ui_tree_window.companion { Companion, Dock }
+import ui_tree_window.host { environmentVariable }
+import ui_inspect_server.lib { Inspector }
+import ui_inspect_server.server { VARIABLE as INSPECT_VARIABLE, debugBuild }
+import ui_inspect_server.channel { Channel, MemoryChannel }
+import silk.collections.list { List }
+import silk.color.rgba { Rgba }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.geometry.rect { Rect }
+import silk.geometry.size { Size2 }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.text.string { String }
+
+/// The environment variable that opens the devtools in the app's process (see the module
+/// documentation).
+pub const VARIABLE: string = "SILK_UI_DEVTOOLS"
+
+/// The root the devtools draw in.
+pub const DEVTOOLS_ROOT: u32 = 4294901760
+
+/// The id of the devtools' root box; their other nodes take the ids after it.
+pub const FIRST_ID: u32 = 4026531840
+
+/// The font family the devtools define for themselves in the app's tree.
+pub const DEVTOOLS_FONT: u32 = 4294901760
+
+/// The size of the devtools' own window, in logical points.
+const WINDOW_WIDTH: f32 = 900.0
+
+const WINDOW_HEIGHT: f32 = 560.0
+
+/// Where the devtools show.
+pub enum Placement {
+  /// In a window of their own.
+  Window,
+  /// Docked at the bottom of the app's first window.
+  Dock,
+}
+
+/// The devtools in the app's process. See the module documentation.
+pub struct EmbeddedDevtools {
+  /// Whether the build and the environment let them open (see `fromEnvironment`).
+  pub available: bool,
+  /// Open them as soon as the app has started.
+  pub openAtStart: bool,
+  /// Where they show; None: a window where the host has windows to spare, else the dock.
+  pub wanted: Option<Placement>,
+  placement: Placement,
+  /// The devtools app while it is open, the client end of its session, and its requests.
+  runtime: Option<Runtime<Devtools, Message, Command>>,
+  client: Option<MemoryChannel>,
+  numbering: Requests,
+  /// The dock area the root box was last placed in; empty while in a window of its own.
+  placed: Rect<f32>,
+  /// Whether their font family is defined in the tree.
+  font: bool,
+  /// The code of the shortcut key that went down, whose release is taken too.
+  held: String,
+  /// The host time of the last `pump`, which the devtools' clock starts from when they open.
+  now: f64,
+}
+
+impl EmbeddedDevtools {
+  /// Devtools that open when `available` (at start with `openAtStart`), in `wanted`.
+  pub fn make(available: bool, openAtStart: bool, wanted: Option<Placement>) -> EmbeddedDevtools {
+    return EmbeddedDevtools {
+      available: available,
+      openAtStart: openAtStart,
+      wanted: wanted,
+      placement: Placement.Window,
+      runtime: Option<Runtime<Devtools, Message, Command>>.None,
+      client: Option<MemoryChannel>.None,
+      numbering: Requests.make(),
+      placed: Rect<f32>.new(0.0, 0.0, 0.0, 0.0),
+      font: false,
+      held: String.make(),
+      now: 0.0,
+    }
+  }
+
+  /// The devtools as this process's environment asks for them: available in a debug build
+  /// with [`VARIABLE`] or `SILK_UI_INSPECT` set, open at start with [`VARIABLE`] set to
+  /// anything but `0` or `off`.
+  pub effect fn fromEnvironment() -> EmbeddedDevtools
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let asked = run environmentVariable(VARIABLE)
+    let inspected = run environmentVariable(INSPECT_VARIABLE)
+    let mut open = false
+    let mut off = false
+    let mut wanted = Option<Placement>.None
+    if let Option<String>.Some { value } = &asked {
+      let text = String.view(&value)
+      off = text == "0" || text == "off"
+      open = !off
+      if text == "window" {
+        wanted = Option<Placement>.some(Placement.Window)
+      } else if text == "dock" {
+        wanted = Option<Placement>.some(Placement.Dock)
+      }
+    }
+    let available = debugBuild() && !off && (asked.isSome() || inspected.isSome())
+    return EmbeddedDevtools.make(available, open && available, wanted)
+  }
+
+  /// Whether the devtools are open.
+  pub fn isOpen(self: &Self) -> bool {
+    return self.runtime.isSome()
+  }
+
+  /// Where they show while open.
+  pub fn showing(self: &Self) -> Placement {
+    return self.placement
+  }
+
+  /// The devtools app, while open.
+  pub fn app(self: &Self) -> Option<&Runtime<Devtools, Message, Command>> {
+    return match &self.runtime {
+      Option<Runtime<Devtools, Message, Command>>.Some { value } => Option<
+        &Runtime<Devtools, Message, Command>
+      >.some(&value)
+      Option<Runtime<Devtools, Message, Command>>.None => Option<
+        &Runtime<Devtools, Message, Command>
+      >.None
+    }
+  }
+
+  /// Opens the devtools in `tree`, inspecting it through `inspector`, at host time `time`.
+  pub effect fn open(
+    self: &mut Self,
+    tree: &mut UiTree<'_>,
+    inspector: &mut Inspector,
+    time: f64,
+  ) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if self.runtime.isSome() {
+      return ()
+    }
+    let client = run inspector.openLocal()
+    run inspector.hide(DEVTOOLS_ROOT, true)
+    run tree.setAside(DEVTOOLS_ROOT, true)
+    if !self.font {
+      let mut fonts = Batch.make()
+      run fonts.fontFamily(DEVTOOLS_FONT, "Noto Sans, sans-serif")
+      run tree.apply(run fonts.take())
+      self.font = true
+    }
+    let mut model = run Devtools.make("this process")
+    model.font = DEVTOOLS_FONT
+    let mut runtime = Runtime<Devtools, Message, Command>.make(move model)
+    runtime.placeAt(DEVTOOLS_ROOT, FIRST_ID)
+    runtime.deferCommands()
+    let mut aside = Aside { tree: &mut tree, root: DEVTOOLS_ROOT }
+    run runtime.start(&mut aside, time)
+
+    // The window it gets when it is not docked.
+    let mut options = RootOptions.default()
+    options.title = run String.copy("Silk devtools")
+    options.size = Option<Size2<f32>>.some(Size2<f32>.new(WINDOW_WIDTH, WINDOW_HEIGHT))
+    let mut batch = List<Mutation>.make()
+    run batch.append(Mutation.UpdateRoot { root: DEVTOOLS_ROOT, options: move options })
+    run tree.apply(move batch)
+    runtime.send(Message.Refresh)
+    self.runtime = Option<Runtime<Devtools, Message, Command>>.some(move runtime)
+    self.client = Option<MemoryChannel>.some(move client)
+    self.numbering = Requests.make()
+    self.placed = Rect<f32>.new(0.0, 0.0, 0.0, 0.0)
+    run self.settle(&mut tree, &mut inspector)
+  }
+
+  /// Closes the devtools: the highlight and the picker they left in the app go, and their root
+  /// and nodes with them. The app's root stays as it was.
+  pub effect fn close(self: &mut Self, tree: &mut UiTree<'_>, inspector: &mut Inspector) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if self.runtime.isNone() {
+      return ()
+    }
+    if let Option<MemoryChannel>.Some { value } = &mut self.client {
+      drop run Channel.send("{\"cmd\":\"highlight\"}") |> Effect.provideMut<Channel>(&mut value)
+      drop run Channel.send("{\"cmd\":\"pickMode\",\"on\":false}")
+        |> Effect.provideMut<Channel>(&mut value)
+    }
+    run serveFirst(&mut tree, &mut inspector)
+    let mut batch = List<Mutation>.make()
+    run batch.append(Mutation.CloseRoot { root: DEVTOOLS_ROOT })
+    run batch.append(Mutation.Destroy { id: FIRST_ID })
+    run tree.apply(move batch)
+    run tree.setAside(DEVTOOLS_ROOT, false)
+    run inspector.hide(DEVTOOLS_ROOT, false)
+    let mut events = List<RootEvent>.make()
+    run tree.takeRootEventsOf(DEVTOOLS_ROOT, &mut events)
+    match move Intrinsic.replace(self.client, Option<MemoryChannel>.None) {
+      Option<MemoryChannel>.Some { value } => {
+        let mut end = move value
+        end.close()
+      }
+      Option<MemoryChannel>.None => {}
+    }
+    drop run inspector.serveLocal(&mut tree)
+    self.runtime = Option<Runtime<Devtools, Message, Command>>.None
+  }
+
+  /// Handles what waits for the devtools until nothing does: their messages, then the commands
+  /// those returned, each a few requests served on the spot, then their messages again.
+  effect fn settle(self: &mut Self, tree: &mut UiTree<'_>, inspector: &mut Inspector) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if let Option<Runtime<Devtools, Message, Command>>.Some { value: runtime } = &mut self.runtime {
+      if let Option<MemoryChannel>.Some { value: client } = &mut self.client {
+        let mut none = NoLink {}
+        let mut rounds: u32 = 0
+        while rounds < 16 {
+          let mut aside = Aside { tree: &mut tree, root: DEVTOOLS_ROOT }
+          run drain(&mut runtime, &mut aside) |> Effect.provideMut<Link>(&mut none)
+          if runtime.deferred() == 0 {
+            break
+          }
+          while runtime.deferred() != 0 {
+            let command = runtime.takeDeferred()
+            let mut link = LocalLink {
+              tree: &mut tree,
+              inspector: &mut inspector,
+              client: &mut client,
+              numbering: &mut self.numbering,
+            }
+            let message = run Perform<
+              Message,
+              OutOfMemoryError
+              ? &mut Link | &mut Allocator
+            >.perform(move command)
+              |> Effect.provideMut<Link>(&mut link)
+            runtime.send(move message)
+          }
+          rounds = rounds + 1
+        }
+      }
+    }
+  }
+
+  /// Places the root box in the dock's `area` of a window, or (an empty `area`) fills a window
+  /// of its own.
+  effect fn place(self: &mut Self, tree: &mut UiTree<'_>, area: Rect<f32>) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if sameRect(area, self.placed) {
+      return ()
+    }
+    self.placed = area
+    let mut style = List<Declaration>.make()
+    if area.isEmpty() {
+      run style.append(css.marginLeft(px(0.0)))
+      run style.append(css.marginTop(px(0.0)))
+      run style.append(css.width(percent(100.0)))
+      run style.append(css.height(percent(100.0)))
+      run style.append(css.borderTopWidth(px(0.0)))
+    } else {
+      run style.append(css.marginLeft(px(area.xMin)))
+      run style.append(css.marginTop(px(area.yMin)))
+      run style.append(css.width(px(area.width())))
+      run style.append(css.height(px(area.height())))
+      run style.append(css.borderTopWidth(px(1.0)))
+      run style.append(css.borderStyle(BorderStyle.Solid))
+      run style.append(css.borderColor(Rgba<f32> { r: 0.79, g: 0.80, b: 0.82, a: 1.0 }))
+    }
+    let mut batch = List<Mutation>.make()
+    run batch.append(
+      Mutation.SetStyle { id: FIRST_ID, state: StyleState.Base, declarations: move style },
+    )
+    drop run tree.useRoot(DEVTOOLS_ROOT)
+    run tree.apply(move batch)
+  }
+}
+
+/// The part of a first window of `width` by `height` the docked devtools cover: the bottom, 45%
+/// of the height between 160 and 420 points, leaving the app at least 80.
+pub fn dockArea(width: f32, height: f32) -> Rect<f32> {
+  let mut tall = f32.max(160.0, f32.min(height * 0.45, 420.0))
+  if height - tall < 80.0 {
+    tall = height * 0.5
+  }
+  let top = f32.floor(height - tall)
+  return Rect<f32>.new(0.0, top, width, height)
+}
+
+fn sameRect(a: Rect<f32>, b: Rect<f32>) -> bool {
+  return a.xMin == b.xMin && a.yMin == b.yMin && a.xMax == b.xMax && a.yMax == b.yMax
+}
+
+/// Whether a key press opens or closes the devtools: F12, or Cmd+Option+I on macOS and
+/// Ctrl+Shift+I elsewhere.
+pub fn shortcut(key: string, code: string, modifiers: u32) -> bool {
+  if key == "F12" && modifiers == 0 {
+    return true
+  }
+  if code != "KeyI" {
+    return false
+  }
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    return modifiers == MOD_META | MOD_ALT
+  } else {
+    return modifiers == MOD_CONTROL | MOD_SHIFT
+  }
+}
+
+/// Answers the requests the local client sent, about the app's first root.
+effect fn serveFirst(tree: &mut UiTree<'_>, inspector: &mut Inspector) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let back = tree.current
+  drop run tree.useRoot(FIRST_ROOT)
+  drop run inspector.serveLocal(&mut tree)
+  drop run tree.useRoot(back)
+}
+
+impl Companion for EmbeddedDevtools {
+  effect fn attach(self: &mut Self, tree: &mut UiTree<'_>, inspector: &mut Inspector) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let windows = tree.rootSupport.extra == ExtraRoot.Window && tree.rootSupport.admits(1)
+    self.placement = match self.wanted {
+      Option<Placement>.Some { value } => value
+      Option<Placement>.None => if windows {
+        Placement.Window
+      } else {
+        Placement.Dock
+      }
+    }
+    if !windows {
+      self.placement = Placement.Dock
+    }
+    if self.available && self.openAtStart {
+      run self.open(&mut tree, &mut inspector, 0.0)
+    }
+  }
+
+  effect fn key(
+    self: &mut Self,
+    tree: &mut UiTree<'_>,
+    inspector: &mut Inspector,
+    input: &Input,
+  ) -> bool
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if !self.available {
+      return false
+    }
+    match &input.* {
+      Input.KeyDown { key, code, modifiers, repeat } => {
+        if !shortcut(String.view(&key), String.view(&code), modifiers) {
+          return false
+        }
+        self.held = run String.copy(String.view(&code))
+        if !repeat {
+          if self.runtime.isSome() {
+            run self.close(&mut tree, &mut inspector)
+          } else {
+            let now = self.now
+            run self.open(&mut tree, &mut inspector, now)
+          }
+        }
+        return true
+      }
+      Input.KeyUp { code, .. } => {
+        if self.held.ownedByteLength() != 0 && String.view(&code) == String.view(&self.held) {
+          self.held.clear()
+          return true
+        }
+        return false
+      }
+      _ => {
+        return false
+      }
+    }
+  }
+
+  fn owns(self: &Self, root: u32) -> bool {
+    return root == DEVTOOLS_ROOT && self.runtime.isSome()
+  }
+
+  fn dock(self: &Self, width: f32, height: f32) -> Option<Dock> {
+    if self.runtime.isNone() || self.placement != Placement.Dock {
+      return Option<Dock>.None
+    }
+    return Option<Dock>.some(Dock { root: DEVTOOLS_ROOT, area: dockArea(width, height) })
+  }
+
+  effect fn pump(
+    self: &mut Self,
+    tree: &mut UiTree<'_>,
+    inspector: &mut Inspector,
+    time: f64,
+  ) -> bool
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if time >= 0.0 {
+      self.now = time
+    }
+    if self.runtime.isNone() {
+      return false
+    }
+
+    // Closing their window closes the devtools.
+    let mut events = List<RootEvent>.make()
+    run tree.takeRootEventsOf(DEVTOOLS_ROOT, &mut events)
+    let list = events.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      match list[i].kind {
+        RootEventKind.CloseRequested => {
+          run self.close(&mut tree, &mut inspector)
+          return true
+        }
+        RootEventKind.Failed => {
+          run self.close(&mut tree, &mut inspector)
+          return true
+        }
+        _ => {}
+      }
+      i = i + 1
+    }
+    let before = tree.revisionOf(DEVTOOLS_ROOT)
+    let pushed = match &self.client {
+      Option<MemoryChannel>.Some { value } => value.pending()
+      Option<MemoryChannel>.None => false
+    }
+    if let Option<Runtime<Devtools, Message, Command>>.Some { value: runtime } = &mut self.runtime {
+      if pushed {
+        runtime.send(Message.Pull)
+      }
+      let mut none = NoLink {}
+      let mut aside = Aside { tree: &mut tree, root: DEVTOOLS_ROOT }
+      drop run pump(&mut runtime, &mut aside) |> Effect.provideMut<Link>(&mut none)
+      if time >= 0.0 {
+        run tick(&mut runtime, &mut aside, time, false) |> Effect.provideMut<Link>(&mut none)
+      }
+    }
+    run self.settle(&mut tree, &mut inspector)
+    return tree.revisionOf(DEVTOOLS_ROOT) != before || tree.needsFrameOf(DEVTOOLS_ROOT)
+  }
+
+  effect fn decide(self: &mut Self, tree: &mut UiTree<'_>, inspector: &mut Inspector) -> bool
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    drop run self.pump(&mut tree, &mut inspector, -1.0)
+    return match &mut self.runtime {
+      Option<Runtime<Devtools, Message, Command>>.Some { value } => value.takePrevented()
+      Option<Runtime<Devtools, Message, Command>>.None => false
+    }
+  }
+
+  effect fn layout(
+    self: &mut Self,
+    tree: &mut UiTree<'_>,
+    inspector: &mut Inspector,
+    root: u32,
+    input: FrameInput,
+  ) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if root != DEVTOOLS_ROOT || self.runtime.isNone() {
+      return ()
+    }
+    let area = if self.placement == Placement.Dock {
+      dockArea(input.width, input.height)
+    } else {
+      Rect<f32>.new(0.0, 0.0, 0.0, 0.0)
+    }
+    run self.place(&mut tree, area)
+    if let Option<Runtime<Devtools, Message, Command>>.Some { value: runtime } = &mut self.runtime {
+      let mut none = NoLink {}
+      run frameRoot(&mut runtime, &mut tree, DEVTOOLS_ROOT, input)
+        |> Effect.provideMut<Link>(&mut none)
+    }
+    run self.settle(&mut tree, &mut inspector)
+  }
+
+  fn nextDeadline(self: &Self) -> Option<f64> {
+    return match &self.runtime {
+      Option<Runtime<Devtools, Message, Command>>.Some { value } => value.nextDeadline()
+      Option<Runtime<Devtools, Message, Command>>.None => Option<f64>.None
+    }
+  }
+}
+
+/// The app's tree as the devtools' backend: their batches apply with their root current, and
+/// they take only their root's records and root events.
+struct Aside<'t, 'f> {
+  tree: &'t mut UiTree<'f>,
+  root: u32,
+}
+
+impl<'t, 'f> Backend for Aside<'t, 'f> {
+  effect fn mutate(self: &mut Self, batch: List<Mutation>) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    drop run self.tree.useRoot(self.root)
+    run self.tree.apply(move batch)
+  }
+
+  effect fn events(self: &mut Self, out: &mut List<Event>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.tree.takeEventsOf(self.root, &mut out)
+  }
+
+  effect fn rootEvents(self: &mut Self, out: &mut List<RootEvent>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.tree.takeRootEventsOf(self.root, &mut out)
+  }
+
+  fn viewport(self: &Self, root: u32) -> Rect<f32> {
+    return self.tree.rootViewport(root)
+  }
+
+  fn roots(self: &Self) -> RootSupport {
+    return self.tree.rootSupport
+  }
+
+  effect fn measure(self: &Self, id: u32) -> Option<Measured>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if let Option<NodeInfo>.Some { value: node } = run info(&self.tree.*, id) {
+      if node.laidOut {
+        return Option<Measured>.Some {
+          value: Measured {
+            bounds: node.bounds,
+            pressed: node.pressed,
+            hovered: node.hovered,
+            focused: node.focused,
+          },
+        }
+      }
+    }
+    return Option<Measured>.None
+  }
+
+  fn range(self: &Self, id: u32) -> Option<VirtualRange> {
+    return self.tree.virtualRange(id)
+  }
+}
+
+/// The devtools' link to the inspector of their own process: each line goes into the local
+/// session and is served at once, about the app's first root.
+struct LocalLink<'t, 'f> {
+  tree: &'t mut UiTree<'f>,
+  inspector: &'t mut Inspector,
+  client: &'t mut MemoryChannel,
+  numbering: &'t mut Requests,
+}
+
+impl<'t, 'f> Link for LocalLink<'t, 'f> {
+  effect fn request(self: &mut Self, line: string, reply: &mut String) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    reply.clear()
+    let id = run self.numbering.send(line) |> Effect.provideMut<Channel>(&mut self.client.*)
+    if id == 0 {
+      run reply.append("the inspector closed the session")
+      return false
+    }
+    run serveFirst(&mut self.tree.*, &mut self.inspector.*)
+    if run self.numbering.collect(id, &mut reply)
+      |> Effect.provideMut<Channel>(&mut self.client.*) {
+      return true
+    }
+    run reply.append("no reply")
+    return false
+  }
+
+  effect fn notify(self: &mut Self, line: string) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !run Channel.send(line) |> Effect.provideMut<Channel>(&mut self.client.*) {
+      return false
+    }
+    run serveFirst(&mut self.tree.*, &mut self.inspector.*)
+    return true
+  }
+
+  effect fn take(self: &mut Self, out: &mut List<String>) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut none = String.make()
+    drop run self.numbering.collect(0, &mut none) |> Effect.provideMut<Channel>(&mut self.client.*)
+    run self.numbering.takeNotes(&mut out)
+    return self.client.open()
+  }
+}
+
+/// The link while the devtools' commands wait for `settle`: they never perform here.
+struct NoLink {}
+
+impl Link for NoLink {
+  effect fn request(self: &mut Self, line: string, reply: &mut String) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    reply.clear()
+    run reply.append("not now")
+    return false
+  }
+
+  effect fn notify(self: &mut Self, line: string) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return false
+  }
+
+  effect fn take(self: &mut Self, out: &mut List<String>) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return true
+  }
+}

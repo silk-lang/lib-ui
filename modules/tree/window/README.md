@@ -40,8 +40,48 @@ before it draws anything. The compositor's fast scrolling, accessibility publica
 inspector's overlay serve the first window only; the others scroll through the tree and publish
 no accessibility tree yet.
 
+### A companion beside the client
+
+`host.runWindowWith` takes a `companion.Companion` besides the client: a second client in the
+same tree, on roots of its own, that the client never hears of. The in-process devtools are one
+(ui-inspect-devtools' `embedded`); `runWindow` runs `NoCompanion`, and check mode runs none.
+
+```silk
+pub interface Companion {
+  effect fn attach(self: &mut Self, tree: &mut UiTree<'_>, inspector: &mut Inspector) -> ()
+  effect fn key(self: &mut Self, tree: &mut UiTree<'_>, inspector: &mut Inspector, input: &Input) -> bool
+  fn owns(self: &Self, root: u32) -> bool
+  fn dock(self: &Self, width: f32, height: f32) -> Option<Dock>
+  effect fn pump(self: &mut Self, tree: &mut UiTree<'_>, inspector: &mut Inspector, time: f64) -> bool
+  effect fn decide(self: &mut Self, tree: &mut UiTree<'_>, inspector: &mut Inspector) -> bool
+  effect fn layout(self: &mut Self, tree: &mut UiTree<'_>, inspector: &mut Inspector, root: u32, input: FrameInput) -> ()
+  fn nextDeadline(self: &Self) -> Option<f64>
+}
+```
+
+- Every key press and release, in any window, goes to `key` first; true takes it from the
+  tree and the client (a shortcut).
+- Input that lands in a root the companion `owns` goes to its `decide`, not the client's, and
+  its frames to its `layout`. The companion sets its roots aside in the tree, so the client's
+  `takeEvents` never returns their records.
+- `pump` runs once per turn of the loop, after the inspector, and whenever its root's window
+  needs it. It gets the inspector, so the companion can be an inspector client with no socket
+  (`Inspector.openLocal`) and hide its roots from it (`Inspector.hide`).
+- A companion root shows in a window of its own, as any root, unless `dock` names it: then it
+  has no window, and is drawn in the first one. The dock covers an `area` at the right or bottom
+  edge; the client's first root is laid out in the rest of the window, which it sees as its
+  window: its viewport, the `Resized` root event and `resize` hook, hit testing and pointer
+  coordinates (the dock is at the far edges, so the origin stays). The companion's root is laid
+  out at the whole window's size, with its content in `area`, and its scene is drawn over the
+  client's (`sceneOf`). Pointer input in `area` goes to the companion's root, the rest to the
+  client's; a press keeps going to the side it began on until the release, the side the pointer
+  leaves hears `PointerLeave`, and a press moves the keyboard to its side. Compositor scrolling
+  is blocked over the dock.
+
 The [direct-tree counter](demo/src/main.silk) is a complete example with no app or
-component framework dependency. From the repository root:
+component framework dependency. It runs with the in-process devtools beside it, which it knows
+nothing of (`SILK_UI_DEVTOOLS=window`, `dock` or `1`, or F12 with `SILK_UI_INSPECT` set). From
+the repository root:
 
     silk task native demo modules/tree/window/demo
     silk task native demo modules/tree/window/demo -- --check

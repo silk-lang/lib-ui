@@ -53,6 +53,8 @@ import nodes { nodeObject, nodeMembers }
 import program { ProgramLog, Timeline }
 import topics {
   Changes,
+  contains,
+  shownRevision,
   TOPIC_TREE,
   TOPIC_FRAME,
   TOPIC_EVENTS,
@@ -219,6 +221,9 @@ pub struct Protocol {
   swallowUp: bool,
   /// What sessions were last told (see `topics.silk`).
   pub changes: Changes,
+  /// The roots the inspector leaves out, as if they were not open: those of devtools drawn in
+  /// the app's own tree (see [`Protocol.hide`]).
+  pub hidden: List<u32>,
 }
 
 impl Protocol {
@@ -243,7 +248,41 @@ impl Protocol {
       picked: NONE,
       swallowUp: false,
       changes: Changes.make(),
+      hidden: List<u32>.make(),
     }
+  }
+
+  /// Leaves root `root` out of everything the inspector serves, or shows it again: its nodes
+  /// are in no reply, no query, highlight or target finds them, its records are not logged and
+  /// its changes and frames are no news. For a second client that draws in the inspected tree,
+  /// such as devtools in the app's process, which must not inspect itself. Requests are served
+  /// with a root that is not hidden current (the window host keeps the first one current).
+  pub effect fn hide(self: &mut Self, root: u32, on: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut i: usize = 0
+    while i < self.hidden.length() {
+      if self.hidden.get(i) == root {
+        drop self.hidden.remove(i)
+      } else {
+        i = i + 1
+      }
+    }
+    if on {
+      run self.hidden.append(root)
+    }
+  }
+
+  /// Whether node `id` is in a hidden root (see [`Protocol.hide`]).
+  pub fn hides(self: &Self, tree: &UiTree<'_>, id: u32) -> bool {
+    if self.hidden.length() == 0 {
+      return false
+    }
+    let slot = tree.slotOf(id)
+    if slot == NONE {
+      return false
+    }
+    return contains(self.hidden.asSlice(), tree.rootHolding(slot))
   }
 
   /// Whether a compound interaction still has input for the host to process.
@@ -330,9 +369,28 @@ impl Protocol {
     let events = tree.events.asSlice()
     let mut i: usize = 0
     while i < events.length {
-      run self.logEvent(&events[i], tree.stats.frame)
+      if !self.hiddenRecord(tree, &events[i]) {
+        run self.logEvent(&events[i], tree.stats.frame)
+      }
       i = i + 1
     }
+  }
+
+  /// Whether a record's path starts at the node of a hidden root.
+  fn hiddenRecord(self: &Self, tree: &UiTree<'_>, event: &Event) -> bool {
+    if self.hidden.length() == 0 || event.path.length() == 0 {
+      return false
+    }
+    let first = event.path.get(0)
+    let list = self.hidden.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      if tree.rootNode(list[i]) == first {
+        return true
+      }
+      i = i + 1
+    }
+    return false
   }
 
   /// Adds one record to the event log.
@@ -434,15 +492,15 @@ impl Protocol {
     if cmd == "hello" {
       run self.hello(&tree.*, request, &mut out)
     } else if cmd == "tree" {
-      run elementTree(&tree.*, request, &mut out)
+      run elementTree(&tree.*, self.hidden.asSlice(), request, &mut out)
     } else if cmd == "events" {
       run self.events(request, &mut out)
     } else if cmd == "snapshot" {
-      run snapshot(&tree.*, request, &mut out)
+      run snapshot(&tree.*, self.hidden.asSlice(), request, &mut out)
     } else if cmd == "query" {
       run self.query(&tree.*, request, &mut out)
     } else if cmd == "inspect" {
-      run inspect(&tree.*, request, &mut out)
+      run inspect(&tree.*, self.hidden.asSlice(), request, &mut out)
     } else if cmd == "pick" {
       run pickAt(&tree.*, request, &mut out)
     } else if cmd == "highlight" {
@@ -456,9 +514,10 @@ impl Protocol {
     } else if cmd == "type" {
       run self.typeText(&mut tree, request, &mut out)
     } else if cmd == "wait" {
-      return run waitFor(&tree.*, request, waited, &mut out)
+      return run waitFor(&tree.*, self.hidden.asSlice(), request, waited, &mut out)
     } else if cmd == "stats" {
-      run stats(&tree.*, request, &mut out)
+      let hidden = tree.nodeCount() - run self.nodeCount(&tree.*)
+      run stats(&tree.*, hidden, request, &mut out)
     } else if cmd == "program" {
       run self.program.describe(request, &mut out)
     } else if cmd == "messages" {
@@ -472,7 +531,7 @@ impl Protocol {
     } else if cmd == "frames" {
       run self.timeline.describe(request, &mut out)
     } else if cmd == "styles" {
-      let id = run targetOf(&tree.*, request, &mut out)
+      let id = run targetOf(&tree.*, self.hidden.asSlice(), request, &mut out)
       if id != NONE {
         run styles(&tree.*, request, id, &mut out)
       }
@@ -489,7 +548,7 @@ impl Protocol {
     } else if cmd == "audit" {
       let mut top = tree.rootId()
       if run hasTarget(request) {
-        top = run targetOf(&tree.*, request, &mut out)
+        top = run targetOf(&tree.*, self.hidden.asSlice(), request, &mut out)
       }
       if top != NONE || !run hasTarget(request) {
         run audit(&tree.*, request, top, &mut out)
@@ -526,8 +585,9 @@ impl Protocol {
     run out.append("[]")
     run frameMembers(tree, &mut out)
     run putInt(&mut out, "root", u32.toU64(tree.rootId()))
-    run rootMembers(tree, &mut out)
-    run putInt(&mut out, "nodes", usize.toU64(tree.nodeCount()))
+    run rootMembers(tree, self.hidden.asSlice(), &mut out)
+    run putIds(&mut out, "hidden", &self.hidden)
+    run putInt(&mut out, "nodes", usize.toU64(run self.nodeCount(tree)))
     run putIds(&mut out, "highlight", &self.highlight.nodes)
     run putFlag(&mut out, "program", self.program.attached)
     run finish(&mut out)
@@ -538,7 +598,52 @@ impl Protocol {
   pub effect fn takeChanges(self: &mut Self, tree: &UiTree<'_>, wanted: u32) -> u32
     ! OutOfMemoryError
     ? &mut Allocator {
-    return run self.changes.take(tree, self.nextSeq, wanted)
+    return run self.changes.take(tree, self.hidden.asSlice(), self.nextSeq, wanted)
+  }
+
+  /// The tree's node count without the nodes of hidden roots.
+  effect fn nodeCount(self: &Self, tree: &UiTree<'_>) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut count = tree.nodeCount()
+    let list = self.hidden.asSlice()
+    let mut stack = List<u32>.make()
+    let mut children = List<u32>.make()
+    let mut i: usize = 0
+    while i < list.length {
+      let node = tree.rootNode(list[i])
+      if node != NONE {
+        run stack.append(tree.slotOf(node))
+      }
+      i = i + 1
+    }
+    while stack.length() != 0 {
+      let last = stack.length() - 1
+      let slot = stack.get(last)
+      stack.truncate(last)
+      count = count - 1
+      run tree.childSlots(slot, &mut children)
+      run stack.appendSlice(children.asSlice())
+    }
+    return count
+  }
+
+  /// `queryAll` without the nodes of hidden roots.
+  effect fn shownQuery(self: &Self, tree: &UiTree<'_>, q: &Query, out: &mut List<u32>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run queryAll(tree, q, &mut out)
+    if self.hidden.length() == 0 {
+      return ()
+    }
+    let mut i: usize = 0
+    while i < out.length() {
+      if self.hides(tree, out.get(i)) {
+        drop out.remove(i)
+      } else {
+        i = i + 1
+      }
+    }
   }
 
   /// Writes the notification line for `topic` (one `TOPIC_*` bit): `{"event": <name>, "frame",
@@ -564,9 +669,9 @@ impl Protocol {
     )
     if topic == TOPIC_TREE || topic == TOPIC_FRAME {
       run frameMembers(tree, &mut out)
-      run putInt(&mut out, "nodes", usize.toU64(tree.nodeCount()))
+      run putInt(&mut out, "nodes", usize.toU64(run self.nodeCount(tree)))
       if topic == TOPIC_TREE {
-        run putInt(&mut out, "revision", tree.semanticRevision)
+        run putInt(&mut out, "revision", run shownRevision(tree, self.hidden.asSlice()))
       }
     } else {
       run putInt(&mut out, "frame", tree.stats.frame)
@@ -574,7 +679,7 @@ impl Protocol {
     if topic == TOPIC_EVENTS {
       run putInt(&mut out, "next", self.nextSeq)
     } else if topic == TOPIC_ROOTS {
-      run rootMembers(tree, &mut out)
+      run rootMembers(tree, self.hidden.asSlice(), &mut out)
     } else if topic == TOPIC_HIGHLIGHT {
       run putIds(&mut out, "nodes", &self.highlight.nodes)
     } else if topic == TOPIC_PICK {
@@ -597,7 +702,7 @@ impl Protocol {
   ) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
-    let id = run targetOf(&tree.*, request, &mut out)
+    let id = run targetOf(&tree.*, self.hidden.asSlice(), request, &mut out)
     if id == NONE {
       return ()
     }
@@ -734,7 +839,7 @@ impl Protocol {
       }
     }
     let mut found = List<u32>.make()
-    run queryAll(tree, &q, &mut found)
+    run self.shownQuery(tree, &q, &mut found)
     let limit = match Json.asU64(Json.field(request, "limit")) {
       Option<u64>.Some { value } => u64.toUsize(value)
       Option<u64>.None => found.length()
@@ -863,7 +968,7 @@ impl Protocol {
     } else if run hasTarget(request) {
       match run queryOf(request) {
         Option<Query>.Some { value } => {
-          run queryAll(tree, &value, &mut ids)
+          run self.shownQuery(tree, &value, &mut ids)
         }
         Option<Query>.None => {
           run failure(&mut out, request, "unknown role")
@@ -875,7 +980,7 @@ impl Protocol {
     let list = ids.asSlice()
     let mut i: usize = 0
     while i < list.length {
-      if tree.contains(list[i]) {
+      if tree.contains(list[i]) && !self.hides(tree, list[i]) {
         run self.highlight.nodes.append(list[i])
       }
       i = i + 1
@@ -906,7 +1011,7 @@ impl Protocol {
     let mut pixels = run Pixmap.make(1, 1)
     let mut target = NONE
     if run hasTarget(request) {
-      target = run targetOf(&tree.*, request, &mut out)
+      target = run targetOf(&tree.*, self.hidden.asSlice(), request, &mut out)
       if target == NONE {
         return ()
       }
@@ -963,7 +1068,7 @@ impl Protocol {
     let mut point = Vector2<f32> { x: 0.0, y: 0.0 }
     let mut target = NONE
     if run hasTarget(request) {
-      target = run targetOf(&tree.*, request, &mut out)
+      target = run targetOf(&tree.*, self.hidden.asSlice(), request, &mut out)
       if target == NONE {
         return ()
       }
@@ -1165,7 +1270,7 @@ impl Protocol {
     ? &mut Allocator {
     let mut inputs = List<Input>.make()
     if run hasTarget(request) {
-      let target = run targetOf(&tree.*, request, &mut out)
+      let target = run targetOf(&tree.*, self.hidden.asSlice(), request, &mut out)
       if target == NONE {
         return ()
       }
@@ -1220,7 +1325,7 @@ effect fn frameMembers(tree: &UiTree<'_>, out: &mut String) -> ()
   run putInt(&mut out, "frame", tree.stats.frame)
 }
 
-effect fn snapshot(tree: &UiTree<'_>, request: &Value, out: &mut String) -> ()
+effect fn snapshot(tree: &UiTree<'_>, hidden: &[u32], request: &Value, out: &mut String) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   let options = if flagField(request, "styles", false) {
@@ -1230,7 +1335,7 @@ effect fn snapshot(tree: &UiTree<'_>, request: &Value, out: &mut String) -> ()
   }
   let mut text = String.make()
   if run hasTarget(request) {
-    let target = run targetOf(tree, request, &mut out)
+    let target = run targetOf(tree, hidden, request, &mut out)
     if target == NONE {
       return ()
     }
@@ -1244,14 +1349,14 @@ effect fn snapshot(tree: &UiTree<'_>, request: &Value, out: &mut String) -> ()
   run finish(&mut out)
 }
 
-effect fn inspect(tree: &UiTree<'_>, request: &Value, out: &mut String) -> ()
+effect fn inspect(tree: &UiTree<'_>, hidden: &[u32], request: &Value, out: &mut String) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   if !run hasTarget(request) {
     run failure(&mut out, request, "inspect needs a target node")
     return ()
   }
-  let target = run targetOf(tree, request, &mut out)
+  let target = run targetOf(tree, hidden, request, &mut out)
   if target == NONE {
     return ()
   }
@@ -1303,12 +1408,21 @@ effect fn rectObject(r: Rect<f32>, out: &mut String) -> ()
 
 /// tree: every node (or the target's subtree) in tree order, each a node object with its
 /// `parent`, `depth` and `children` count, so a client can draw the element tree.
-/// `"roots"`: the open roots, the current one first, each with its root node when it has one.
-effect fn rootMembers(tree: &UiTree<'_>, out: &mut String) -> ()
+/// `"roots"`: the open roots but the `hidden` ones, the current one first, each with its root
+/// node when it has one.
+effect fn rootMembers(tree: &UiTree<'_>, hidden: &[u32], out: &mut String) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
+  let mut all = List<u32>.make()
+  run tree.openRoots(&mut all)
   let mut roots = List<u32>.make()
-  run tree.openRoots(&mut roots)
+  let mut k: usize = 0
+  while k < all.length() {
+    if !contains(hidden, all.get(k)) {
+      run roots.append(all.get(k))
+    }
+    k = k + 1
+  }
   run putKey(&mut out, "roots")
   run out.append("[")
   let mut i: usize = 0
@@ -1329,19 +1443,19 @@ effect fn rootMembers(tree: &UiTree<'_>, out: &mut String) -> ()
   run out.append("]")
 }
 
-effect fn elementTree(tree: &UiTree<'_>, request: &Value, out: &mut String) -> ()
+effect fn elementTree(tree: &UiTree<'_>, hidden: &[u32], request: &Value, out: &mut String) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   let mut top = tree.rootId()
   if run hasTarget(request) {
-    top = run targetOf(tree, request, &mut out)
+    top = run targetOf(tree, hidden, request, &mut out)
     if top == NONE {
       return ()
     }
   }
   run begin(&mut out, request)
   run frameMembers(tree, &mut out)
-  run rootMembers(tree, &mut out)
+  run rootMembers(tree, hidden, &mut out)
   run putKey(&mut out, "nodes")
   run out.append("[")
   if top != NONE && tree.contains(top) {
@@ -1412,7 +1526,13 @@ effect fn pickAt(tree: &UiTree<'_>, request: &Value, out: &mut String) -> ()
   run finish(&mut out)
 }
 
-effect fn waitFor(tree: &UiTree<'_>, request: &Value, waited: u64, out: &mut String) -> Outcome
+effect fn waitFor(
+  tree: &UiTree<'_>,
+  hidden: &[u32],
+  request: &Value,
+  waited: u64,
+  out: &mut String,
+) -> Outcome
   ! OutOfMemoryError
   ? &mut Allocator {
   if !run hasTarget(request) {
@@ -1426,7 +1546,7 @@ effect fn waitFor(tree: &UiTree<'_>, request: &Value, waited: u64, out: &mut Str
       return Outcome.Done
     }
   }
-  let found = run queryFirst(tree, &q)
+  let found = run firstShown(tree, hidden, &q)
   let gone = flagField(request, "gone", false)
   if (found == NONE) == gone {
     let mut name = String.make()
@@ -1453,13 +1573,19 @@ effect fn waitFor(tree: &UiTree<'_>, request: &Value, waited: u64, out: &mut Str
   return Outcome.Pending
 }
 
-effect fn stats(tree: &UiTree<'_>, request: &Value, out: &mut String) -> ()
+/// stats: the last frame's `FrameStats`, without the `hidden` nodes of hidden roots in `nodes`.
+effect fn stats(tree: &UiTree<'_>, hidden: usize, request: &Value, out: &mut String) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   let s = tree.stats
   run begin(&mut out, request)
   run frameMembers(tree, &mut out)
-  run putInt(&mut out, "nodes", usize.toU64(s.nodes))
+  let nodes = if s.nodes > hidden {
+    s.nodes - hidden
+  } else {
+    0
+  }
+  run putInt(&mut out, "nodes", usize.toU64(nodes))
   run putInt(&mut out, "fragments", usize.toU64(s.fragments))
   run putFlag(&mut out, "layoutSkipped", s.layoutSkipped)
   run putKey(&mut out, "layout")
@@ -1564,8 +1690,9 @@ effect fn queryOf(request: &Value) -> Option<Query>
   return Option<Query>.Some { value: move q }
 }
 
-/// The first node the request's target matches, or NONE with a failure written to `out`.
-effect fn targetOf(tree: &UiTree<'_>, request: &Value, out: &mut String) -> u32
+/// The first node the request's target matches, or NONE with a failure written to `out`. Nodes
+/// in `hidden` roots match nothing.
+effect fn targetOf(tree: &UiTree<'_>, hidden: &[u32], request: &Value, out: &mut String) -> u32
   ! OutOfMemoryError
   ? &mut Allocator {
   let q = match run queryOf(request) {
@@ -1575,11 +1702,31 @@ effect fn targetOf(tree: &UiTree<'_>, request: &Value, out: &mut String) -> u32
       return NONE
     }
   }
-  let found = run queryFirst(tree, &q)
+  let found = run firstShown(tree, hidden, &q)
   if found == NONE {
     run failure(&mut out, request, "no node matches")
   }
   return found
+}
+
+/// The first node `q` matches in tree order that is in none of the `hidden` roots, or NONE.
+effect fn firstShown(tree: &UiTree<'_>, hidden: &[u32], q: &Query) -> u32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if hidden.length == 0 {
+    return run queryFirst(tree, q)
+  }
+  let mut found = List<u32>.make()
+  run queryAll(tree, q, &mut found)
+  let list = found.asSlice()
+  let mut i: usize = 0
+  while i < list.length {
+    if !contains(hidden, tree.rootHolding(tree.slotOf(list[i]))) {
+      return list[i]
+    }
+    i = i + 1
+  }
+  return NONE
 }
 
 /// The `modifiers` member: names out of shift, control (or ctrl), alt and meta.
