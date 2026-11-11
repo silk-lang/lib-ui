@@ -153,6 +153,10 @@ import silk.text.string { String }
 /// Seconds between tries while the app cannot be reached.
 pub const RETRY_INTERVAL: f64 = 1.0
 
+/// Seconds between the Frames panel's reads while the app draws: an app that draws every
+/// frame would otherwise have the devtools read its timeline as often.
+pub const FRAMES_INTERVAL: f64 = 0.1
+
 /// How many event records the log keeps.
 pub const MAX_LOG: usize = 200
 
@@ -218,7 +222,8 @@ const BAR_HEIGHT: f32 = 96.0
 pub union Message {
   /// Read everything again.
   Refresh,
-  /// The timer that tries again while the app cannot be reached.
+  /// The timer that tries again while the app cannot be reached, and reads the frames the app
+  /// drew since the Frames panel last did.
   Tick { pub time: f64 },
   /// Notifications from the app wait: read what they say changed.
   Pull,
@@ -302,6 +307,8 @@ pub union Command {
   },
   /// Take the app's notifications and read again what they say changed.
   Pull { pub since: u64, pub selected: u32, pub panel: Panel },
+  /// Read the last frame's stats and the timeline.
+  Frames,
   /// Subscribe to exactly `topics` and `names`.
   Subscribe { pub topics: u32, pub names: List<String> },
   /// Send request `line` without waiting; its reply comes with the notifications.
@@ -370,6 +377,8 @@ pub struct Devtools {
   /// Why the app refused the last style edit, or empty.
   pub styleError: String,
   pub frames: FrameView,
+  /// The app drew frames the Frames panel has yet to read; it does every [`FRAMES_INTERVAL`].
+  pub framesDue: bool,
   pub issues: List<Issue>,
   /// The audit's summary, or empty before the first one.
   pub auditLine: String,
@@ -427,6 +436,7 @@ impl Devtools {
       openChanges: 0,
       styleError: String.make(),
       frames: FrameView.none(),
+      framesDue: false,
       issues: List<Issue>.make(),
       auditLine: String.make(),
       hovered: NO_PARENT,
@@ -912,6 +922,7 @@ fn emptySnapshot(since: u64) -> Snapshot {
     news: List<String>.make(),
     replies: List<String>.make(),
     frames: Option<FrameView>.None,
+    drew: false,
     picking: false,
     picked: NO_PARENT,
     changes: List<ChangeRow>.make(),
@@ -1016,8 +1027,9 @@ fn pickedOf(reply: &Value) -> u32 {
 }
 
 /// Takes the app's notifications and reads again what they say changed: the element tree and
-/// the selected node after `tree` or `roots`, the event log after `events`, what `panel` shows
-/// after `frame`, the picker after `pick`. The status line comes with `tree` and `frame`
+/// the selected node after `tree` or `roots`, the event log after `events`, the picker after
+/// `pick`. A `frame` only marks the snapshot (`drew`) while `panel` is the Frames panel, which
+/// reads at its own pace. The status line comes with `tree` and `frame`
 /// notifications themselves; extension topics and the replies to `ask` go into the snapshot.
 effect fn pull(since: u64, selected: u32, panel: Panel) -> Message
   ! OutOfMemoryError
@@ -1087,26 +1099,7 @@ effect fn pull(since: u64, selected: u32, panel: Panel) -> Message
   }
   let mut quiet = String.make()
   if u32.bitAnd(changed, TOPIC_FRAME | TOPIC_TREE) != 0 {
-    if panel == Panel.Frames {
-      match run ask("{\"cmd\":\"stats\"}", &mut error) {
-        Option<Value>.Some { value } => {
-          run parseStats(&value, &mut snapshot.stats)
-          snapshot.parts = snapshot.parts | PART_STATS
-        }
-        Option<Value>.None => {
-          return Message.Failed { error: move error }
-        }
-      }
-    }
-    if panel == Panel.Frames {
-      let frames = run requestLine("frames", "limit", MAX_FRAMES)
-      match run ask(String.view(&frames), &mut quiet) {
-        Option<Value>.Some { value } => {
-          snapshot.frames = Option<FrameView>.Some { value: run parseFrames(&value) }
-        }
-        Option<Value>.None => {}
-      }
-    }
+    snapshot.drew = panel == Panel.Frames
   }
   if u32.bitAnd(changed, TOPIC_PICK) != 0 {
     match run ask("{\"cmd\":\"pickMode\"}", &mut quiet) {
@@ -1126,6 +1119,32 @@ effect fn pull(since: u64, selected: u32, panel: Panel) -> Message
       }
       Option<Value>.None => {}
     }
+  }
+  return Message.Synced { snapshot: move snapshot }
+}
+
+/// Reads the last frame's stats and the timeline.
+effect fn readFrames() -> Message
+  ! OutOfMemoryError
+  ? &mut Link | &mut Allocator {
+  let mut error = String.make()
+  let mut snapshot = emptySnapshot(0)
+  match run ask("{\"cmd\":\"stats\"}", &mut error) {
+    Option<Value>.Some { value } => {
+      run parseStats(&value, &mut snapshot.stats)
+      snapshot.parts = snapshot.parts | PART_STATS
+    }
+    Option<Value>.None => {
+      return Message.Failed { error: move error }
+    }
+  }
+  let mut quiet = String.make()
+  let frames = run requestLine("frames", "limit", MAX_FRAMES)
+  match run ask(String.view(&frames), &mut quiet) {
+    Option<Value>.Some { value } => {
+      snapshot.frames = Option<FrameView>.Some { value: run parseFrames(&value) }
+    }
+    Option<Value>.None => {}
   }
   return Message.Synced { snapshot: move snapshot }
 }
@@ -1291,6 +1310,7 @@ impl Perform<Message, OutOfMemoryError ? &mut Link | &mut Allocator> for Command
         &names,
       )
       Command.Pull { since, selected, panel } => run pull(since, selected, panel)
+      Command.Frames => run readFrames()
       Command.Subscribe { topics, names } => run subscribed(topics, &names)
       Command.Ask { line, purpose, index } => run askLater(String.view(&line), purpose, index)
       Command.Highlight { node, selected } => run highlightNode(node, selected)
@@ -3951,7 +3971,13 @@ impl App<Message, Command> for Devtools {
       }
       Message.Tick { time: _ } => {
         if self.error.ownedByteLength() != 0 {
+          self.framesDue = false
           self.sync(&mut cx)
+        } else if self.framesDue {
+          self.framesDue = false
+          if self.panel == Panel.Frames {
+            cx.command(Command.Frames)
+          }
         }
       }
       Message.Pull => {
@@ -4200,6 +4226,9 @@ impl App<Message, Command> for Devtools {
         if full || self.panelNews(&s.news) {
           self.readPanel(&mut cx)
         }
+        if s.drew {
+          self.framesDue = true
+        }
         if s.parts == 0 && s.frames.isNone() {
           return ()
         }
@@ -4285,6 +4314,8 @@ impl App<Message, Command> for Devtools {
   fn subscriptions(self: &Self, subs: &mut Subscriptions<Message>) -> () {
     if self.error.ownedByteLength() != 0 {
       subs.every(1, RETRY_INTERVAL, |time| Message.Tick { time: time })
+    } else if self.framesDue {
+      subs.every(6, FRAMES_INTERVAL, |time| Message.Tick { time: time })
     }
     subs.keyBinding(2, "ArrowDown", 0, || Message.SelectNext)
     subs.keyBinding(3, "ArrowUp", 0, || Message.SelectPrevious)
