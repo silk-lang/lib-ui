@@ -1,0 +1,99 @@
+//! The bundled examples on the embedded engine, without a window. Build them first
+//! (`npm ci && npm run build` in modules/js), then run from the repository root:
+//! `silk test --manifest-path modules/js/examples/tests/silk.toml --root src/tests.silk`.
+import ui_js.lib { JsHost, JsError }
+import ui_tree.lib { Tree, TreeError, ProtocolError, Viewport, Input }
+import ui_tree.inspect { findAll, info, NodeInfo }
+import ui_fixtures.fixtures as fixtures
+import silkjs.js_atomics_native { WaiterDomain, SynchronizationError }
+import silkjs.runtime_memory { RuntimeAllocator }
+import silkjs.js_libc_platform as platform
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+
+fn viewport() -> Viewport {
+  return Viewport { width: 400.0, height: 300.0, scale: 1.0 }
+}
+
+/// Whether a node has `value` as its test id, label or text.
+effect fn shows(tree: &Tree<'_>, value: string) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut found = List<u32>.make()
+  run findAll(tree.engine(), value, &mut found)
+  return found.length() > 0
+}
+
+/// Presses and releases the primary button in the middle of the node named `value`.
+effect fn click(host: &mut JsHost<'_>, tree: &mut Tree<'_>, value: string<'static>) -> ()
+  ! ProtocolError | OutOfMemoryError | JsError | AssertionError<'static>
+  ? &mut Allocator {
+  let mut found = List<u32>.make()
+  run findAll(tree.engine(), value, &mut found)
+  run Testing.expect(found.length() > 0, value)
+  let mut x: f32 = 0.0
+  let mut y: f32 = 0.0
+  if let Option<NodeInfo>.Some { value: node } = run info(tree.engine(), found.get(0)) {
+    x = (node.bounds.xMin + node.bounds.xMax) * 0.5
+    y = (node.bounds.yMin + node.bounds.yMax) * 0.5
+  }
+  run host.input(&mut tree, Input.press(x, y))
+  run host.input(&mut tree, Input.release(x, y))
+}
+
+/// React 19 with hooks: the first render is there when `render` returns, a click commits a
+/// state change before the mutations apply, a controlled input shows what the component
+/// keeps, and an effect's interval runs on the host's timers.
+effect fn reactCounter(host: &mut JsHost<'_>, tree: &mut Tree<'_>) -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>
+  ? &mut Allocator {
+  let bundle = run platform.readFile(b"modules/js/examples/react-counter/dist/app.js")
+  run host.module(bundle.asSlice(), b"app.js")
+  run host.flush(&mut tree)
+  drop run tree.frame(viewport(), 0.0)
+  run Testing.expect(run shows(&tree.*, "Click me"), "the first render shows the button")
+
+  run click(&mut host, &mut tree, "counter")
+  drop run tree.frame(viewport(), 0.1)
+  run Testing.expect(run shows(&tree.*, "Clicked"), "the click changed the label")
+
+  run click(&mut host, &mut tree, "name")
+  run host.input(&mut tree, run Input.text("ab"))
+  drop run tree.frame(viewport(), 0.2)
+  run Testing.expect(run shows(&tree.*, "Hello AB. "), "the component saw what was typed, in upper case")
+  run Testing.expect(run shows(&tree.*, "AB"), "the controlled input shows the component's value")
+
+  // The effect that starts the interval runs on a timer of React's scheduler, then the
+  // interval itself fires a second later.
+  run host.tick(0.5, false)
+  run host.tick(1.6, false)
+  run host.tick(1.7, false)
+  run host.flush(&mut tree)
+  drop run tree.frame(viewport(), 1.7)
+  run Testing.expect(run shows(&tree.*, "1"), "the interval counted a second")
+}
+
+effect fn withHost() -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run Tree.make(&fonts)
+  let domain = run WaiterDomain.make()
+  let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let memory = run allocator.observe()
+  let mut host = run JsHost.open(&memory, domain.handle()) |> Effect.provideMut<Allocator>(&mut allocator)
+  let ran = run Effect.result(reactCounter(&mut host, &mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
+  run host.close() |> Effect.provideMut<Allocator>(&mut allocator)
+  match move ran {
+    Result<(), TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>>.Success { .. } => ()
+    Result<(), TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>>.Failure { error } => { fail move error }
+  }
+}
+
+test effect fn reactCounterRunsOnTheEmbeddedEngine() -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run withHost() |> Effect.provideMut<Allocator>(&mut allocator)
+}

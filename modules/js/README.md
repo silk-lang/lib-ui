@@ -1,9 +1,9 @@
 # ui-js
 
 Runs a JavaScript application on a UI tree, with the [SilkJS](https://github.com/silk-lang/lib-silkjs)
-engine embedded in the process. Two parts are here: the Silk host with its native bridge, and
-`@silk/ui`, the JavaScript package applications import. A React renderer and a Vite plugin
-build on them and are not here yet.
+engine embedded in the process. Three parts are here: the Silk host with its native bridge,
+`@silk/ui`, the node and event API, and `@silk/react`, a React renderer on it. A Vite plugin
+with hot reload is not here yet.
 
 ## @silk/ui
 
@@ -47,6 +47,56 @@ mount(createBox({ width: 400, height: 300 }, button));
   throws a `TypeError`.
 - **Errors.** A listener that throws does not stop the dispatch. `setErrorHandler` receives
   the exception. Without a handler the host reports the first one after the input.
+
+## @silk/react
+
+[packages/react](packages/react) renders React components to the tree. Host elements are the
+tree's node kinds, and strings in children become text nodes.
+
+```jsx
+import { useState } from "react";
+import { createRoot } from "@silk/react";
+
+function Counter() {
+  const [clicks, setClicks] = useState(0);
+  return (
+    <box
+      tabIndex={0}
+      style={{ width: 180, height: 70, backgroundColor: "rgb(0, 100, 200)" }}
+      hoverStyle={{ backgroundColor: "rgb(0, 120, 230)" }}
+      onClick={() => setClicks(clicks + 1)}
+    >
+      Clicked {clicks} times
+    </box>
+  );
+}
+
+createRoot().render(<Counter />);
+```
+
+- **Props.** `style`, and `hoverStyle`, `activeStyle`, `focusStyle` and `focusVisibleStyle`
+  for the looks of those states. `onClick`, `onPointerDown`, `onKeyDown`, `onInput` and so
+  on for every event of the tree, with a `Capture` suffix for the capture phase. Listeners
+  receive the `@silk/ui` event. Every other prop is a tree attribute (`tabIndex`, `testId`,
+  `label`, `disabled`, `placeholder`).
+- **Inputs.** `value` on `<input>` is controlled as in React DOM: the field shows what the
+  component keeps, whatever was typed.
+- **Timing.** `root.render` commits before it returns, so the first frame of a window has
+  the content. A state change in a click, key or input listener commits before the host
+  applies the mutations, so the next frame shows it. Other updates go through React's
+  scheduler on the host's timers.
+- **JSX.** Set the JSX import source to `@silk/react`, or use React's own runtime: both
+  work.
+
+[examples/react-counter](examples/react-counter) bundles a counter with Vite into one ES
+module. From `modules/js`, `npm ci && npm run build`, then from the repository root:
+
+```sh
+silk run --manifest-path modules/js/demo/silk.toml modules/js/examples/react-counter/dist/app.js
+```
+
+React 19.3 with react-reconciler 0.34 runs on the engine as it is: the bundle needs only
+the web globals below.
 
 ## The host
 
@@ -115,6 +165,9 @@ Run it from the repository root. `silk task native check` runs it with `--check`
 ## Status
 
 - Tests: `silk test --manifest-path modules/js/tests/silk.toml --root src/tests.silk` from the
-  repository root.
-- Not here yet: unhandled rejection reports, images and canvas commands from JavaScript, the
-  React renderer and the Vite plugin.
+  repository root for the host, `npm test` in `modules/js` for the JavaScript packages
+  against a stand-in for the native functions, and
+  `silk test --manifest-path modules/js/examples/tests/silk.toml --root src/tests.silk` for
+  the bundled examples on the engine (build them first).
+- Not here yet: unhandled rejection reports, images and canvas commands from JavaScript, and
+  the Vite plugin with hot reload.
