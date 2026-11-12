@@ -1,8 +1,8 @@
-//! An order: a parent program that embeds the same child twice. The child is a quantity
-//! stepper that knows nothing about its parent.
-import core.look { INK, LINE, MUTED, button, rgb }
+//! An order: a parent program that embeds the same child three times. The child is one line
+//! of the order, with a quantity stepper, and knows nothing about its parent.
+import core.look { ACCENT, INK, LINE, MUTED, button, rgb }
 import ui_app.css
-import ui_app.css { px, Align, BorderStyle }
+import ui_app.css { percent, px, Align, BorderStyle }
 import ui_app.lib {
   Document,
   fold,
@@ -18,11 +18,14 @@ import ui_app.lib {
 import silk.collections.list { List }
 import silk.core.option { Option }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.i64
 
 // The child.
 
 pub struct Stepper {
   pub label: string<'static>,
+  /// The price of one, in cents.
+  pub price: i64,
   pub quantity: i64,
 }
 
@@ -33,7 +36,8 @@ pub union StepperMessage {
 
 /// What a stepper tells its parent.
 pub union StepperOutput {
-  Changed { pub by: i64 },
+  /// The quantity changed by `by`, which changes the line's cost by `cost` cents.
+  Changed { pub by: i64, pub cost: i64 },
 }
 
 /// What a parent may ask of a stepper.
@@ -56,12 +60,14 @@ impl Submodel<StepperMessage, NoCommand, StepperOutput> for Stepper {
     match move message {
       StepperMessage.ClickedMore => {
         model.quantity = model.quantity + 1
-        return Step.of(move model).reporting(StepperOutput.Changed { by: 1 })
+        let cost = model.price
+        return Step.of(move model).reporting(StepperOutput.Changed { by: 1, cost: cost })
       }
       StepperMessage.ClickedFewer => {
         if model.quantity > 0 {
           model.quantity = model.quantity - 1
-          return Step.of(move model).reporting(StepperOutput.Changed { by: -1 })
+          let cost = model.price
+          return Step.of(move model).reporting(StepperOutput.Changed { by: -1, cost: 0 - cost })
         }
       }
     }
@@ -72,16 +78,64 @@ impl Submodel<StepperMessage, NoCommand, StepperOutput> for Stepper {
     return h.row(
       &[h.style(&[css.alignItems(Align.Center), css.columnGap(px(10.0))])],
       &[
-        h.box(&[h.style(&[css.flexGrow(1.0)])], &[h.text(model.label)]),
+        h.column(
+          &[h.style(&[css.flexGrow(1.0)])],
+          &[
+            h.text(model.label),
+            h.box(
+              &[h.style(&[css.fontSize(px(13.0)), css.color(rgb(MUTED))])],
+              &[money<StepperMessage>(h, model.price)],
+            ),
+          ],
+        ),
         button(h, "-", StepperMessage.ClickedFewer),
         h.row(
           &[h.style(&[css.minWidth(px(24.0)), css.justifyContent(Align.Center)])],
           &[h.number(model.quantity)],
         ),
         button(h, "+", StepperMessage.ClickedMore),
+        h.row(
+          &[
+            h.style(
+              &[
+                css.minWidth(px(64.0)),
+                css.justifyContent(Align.End),
+                css.fontVariantNumeric("tabular-nums"),
+                css.color(
+                  rgb(
+                    if model.quantity == 0 {
+                      MUTED
+                    } else {
+                      INK
+                    },
+                  ),
+                ),
+              ],
+            ),
+          ],
+          &[money<StepperMessage>(h, model.price * model.quantity)],
+        ),
       ],
     )
   }
+}
+
+/// Cents as dollars: `$4.50`.
+fn money<M>(h: &Document<M>, cents: i64) -> Node {
+  return h.row(
+    &[],
+    &[
+      h.text("$"),
+      h.number(cents / 100),
+      h.text("."),
+      if cents % 100 < 10 {
+        h.text("0")
+      } else {
+        h.empty()
+      },
+      h.number(cents % 100),
+    ],
+  )
 }
 
 impl Receives<StepperInput, NoCommand, StepperOutput> for Stepper {
@@ -102,22 +156,30 @@ impl Receives<StepperInput, NoCommand, StepperOutput> for Stepper {
 pub struct Order {
   pub coffee: Stepper,
   pub croissant: Stepper,
-  /// How many things are in the order, kept up to date from what the steppers report.
+  pub juice: Stepper,
+  /// How many things are in the order and what they cost, in cents. Both are kept up to date
+  /// from what the steppers report.
   pub pieces: i64,
+  pub total: i64,
 }
 
 pub union Message {
   GotCoffeeMessage { pub message: StepperMessage },
   GotCroissantMessage { pub message: StepperMessage },
+  GotJuiceMessage { pub message: StepperMessage },
   ClickedClear,
 }
 
 type Next = Update<Order, NoCommand, NoOutput>
 
+/// Delivery is free from this many cents.
+const FREE_FROM: i64 = 2000
+
 /// Adds what a stepper reported to the order.
 fn count(model: &mut Order, out: Option<StepperOutput>) -> () {
-  if let Option<StepperOutput>.Some { value: StepperOutput.Changed { by } } = move out {
+  if let Option<StepperOutput>.Some { value: StepperOutput.Changed { by, cost } } = move out {
     model.pieces = model.pieces + by
+    model.total = model.total + cost
   }
 }
 
@@ -127,9 +189,11 @@ impl Program<Message, NoCommand> for Order {
     ? &mut Allocator {
     return Next.of(
       Order {
-        coffee: Stepper { label: "Coffee", quantity: 0 },
-        croissant: Stepper { label: "Croissant", quantity: 0 },
+        coffee: Stepper { label: "Flat white", price: 450, quantity: 0 },
+        croissant: Stepper { label: "Almond croissant", price: 375, quantity: 0 },
+        juice: Stepper { label: "Orange juice", price: 500, quantity: 0 },
         pieces: 0,
+        total: 0,
       },
     )
   }
@@ -146,10 +210,16 @@ impl Program<Message, NoCommand> for Order {
         let folded = run fold(&mut model.croissant, move inner)
         count(&mut model, move folded.out)
       }
+      Message.GotJuiceMessage { message: inner } => {
+        let folded = run fold(&mut model.juice, move inner)
+        count(&mut model, move folded.out)
+      }
       Message.ClickedClear => {
         drop run foldInput(&mut model.coffee, StepperInput.Clear)
         drop run foldInput(&mut model.croissant, StepperInput.Clear)
+        drop run foldInput(&mut model.juice, StepperInput.Clear)
         model.pieces = 0
+        model.total = 0
       }
     }
     return Next.of(move model)
@@ -159,7 +229,7 @@ impl Program<Message, NoCommand> for Order {
     return h.column(
       &[
         h.style(
-          &[css.padding(px(16.0)), css.rowGap(px(10.0)), css.color(rgb(INK)), css.maxWidth(px(320.0))],
+          &[css.padding(px(16.0)), css.rowGap(px(12.0)), css.color(rgb(INK)), css.maxWidth(px(380.0))],
         ),
       ],
       &[
@@ -171,27 +241,96 @@ impl Program<Message, NoCommand> for Order {
           &model.croissant,
           |message: StepperMessage| Message.GotCroissantMessage { message: move message },
         ),
+        h.submodel(
+          &model.juice,
+          |message: StepperMessage| Message.GotJuiceMessage { message: move message },
+        ),
+        delivery(h, model),
         h.row(
           &[
             h.style(
               &[
                 css.alignItems(Align.Center),
                 css.columnGap(px(6.0)),
-                css.paddingTop(px(10.0)),
+                css.paddingTop(px(12.0)),
                 css.borderTopWidth(px(1.0)),
                 css.borderStyle(BorderStyle.Solid),
                 css.borderColor(rgb(LINE)),
-                css.color(rgb(MUTED)),
               ],
             ),
           ],
           &[
-            h.box(&[h.testId("pieces")], &[h.number(model.pieces)]),
-            h.box(&[h.style(&[css.flexGrow(1.0)])], &[h.text("in the order")]),
-            button(h, "Clear", Message.ClickedClear),
+            h.row(
+              &[h.style(&[css.columnGap(px(4.0)), css.color(rgb(MUTED)), css.flexGrow(1.0)])],
+              &[
+                h.box(&[h.testId("pieces")], &[h.number(model.pieces)]),
+                h.text(
+                  if model.pieces == 1 {
+                    "item"
+                  } else {
+                    "items"
+                  },
+                ),
+              ],
+            ),
+            h.box(
+              &[
+                h.testId("total"),
+                h.style(
+                  &[css.fontSize(px(20.0)), css.fontWeight(700.0), css.fontVariantNumeric("tabular-nums")],
+                ),
+              ],
+              &[money<Message>(h, model.total)],
+            ),
           ],
+        ),
+        h.row(
+          &[h.style(&[css.columnGap(px(8.0)), css.justifyContent(Align.End)])],
+          &[button(h, "Clear", Message.ClickedClear)],
         ),
       ],
     )
   }
+}
+
+/// How far the order is from free delivery: a line of text over a bar that fills up.
+fn delivery(h: &Document<Message>, model: &Order) -> Node {
+  let short = FREE_FROM - model.total
+  let share: f32 = if short <= 0 {
+    100.0
+  } else {
+    i64.toF32(model.total) * 100.0 / i64.toF32(FREE_FROM)
+  }
+  return h.column(
+    &[h.style(&[css.rowGap(px(6.0)), css.fontSize(px(13.0)), css.color(rgb(MUTED))])],
+    &[
+      if short <= 0 {
+        h.box(&[h.style(&[css.color(rgb(ACCENT))])], &[h.text("Delivery is free")])
+      } else {
+        h.row(
+          &[h.style(&[css.columnGap(px(4.0))])],
+          &[money<Message>(h, short), h.text("more for free delivery")],
+        )
+      },
+      h.box(
+        &[h.style(&[css.height(px(6.0)), css.borderRadius(px(3.0)), css.backgroundColor(rgb(0xE5E7EB))])],
+        &[
+          h.box(
+            &[
+              h.style(
+                &[
+                  css.height(px(6.0)),
+                  css.width(percent(share)),
+                  css.borderRadius(px(3.0)),
+                  css.backgroundColor(rgb(ACCENT)),
+                ],
+              ),
+              h.transition("width 200ms ease"),
+            ],
+            &[],
+          ),
+        ],
+      ),
+    ],
+  )
 }
