@@ -417,6 +417,8 @@ pub struct UiTree<'a> {
   pub replayable: bool,
   pub seed: HashSeed,
   pub stylesDirty: bool,
+  /// Some nodes have `styleDirty`: the next resolve visits only their subtrees' paths.
+  pub stylesPending: bool,
   pub frameNumber: u64,
   /// Changes to published semantics or allocated geometry.
   pub semanticRevision: u64,
@@ -570,6 +572,7 @@ impl<'a> UiTree<'a> {
       replayable: false,
       seed: seed,
       stylesDirty: true,
+      stylesPending: false,
       frameNumber: 0,
       semanticRevision: 0,
       revision: 0,
@@ -652,6 +655,25 @@ impl<'a> UiTree<'a> {
 
   pub fn node(self: &Self, slot: u32) -> &Node {
     return &self.nodes.asSlice()[u32.toUsize(slot)]
+  }
+
+  /// Says that the style inputs of the node at `slot` changed (its declarations, its
+  /// parent, its hover, press or focus state): the next resolve restyles it, and its
+  /// descendants as far as what they inherit changed. Its ancestors are marked so the resolve
+  /// finds it from the root.
+  pub fn restyle(self: &mut Self, slot: u32) -> () {
+    self.stylesPending = true
+    let nodes = self.nodes.asMutSlice()
+    nodes[u32.toUsize(slot)].styleDirty = true
+    let mut up = nodes[u32.toUsize(slot)].parent
+    while up != NONE {
+      let at = u32.toUsize(up)
+      if nodes[at].subtreeDirty {
+        return ()
+      }
+      nodes[at].subtreeDirty = true
+      up = nodes[at].parent
+    }
   }
 
   fn nodeMut(self: &mut Self, slot: u32) -> &mut Node {
@@ -835,7 +857,7 @@ impl<'a> UiTree<'a> {
           }
           i = i + 1
         }
-        self.stylesDirty = true
+        self.restyle(slot)
       }
       Mutation.ClearStyle { id, state } => {
         let slot = run self.require(index, id)
@@ -857,7 +879,7 @@ impl<'a> UiTree<'a> {
             node.focusVisible.clear()
           }
         }
-        self.stylesDirty = true
+        self.restyle(slot)
       }
       Mutation.SetText { id, value } => {
         let slot = run self.require(index, id)
@@ -913,7 +935,7 @@ impl<'a> UiTree<'a> {
           Attribute.Multiline { value } => {
             node.edit.multiline = value
             let isInput = node.kind == NodeKind.Input
-            self.stylesDirty = true
+            self.restyle(slot)
             if isInput {
               run edit.syncDisplay(&mut self, slot)
             }
@@ -1179,6 +1201,8 @@ impl<'a> UiTree<'a> {
       reportedBounds: Rect<f32>.new(0.0, 0.0, 0.0, 0.0),
       hovered: false,
       pressed: false,
+      styleDirty: true,
+      subtreeDirty: false,
       scrollX: 0.0,
       scrollY: 0.0,
       resource: NONE,
@@ -1213,7 +1237,7 @@ impl<'a> UiTree<'a> {
     if kind == NodeKind.Input {
       run edit.syncDisplay(&mut self, slot)
     }
-    self.stylesDirty = true
+    // A new node is detached: it is resolved when it is attached (`restyle`).
   }
 
   fn canHaveChildren(kind: NodeKind) -> bool {
@@ -1269,7 +1293,7 @@ impl<'a> UiTree<'a> {
     )
     let moved = self.nodeMut(childSlot)
     moved.parent = parentSlot
-    self.stylesDirty = true
+    self.restyle(childSlot)
 
     // The child left another root, which is not current: that root changed all the same.
     if from != NONE && from != self.current {
@@ -1294,7 +1318,9 @@ impl<'a> UiTree<'a> {
     if self.focused != NONE && self.within(self.focused, slot) {
       run self.focusSlot(NONE)
     }
-    self.stylesDirty = true
+    // No style depends on a sibling or a child, so the nodes left behind keep theirs. The
+    // detached subtree is resolved when it is attached again.
+    self.applied = true
   }
 
   effect fn destroy(self: &mut Self, index: usize, slot: u32) -> ()
@@ -1613,7 +1639,7 @@ impl<'a> UiTree<'a> {
       laidOutRevision: Intrinsic.replace(self.laidOutRevision, usize.MAX),
       laidOutScrolls: Intrinsic.replace(self.laidOutScrolls, usize.MAX),
       replayable: Intrinsic.replace(self.replayable, false),
-      stylesDirty: Intrinsic.replace(self.stylesDirty, true),
+      stylesDirty: Intrinsic.replace(self.stylesDirty, true) || Intrinsic.replace(self.stylesPending, false),
       applied: Intrinsic.replace(self.applied, true),
       paintDirty: Intrinsic.replace(self.paintDirty, false),
       paintCachesStale: Intrinsic.replace(self.paintCachesStale, true),
@@ -2104,7 +2130,13 @@ impl<'a> UiTree<'a> {
     if slot != NONE && u32.bitAnd(self.node(slot).listeners, LISTEN_FOCUS) != 0 {
       run self.queue(EventKind.Focus, slot)
     }
-    self.stylesDirty = true
+    // Focus variants apply to the focused node alone.
+    if previous != NONE && self.node(previous).live {
+      self.restyle(previous)
+    }
+    if slot != NONE {
+      self.restyle(slot)
+    }
   }
 
   /// The node ids from the root down to `slot`.
@@ -2502,27 +2534,63 @@ impl<'a> UiTree<'a> {
   effect fn resolveStyles(self: &mut Self) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
-    if !self.stylesDirty {
+    if !self.stylesDirty && !self.stylesPending {
       return ()
     }
+    let full = self.stylesDirty
     self.stylesDirty = false
+    self.stylesPending = false
     self.paintCachesStale = true
     if self.root == NONE {
       return ()
     }
-    let mut stack = List<u32>.make()
-    let mut children = List<u32>.make()
-    run stack.append(self.root)
+    // Each entry is a slot and whether its parent's inherited values changed.
+    let mut stack = List<u64>.make()
+    run stack.append(u32.toU64(self.root))
     while stack.length() != 0 {
       let last = stack.length() - 1
-      let slot = stack.get(last)
+      let entry = stack.get(last)
       stack.truncate(last)
-      run self.resolve(slot)
-      run self.childSlots(slot, &mut children)
-      let mut i = children.length()
-      while i > 0 {
-        i = i - 1
-        run stack.append(children.get(i))
+      let slot = u64.toU32(u64.bitAnd(entry, 0xFFFFFFFF))
+      let forced = full || u64.shiftRight(entry, 32) != 0
+      let node = self.node(slot)
+      let own = forced || node.styleDirty
+      let below = node.subtreeDirty
+      let mut changed = full
+      if own {
+        let before = node.computed.text
+        let events = node.computed.paint.pointerEvents
+        run self.resolve(slot)
+        let after = &self.node(slot).computed
+        changed = full || !sameText(&before, &after.text) || events != after.paint.pointerEvents
+      }
+      let cleared = self.nodeMut(slot)
+      cleared.styleDirty = false
+      cleared.subtreeDirty = false
+      if changed || below {
+        let flag: u64 = if changed { 0x100000000 } else { 0 }
+        // Children in reverse, so the first is resolved first.
+        let css = self.node(slot).css
+        let first = stack.length()
+        let layoutNodes = self.layout.nodes.asSlice()
+        let mut child = layoutNodes[css].firstChild
+        while child != NO_INDEX {
+          let found = self.slotOfCssNode(child)
+          if found != NONE {
+            run stack.append(u64.bitOr(u32.toU64(found), flag))
+          }
+          child = layoutNodes[child].nextSibling
+        }
+        let items = stack.asMutSlice()
+        let mut a = first
+        let mut b = items.length
+        while b > a + 1 {
+          b = b - 1
+          let swap = items[a]
+          items[a] = items[b]
+          items[b] = swap
+          a = a + 1
+        }
       }
     }
   }
@@ -2774,7 +2842,7 @@ impl<'a> UiTree<'a> {
   /// scroll into view waits. Hosts that draw only on demand ask after applying batches and
   /// dispatching input.
   pub fn needsFrame(self: &Self) -> bool {
-    return self.applied || self.stylesDirty || self.paintDirty || self.scrolled
+    return self.applied || self.stylesDirty || self.stylesPending || self.paintDirty || self.scrolled
       || cssom_view.scrollAnimating(self)
       || self.layout.revision() != self.laidOutRevision
       || self.layout.scrollRevision() != self.laidOutScrolls
@@ -2941,7 +3009,7 @@ impl<'a> UiTree<'a> {
 
   /// Whether a mutation or an edit changed styles or layout inputs since the last layout.
   pub fn layoutPending(self: &Self) -> bool {
-    return self.stylesDirty || self.layout.revision() != self.laidOutRevision
+    return self.stylesDirty || self.stylesPending || self.layout.revision() != self.laidOutRevision
   }
 
   /// Resolves styles and lays out now, at the last frame's size, so geometry queries between
@@ -3428,4 +3496,40 @@ effect fn defineIcon(
 effect fn resourceFailed(error: ResourceError) -> bool {
   drop error
   return false
+}
+
+/// Whether two computed text styles are the same, so the children that inherit them need no
+/// restyle.
+fn sameText(left: &TextStyle, right: &TextStyle) -> bool {
+  return left.writingMode == right.writingMode && left.textOrientation == right.textOrientation
+    && left.textAlignLast == right.textAlignLast
+    && left.textWrap == right.textWrap
+    && left.whiteSpaceCollapse == right.whiteSpaceCollapse
+    && left.textJustify == right.textJustify
+    && &left.textIndent == &right.textIndent
+    && &left.tabSize == &right.tabSize
+    && left.orphans == right.orphans
+    && left.widows == right.widows
+    && left.visibility == right.visibility
+    && left.family == right.family
+    && left.size == right.size
+    && left.weight == right.weight
+    && left.style == right.style
+    && &left.lineHeight == &right.lineHeight
+    && &left.color == &right.color
+    && left.align == right.align
+    && left.whiteSpace == right.whiteSpace
+    && left.direction == right.direction
+    && left.decoration.underline == right.decoration.underline
+    && left.decoration.overline == right.decoration.overline
+    && left.decoration.lineThrough == right.decoration.lineThrough
+    && &left.decorationColor == &right.decorationColor
+    && left.hasDecorationColor == right.hasDecorationColor
+    && left.wavy == right.wavy
+    && left.visible == right.visible
+    && &left.caretColor == &right.caretColor
+    && left.hasCaretColor == right.hasCaretColor
+    && &left.selectionColor == &right.selectionColor
+    && &left.placeholderColor == &right.placeholderColor
+    && left.hasPlaceholderColor == right.hasPlaceholderColor
 }

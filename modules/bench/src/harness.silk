@@ -1,0 +1,217 @@
+//! A small benchmark harness: a benchmark is a value with a `prepare` step that is not
+//! measured and a `body` that is. The harness finds how many operations fill a sample, runs
+//! warm-up samples, then measured ones, and reports the median, the least and the spread of
+//! the time of one operation.
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.i64
+import silk.num.u64
+import silk.num.usize
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.system_clock { Instant, SystemClock }
+import silk.text.string { String }
+import ui_tree.lib { TreeError }
+
+/// One benchmark: `prepare` runs before each operation and is not timed, `body` is the
+/// operation.
+pub interface Bench {
+  effect fn prepare(self: &mut Self) -> () ! TreeError | OutOfMemoryError ? &mut Allocator {
+    return ()
+  }
+
+  effect fn body(self: &mut Self) -> () ! TreeError | OutOfMemoryError ? &mut Allocator
+}
+
+/// What a run of one benchmark measured, in nanoseconds an operation.
+pub struct Measurement {
+  pub median: i64,
+  pub least: i64,
+  pub mean: i64,
+  pub operations: u64,
+}
+
+impl Copy for Measurement {}
+
+/// How long a benchmark runs.
+pub struct Settings {
+  /// The least time of a sample, in nanoseconds.
+  pub sample: i64,
+  pub warmup: usize,
+  pub samples: usize,
+  /// Run each body once and measure nothing.
+  pub smoke: bool,
+}
+
+impl Copy for Settings {}
+
+impl Settings {
+  pub fn standard() -> Settings {
+    return Settings { sample: 100000000, warmup: 2, samples: 9, smoke: false }
+  }
+
+  pub fn quick() -> Settings {
+    return Settings { sample: 20000000, warmup: 1, samples: 5, smoke: false }
+  }
+
+  pub fn smokeOnly() -> Settings {
+    return Settings { sample: 0, warmup: 0, samples: 1, smoke: true }
+  }
+}
+
+fn nanos(at: &Instant) -> i64 {
+  return SystemClock.seconds(at) * 1000000000 + SystemClock.nanoseconds(at)
+}
+
+/// The time of `operations` operations of `bench`, prepare steps excluded.
+effect fn sample<B: Bench>(bench: &mut B, operations: u64, wall: &mut i64) -> i64
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock {
+  let mut total: i64 = 0
+  let mut i: u64 = 0
+  let began = run MonotonicClock.now()
+  while i < operations {
+    run bench.prepare()
+    let start = run MonotonicClock.now()
+    run bench.body()
+    let end = run MonotonicClock.now()
+    total = total + nanos(&end) - nanos(&start)
+    i = i + 1
+  }
+  let finished = run MonotonicClock.now()
+  wall.* = nanos(&finished) - nanos(&began)
+  return total
+}
+
+/// Measures `bench` with `settings`.
+pub effect fn measure<B: Bench>(bench: &mut B, settings: Settings) -> Measurement
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock {
+  if settings.smoke {
+    let mut wall: i64 = 0
+    let single = run sample(&mut bench, 1, &mut wall)
+    return Measurement { median: single, least: single, mean: single, operations: 1 }
+  }
+  let mut operations: u64 = 1
+  let mut wall: i64 = 0
+  while true {
+    let spent = run sample(&mut bench, operations, &mut wall)
+    // A benchmark whose prepare step costs much more than its body stops at the time its
+    // samples take, not the time they measure.
+    if spent >= settings.sample || wall >= settings.sample * 4 || operations >= 1048576 {
+      break
+    }
+    // Aim at the sample time from what this many took, at least doubling.
+    let mut next = operations * 2
+    if spent > 0 {
+      let wanted = i64.toU64(settings.sample / spent + 1) * operations
+      if wanted > next {
+        next = wanted
+      }
+    }
+    // Never let the prepare steps of the next round take much longer than a sample's wall
+    // budget.
+    if wall > 0 {
+      let affordable = i64.toU64(settings.sample * 4 / wall + 1) * operations
+      if affordable < next {
+        next = affordable
+      }
+    }
+    operations = next
+  }
+  let mut w: usize = 0
+  while w < settings.warmup {
+    drop run sample(&mut bench, operations, &mut wall)
+    w = w + 1
+  }
+  let mut times = List<i64>.make()
+  let mut s: usize = 0
+  let mut sum: i64 = 0
+  while s < settings.samples {
+    let spent = run sample(&mut bench, operations, &mut wall)
+    let each = spent / u64.toI64(operations)
+    run times.append(each)
+    sum = sum + each
+    s = s + 1
+  }
+  sort(&mut times)
+  return Measurement {
+    median: times.get(times.length() / 2),
+    least: times.get(0),
+    mean: sum / usize.toI64(settings.samples),
+    operations: operations,
+  }
+}
+
+fn sort(values: &mut List<i64>) -> () {
+  let mut i: usize = 1
+  while i < values.length() {
+    let value = values.get(i)
+    let mut j = i
+    while j > 0 && values.get(j - 1) > value {
+      let previous = values.get(j - 1)
+      values.set(j, previous)
+      j = j - 1
+    }
+    values.set(j, value)
+    i = i + 1
+  }
+}
+
+/// `value` in decimal.
+pub effect fn decimal(out: &mut String, value: i64) -> () ! OutOfMemoryError ? &mut Allocator {
+  if value < 0 {
+    run out.append("-")
+    run decimal(&mut out, 0 - value)
+    return ()
+  }
+  let mut digits: [u8; 20] = [0; 20]
+  let mut count: usize = 0
+  let mut rest = value
+  while true {
+    digits[count] = i64.toU8(rest % 10) + 48
+    count = count + 1
+    rest = rest / 10
+    if rest == 0 {
+      break
+    }
+  }
+  while count > 0 {
+    count = count - 1
+    let one: [u8; 1] = [digits[count]]
+    run out.append(unsafe String.fromUtf8Unchecked(&one))
+  }
+}
+
+/// `value` nanoseconds as a time with three significant decimals: ns, us or ms.
+pub effect fn duration(out: &mut String, value: i64) -> () ! OutOfMemoryError ? &mut Allocator {
+  if value < 10000 {
+    run decimal(&mut out, value)
+    run out.append(" ns")
+  } else if value < 10000000 {
+    run fixed(&mut out, value, 1000)
+    run out.append(" us")
+  } else {
+    run fixed(&mut out, value, 1000000)
+    run out.append(" ms")
+  }
+}
+
+/// `value / unit` with two decimals.
+effect fn fixed(out: &mut String, value: i64, unit: i64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let hundredths = (value * 100 + unit / 2) / unit
+  run decimal(&mut out, hundredths / 100)
+  run out.append(".")
+  let part = hundredths % 100
+  if part < 10 {
+    run out.append("0")
+  }
+  run decimal(&mut out, part)
+}
+
+/// Pads `out` with spaces to `width` bytes.
+pub effect fn pad(out: &mut String, from: usize, width: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  while out.ownedByteLength() - from < width {
+    run out.append(" ")
+  }
+}
