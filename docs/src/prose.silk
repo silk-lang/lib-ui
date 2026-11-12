@@ -1,0 +1,809 @@
+//! Draws a page's blocks: headings, paragraphs with their inline markup, code, lists, notes,
+//! tables, pictures and live demos.
+import code { Piece, CALL, COMMENT, KEYWORD, NUMBER, TEXT, TYPE }
+import demos
+import demos { DemoMessage }
+import markdown { Block }
+import model { Message, Site }
+import shots
+import theme {
+  BODY,
+  CODE_CALL,
+  CODE_COMMENT,
+  CODE_KEYWORD,
+  CODE_NUMBER,
+  CODE_PLAIN,
+  CODE_SURFACE,
+  CODE_TEXT,
+  CODE_TYPE,
+  FAINT,
+  INK,
+  MONO,
+  MUTED,
+  PANEL,
+  PAPER,
+  RULE,
+  SIGNAL,
+  SIGNAL_INK,
+  SIGNAL_SOFT,
+  background,
+  borderColor,
+  color,
+  outline,
+  pad,
+  round
+}
+import ui_app.css
+import ui_app.css { px, percent, Align, FontStyle, Keyword, Overflow, Property, WhiteSpace }
+import ui_app.heap { Heap }
+import ui_app.lib { Attr, Document, Node, Role }
+import silk.collections.list { List }
+import silk.num.u32
+import silk.num.usize
+import silk.text.string { String }
+
+// Inline markup.
+
+fn find(bytes: &[u8], from: usize, byte: u8) -> usize {
+  let mut i = from
+  while i < bytes.length && bytes[i] != byte {
+    i = i + 1
+  }
+  return i
+}
+
+/// Where the next `**` is at or after `from`, or the text's length.
+fn findPair(bytes: &[u8], from: usize) -> usize {
+  let mut i = from
+  while i + 1 < bytes.length {
+    if bytes[i] == 42 && bytes[i + 1] == 42 {
+      return i
+    }
+    i = i + 1
+  }
+  return bytes.length
+}
+
+fn codeSpan<M>(h: &Document<M>, value: string) -> Node {
+  return h.span(
+    &[
+      h.style(
+        &[
+          css.fontFamily(MONO),
+          css.raw(Property.FontSize, "0.86em"),
+          color(INK),
+          background(PANEL),
+          round(5.0),
+          css.raw(Property.Padding, "0.12em 0.38em"),
+          css.raw(Property.Border, "1px solid"),
+          borderColor(RULE),
+          css.raw(Property.OverflowWrap, "anywhere"),
+        ],
+      ),
+    ],
+    &[h.text(value)],
+  )
+}
+
+fn linkLook<M>(h: &Document<M>) -> Attr {
+  return h.attrs(
+    &[
+      h.style(
+        &[
+          css.display(Keyword.Inline),
+          color(SIGNAL_INK),
+          css.fontWeight(500.0),
+          css.raw(Property.TextDecoration, "underline"),
+          css.raw(Property.TextDecorationColor, "var(--signal-line)"),
+          css.raw(Property.TextDecorationThickness, "1.5px"),
+        ],
+      ),
+      h.hover(&[css.raw(Property.TextDecorationColor, "currentColor")]),
+      h.focusVisible(&[css.raw(Property.TextDecorationColor, "currentColor")]),
+    ],
+  )
+}
+
+/// The nodes of `text`, a run of prose: plain text, `code`, `**strong**`, `*emphasis*` and
+/// `[links](/path/)`.
+pub fn inline<M>(h: &Document<M>, text: string, out: &mut List<Node>) -> () {
+  let mut heap = Heap.make()
+  let bytes = String.utf8Bytes(text)
+  let mut plain: usize = 0
+  let mut at: usize = 0
+  while at < bytes.length {
+    let byte = bytes[at]
+    let mut end = at
+    let mut made = h.empty()
+    if byte == 96 {
+      let close = find(bytes, at + 1, 96)
+      if close < bytes.length {
+        made = codeSpan(h, String.slice(text, at + 1, close - at - 1))
+        end = close + 1
+      }
+    } else if byte == 42 && at + 1 < bytes.length && bytes[at + 1] == 42 {
+      let close = findPair(bytes, at + 2)
+      if close < bytes.length {
+        let mut inner = List<Node>.make()
+        inline(h, String.slice(text, at + 2, close - at - 2), &mut inner)
+        made = h.span(&[h.style(&[css.fontWeight(650.0), color(INK)])], inner.asSlice())
+        end = close + 2
+      }
+    } else if byte == 42 && at + 1 < bytes.length && bytes[at + 1] != 32 {
+      let close = find(bytes, at + 1, 42)
+      if close < bytes.length {
+        let mut inner = List<Node>.make()
+        inline(h, String.slice(text, at + 1, close - at - 1), &mut inner)
+        made = h.span(&[h.style(&[css.fontStyle(FontStyle.Italic)])], inner.asSlice())
+        end = close + 1
+      }
+    } else if byte == 91 {
+      let close = find(bytes, at + 1, 93)
+      if close + 1 < bytes.length && bytes[close + 1] == 40 {
+        let last = find(bytes, close + 2, 41)
+        if last < bytes.length {
+          let mut inner = List<Node>.make()
+          inline(h, String.slice(text, at + 1, close - at - 1), &mut inner)
+          made = h.link(
+            String.slice(text, close + 2, last - close - 2),
+            &[linkLook(h)],
+            inner.asSlice(),
+          )
+          end = last + 1
+        }
+      }
+    }
+    if end == at {
+      at = at + 1
+    } else {
+      if plain < at {
+        heap.alloc(out.append(h.text(String.slice(text, plain, at - plain))))
+      }
+      heap.alloc(out.append(made))
+      at = end
+      plain = end
+    }
+  }
+  if plain < bytes.length {
+    heap.alloc(out.append(h.text(String.slice(text, plain, bytes.length - plain))))
+  }
+}
+
+/// A box of prose with the look `attributes`.
+fn prose<M>(h: &Document<M>, attributes: &[Attr], text: string) -> Node {
+  let mut nodes = List<Node>.make()
+  inline(h, text, &mut nodes)
+  return h.box(attributes, nodes.asSlice())
+}
+
+// Blocks.
+
+fn proseLook<M>(h: &Document<M>) -> Attr {
+  return h.style(
+    &[
+      color(BODY),
+      css.fontSize(px(16.0)),
+      css.raw(Property.LineHeight, "1.7"),
+      css.raw(Property.OverflowWrap, "break-word"),
+    ],
+  )
+}
+
+fn heading<M>(h: &Document<M>, level: u32, text: string, slug: string) -> Node {
+  if level <= 1 {
+    return h.box(
+      &[
+        h.accessRole(Role.Heading),
+        h.style(
+          &[
+            color(INK),
+            css.raw(Property.FontSize, "clamp(30px, 5vw, 40px)"),
+            css.fontWeight(700.0),
+            css.raw(Property.LineHeight, "1.12"),
+            css.letterSpacing("-0.035em"),
+          ],
+        ),
+      ],
+      &[h.text(text), h.span(&[h.style(&[color(SIGNAL)])], &[h.text(".")])],
+    )
+  }
+  if level == 2 {
+    return prose(
+      h,
+      &[
+        h.accessRole(Role.Heading),
+        h.testId(slug),
+        h.style(
+          &[
+            color(INK),
+            css.fontSize(px(25.0)),
+            css.fontWeight(650.0),
+            css.raw(Property.LineHeight, "1.25"),
+            css.letterSpacing("-0.025em"),
+            css.marginTop(px(52.0)),
+            css.paddingTop(px(28.0)),
+            css.raw(Property.BorderTop, "1px solid var(--rule)"),
+          ],
+        ),
+      ],
+      text,
+    )
+  }
+  return prose(
+    h,
+    &[
+      h.accessRole(Role.Heading),
+      h.testId(slug),
+      h.style(
+        &[
+          color(INK),
+          css.fontSize(px(18.5)),
+          css.fontWeight(650.0),
+          css.raw(Property.LineHeight, "1.35"),
+          css.letterSpacing("-0.015em"),
+          css.marginTop(px(34.0)),
+        ],
+      ),
+    ],
+    text,
+  )
+}
+
+/// The first paragraph of a page, right under its title.
+fn lead<M>(h: &Document<M>, text: string) -> Node {
+  return prose(
+    h,
+    &[
+      h.style(
+        &[
+          color(MUTED),
+          css.raw(Property.FontSize, "clamp(17px, 2.2vw, 19px)"),
+          css.raw(Property.LineHeight, "1.6"),
+          css.marginTop(px(16.0)),
+          css.raw(Property.OverflowWrap, "break-word"),
+        ],
+      ),
+    ],
+    text,
+  )
+}
+
+fn paragraph<M>(h: &Document<M>, text: string) -> Node {
+  return prose(h, &[proseLook(h), h.style(&[css.marginTop(px(18.0))])], text)
+}
+
+fn item<M>(h: &Document<M>, ordered: bool, depth: u32, marker: string, text: string) -> Node {
+  let sign = if ordered {
+    marker
+  } else {
+    "•"
+  }
+  return h.row(
+    &[
+      proseLook(h),
+      h.accessRole(Role.ListItem),
+      h.style(
+        &[css.marginTop(px(8.0)), css.paddingLeft(px(4.0 + 22.0 * u32.toF32(depth)))],
+      ),
+    ],
+    &[
+      h.box(
+        &[
+          h.style(
+            &[
+              css.width(px(26.0)),
+              css.flexShrink(0.0),
+              color(FAINT),
+              css.fontVariantNumeric("tabular-nums"),
+            ],
+          ),
+        ],
+        &[h.text(sign)],
+      ),
+      prose(h, &[h.style(&[css.flexGrow(1.0), css.minWidth(px(0.0))])], text),
+    ],
+  )
+}
+
+/// A note: the lines of a block quote, without their `>`.
+fn note<M>(h: &Document<M>, text: string) -> Node {
+  let mut heap = Heap.make()
+  let bytes = String.utf8Bytes(text)
+  let mut nodes = List<Node>.make()
+  let mut at: usize = 0
+  while at < bytes.length {
+    let end = find(bytes, at, 10)
+    let mut start = at
+    if start < end && bytes[start] == 62 {
+      start = start + 1
+    }
+    if start < end && bytes[start] == 32 {
+      start = start + 1
+    }
+    inline(h, String.slice(text, start, end - start), &mut nodes)
+    heap.alloc(nodes.append(h.text(" ")))
+    at = end + 1
+  }
+  return h.box(
+    &[
+      proseLook(h),
+      h.accessRole(Role.Group),
+      h.style(
+        &[
+          css.marginTop(px(22.0)),
+          background(SIGNAL_SOFT),
+          css.raw(Property.BorderLeft, "3px solid var(--signal)"),
+          css.raw(Property.BorderRadius, "0 10px 10px 0"),
+          css.fontSize(px(15.0)),
+        ],
+      ),
+      h.style(&pad(13.0, 18.0)),
+    ],
+    nodes.asSlice(),
+  )
+}
+
+/// The cells of the table row in `text[at..end]`: the text between its pipes.
+fn cells<M>(
+  h: &Document<M>,
+  text: string,
+  at: usize,
+  end: usize,
+  header: bool,
+  last: bool,
+  out: &mut List<Node>,
+) -> u32 {
+  let mut heap = Heap.make()
+  let bytes = String.utf8Bytes(text)
+  let mut count: u32 = 0
+  let mut start = at + 1
+  let mut i = start
+  let mut quoted = false
+  while i < end {
+    if bytes[i] == 96 {
+      quoted = !quoted
+    }
+    if bytes[i] == 124 && !quoted {
+      let value = String.trim(String.slice(text, start, i - start))
+      let look = if header {
+        h.style(
+          &[
+            color(MUTED),
+            css.fontFamily(MONO),
+            css.fontSize(px(11.5)),
+            css.fontWeight(500.0),
+            css.letterSpacing("0.08em"),
+            css.textTransform("uppercase"),
+            css.raw(Property.BorderBottom, "1px solid var(--rule)"),
+          ],
+        )
+      } else if last {
+        h.style(&[color(BODY)])
+      } else {
+        h.style(&[color(BODY), css.raw(Property.BorderBottom, "1px solid var(--rule)")])
+      }
+      heap.alloc(
+        out.append(
+          prose(
+            h,
+            &[
+              look,
+              h.style(&[css.raw(Property.Padding, "11px 20px 11px 0"), css.minWidth(px(0.0))]),
+            ],
+            value,
+          ),
+        ),
+      )
+      count = count + 1
+      start = i + 1
+    }
+    i = i + 1
+  }
+  return count
+}
+
+fn columns(count: u32) -> string<'static> {
+  if count <= 2 {
+    return "minmax(max-content, auto) minmax(0, 1fr)"
+  }
+  if count == 3 {
+    return "repeat(2, minmax(max-content, auto)) minmax(0, 1fr)"
+  }
+  if count == 4 {
+    return "repeat(3, minmax(max-content, auto)) minmax(0, 1fr)"
+  }
+  return "repeat(5, auto)"
+}
+
+fn table<M>(h: &Document<M>, text: string) -> Node {
+  let bytes = String.utf8Bytes(text)
+  let mut nodes = List<Node>.make()
+  let mut count: u32 = 0
+  let mut row: u32 = 0
+  let mut at: usize = 0
+  while at < bytes.length {
+    let end = find(bytes, at, 10)
+    // The second line is the rule under the header.
+    if row != 1 {
+      count = cells(h, text, at, end, row == 0, end >= bytes.length, &mut nodes)
+    }
+    row = row + 1
+    at = end + 1
+  }
+  return h.box(
+    &[h.style(&[css.marginTop(px(22.0)), css.overflowX(Overflow.Auto)])],
+    &[
+      h.box(
+        &[
+          h.accessRole(Role.Group),
+          h.style(
+            &[
+              css.raw(Property.Display, "grid"),
+              css.raw(Property.GridTemplateColumns, columns(count)),
+              css.fontSize(px(14.5)),
+              css.raw(Property.LineHeight, "1.55"),
+              css.minWidth(px(420.0)),
+            ],
+          ),
+        ],
+        nodes.asSlice(),
+      ),
+    ],
+  )
+}
+
+fn pieceColor(kind: u8) -> string<'static> {
+  if kind == KEYWORD {
+    return CODE_KEYWORD
+  }
+  if kind == TYPE {
+    return CODE_TYPE
+  }
+  if kind == TEXT {
+    return CODE_TEXT
+  }
+  if kind == COMMENT {
+    return CODE_COMMENT
+  }
+  if kind == NUMBER {
+    return CODE_NUMBER
+  }
+  if kind == CALL {
+    return CODE_CALL
+  }
+  return CODE_PLAIN
+}
+
+/// The text of a listing with its colors: one run of inline nodes, so a selection copies
+/// the text exactly as it is written.
+fn listing<M>(h: &Document<M>, body: string, pieces: &[Piece]) -> Node {
+  let mut heap = Heap.make()
+  let mut nodes = List<Node>.make()
+  let length = String.byteLength(body)
+  let mut at: usize = 0
+  let mut i: usize = 0
+  while i < pieces.length {
+    let piece = pieces[i]
+    if piece.start > at {
+      heap.alloc(nodes.append(h.text(String.slice(body, at, piece.start - at))))
+    }
+    let look = if piece.kind == COMMENT {
+      h.style(&[color(pieceColor(piece.kind)), css.fontStyle(FontStyle.Italic)])
+    } else {
+      h.style(&[color(pieceColor(piece.kind))])
+    }
+    heap.alloc(
+      nodes.append(h.span(&[look], &[h.text(String.slice(body, piece.start, piece.length))])),
+    )
+    at = piece.start + piece.length
+    i = i + 1
+  }
+  if at < length {
+    heap.alloc(nodes.append(h.text(String.slice(body, at, length - at))))
+  }
+  return h.box(
+    &[
+      h.style(
+        &[
+          css.whiteSpace(WhiteSpace.Pre),
+          css.overflowX(Overflow.Auto),
+          css.fontFamily(MONO),
+          css.fontSize(px(13.25)),
+          css.raw(Property.LineHeight, "1.65"),
+          css.raw(Property.TabSize, "2"),
+          css.raw(Property.FontFeatureSettings, "\"liga\" 0, \"calt\" 0"),
+          color(CODE_PLAIN),
+        ],
+      ),
+      h.style(&pad(16.0, 18.0)),
+    ],
+    nodes.asSlice(),
+  )
+}
+
+/// The small button at a listing's top right.
+fn copyButton(h: &Document<Message>, index: u32, copied: bool) -> Node {
+  return h.button(
+    &[
+      h.onClick(Message.ClickedCopy { block: index }),
+      h.label("Copy this code"),
+      h.style(
+        &[
+          css.fontFamily(MONO),
+          css.fontSize(px(11.0)),
+          css.letterSpacing("0.06em"),
+          css.textTransform("uppercase"),
+          round(6.0),
+          if copied {
+            color(SIGNAL_INK)
+          } else {
+            color(MUTED)
+          },
+        ],
+      ),
+      h.style(&pad(4.0, 8.0)),
+      h.hover(&[background(PAPER), color(INK)]),
+      h.focusVisible(&[css.raw(Property.BoxShadow, "0 0 0 2px var(--signal)")]),
+    ],
+    &[
+      h.text(
+        if copied {
+          "Copied"
+        } else {
+          "Copy"
+        },
+      ),
+    ],
+  )
+}
+
+fn languageName(language: string) -> string<'static> {
+  if language == "silk" {
+    return "Silk"
+  }
+  if language == "sh" {
+    return "Shell"
+  }
+  if language == "toml" {
+    return "TOML"
+  }
+  if language == "js" {
+    return "JavaScript"
+  }
+  if language == "html" {
+    return "HTML"
+  }
+  if language == "yaml" {
+    return "YAML"
+  }
+  if language == "json" {
+    return "JSON"
+  }
+  return "Output"
+}
+
+fn codeBlock(
+  h: &Document<Message>,
+  index: u32,
+  copied: bool,
+  language: string,
+  title: string,
+  body: string,
+  pieces: &[Piece],
+) -> Node {
+  let mut name: string = title
+  if title == "" {
+    name = languageName(language)
+  }
+  return h.column(
+    &[
+      h.style(&[css.marginTop(px(20.0)), background(CODE_SURFACE), round(12.0)]),
+      outline(h, RULE),
+    ],
+    &[
+      h.row(
+        &[
+          h.style(
+            &[
+              css.alignItems(Align.Center),
+              css.justifyContent(Align.SpaceBetween),
+              css.raw(Property.BorderBottom, "1px solid var(--rule)"),
+              css.minHeight(px(36.0)),
+            ],
+          ),
+          h.style(&pad(0.0, 10.0)),
+        ],
+        &[
+          h.box(
+            &[
+              h.style(
+                &[
+                  css.fontFamily(MONO),
+                  css.fontSize(px(12.0)),
+                  color(MUTED),
+                  css.paddingLeft(px(8.0)),
+                  css.raw(Property.OverflowWrap, "anywhere"),
+                ],
+              ),
+            ],
+            &[h.text(name)],
+          ),
+          copyButton(h, index, copied),
+        ],
+      ),
+      listing(h, body, pieces),
+    ],
+  )
+}
+
+/// A live demo: the running program in a frame of its own, as a small window.
+fn demo(h: &Document<Message>, model: &Site, name: string) -> Node {
+  if !demos.exists(name) {
+    return h.empty()
+  }
+  return h.column(
+    &[
+      h.style(&[css.marginTop(px(22.0)), round(12.0), css.raw(Property.Overflow, "clip")]),
+      outline(h, RULE),
+    ],
+    &[
+      h.row(
+        &[
+          h.style(
+            &[
+              css.alignItems(Align.Center),
+              css.columnGap(px(8.0)),
+              background(PANEL),
+              css.raw(Property.BorderBottom, "1px solid var(--rule)"),
+              css.minHeight(px(36.0)),
+            ],
+          ),
+          h.style(&pad(0.0, 16.0)),
+        ],
+        &[
+          h.box(
+            &[
+              h.style(
+                &[css.width(px(7.0)), css.height(px(7.0)), round(4.0), background(SIGNAL)],
+              ),
+            ],
+            &[],
+          ),
+          h.box(
+            &[
+              h.style(
+                &[
+                  css.fontFamily(MONO),
+                  css.fontSize(px(11.0)),
+                  css.fontWeight(500.0),
+                  css.letterSpacing("0.1em"),
+                  css.textTransform("uppercase"),
+                  color(MUTED),
+                ],
+              ),
+            ],
+            &[h.text("Live: this is the program below, running")],
+          ),
+        ],
+      ),
+      // A demo is an app of its own: it brings its colors, on a white window.
+      h.box(
+        &[
+          h.testId("demo"),
+          h.style(
+            &[
+              css.raw(Property.BackgroundColor, "var(--window)"),
+              css.raw(Property.Color, "var(--window-ink)"),
+              css.fontSize(px(15.0)),
+              css.overflowX(Overflow.Auto),
+            ],
+          ),
+        ],
+        &[
+          h.map(
+            |inner: &Document<DemoMessage>| demos.view(&model.demos, name, inner),
+            |message| Message.GotDemoMessage { message: move message },
+          ),
+        ],
+      ),
+    ],
+  )
+}
+
+/// A picture the build drew: `argument` is its name, then its caption in quotes.
+fn shot<M>(h: &Document<M>, argument: string) -> Node {
+  let bytes = String.utf8Bytes(argument)
+  let space = find(bytes, 0, 32)
+  let name = String.slice(argument, 0, space)
+  let open = find(bytes, space, 34)
+  let close = find(bytes, open + 1, 34)
+  let caption = if open < bytes.length {
+    String.slice(argument, open + 1, close - open - 1)
+  } else {
+    String.slice(argument, 0, 0)
+  }
+  let resource = shots.resourceOf(name)
+  if resource == 0 {
+    return h.empty()
+  }
+  return h.column(
+    &[h.style(&[css.marginTop(px(22.0)), css.rowGap(px(10.0)), css.alignItems(Align.Start)])],
+    &[
+      h.image(
+        resource,
+        &[
+          h.label(caption),
+          h.style(
+            &[
+              css.maxWidth(percent(100.0)),
+              css.raw(Property.Height, "auto"),
+              round(12.0),
+              css.raw(Property.Border, "1px solid var(--rule)"),
+            ],
+          ),
+        ],
+      ),
+      h.box(&[h.style(&[css.fontSize(px(13.5)), color(MUTED)])], &[h.text(caption)]),
+    ],
+  )
+}
+
+/// The blocks of the page the model shows.
+pub fn page(h: &Document<Message>, model: &Site) -> Node {
+  let mut heap = Heap.make()
+  let blocks = model.blocks.asSlice()
+  let mut nodes = List<Node>.make()
+  let mut i: usize = 0
+  while i < blocks.length {
+    let index = usize.toU32(i)
+    let node = match &blocks[i] {
+      Block.Heading { level, text, slug } => heading(h, level, text, String.view(&slug))
+      Block.Paragraph { text } => {
+        // The paragraph right under the title introduces the page.
+        if i == 1 {
+          lead(h, text)
+        } else {
+          paragraph(h, text)
+        }
+      }
+      Block.Code { language, title, body, pieces } => codeBlock(
+        h,
+        index,
+        model.copied == index,
+        language,
+        title,
+        body,
+        pieces.asSlice(),
+      )
+      Block.Item { ordered, depth, marker, text } => item(
+        h,
+        ordered,
+        depth,
+        marker,
+        text,
+      )
+      Block.Note { text } => note(h, text)
+      Block.Table { text } => table(h, text)
+      Block.Rule => h.box(
+        &[
+          h.style(
+            &[css.marginTop(px(40.0)), css.height(px(1.0)), background(RULE)],
+          ),
+        ],
+        &[],
+      )
+      Block.Directive { name, argument } => {
+        if name == "demo" {
+          demo(h, model, argument)
+        } else if name == "shot" {
+          shot(h, argument)
+        } else {
+          h.empty()
+        }
+      }
+    }
+    heap.alloc(nodes.append(node))
+    i = i + 1
+  }
+  return h.fragment(nodes.asSlice())
+}

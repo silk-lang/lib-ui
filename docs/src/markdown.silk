@@ -1,0 +1,404 @@
+//! The Markdown the pages are written in, split into blocks.
+//!
+//! The subset is small on purpose: headings, paragraphs, fenced code, lists, notes (`>`),
+//! tables, rules, and directives (`::name argument`) for what Markdown has no word for: an
+//! example's source, a live demo, a picture of a rendered tree. Inline markup (`code`, strong,
+//! emphasis, links) is read when a block is drawn, in `prose`.
+//!
+//! A block keeps views of the page's text, which is part of the program, so parsing a page
+//! copies nothing but the heading slugs.
+import code { Piece, tokenize }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.usize
+import silk.text.string { String, InvalidUtf8 }
+
+pub union Block {
+  Heading { pub level: u32, pub text: string<'static>, pub slug: String },
+  Paragraph { pub text: string<'static> },
+  /// A fenced block. `title` is the fence's `title="..."`, or the file an example came from.
+  Code {
+    pub language: string<'static>,
+    pub title: string<'static>,
+    pub body: string<'static>,
+    pub pieces: List<Piece>,
+  },
+  /// One list item. `marker` is the number of an ordered item, with its dot.
+  Item { pub ordered: bool, pub depth: u32, pub marker: string<'static>, pub text: string<'static> },
+  /// A block quote: its lines, each still with its `>`.
+  Note { pub text: string<'static> },
+  /// A pipe table: its lines.
+  Table { pub text: string<'static> },
+  Rule,
+  /// `::name argument` on a line of its own.
+  Directive { pub name: string<'static>, pub argument: string<'static> },
+}
+
+const NEWLINE: u8 = 10
+
+const SPACE: u8 = 32
+
+const HASH: u8 = 35
+
+const STAR: u8 = 42
+
+const DASH: u8 = 45
+
+const DOT: u8 = 46
+
+const COLON: u8 = 58
+
+const GREATER: u8 = 62
+
+const BACKTICK: u8 = 96
+
+const PIPE: u8 = 124
+
+/// The end of the line that starts at `at`: the index of its newline, or the text's length.
+fn lineEnd(bytes: &[u8], at: usize) -> usize {
+  let mut end = at
+  while end < bytes.length && bytes[end] != NEWLINE {
+    end = end + 1
+  }
+  return end
+}
+
+/// How many spaces the line at `at` starts with.
+fn indent(bytes: &[u8], at: usize, end: usize) -> usize {
+  let mut i = at
+  while i < end && bytes[i] == SPACE {
+    i = i + 1
+  }
+  return i - at
+}
+
+fn blank(bytes: &[u8], at: usize, end: usize) -> bool {
+  return at + indent(bytes, at, end) == end
+}
+
+fn startsWith(bytes: &[u8], at: usize, end: usize, token: &[u8]) -> bool {
+  if at + token.length > end {
+    return false
+  }
+  let mut i: usize = 0
+  while i < token.length {
+    if bytes[at + i] != token[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn isDigit(byte: u8) -> bool {
+  return byte >= 48 && byte <= 57
+}
+
+/// The length of the list marker the line starts with after its indent (`- `, `* `, `12. `),
+/// or zero when it is no list item.
+fn markerLength(bytes: &[u8], at: usize, end: usize) -> usize {
+  if at + 1 < end && (bytes[at] == DASH || bytes[at] == STAR) && bytes[at + 1] == SPACE {
+    return 2
+  }
+  let mut i = at
+  while i < end && isDigit(bytes[i]) {
+    i = i + 1
+  }
+  if i > at && i + 1 < end && bytes[i] == DOT && bytes[i + 1] == SPACE {
+    return i + 2 - at
+  }
+  return 0
+}
+
+/// Whether the line at `at` starts a block of its own, so a paragraph before it ends.
+fn startsBlock(bytes: &[u8], at: usize, end: usize) -> bool {
+  if blank(bytes, at, end) {
+    return true
+  }
+  let first = bytes[at]
+  if first == HASH || first == GREATER || first == PIPE {
+    return true
+  }
+  if startsWith(bytes, at, end, b"```") || startsWith(bytes, at, end, b"::") {
+    return true
+  }
+  let inset = indent(bytes, at, end)
+  return markerLength(bytes, at + inset, end) > 0
+}
+
+/// A heading's address in its page: lower case letters and digits, with one dash for each run
+/// of anything else.
+effect fn slugOf(text: string) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let bytes = String.utf8Bytes(text)
+  let mut out = Bytes.make()
+  let mut dash = false
+  let mut i: usize = 0
+  while i < bytes.length {
+    let byte = bytes[i]
+    let lower = if byte >= 65 && byte <= 90 {
+      byte + 32
+    } else {
+      byte
+    }
+    if lower >= 97 && lower <= 122 || isDigit(lower) {
+      if dash && out.length() > 0 {
+        run out.append(b"-")
+      }
+      dash = false
+      let one: [u8; 1] = [lower]
+      run out.append(&one)
+    } else {
+      dash = true
+    }
+    i = i + 1
+  }
+  return match String.fromBytes(move out) {
+    Result<String, InvalidUtf8>.Success { value } => move value
+    Result<String, InvalidUtf8>.Failure { error } => {
+      drop error
+      String.make()
+    }
+  }
+}
+
+/// The value of `key="value"` in a fence's info string, or nothing.
+fn attribute(info: string<'static>, key: string) -> string<'static> {
+  let bytes = String.utf8Bytes(info)
+  let name = String.utf8Bytes(key)
+  let mut i: usize = 0
+  while i + name.length + 2 <= bytes.length {
+    if startsWith(bytes, i, bytes.length, name) && bytes[i + name.length] == 61
+      && bytes[i + name.length + 1] == 34 {
+      let start = i + name.length + 2
+      let mut end = start
+      while end < bytes.length && bytes[end] != 34 {
+        end = end + 1
+      }
+      return String.slice(info, start, end - start)
+    }
+    i = i + 1
+  }
+  return ""
+}
+
+/// The first word of `text`.
+fn firstWord(text: string<'static>) -> string<'static> {
+  let bytes = String.utf8Bytes(text)
+  let mut end: usize = 0
+  while end < bytes.length && bytes[end] != SPACE {
+    end = end + 1
+  }
+  return String.slice(text, 0, end)
+}
+
+/// A code block of `body`, with its colors worked out once.
+pub effect fn codeBlock(language: string<'static>, title: string<'static>, body: string<'static>) -> Block
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let pieces = run tokenize(language, body)
+  return Block.Code { language: language, title: title, body: body, pieces: move pieces }
+}
+
+/// The title of a page: the text of its first line, a level one heading.
+pub fn titleOf(source: string<'static>) -> string<'static> {
+  let bytes = String.utf8Bytes(source)
+  let end = lineEnd(bytes, 0)
+  if end > 2 && bytes[0] == HASH && bytes[1] == SPACE {
+    return String.trim(String.slice(source, 2, end - 2))
+  }
+  return ""
+}
+
+/// The blocks of `source`.
+pub effect fn parse(source: string<'static>) -> List<Block>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let bytes = String.utf8Bytes(source)
+  let mut blocks = List<Block>.make()
+  let mut at: usize = 0
+  while at < bytes.length {
+    let end = lineEnd(bytes, at)
+    if blank(bytes, at, end) {
+      at = end + 1
+      continue
+    }
+    if startsWith(bytes, at, end, b"```") {
+      // A fence: everything up to the next line that starts with one.
+      let info = String.trim(String.slice(source, at + 3, end - at - 3))
+      let start = if end < bytes.length {
+        end + 1
+      } else {
+        end
+      }
+      let mut close = start
+      while close < bytes.length && !startsWith(bytes, close, lineEnd(bytes, close), b"```") {
+        close = lineEnd(bytes, close) + 1
+      }
+      if close > bytes.length {
+        close = bytes.length
+      }
+      let mut length = close - start
+      if length > 0 && bytes[start + length - 1] == NEWLINE {
+        length = length - 1
+      }
+      let block = run codeBlock(
+        firstWord(info),
+        attribute(info, "title"),
+        String.slice(source, start, length),
+      )
+      run blocks.append(move block)
+      at = lineEnd(bytes, close) + 1
+      continue
+    }
+    if bytes[at] == HASH {
+      let mut level: usize = 0
+      while at + level < end && bytes[at + level] == HASH {
+        level = level + 1
+      }
+      let text = String.trim(String.slice(source, at + level, end - at - level))
+      run blocks.append(
+        Block.Heading { level: usize.toU32(level), text: text, slug: run slugOf(text) },
+      )
+      at = end + 1
+      continue
+    }
+    if startsWith(bytes, at, end, b"::") {
+      let line = String.trim(String.slice(source, at + 2, end - at - 2))
+      let name = firstWord(line)
+      let rest = String.byteLength(line) - String.byteLength(name)
+      let argument = String.trim(String.slice(line, String.byteLength(name), rest))
+      run blocks.append(Block.Directive { name: name, argument: argument })
+      at = end + 1
+      continue
+    }
+    if startsWith(bytes, at, end, b"---") && blank(bytes, at + 3, end) {
+      run blocks.append(Block.Rule)
+      at = end + 1
+      continue
+    }
+    if bytes[at] == GREATER || bytes[at] == PIPE {
+      // Every following line that starts the same way belongs to the note or the table.
+      let lead = bytes[at]
+      let mut last = end
+      let mut next = end + 1
+      while next < bytes.length && bytes[next] == lead {
+        last = lineEnd(bytes, next)
+        next = last + 1
+      }
+      let text = String.slice(source, at, last - at)
+      if lead == GREATER {
+        run blocks.append(Block.Note { text: text })
+      } else {
+        run blocks.append(Block.Table { text: text })
+      }
+      at = last + 1
+      continue
+    }
+    let inset = indent(bytes, at, end)
+    let marker = markerLength(bytes, at + inset, end)
+    if marker > 0 {
+      // An item, and the indented lines that continue it.
+      let mut last = end
+      let mut next = end + 1
+      while next < bytes.length {
+        let nextEnd = lineEnd(bytes, next)
+        let nextInset = indent(bytes, next, nextEnd)
+        if blank(bytes, next, nextEnd) || nextInset < inset + 2
+          || markerLength(bytes, next + nextInset, nextEnd) > 0 {
+          break
+        }
+        last = nextEnd
+        next = nextEnd + 1
+      }
+      let start = at + inset + marker
+      let ordered = isDigit(bytes[at + inset])
+      run blocks.append(
+        Block.Item {
+          ordered: ordered,
+          depth: usize.toU32(inset / 2),
+          marker: String.slice(source, at + inset, marker - 1),
+          text: String.slice(source, start, last - start),
+        },
+      )
+      at = last + 1
+      continue
+    }
+
+    // A paragraph: the lines up to the next blank one, or the next block.
+    let mut last = end
+    let mut next = end + 1
+    while next < bytes.length && !startsBlock(bytes, next, lineEnd(bytes, next)) {
+      last = lineEnd(bytes, next)
+      next = last + 1
+    }
+    run blocks.append(Block.Paragraph { text: String.slice(source, at, last - at) })
+    at = last + 1
+  }
+  return move blocks
+}
+
+/// The lines of `source` from the first one that contains `needle` to the end of the item it
+/// starts: the next line with the same indent that is a closing brace. With nothing found, all
+/// of `source`. This is how a page shows one function of an example.
+pub fn excerpt(source: string<'static>, needle: string) -> string<'static> {
+  let bytes = String.utf8Bytes(source)
+  let mut at: usize = 0
+  while at < bytes.length {
+    let end = lineEnd(bytes, at)
+    let line = String.slice(source, at, end - at)
+    if String.contains(line, needle) {
+      // Doc comments right above belong to the item.
+      let mut start = at
+      while start > 0 {
+        let mut before = start - 1
+        while before > 0 && bytes[before - 1] != NEWLINE {
+          before = before - 1
+        }
+        let beforeEnd = start - 1
+        let inset = indent(bytes, before, beforeEnd)
+        if !startsWith(bytes, before + inset, beforeEnd, b"///") {
+          break
+        }
+        start = before
+      }
+      let inset = indent(bytes, at, end)
+      let opens = end > at && bytes[end - 1] == 123
+      if !opens {
+        // A line that opens nothing, unless the item's braces start on a later line (a
+        // signature with its failures and requirements below it).
+        let mut probe = end + 1
+        let mut found = false
+        while probe < bytes.length {
+          let probeEnd = lineEnd(bytes, probe)
+          if indent(bytes, probe, probeEnd) <= inset && !blank(bytes, probe, probeEnd) {
+            break
+          }
+          if probeEnd > probe && bytes[probeEnd - 1] == 123 {
+            found = true
+            break
+          }
+          probe = probeEnd + 1
+        }
+        if !found {
+          return String.slice(source, start, end - start)
+        }
+      }
+      let mut next = end + 1
+      while next < bytes.length {
+        let nextEnd = lineEnd(bytes, next)
+        if indent(bytes, next, nextEnd) == inset && nextEnd == next + inset + 1
+          && bytes[next + inset] == 125 {
+          return String.slice(source, start, nextEnd - start)
+        }
+        next = nextEnd + 1
+      }
+      return String.slice(source, start, bytes.length - start)
+    }
+    at = end + 1
+  }
+  return source
+}

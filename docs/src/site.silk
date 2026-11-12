@@ -1,0 +1,699 @@
+//! The site's program: how the model changes, what it listens to, and the shell around the
+//! pages (the top bar, the sidebar, the page, and the list of the page's sections).
+import content
+import demos
+import demos { DemoMessage }
+import home
+import markdown { Block }
+import model { Command, Message, Site, NO_BLOCK }
+import pages
+import pages { COUNT, HOME, NO_GUIDE }
+import prose
+import theme {
+  BODY,
+  FAINT,
+  INK,
+  MEDIUM,
+  MONO,
+  MUTED,
+  NARROW,
+  PANEL,
+  PAPER,
+  RULE,
+  SANS,
+  SIGNAL,
+  SIGNAL_INK,
+  SIGNAL_SOFT,
+  background,
+  color,
+  narrowOnly,
+  outline,
+  pad,
+  round,
+  wideOnly
+}
+import ui_app.css
+import ui_app.css {
+  px,
+  Align,
+  BoxSizing,
+  FlexDirection,
+  FlexWrap,
+  Keyword,
+  Overflow,
+  Property,
+  WhiteSpace
+}
+import ui_app.heap { Heap }
+import ui_app.lib { Document, Node, NoOutput, Program, Role, Subscriptions, Update }
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.text.string { String }
+
+/// The program. Its model is [`Site`], which lives with the messages in `model`.
+pub struct Docs {
+  pub site: Site,
+}
+
+type Next = Update<Docs, Command, NoOutput>
+
+/// The height of the top bar, which the columns under it stick below.
+const BAR: f32 = 60.0
+
+impl Program<Message, Command> for Docs {
+  effect fn init() -> Next
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let site = Site {
+      route: HOME,
+      blocks: List<Block>.make(),
+      located: false,
+      menu: false,
+      copied: NO_BLOCK,
+      demos: run demos.start(),
+    }
+    return Next.of(Docs { site: move site })
+  }
+
+  effect fn update(docs: Docs, message: Message) -> Next
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut model = move docs.site
+    match move message {
+      Message.ChangedLocation { route } => {
+        // A move inside the page (to one of its sections) is the page's own business.
+        if model.located && route == model.route {
+          return Next.of(Docs { site: move model })
+        }
+        let first = !model.located
+        model.located = true
+        model.route = route
+        model.menu = false
+        model.copied = NO_BLOCK
+        model.blocks = if route < COUNT {
+          run content.load(pages.page(route).source)
+        } else {
+          List<Block>.make()
+        }
+        let mut commands = List<Command>.make()
+        run commands.append(Command.SetTitle { title: pages.title(route) })
+        if !first {
+          run commands.append(Command.ScrollToTop)
+        }
+        return Next.batch(Docs { site: move model }, move commands)
+      }
+      Message.ClickedMenu => {
+        model.menu = !model.menu
+      }
+      Message.ClickedTheme => {
+        return run Next.with(Docs { site: move model }, Command.ToggleTheme)
+      }
+      Message.ClickedCopy { block } => {
+        let blocks = model.blocks.asSlice()
+        let at = u32.toUsize(block)
+        if at < blocks.length {
+          if let Block.Code { body, .. } = &blocks[at] {
+            let text = body
+            model.copied = block
+            return run Next.with(Docs { site: move model }, Command.Copy { text: text })
+          }
+        }
+      }
+      Message.CopyNoticeExpired => {
+        model.copied = NO_BLOCK
+      }
+      Message.CompletedPageRequest => {}
+      Message.GotDemoMessage { message: inner } => {
+        run demos.update(&mut model.demos, move inner)
+      }
+    }
+    return Next.of(Docs { site: move model })
+  }
+
+  fn view(docs: &Docs, h: &Document<Message>) -> Node {
+    let model = &docs.site
+    let shell = h.style(
+      &[
+        css.fontFamily(SANS),
+        css.fontSize(px(16.0)),
+        color(BODY),
+        background(PAPER),
+        css.raw(Property.MinHeight, "100vh"),
+        css.raw(Property.SilkSelectionColor, "var(--signal-soft)"),
+      ],
+    )
+    return h.column(&[shell], &[topBar(model, h), menu(model, h), body(model, h)])
+  }
+
+  fn subscriptions(docs: &Docs, subs: &mut Subscriptions<Message>) -> () {
+    let model = &docs.site
+    subs.location(1, |path| Message.ChangedLocation { route: pages.routeAt(path) })
+    if model.copied != NO_BLOCK {
+      subs.every(2, 1.6, |time| Message.CopyNoticeExpired)
+    }
+    subs.lift(
+      3,
+      |inner: &mut Subscriptions<DemoMessage>| demos.subscriptions(&model.demos, &mut inner),
+      |message| Message.GotDemoMessage { message: move message },
+    )
+  }
+}
+
+// The top bar.
+
+fn mark<M>(h: &Document<M>) -> Node {
+  return h.link(
+    "/",
+    &[
+      h.label("Silk UI, home"),
+      h.style(
+        &[
+          css.display(Keyword.Flex),
+          css.alignItems(Align.Center),
+          css.columnGap(px(10.0)),
+          css.flexShrink(0.0),
+        ],
+      ),
+    ],
+    &[
+      h.box(
+        &[
+          h.style(
+            &[
+              css.width(px(22.0)),
+              css.height(px(22.0)),
+              round(6.0),
+              background(SIGNAL),
+              css.raw(Property.Rotate, "45deg"),
+              css.raw(Property.Scale, "0.82"),
+            ],
+          ),
+        ],
+        &[],
+      ),
+      h.box(
+        &[
+          h.style(
+            &[
+              color(INK),
+              css.fontSize(px(17.0)),
+              css.fontWeight(700.0),
+              css.letterSpacing("-0.02em"),
+              css.whiteSpace(WhiteSpace.NoWrap),
+            ],
+          ),
+        ],
+        &[h.text("Silk UI")],
+      ),
+    ],
+  )
+}
+
+/// A link in the top bar to the guide `guide`.
+fn guideTab(model: &Site, h: &Document<Message>, guide: u32) -> Node {
+  let selected = model.route < COUNT && pages.page(model.route).guide == guide
+  return h.link(
+    pages.page(pages.guideStart(guide)).path,
+    &[
+      h.selected(selected),
+      h.style(
+        &[
+          css.fontSize(px(14.5)),
+          css.fontWeight(500.0),
+          css.whiteSpace(WhiteSpace.NoWrap),
+          round(8.0),
+          if selected {
+            color(INK)
+          } else {
+            color(MUTED)
+          },
+        ],
+      ),
+      h.style(&pad(7.0, 12.0)),
+      if selected {
+        h.style(&[background(PANEL)])
+      } else {
+        h.hover(&[color(INK)])
+      },
+      h.focusVisible(&[css.raw(Property.BoxShadow, "0 0 0 2px var(--signal)")]),
+    ],
+    &[h.text(pages.guideName(guide))],
+  )
+}
+
+/// A quiet button of the top bar.
+fn barButton(h: &Document<Message>, label: string, message: Message) -> Node {
+  return h.button(
+    &[
+      h.onClick(move message),
+      h.style(
+        &[
+          css.fontSize(px(13.5)),
+          css.fontWeight(500.0),
+          color(MUTED),
+          css.whiteSpace(WhiteSpace.NoWrap),
+          round(8.0),
+        ],
+      ),
+      h.style(&pad(6.0, 11.0)),
+      outline(h, RULE),
+      h.hover(&[color(INK), background(PANEL)]),
+      h.focusVisible(&[css.raw(Property.BoxShadow, "0 0 0 2px var(--signal)")]),
+    ],
+    &[h.text(label)],
+  )
+}
+
+fn topBar(model: &Site, h: &Document<Message>) -> Node {
+  let guides: [u32; 3] = [0, 1, 2]
+  return h.row(
+    &[
+      h.accessRole(Role.Navigation),
+      h.style(
+        &[
+          css.raw(Property.Position, "sticky"),
+          css.top(px(0.0)),
+          css.raw(Property.ZIndex, "10"),
+          css.height(px(BAR)),
+          css.flexShrink(0.0),
+          css.alignItems(Align.Center),
+          css.columnGap(px(18.0)),
+          css.boxSizing(BoxSizing.BorderBox),
+          css.raw(Property.BackgroundColor, "var(--paper-veil)"),
+          css.raw(Property.BackdropFilter, "blur(12px)"),
+          css.raw(Property.BorderBottom, "1px solid var(--rule)"),
+        ],
+      ),
+      h.style(&[css.raw(Property.Padding, "0 clamp(16px, 3vw, 28px)")]),
+    ],
+    &[
+      mark(h),
+      h.row(
+        &[wideOnly(h, NARROW), h.style(&[css.columnGap(px(2.0)), css.marginLeft(px(10.0))])],
+        &[h.each(&guides, |guide| guideTab(model, h, guide.*))],
+      ),
+      h.box(&[h.style(&[css.flexGrow(1.0)])], &[]),
+      barButton(h, "Theme", Message.ClickedTheme),
+      h.link(
+        "https://github.com/silk-lang/lib-ui",
+        &[
+          wideOnly(h, NARROW),
+          h.style(
+            &[
+              css.fontSize(px(13.5)),
+              css.fontWeight(500.0),
+              color(MUTED),
+              css.whiteSpace(WhiteSpace.NoWrap),
+            ],
+          ),
+          h.hover(&[color(INK)]),
+        ],
+        &[h.text("GitHub")],
+      ),
+      h.box(
+        &[narrowOnly(h, NARROW)],
+        &[
+          barButton(
+            h,
+            if model.menu {
+              "Close"
+            } else {
+              "Menu"
+            },
+            Message.ClickedMenu,
+          ),
+        ],
+      ),
+    ],
+  )
+}
+
+// Navigation.
+
+fn label<M>(h: &Document<M>, value: string) -> Node {
+  return h.box(
+    &[
+      h.style(
+        &[
+          css.fontFamily(MONO),
+          css.fontSize(px(11.0)),
+          css.fontWeight(500.0),
+          css.letterSpacing("0.12em"),
+          css.textTransform("uppercase"),
+          color(FAINT),
+        ],
+      ),
+      h.style(&pad(0.0, 10.0)),
+    ],
+    &[h.text(value)],
+  )
+}
+
+fn pageLink(model: &Site, h: &Document<Message>, index: u32) -> Node {
+  let selected = model.route == index
+  return h.link(
+    pages.page(index).path,
+    &[
+      h.selected(selected),
+      h.style(
+        &[
+          css.fontSize(px(14.5)),
+          css.raw(Property.LineHeight, "1.35"),
+          round(7.0),
+          if selected {
+            color(SIGNAL_INK)
+          } else {
+            color(BODY)
+          },
+        ],
+      ),
+      h.style(&pad(6.5, 10.0)),
+      if selected {
+        h.style(&[background(SIGNAL_SOFT), css.fontWeight(600.0)])
+      } else {
+        h.hover(&[background(PANEL), color(INK)])
+      },
+      h.focusVisible(&[css.raw(Property.BoxShadow, "inset 0 0 0 2px var(--signal)")]),
+    ],
+    &[h.text(pages.title(index))],
+  )
+}
+
+/// The pages of `guide`, under its name.
+fn guideLinks(model: &Site, h: &Document<Message>, guide: u32) -> Node {
+  let mut heap = Heap.make()
+  let mut nodes = List<Node>.make()
+  heap.alloc(nodes.append(label(h, pages.guideName(guide))))
+  let mut index: u32 = 0
+  while index < COUNT {
+    if pages.page(index).guide == guide {
+      heap.alloc(nodes.append(pageLink(model, h, index)))
+    }
+    index = index + 1
+  }
+  return h.column(&[h.style(&[css.rowGap(px(2.0))])], nodes.asSlice())
+}
+
+/// The guide the shown page belongs to; the first one for a page of none.
+fn shownGuide(model: &Site) -> u32 {
+  if model.route < COUNT && pages.page(model.route).guide != NO_GUIDE {
+    return pages.page(model.route).guide
+  }
+  return pages.CORE
+}
+
+fn sideBar(model: &Site, h: &Document<Message>) -> Node {
+  return h.box(
+    &[wideOnly(h, NARROW)],
+    &[
+      h.column(
+        &[
+          h.accessRole(Role.Navigation),
+          h.style(
+            &[
+              css.raw(Property.Position, "sticky"),
+              css.top(px(BAR)),
+              css.width(px(272.0)),
+              css.raw(Property.Height, "calc(100vh - 60px)"),
+              css.boxSizing(BoxSizing.BorderBox),
+              css.overflowY(Overflow.Auto),
+              css.raw(Property.BorderRight, "1px solid var(--rule)"),
+              css.rowGap(px(30.0)),
+            ],
+          ),
+          h.style(&pad(30.0, 18.0)),
+        ],
+        &[guideLinks(model, h, shownGuide(model))],
+      ),
+    ],
+  )
+}
+
+/// The menu of a narrow window: every guide's pages, under the top bar.
+fn menu(model: &Site, h: &Document<Message>) -> Node {
+  if !model.menu {
+    return h.empty()
+  }
+  let guides: [u32; 3] = [0, 1, 2]
+  return h.box(
+    &[narrowOnly(h, NARROW)],
+    &[
+      h.column(
+        &[
+          h.accessRole(Role.Navigation),
+          h.style(
+            &[css.rowGap(px(26.0)), css.raw(Property.BorderBottom, "1px solid var(--rule)")],
+          ),
+          h.style(&pad(22.0, 14.0)),
+        ],
+        &[h.each(&guides, |guide| guideLinks(model, h, guide.*))],
+      ),
+    ],
+  )
+}
+
+// The page.
+
+/// The list of the page's sections, for a wide window.
+fn sections(model: &Site, h: &Document<Message>) -> Node {
+  let mut heap = Heap.make()
+  let blocks = model.blocks.asSlice()
+  let mut nodes = List<Node>.make()
+  let mut i: usize = 0
+  while i < blocks.length {
+    if let Block.Heading { level, text, slug } = &blocks[i] {
+      if level == 2 {
+        let mut address = heap.alloc(String.copy("#"))
+        heap.alloc(address.append(String.view(&slug)))
+        let mut words = List<Node>.make()
+        prose.inline(h, text, &mut words)
+        heap.alloc(
+          nodes.append(
+            h.link(
+              String.view(&address),
+              &[
+                h.style(
+                  &[
+                    css.fontSize(px(13.5)),
+                    css.raw(Property.LineHeight, "1.4"),
+                    color(MUTED),
+                  ],
+                ),
+                h.style(&pad(5.0, 0.0)),
+                h.hover(&[color(INK)]),
+                h.focusVisible(&[color(INK)]),
+              ],
+              words.asSlice(),
+            ),
+          ),
+        )
+      }
+    }
+    i = i + 1
+  }
+  if nodes.length() < 2 {
+    return h.empty()
+  }
+  return h.box(
+    &[wideOnly(h, MEDIUM)],
+    &[
+      h.column(
+        &[
+          h.style(
+            &[
+              css.raw(Property.Position, "sticky"),
+              css.top(px(BAR)),
+              css.width(px(236.0)),
+              css.raw(Property.MaxHeight, "calc(100vh - 60px)"),
+              css.boxSizing(BoxSizing.BorderBox),
+              css.overflowY(Overflow.Auto),
+            ],
+          ),
+          h.style(&pad(44.0, 24.0)),
+        ],
+        &[
+          h.box(
+            &[
+              h.style(
+                &[
+                  css.fontFamily(MONO),
+                  css.fontSize(px(11.0)),
+                  css.fontWeight(500.0),
+                  css.letterSpacing("0.12em"),
+                  css.textTransform("uppercase"),
+                  color(FAINT),
+                  css.marginBottom(px(10.0)),
+                ],
+              ),
+            ],
+            &[h.text("On this page")],
+          ),
+          h.fragment(nodes.asSlice()),
+        ],
+      ),
+    ],
+  )
+}
+
+/// The next or previous page of the same guide, as a card at the page's end.
+fn pagerCard(h: &Document<Message>, index: u32, forward: bool) -> Node {
+  return h.link(
+    pages.page(index).path,
+    &[
+      h.style(
+        &[
+          css.display(Keyword.Flex),
+          css.flexDirection(FlexDirection.Column),
+          css.rowGap(px(4.0)),
+          css.flexGrow(1.0),
+          css.flexBasis(px(220.0)),
+          round(12.0),
+          if forward {
+            css.alignItems(Align.End)
+          } else {
+            css.alignItems(Align.Start)
+          },
+        ],
+      ),
+      h.style(&pad(14.0, 18.0)),
+      outline(h, RULE),
+      h.hover(&[css.raw(Property.BorderColor, "var(--signal)")]),
+      h.focusVisible(&[css.raw(Property.BorderColor, "var(--signal)")]),
+    ],
+    &[
+      h.box(
+        &[
+          h.style(
+            &[
+              css.fontFamily(MONO),
+              css.fontSize(px(11.0)),
+              css.letterSpacing("0.1em"),
+              css.textTransform("uppercase"),
+              color(FAINT),
+            ],
+          ),
+        ],
+        &[
+          h.text(
+            if forward {
+              "Next"
+            } else {
+              "Previous"
+            },
+          ),
+        ],
+      ),
+      h.box(
+        &[h.style(&[css.fontSize(px(16.0)), css.fontWeight(600.0), color(INK)])],
+        &[h.text(pages.title(index))],
+      ),
+    ],
+  )
+}
+
+fn pager(model: &Site, h: &Document<Message>) -> Node {
+  let route = model.route
+  let guide = pages.page(route).guide
+  let before = route > 0 && pages.page(route - 1).guide == guide
+  let after = route + 1 < COUNT && pages.page(route + 1).guide == guide
+  return h.row(
+    &[
+      h.style(
+        &[
+          css.marginTop(px(64.0)),
+          css.columnGap(px(14.0)),
+          css.rowGap(px(14.0)),
+          css.flexWrap(FlexWrap.Wrap),
+        ],
+      ),
+    ],
+    &[
+      if before {
+        pagerCard(h, route - 1, false)
+      } else {
+        h.box(&[h.style(&[css.flexGrow(1.0), css.flexBasis(px(220.0))])], &[])
+      },
+      if after {
+        pagerCard(h, route + 1, true)
+      } else {
+        h.box(&[h.style(&[css.flexGrow(1.0), css.flexBasis(px(220.0))])], &[])
+      },
+    ],
+  )
+}
+
+fn notFound(h: &Document<Message>) -> Node {
+  return h.column(
+    &[h.style(&[css.rowGap(px(16.0)), css.alignItems(Align.Start)])],
+    &[
+      h.box(
+        &[
+          h.style(
+            &[
+              color(INK),
+              css.fontSize(px(36.0)),
+              css.fontWeight(700.0),
+              css.letterSpacing("-0.035em"),
+            ],
+          ),
+        ],
+        &[h.text("There is no page here"), h.span(&[h.style(&[color(SIGNAL)])], &[h.text(".")])],
+      ),
+      h.box(
+        &[h.style(&[color(MUTED), css.fontSize(px(17.0))])],
+        &[h.text("The address may be old, or mistyped. The guides are all in the bar above.")],
+      ),
+      h.link(
+        "/",
+        &[h.style(&[color(SIGNAL_INK), css.fontWeight(600.0)])],
+        &[h.text("Go to the start")],
+      ),
+    ],
+  )
+}
+
+fn article(model: &Site, h: &Document<Message>) -> Node {
+  let inner = if model.route >= COUNT {
+    notFound(h)
+  } else {
+    h.fragment(&[prose.page(h, model), pager(model, h)])
+  }
+  return h.box(
+    &[
+      h.accessRole(Role.Main),
+      h.style(&[css.flexGrow(1.0), css.minWidth(px(0.0))]),
+    ],
+    &[
+      h.box(
+        &[
+          h.style(
+            &[
+              css.maxWidth(px(760.0)),
+              css.raw(Property.Margin, "0 auto"),
+              css.raw(
+                Property.Padding,
+                "clamp(30px, 5vw, 52px) clamp(18px, 4vw, 48px) 110px",
+              ),
+            ],
+          ),
+        ],
+        &[inner],
+      ),
+    ],
+  )
+}
+
+fn body(model: &Site, h: &Document<Message>) -> Node {
+  if model.route == HOME {
+    return home.view(model, h)
+  }
+  // Keyed by page, so no node of one page is taken for a node of the next.
+  return h.keyed(
+    u32.toU64(model.route) + 1,
+    h.row(
+      &[h.style(&[css.flexGrow(1.0), css.alignItems(Align.Start)])],
+      &[sideBar(model, h), article(model, h), sections(model, h)],
+    ),
+  )
+}

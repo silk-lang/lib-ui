@@ -1,0 +1,216 @@
+//! Colors for code: a block's text split into pieces, each with a kind.
+//!
+//! This is not a parser. It knows comments, strings, numbers and words, and which words are
+//! keywords in Silk, JavaScript, TOML and the shell, which is enough to make a listing easy
+//! to read.
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.string { String }
+
+pub const PLAIN: u8 = 0
+
+pub const KEYWORD: u8 = 1
+
+pub const TYPE: u8 = 2
+
+pub const TEXT: u8 = 3
+
+pub const COMMENT: u8 = 4
+
+pub const NUMBER: u8 = 5
+
+/// A name being called or declared.
+pub const CALL: u8 = 6
+
+/// A run of a block's text and what it is.
+pub struct Piece {
+  pub start: usize,
+  pub length: usize,
+  pub kind: u8,
+}
+
+impl Copy for Piece {}
+
+fn isLetter(byte: u8) -> bool {
+  return byte >= 97 && byte <= 122 || byte >= 65 && byte <= 90 || byte == 95
+}
+
+fn isDigit(byte: u8) -> bool {
+  return byte >= 48 && byte <= 57
+}
+
+fn among(word: string, words: &[string]) -> bool {
+  let mut i: usize = 0
+  while i < words.length {
+    if words[i] == word {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+fn silkKeyword(word: string) -> bool {
+  let words: [string; 36] = [
+    "fn",
+    "pub",
+    "effect",
+    "impl",
+    "for",
+    "struct",
+    "union",
+    "enum",
+    "interface",
+    "service",
+    "match",
+    "return",
+    "let",
+    "mut",
+    "move",
+    "run",
+    "if",
+    "else",
+    "while",
+    "break",
+    "continue",
+    "import",
+    "export",
+    "type",
+    "as",
+    "const",
+    "static",
+    "unsafe",
+    "extern",
+    "fail",
+    "drop",
+    "once",
+    "true",
+    "false",
+    "never",
+    "Self",
+  ]
+  return among(word, &words)
+}
+
+fn scriptKeyword(word: string) -> bool {
+  let words: [string; 22] = [
+    "import",
+    "export",
+    "from",
+    "const",
+    "let",
+    "var",
+    "function",
+    "return",
+    "await",
+    "async",
+    "new",
+    "if",
+    "else",
+    "for",
+    "of",
+    "while",
+    "class",
+    "true",
+    "false",
+    "null",
+    "undefined",
+    "typeof",
+  ]
+  return among(word, &words)
+}
+
+fn tomlKeyword(word: string) -> bool {
+  let words: [string; 2] = ["true", "false"]
+  return among(word, &words)
+}
+
+/// The pieces of `body`, a listing in `language`. Text between pieces is plain.
+pub effect fn tokenize(language: string, body: string) -> List<Piece>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = List<Piece>.make()
+  let silk = language == "silk"
+  let script = language == "js" || language == "ts" || language == "html" || language == "json"
+  let toml = language == "toml" || language == "yaml"
+  let shell = language == "sh"
+  if !silk && !script && !toml && !shell {
+    return move out
+  }
+  let hashComments = toml || shell
+  let bytes = String.utf8Bytes(body)
+  let mut at: usize = 0
+  while at < bytes.length {
+    let byte = bytes[at]
+    let mut end = at
+    let mut kind = PLAIN
+    if !hashComments && byte == 47 && at + 1 < bytes.length && bytes[at + 1] == 47 {
+      while end < bytes.length && bytes[end] != 10 {
+        end = end + 1
+      }
+      kind = COMMENT
+    } else if hashComments && byte == 35 && (at == 0 || bytes[at - 1] == 10 || bytes[at - 1] == 32) {
+      while end < bytes.length && bytes[end] != 10 {
+        end = end + 1
+      }
+      kind = COMMENT
+    } else if byte == 34 || (script || shell) && byte == 39 || script && byte == 96 {
+      end = at + 1
+      while end < bytes.length && bytes[end] != byte && (bytes[end] != 10 || byte == 96) {
+        if bytes[end] == 92 && end + 1 < bytes.length {
+          end = end + 1
+        }
+        end = end + 1
+      }
+      if end < bytes.length && bytes[end] == byte {
+        end = end + 1
+      }
+      kind = TEXT
+    } else if isLetter(byte) {
+      while end < bytes.length && (isLetter(bytes[end]) || isDigit(bytes[end])) {
+        end = end + 1
+      }
+      let word = String.slice(body, at, end - at)
+      if silk && silkKeyword(word) || script && scriptKeyword(word) || toml && tomlKeyword(word) {
+        kind = KEYWORD
+      } else if silk && byte >= 65 && byte <= 90 {
+        kind = TYPE
+      } else if (silk || script) && end < bytes.length && bytes[end] == 40 {
+        kind = CALL
+      } else if toml && lineStart(bytes, at) {
+        kind = CALL
+      }
+      if kind == PLAIN {
+        at = end
+        continue
+      }
+    } else if isDigit(byte) && (at == 0 || !isLetter(bytes[at - 1])) {
+      while end < bytes.length && (isDigit(bytes[end]) || bytes[end] == 46 || isLetter(bytes[end])) {
+        end = end + 1
+      }
+      kind = NUMBER
+    } else if toml && byte == 91 && lineStart(bytes, at) {
+      while end < bytes.length && bytes[end] != 10 {
+        end = end + 1
+      }
+      kind = TYPE
+    }
+    if kind == PLAIN {
+      at = at + 1
+    } else {
+      run out.append(Piece { start: at, length: end - at, kind: kind })
+      at = end
+    }
+  }
+  return move out
+}
+
+/// Whether only spaces come before `at` on its line.
+fn lineStart(bytes: &[u8], at: usize) -> bool {
+  let mut i = at
+  while i > 0 && bytes[i - 1] == 32 {
+    i = i - 1
+  }
+  return i == 0 || bytes[i - 1] == 10
+}
