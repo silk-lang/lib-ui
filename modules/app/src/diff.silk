@@ -44,7 +44,9 @@ import silk.core.result { Result }
 pub struct DiffState {
   pub nextId: u32,
   /// Tree id to entry index in the newest render.
-  pub ids: HashMap<Word, u32>,
+  /// Built by `entryOf` on its first call after a render: dispatch needs it, a render does not.
+  ids: HashMap<Word, u32>,
+  indexed: bool,
   used: List<bool>,
   newStyle: List<Declaration>,
   oldStyle: List<Declaration>,
@@ -61,6 +63,7 @@ impl DiffState {
     return DiffState {
       nextId: ROOT_ID + 1,
       ids: HashMap<Word, u32>.make(Hash.seed(0xD1FF)),
+      indexed: false,
       used: List<bool>.make(),
       newStyle: List<Declaration>.make(),
       oldStyle: List<Declaration>.make(),
@@ -73,8 +76,23 @@ impl DiffState {
     }
   }
 
-  /// The entry of the newest render with tree id `id`, or `NO_ENTRY`.
-  pub fn entryOf(self: &Self, id: u32) -> u32 {
+  /// The entry of `arena`, the newest render, with tree id `id`, or `NO_ENTRY`.
+  pub effect fn entryOf(self: &mut Self, arena: &Arena, id: u32) -> u32
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.indexed {
+      self.indexed = true
+      self.ids.clear()
+      let count = arena.length()
+      let mut i: u32 = 0
+      while i < count {
+        let entryId = arena.entry(i).id
+        if entryId != 0 {
+          drop run self.ids.insert(Hash.word(u32.toU64(entryId)), i)
+        }
+        i = i + 1
+      }
+    }
     return match self.ids.get(Hash.word(u32.toU64(id))) {
       Option<u32>.Some { value } => value
       Option<u32>.None => NO_ENTRY
@@ -107,7 +125,7 @@ pub effect fn diffFrom(
 ) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
-  state.ids.clear()
+  state.indexed = false
   state.used.clear()
   run state.used.appendRepeated(false, u32.toUsize(old.length()))
   let count = next.length()
@@ -122,7 +140,6 @@ pub effect fn diffFrom(
   let mut root = next.entry(0)
   root.id = rootId
   next.setEntry(0, root)
-  drop run state.ids.insert(Hash.word(u32.toU64(rootId)), 0)
   run props(&next, 0, &old, root.old, rootId, &mut state, &mut out)
   run children(&mut next, 0, &old, root.old, &mut state, &mut out)
 
@@ -179,7 +196,6 @@ effect fn create(
   let mut entry = next.entry(index)
   entry.id = id
   next.setEntry(index, entry)
-  drop run state.ids.insert(Hash.word(u32.toU64(id)), index)
   run out.append(Mutation.Create { id: id, kind: entry.kind })
   run props(&next, index, &old, NO_ENTRY, id, &mut state, &mut out)
   let mut child = entry.firstChild
@@ -206,28 +222,13 @@ effect fn update(
   let id = before.id
   entry.id = id
   next.setEntry(index, entry)
-  drop run state.ids.insert(Hash.word(u32.toU64(id)), index)
   if entry.copied {
-    // Copied by `lazy`: same ids, nothing to send. Its subtree still needs its ids known.
-    run register(&next, entry.firstChild, &mut state)
+    // Copied by `lazy`: same ids, nothing to send.
     return id
   }
   run props(&next, index, &old, entry.old, id, &mut state, &mut out)
   run children(&mut next, index, &old, entry.old, &mut state, &mut out)
   return id
-}
-
-/// Records the ids of a copied subtree, starting at its first child `first`.
-effect fn register(next: &Arena, first: u32, state: &mut DiffState) -> ()
-  ! OutOfMemoryError
-  ? &mut Allocator {
-  let mut child = first
-  while child != NO_ENTRY {
-    let entry = next.entry(child)
-    drop run state.ids.insert(Hash.word(u32.toU64(entry.id)), child)
-    run register(&next, entry.firstChild, &mut state)
-    child = entry.next
-  }
 }
 
 /// Reconciles the children of `index` with those of its old entry `before` (or none).
@@ -298,6 +299,28 @@ effect fn stableRun(
   ! OutOfMemoryError
   ? &mut Allocator {
   let stableStart = state.stable.length()
+  // Most renders keep every child matched and in order: all of them stay.
+  let mut ordered = true
+  let mut last: u32 = 0
+  let mut k = start
+  while k < end {
+    let matched = next.entry(state.children.get(k)).old
+    if matched == NO_ENTRY {
+      ordered = false
+      break
+    }
+    let position = old.entry(matched).position
+    if k > start && position <= last {
+      ordered = false
+      break
+    }
+    last = position
+    k = k + 1
+  }
+  if ordered {
+    run state.stable.appendRepeated(true, end - start)
+    return ()
+  }
   run state.stable.appendRepeated(false, end - start)
 
   // Longest increasing subsequence of old positions over the matched children (patience
