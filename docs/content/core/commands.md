@@ -2,6 +2,8 @@
 
 `update` cannot touch the outside world. So how does a program read a file, ask a server, or roll a die? It returns a **command**: a value that says what it wants done. The runtime does it, and the result comes back as a message.
 
+> **Note:** In the loop, commands are how `update` reaches the outside world, once, and gets an answer. For things that keep happening, see [Subscriptions](/core/subscriptions/). Step 4 of the [tutorial](/core/tutorial/) adds a command to a growing app.
+
 ## Dice
 
 ::demo dice
@@ -75,3 +77,12 @@ That last line is the point. Here is the test for this program. It decides what 
 A command runs to its end before the next message is handled, so a command should be quick. For work that takes a while, such as a network request or a long computation, the command *starts* the work and returns. The result arrives later through a **port**, which is a kind of [subscription](/core/subscriptions/).
 
 [Background work](/native/background-work/) builds a whole program around that.
+
+## Recap
+
+- `update` returns a command as a value. The runtime runs it afterward.
+- A command always ends in one message, which goes to `update`.
+- `execute` reaches the world only through services it names. Whoever starts the program provides them.
+- A different service in a test is all it takes to control the outside world.
+
+Next: [Subscriptions](/core/subscriptions/).

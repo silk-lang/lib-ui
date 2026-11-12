@@ -2,6 +2,8 @@
 
 A Silk UI program runs in a web page as WebAssembly. The page gives it real DOM nodes, so the browser does layout, text, focus, scrolling and accessibility, and your program does what it always does.
 
+> **Note:** This is the host side of the picture in [Silk UI at a glance](/core/): the program stays the same, and the page provides the screen and the services.
+
 This page builds the dice program from [Commands](/core/commands/) for the web. It is four files.
 
 ## The program
@@ -101,3 +103,12 @@ The program is the same, and it behaves the same. A few things differ because th
 - Text is laid out by the browser, with the fonts the page has.
 - `css.raw` values go to the browser as they are, so everything CSS can do is available.
 - There is one window. A program that declares more [windows](/native/windows/) hears that they failed to open.
+
+## Recap
+
+- The program compiles to WebAssembly and a small script mounts it on real DOM nodes.
+- The entry point exports two functions and provides the program's services.
+- Pages can be drawn to markup ahead of time and taken over when the program loads.
+- The same program runs in a native window with a different host.
+
+Next: [Native apps](/native/).

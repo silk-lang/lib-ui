@@ -2,6 +2,8 @@
 
 The view describes the screen, and it also says which message each thing the user does turns into. This page builds a to-do list: a text field, a list that changes, and buttons in every row.
 
+> **Note:** In the loop, this is the step from the screen back to `update`: what the user does becomes a message. It is steps 1 and 2 of the [tutorial](/core/tutorial/).
+
 ## A to-do list
 
 ::demo todo
@@ -103,3 +105,12 @@ h.onKeyDown(
 ## Keys that work everywhere
 
 A shortcut that should work wherever focus is does not belong on a node. It is a [subscription](/core/subscriptions/): `subs.keyBinding`.
+
+## Recap
+
+- An event attribute pairs something the user does with the message to send.
+- A message is a value built while drawing. Nothing runs until the event happens.
+- Text being typed is state, so it lives in the model: `h.onInput` reports each change.
+- Name messages for what happened, and let `update` decide what it means.
+
+Next: [Commands](/core/commands/).

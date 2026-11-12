@@ -2,9 +2,11 @@
 
 A Silk UI program is a loop. This page follows one click around it, then shows the two other ways a message can arrive.
 
+> **Note:** This is the mechanics behind the loop drawn in [Silk UI at a glance](/core/). Read that first if you have not seen the whole picture.
+
 ## One click, all the way around
 
-Take the counter from [Your first program](/core/). The user clicks `+`.
+Take the counter from [Your first program](/core/first-program/). The user clicks `+`.
 
 ```text
         the user clicks +
@@ -96,3 +98,12 @@ The runtime that drives the loop talks to a **backend**: the thing that actually
 | Markup | Text | Server rendering and static sites, like this one |
 
 This site is a Silk UI program. The page you are reading was drawn to markup when the site was built, and the same program took it over when it loaded.
+
+## Recap
+
+- Everything that happens becomes one message, handed to `update`.
+- Messages have three sources: the view, commands and subscriptions.
+- `view`, `subscriptions` and `windows` are functions of the model. The runtime makes the world match what they return.
+- `update` and `view` cannot touch the outside world, which is why programs test and port so easily.
+
+Next: [Views](/core/views/).

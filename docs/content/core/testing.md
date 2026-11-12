@@ -2,6 +2,8 @@
 
 A Silk UI program is a model, messages, and functions between them. A test needs no window, no browser and no mocks of the screen. It sends messages and looks at the model.
 
+> **Note:** Tests are where the rules pay off: one model, messages as the only input, and the world behind services. Step 5 of the [tutorial](/core/tutorial/) tests a whole app this way.
+
 All the tests on this page are the real tests of the examples in these docs. They run on every change to the repository.
 
 ```sh
@@ -70,3 +72,12 @@ If the field were covered by another node, or the button were off screen, the cl
 | With the harness | The few paths where the view matters: forms, keyboard, focus |
 
 Native apps add one more tool, a shell that writes down what was asked of it: see [Testing without a window](/native/testing/).
+
+## Recap
+
+- Make the program, send messages, read the model.
+- Provide a fake service to control what commands see.
+- Move time with `tick` and the address with `navigate`.
+- Use the harness for the few paths where the view itself matters.
+
+Next: [In the browser](/core/browser/), or [Native apps](/native/).

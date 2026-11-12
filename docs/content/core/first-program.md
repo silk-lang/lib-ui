@@ -2,6 +2,8 @@
 
 This page reads one small program from top to bottom: a counter. It is the smallest thing that is still a whole Silk UI program, and every bigger program has the same parts.
 
+> **Note:** New here? [Silk UI at a glance](/core/) shows how all the parts fit before you read any code. This page then takes the smallest program apart, and the [tutorial](/core/tutorial/) builds a bigger one step by step.
+
 ## The program
 
 Here it is, running. Click the buttons.
@@ -89,3 +91,12 @@ ui_app = { git = "https://github.com/silk-lang/lib-ui.git", rev = "<a commit>", 
 ```
 
 The examples in these docs live in the same repository as Silk UI, under `docs/examples`, so their own manifests name it by path instead.
+
+## Recap
+
+- A program is a **model** and three functions: `init`, `update`, `view`.
+- **Messages** are the only way the model changes, and `update` is the only place it does.
+- `view` describes the screen for a model. It never changes anything.
+- A piece of UI is a function that returns a `Node`.
+
+Next: [build something bigger](/core/tutorial/), or see [how the loop runs](/core/how-it-runs/).

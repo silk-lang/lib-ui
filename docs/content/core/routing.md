@@ -2,6 +2,8 @@
 
 A program with more than one page keeps the page it is on in its model, like everything else. The address is just another thing that can change, and a change is just another message.
 
+> **Note:** Routing uses nothing new: the address is a [subscription](/core/subscriptions/), the route is a field of the model, and the view is an `if` on it.
+
 ## Two pages
 
 ::source examples/src/core/pages.silk
@@ -37,3 +39,12 @@ Sometimes the program decides to go somewhere: after a form is saved, or when a 
 A test moves the location itself and checks the model.
 
 ::source tests/src/core.silk "effect fn pagesBody"
+
+## Recap
+
+- The current route is state, so it is in the model.
+- `subs.location` turns every change of the address into a message.
+- `h.link` moves the address without loading a page, and `update` can move it too.
+- A function from a path to a route is easy to test alone.
+
+Next: [Composition](/core/composition/).

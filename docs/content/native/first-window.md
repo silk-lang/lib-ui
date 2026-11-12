@@ -1,6 +1,6 @@
 # Your first window
 
-A native app is a Silk UI program plus one small file that opens a window. This page takes the counter from [Your first program](/core/), unchanged, and runs it as a desktop app.
+A native app is a Silk UI program plus one small file that opens a window. This page takes the counter from [Your first program](/core/first-program/), unchanged, and runs it as a desktop app.
 
 ## The app
 
