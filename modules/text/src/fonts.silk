@@ -35,6 +35,9 @@ import read_fonts.lib { FontRef }
 import read_fonts.model.metrics { Metrics, LineBox }
 import font_types.lib { F2Dot14, F48Dot16, Tag }
 import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.collections.hash { Hash, Word }
+import silk.collections.hash_map { HashMap }
 import silk.core.option { Option }
 import silk.core.result { Result }
 import silk.core.ownership { Copy }
@@ -46,6 +49,8 @@ import silk.num.f64
 import silk.num.i32
 import silk.num.u16
 import silk.num.u32
+import silk.num.u64
+import silk.num.u8
 import silk.num.usize
 
 const TAG_WGHT: u32 = 0x77676874
@@ -121,6 +126,26 @@ pub struct RawGlyph {
 
 impl Copy for RawGlyph {}
 
+/// A text shaped before: its key, and where its text and glyphs are kept.
+struct Shaped {
+  hash: u64,
+  instance: usize,
+  start: usize,
+  end: usize,
+  rtl: bool,
+  vertical: bool,
+  script: u32,
+  textStart: usize,
+  textLength: usize,
+  glyphStart: usize,
+  glyphCount: usize,
+}
+
+impl Copy for Shaped {}
+
+/// The cache holds at most this many glyphs; past it, it starts again empty.
+const SHAPED_GLYPHS: usize = 262144
+
 pub struct FontState<'a> {
   pub matcher: FontMatcher<'a>,
   styles: List<StyleEntry>,
@@ -130,6 +155,15 @@ pub struct FontState<'a> {
   data: List<Option<ShaperData<'a>>>,
   plans: List<PlanEntry<'a>>,
   buffer: Buffer,
+  /// Shaping results by text, instance, range, direction and script. Shaping is a pure
+  /// function of these, and the same labels are shaped again by every layout that measures
+  /// them (a flex probe and the final layout, a relayout after an unrelated change).
+  shapedIndex: HashMap<Word, u32>,
+  shaped: List<Shaped>,
+  shapedText: List<u8>,
+  shapedGlyphs: List<RawGlyph>,
+  /// Shaper calls the cache did not answer, for tests and benchmarks.
+  pub shaperCalls: usize,
   /// Round ascent, descent and line gap to whole pixels, as Blink does on every platform.
   pub roundMetrics: bool,
 }
@@ -154,6 +188,50 @@ fn metric(value: F48Dot16) -> f32 {
   return f64.toF32(F48Dot16.toF64(value))
 }
 
+fn mix(hash: u64, value: u64) -> u64 {
+  return u64.wrappingMultiply(u64.bitXor(hash, value), 0x100000001B3)
+}
+
+/// FNV-1a over the text and the rest of a shaping key.
+fn shapeHash(
+  instance: usize,
+  text: string,
+  start: usize,
+  end: usize,
+  rtl: bool,
+  script: u32,
+  vertical: bool,
+) -> u64 {
+  let bytes = String.utf8Bytes(text)
+  let mut hash: u64 = 0xCBF29CE484222325
+  let mut i: usize = 0
+  while i < bytes.length {
+    hash = mix(hash, u8.toU64(bytes[i]))
+    i = i + 1
+  }
+  hash = mix(hash, usize.toU64(instance))
+  hash = mix(hash, usize.toU64(start))
+  hash = mix(hash, usize.toU64(end))
+  hash = mix(hash, u32.toU64(script))
+  let direction: u64 = if rtl { 1 } else { 0 }
+  let orientation: u64 = if vertical { 2 } else { 0 }
+  return mix(hash, direction + orientation)
+}
+
+fn sameBytes(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < left.length {
+    if left[i] != right[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
 effect fn makePlan<'a>(data: &ShaperData<'a>, coords: &[F2Dot14], buffer: &Buffer) -> ShapePlan<'a>
   ! OutOfMemoryError
   ? &mut Allocator {
@@ -174,6 +252,11 @@ impl<'a> FontState<'a> {
       data: List<Option<ShaperData<'a>>>.make(),
       plans: List<PlanEntry<'a>>.make(),
       buffer: Buffer.new(),
+      shapedIndex: HashMap<Word, u32>.make(Hash.seed(0x7368617065)),
+      shaped: List<Shaped>.make(),
+      shapedText: List<u8>.make(),
+      shapedGlyphs: List<RawGlyph>.make(),
+      shaperCalls: 0,
       roundMetrics: true,
     }
   }
@@ -453,6 +536,65 @@ impl<'a> FontState<'a> {
   ) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
+    let hash = shapeHash(instance, text, start, end, rtl, script.value, vertical)
+    if let Option<u32>.Some { value: at } = self.shapedIndex.get(Hash.word(hash)) {
+      let entry = self.shaped.get(u32.toUsize(at))
+      if entry.hash == hash && entry.instance == instance && entry.start == start
+        && entry.end == end && entry.rtl == rtl && entry.vertical == vertical
+        && entry.script == script.value
+        && sameBytes(
+          Slice.view(self.shapedText.asSlice(), entry.textStart, entry.textLength),
+          String.utf8Bytes(text),
+        ) {
+        run out.appendSlice(
+          Slice.view(self.shapedGlyphs.asSlice(), entry.glyphStart, entry.glyphCount),
+        )
+        return
+      }
+    }
+    let first = out.length()
+    run self.shapeUncached(instance, text, start, end, rtl, script, vertical, &mut out)
+    if self.shapedGlyphs.length() + (out.length() - first) > SHAPED_GLYPHS {
+      self.shapedIndex.clear()
+      self.shaped.clear()
+      self.shapedText.clear()
+      self.shapedGlyphs.clear()
+    }
+    let entry = Shaped {
+      hash: hash,
+      instance: instance,
+      start: start,
+      end: end,
+      rtl: rtl,
+      vertical: vertical,
+      script: script.value,
+      textStart: self.shapedText.length(),
+      textLength: String.byteLength(text),
+      glyphStart: self.shapedGlyphs.length(),
+      glyphCount: out.length() - first,
+    }
+    run self.shapedText.appendSlice(String.utf8Bytes(text))
+    run self.shapedGlyphs.appendSlice(Slice.view(out.asSlice(), first, out.length() - first))
+    let index = usize.toU32(self.shaped.length())
+    run self.shaped.append(entry)
+    drop run self.shapedIndex.insert(Hash.word(hash), index)
+  }
+
+  /// Shapes as `shapeTextOriented` does, without the cache.
+  effect fn shapeUncached(
+    self: &mut Self,
+    instance: usize,
+    text: string,
+    start: usize,
+    end: usize,
+    rtl: bool,
+    script: Script,
+    vertical: bool,
+    out: &mut List<RawGlyph>,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.shaperCalls = self.shaperCalls + 1
     let face = self.instances.asSlice()[instance].face
     if !run self.loadFace(face) {
       return

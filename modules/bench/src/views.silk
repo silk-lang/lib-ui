@@ -1,0 +1,199 @@
+//! The framework benchmarks: a ui-app view of 1,000 keyed rows mounted, rendered again
+//! unchanged, with one row changed, with one row moved and reversed, and a parent of 2,600
+//! cells rendered again, each cell either always run or memoized (`lazy`). The scenarios and
+//! sizes follow FerroUI's `declarative::ViewBenchmark`. An operation is the update of the
+//! model, the view, the diff and the tree applying the mutations; no layout or paint.
+import harness { Bench }
+import ui_app.app { App, Context, NoCommand }
+import ui_app.runtime { Runtime }
+import ui_app.ui { Ui }
+import ui_tree.legacy { UiTree }
+import ui_tree.engine { TreeError as RawError }
+import ui_tree.lib { TreeError }
+import silk.core.effect { Effect }
+import font_collection.lib { FontCollection }
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+
+pub const ROWS: u32 = 1000
+
+pub const COMPONENTS: u32 = 2600
+
+pub enum Shape {
+  List,
+  Components,
+  Memoized,
+}
+
+pub struct Rows {
+  pub shape: Shape,
+  pub order: List<u32>,
+  pub version: u64,
+  pub changed: u32,
+}
+
+pub enum Message {
+  Nothing,
+}
+
+impl App<Message, NoCommand> for Rows {
+  fn update(self: &mut Self, message: Message, cx: &mut Context<NoCommand>) -> () {}
+
+  fn view(self: &Self, ui: &mut Ui<Message>) -> () {
+    match self.shape {
+      Shape.List => {
+        ui.column(
+          |ui| {
+            let order = self.order.asSlice()
+            let mut i: usize = 0
+            while i < order.length {
+              let row = order[i]
+              ui.key(u32.toU64(row))
+              if row == self.changed {
+                ui.number(u32.toI64(row) + 1000000)
+              } else {
+                ui.number(u32.toI64(row))
+              }
+              i = i + 1
+            }
+          },
+        )
+      }
+      Shape.Components => {
+        ui.column(
+          |ui| {
+            let mut i: u32 = 0
+            while i < COMPONENTS {
+              ui.box(|ui| { ui.number(u32.toI64(i)) })
+              i = i + 1
+            }
+          },
+        )
+      }
+      Shape.Memoized => {
+        ui.column(
+          |ui| {
+            let mut i: u32 = 0
+            while i < COMPONENTS {
+              ui.lazy(u32.toU64(i), |ui| { ui.box(|ui| { ui.number(u32.toI64(i)) }) })
+              i = i + 1
+            }
+          },
+        )
+      }
+    }
+  }
+}
+
+effect fn lifted(error: RawError) -> never ! TreeError {
+  fail TreeError.lift(error)
+}
+
+pub enum ViewStep {
+  /// Start a new app on an empty tree: the first view mounted as 1,000 text nodes.
+  MountList,
+  RunUnchanged,
+  RunOneRowChanged,
+  MoveOneRow,
+  ReverseRows,
+  /// The parent of 2,600 cells rendered again.
+  RunParentOfComponents,
+}
+
+pub struct Views<'a> {
+  fonts: &'a FontCollection,
+  pub step: ViewStep,
+  shape: Shape,
+  tree: UiTree<'a>,
+  app: Runtime<Rows, Message, NoCommand>,
+}
+
+effect fn ordered() -> List<u32> ! OutOfMemoryError ? &mut Allocator {
+  let mut order = List<u32>.make()
+  let mut i: u32 = 0
+  while i < ROWS {
+    run order.append(i)
+    i = i + 1
+  }
+  return move order
+}
+
+effect fn model(shape: Shape) -> Rows ! OutOfMemoryError ? &mut Allocator {
+  return Rows { shape: shape, order: run ordered(), version: 0, changed: u32.MAX }
+}
+
+impl<'a> Views<'a> {
+  pub effect fn make(fonts: &'a FontCollection, step: ViewStep, shape: Shape) -> Views<'a>
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut tree = run Effect.catch<RawError>(UiTree.make(fonts), lifted)
+    let mut app = Runtime<Rows, Message, NoCommand>.make(run model(shape))
+    if step != ViewStep.MountList {
+      run Effect.catch<RawError>(app.start(&mut tree, 0.0), lifted)
+    }
+    return Views { fonts: fonts, step: step, shape: shape, tree: move tree, app: move app }
+  }
+}
+
+impl<'a> Bench for Views<'a> {
+  effect fn prepare(self: &mut Self) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if self.step == ViewStep.MountList {
+      self.tree = run Effect.catch<RawError>(UiTree.make(self.fonts), lifted)
+      self.app = Runtime<Rows, Message, NoCommand>.make(run model(self.shape))
+    }
+  }
+
+  effect fn body(self: &mut Self) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    match self.step {
+      ViewStep.MountList => {
+        run Effect.catch<RawError>(self.app.start(&mut self.tree, 0.0), lifted)
+        return ()
+      }
+      ViewStep.RunUnchanged => {
+        self.app.model.version = self.app.model.version + 1
+      }
+      ViewStep.RunOneRowChanged => {
+        let next = if self.app.model.changed == u32.MAX {
+          0
+        } else {
+          (self.app.model.changed + 1) % ROWS
+        }
+        self.app.model.changed = next
+      }
+      ViewStep.MoveOneRow => {
+        let order = &mut self.app.model.order
+        if order.get(0) == ROWS - 1 {
+          let first = order.remove(0)
+          run order.append(first)
+        } else {
+          let end = order.length() - 1
+          let last = order.remove(end)
+          run order.insert(0, last)
+        }
+      }
+      ViewStep.ReverseRows => {
+        let order = &mut self.app.model.order
+        let count = order.length()
+        let mut i: usize = 0
+        while i < count / 2 {
+          let a = order.get(i)
+          let b = order.get(count - 1 - i)
+          order.set(i, b)
+          order.set(count - 1 - i, a)
+          i = i + 1
+        }
+      }
+      ViewStep.RunParentOfComponents => {
+        self.app.model.version = self.app.model.version + 1
+      }
+    }
+    run Effect.catch<RawError>(self.app.render(&mut self.tree), lifted)
+  }
+}
