@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { createRoot } from "@silk/react";
+import { createRoot } from "@silk/ui-react";
 
 function Counter() {
   const [clicks, setClicks] = useState(0);

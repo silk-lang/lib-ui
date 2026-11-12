@@ -1,4 +1,4 @@
-// @silk/react: a React renderer for the Silk UI tree.
+// @silk/ui-react: a React renderer for the Silk UI tree.
 //
 // Host elements are the tree's node kinds: <box>, <input>, <image>, <icon>, <canvas>.
 // Strings in children become text nodes. Props:
@@ -135,7 +135,7 @@ function applyProps(node, previous, next) {
 const EMPTY = {};
 
 const hostConfig = {
-  rendererPackageName: "@silk/react",
+  rendererPackageName: "@silk/ui-react",
   rendererVersion: "0.1.0",
   extraDevToolsConfig: null,
   supportsMutation: true,

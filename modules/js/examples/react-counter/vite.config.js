@@ -3,7 +3,7 @@ import { defineConfig } from "vite";
 // One self-contained ES module: the ui-js host evaluates it as the entry module.
 export default defineConfig({
   define: { "process.env.NODE_ENV": JSON.stringify("production") },
-  oxc: { jsx: { runtime: "automatic", importSource: "@silk/react" } },
+  oxc: { jsx: { runtime: "automatic", importSource: "@silk/ui-react" } },
   build: {
     target: "es2022",
     minify: false,

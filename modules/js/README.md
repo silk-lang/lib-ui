@@ -2,7 +2,7 @@
 
 Runs a JavaScript application on a UI tree, with the [SilkJS](https://github.com/silk-lang/lib-silkjs)
 engine embedded in the process. Three parts are here: the Silk host with its native bridge,
-`@silk/ui`, the node and event API, and `@silk/react`, a React renderer on it. A Vite plugin
+`@silk/ui`, the node and event API, and `@silk/ui-react`, a React renderer on it. A Vite plugin
 with hot reload is not here yet.
 
 ## @silk/ui
@@ -48,14 +48,14 @@ mount(createBox({ width: 400, height: 300 }, button));
 - **Errors.** A listener that throws does not stop the dispatch. `setErrorHandler` receives
   the exception. Without a handler the host reports the first one after the input.
 
-## @silk/react
+## @silk/ui-react
 
-[packages/react](packages/react) renders React components to the tree. Host elements are the
+[packages/ui-react](packages/ui-react) renders React components to the tree. Host elements are the
 tree's node kinds, and strings in children become text nodes.
 
 ```jsx
 import { useState } from "react";
-import { createRoot } from "@silk/react";
+import { createRoot } from "@silk/ui-react";
 
 function Counter() {
   const [clicks, setClicks] = useState(0);
@@ -85,7 +85,7 @@ createRoot().render(<Counter />);
   the content. A state change in a click, key or input listener commits before the host
   applies the mutations, so the next frame shows it. Other updates go through React's
   scheduler on the host's timers.
-- **JSX.** Set the JSX import source to `@silk/react`, or use React's own runtime: both
+- **JSX.** Set the JSX import source to `@silk/ui-react`, or use React's own runtime: both
   work.
 
 [examples/react-counter](examples/react-counter) bundles a counter with Vite into one ES
