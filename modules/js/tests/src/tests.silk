@@ -1,0 +1,108 @@
+//! ui-js tests: a JavaScript counter builds its nodes through the bridge, handles events
+//! between the tree's begin and finish, and reports what it throws.
+//! Run from the repository root (the fixtures read fonts and scripts from there).
+import ui_js.lib { JsHost, JsError }
+import ui_tree.lib { Tree, TreeError, ProtocolError, Viewport, NodeId, Input }
+import ui_fixtures.fixtures as fixtures
+import silkjs.js_atomics_native { WaiterDomain, SynchronizationError }
+import silkjs.runtime_memory { RuntimeAllocator }
+import silkjs.js_libc_platform as platform
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+fn viewport() -> Viewport {
+  return Viewport { width: 400.0, height: 300.0, scale: 1.0 }
+}
+
+fn focusIs(tree: &Tree<'_>, id: u32) -> bool {
+  return match tree.focused() {
+    Option.Some { value } => value.raw() == id
+    Option.None => false
+  }
+}
+
+effect fn labelIs(tree: &Tree<'_>, expected: string) -> bool {
+  return match tree.view(NodeId.of(4)) {
+    Option.Some { value } => value.text() == expected
+    Option.None => false
+  }
+}
+
+/// The counter's ids: 1 the root, 2 the field, 3 the button, 4 the label. The button sits
+/// below the 30 pixel field, so (10, 50) is inside it.
+effect fn counter(host: &mut JsHost<'_>, tree: &mut Tree<'_>) -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>
+  ? &mut Allocator {
+  let source = run platform.readFile(b"modules/js/tests/fixtures/counter.js")
+  run host.evaluate(source.asSlice(), b"counter.js")
+  run Testing.expect(host.pending() != 0, "the script queued mutations and applied none")
+  run host.flush(&mut tree)
+  drop run tree.frame(viewport(), 0.0)
+  run Testing.expect(focusIs(&tree.*, 2), "the script focused the field")
+  run Testing.expect(run labelIs(&tree.*, "Click me"), "the label holds its first text")
+
+  // The pointerdown handler runs before the default and prevents it: focus stays.
+  run host.input(&mut tree, Input.press(10.0, 50.0))
+  run host.input(&mut tree, Input.release(10.0, 50.0))
+  run Testing.expect(focusIs(&tree.*, 2), "a prevented press keeps focus on the field")
+  run Testing.expect(run labelIs(&tree.*, "Clicked 1"), "and the click handler still ran")
+
+  // The same press without preventDefault moves focus to the button.
+  run host.evaluate(b"keepFocus = false", b"test")
+  run host.input(&mut tree, Input.press(10.0, 50.0))
+  run host.input(&mut tree, Input.release(10.0, 50.0))
+  run Testing.expect(focusIs(&tree.*, 3), "an unprevented press focuses the button")
+  run Testing.expect(run labelIs(&tree.*, "Clicked 2"), "the second click counted")
+
+  // The handler saw the pointer position.
+  run host.evaluate(b"if (lastPoint !== '10,50') throw new Error('point was ' + lastPoint)", b"test")
+}
+
+/// An uncaught exception comes back as its message, and the host keeps working after it.
+effect fn errors(host: &mut JsHost<'_>) -> ()
+  ! OutOfMemoryError | JsError | AssertionError<'static>
+  ? &mut Allocator {
+  let failed = run Effect.result(host.evaluate(b"throw new TypeError('nope')", b"test"))
+  match move failed {
+    Result<(), OutOfMemoryError | JsError>.Success { .. } => { run Testing.expect(false, "a throw must fail the evaluation") }
+    Result<(), OutOfMemoryError | JsError>.Failure { error } => {
+      match move error {
+        JsError { message } => { run Testing.expect(String.view(&message) == "TypeError: nope", "the message names the error") }
+        OutOfMemoryError allocation => { fail move allocation }
+      }
+    }
+  }
+  run host.evaluate(b"globalThis.after = 1 + 1", b"test")
+}
+
+effect fn withHost() -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run Tree.make(&fonts)
+  let domain = run WaiterDomain.make()
+  let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let memory = run allocator.observe()
+  let mut host = run JsHost.open(&memory, domain.handle()) |> Effect.provideMut<Allocator>(&mut allocator)
+  let ran = run Effect.result(counter(&mut host, &mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
+  let checked = run Effect.result(errors(&mut host)) |> Effect.provideMut<Allocator>(&mut allocator)
+  run host.close() |> Effect.provideMut<Allocator>(&mut allocator)
+  match move ran {
+    Result<(), TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>>.Success { .. } => ()
+    Result<(), TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>>.Failure { error } => { fail move error }
+  }
+  match move checked {
+    Result<(), OutOfMemoryError | JsError | AssertionError<'static>>.Success { .. } => ()
+    Result<(), OutOfMemoryError | JsError | AssertionError<'static>>.Failure { error } => { fail move error }
+  }
+}
+
+test effect fn javascriptCounterHandlesEventsSynchronously() -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run withHost() |> Effect.provideMut<Allocator>(&mut allocator)
+}

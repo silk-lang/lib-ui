@@ -1,0 +1,248 @@
+//! The host: one engine, one realm, and the loop steps a window host calls.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.text.string { String }
+import silk.num.u32
+import silk.num.f32
+import ui_tree.lib { Tree, ProtocolError, Input, EventKind, EventRecord, Event }
+import silkjs.js_engine { Engine }
+import silkjs.js_heap { HeapHeader }
+import silkjs.js_value { ValueBits }
+import silkjs.js_realm { Realm, lendRealm }
+import silkjs.js_owned_value { Value, ValueRef }
+import silkjs.js_core_types { NativeFunctionId, NativeCallProtocol }
+import silkjs.js_exceptions { JsException }
+import silkjs.js_strings { Strings }
+import silkjs.js_atomics_native { Domain }
+import silkjs.runtime_memory { AllocationObserver }
+import silkjs.js_runtime as runtime
+import silkjs.js_gc as gc
+import silkjs.js_intrinsic_install as intrinsics
+import silkjs.js_native_functions as functions
+import silkjs.js_object_allocate as objects
+import silkjs.js_intl_common as common
+import silkjs.js_eval as evaluation
+import silkjs.js_promise as promise
+import silkjs.native_stack as stack
+import bridge
+import bridge { Bridge }
+
+/// JavaScript threw and nothing caught it. `message` is the thrown value as a string.
+pub struct JsError {
+  pub message: String,
+}
+
+/// A JavaScript realm bound to a UI tree's client side.
+///
+/// Every effect here allocates JavaScript memory, so provide the `RuntimeAllocator` that
+/// `memory` observes as their `Allocator`. Call [`JsHost.close`] before dropping the host.
+pub struct JsHost<'m> {
+  engine: Engine<'m, Bridge>,
+  runtime: *mut HeapHeader,
+  context: *mut HeapHeader,
+  closed: bool,
+}
+
+/// The position of `kind` in the ui-protocol `LISTEN_*` flags, which is the number JavaScript
+/// receives as the event's kind.
+pub fn kindCode(kind: EventKind) -> u32 {
+  if kind == EventKind.PointerDown { return 0 }
+  if kind == EventKind.PointerUp { return 1 }
+  if kind == EventKind.Click { return 2 }
+  if kind == EventKind.PointerMove { return 3 }
+  if kind == EventKind.PointerEnter { return 4 }
+  if kind == EventKind.PointerLeave { return 5 }
+  if kind == EventKind.Wheel { return 6 }
+  if kind == EventKind.KeyDown { return 7 }
+  if kind == EventKind.KeyUp { return 8 }
+  if kind == EventKind.Focus { return 9 }
+  if kind == EventKind.Blur { return 10 }
+  if kind == EventKind.Input { return 11 }
+  if kind == EventKind.Scroll { return 12 }
+  if kind == EventKind.Layout { return 13 }
+  if kind == EventKind.PointerCancel { return 14 }
+  if kind == EventKind.GotPointerCapture { return 15 }
+  return 16
+}
+
+fn pointOf(event: &Event) -> [f32; 2] {
+  return match &event.* {
+    Event.PointerDown { pointer, .. } => [pointer.x, pointer.y]
+    Event.PointerUp { pointer, .. } => [pointer.x, pointer.y]
+    Event.Click { pointer, .. } => [pointer.x, pointer.y]
+    Event.PointerMove { pointer } => [pointer.x, pointer.y]
+    Event.PointerEnter { pointer } => [pointer.x, pointer.y]
+    Event.PointerLeave { pointer } => [pointer.x, pointer.y]
+    Event.Wheel { pointer, .. } => [pointer.x, pointer.y]
+    Event.PointerCancel { pointer } => [pointer.x, pointer.y]
+    Event.Scroll { x, y } => [x, y]
+    _ => [0.0, 0.0]
+  }
+}
+
+effect fn define<'a, 'b, 'm>(engine: &mut Engine<'m, Bridge>, realm: Realm<'a>, object: ValueRef<'b>, id: u32) -> () ! JsException ? &mut Allocator {
+  let memory = engine.memory
+  let function = run functions.newFunction(&mut engine, memory, realm, NativeFunctionId.Host { id: id }, bridge.name(id), bridge.arity(id), NativeCallProtocol.Generic, 0)
+  run common.define(&mut engine, realm, object.borrow(), bridge.name(id), unsafe Value.adoptBits(function), 7)
+}
+
+effect fn install<'a, 'm>(engine: &mut Engine<'m, Bridge>, realm: Realm<'a>) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  let memory = engine.memory
+  let ui = run objects.newObject(&mut engine, memory, realm)
+  let mut id: u32 = 1
+  while id <= bridge.LAST {
+    run define(&mut engine, realm, ui.borrow(), id)
+    id = id + 1
+  }
+  run common.define(&mut engine, realm, realm.globalObject(), b"__ui", move ui, 7)
+}
+
+/// Takes the pending exception as a `JsError`.
+effect fn thrown<'a, 'm>(engine: &mut Engine<'m, Bridge>, realm: Realm<'a>) -> JsError ! OutOfMemoryError ? &mut Allocator {
+  let value = realm.takeException()
+  let converted = run Effect.result(common.toString(&mut engine, realm, value.borrow()))
+  let mut message = String.make()
+  match move converted {
+    Result<Value, JsException>.Success { value: text } => {
+      let bytes = run Strings.toUtf8(text.borrow().view(), false)
+      message = run String.copy(unsafe String.fromUtf8Unchecked(bytes.asSlice()))
+      realm.release(&mut engine, move text)
+    }
+    Result<Value, JsException>.Failure { .. } => {
+      let again = realm.takeException()
+      realm.release(&mut engine, move again)
+      message = run String.copy("an exception that could not be converted to a string")
+    }
+  }
+  realm.release(&mut engine, move value)
+  return JsError { message: move message }
+}
+
+effect fn evaluateIn<'a, 'm>(engine: &mut Engine<'m, Bridge>, realm: Realm<'a>, source: &[u8], name: &[u8]) -> () ! JsException ? &mut Allocator {
+  let memory = engine.memory
+  let value = run evaluation.evaluate(&mut engine, memory, realm, source, name, 0)
+  realm.release(&mut engine, move value)
+}
+
+/// Calls `__ui.dispatch(kind, target, x, y)` when the application installed one, and says
+/// whether it returned true, which means a handler prevented the default.
+effect fn dispatchIn<'a, 'm>(engine: &mut Engine<'m, Bridge>, realm: Realm<'a>, record: &EventRecord) -> bool ! JsException ? &mut Allocator {
+  let ui = run common.get(&mut engine, realm, realm.globalObject(), b"__ui")
+  let function = run common.get(&mut engine, realm, ui.borrow(), b"dispatch")
+  let mut prevented = false
+  if function.borrow().view().isObject() {
+    let point = pointOf(&record.event)
+    let arguments = [
+      ValueBits.number(u32.toF64(kindCode(record.event.kind()))),
+      ValueBits.number(u32.toF64(record.target.raw())),
+      ValueBits.number(f32.toF64(point[0])),
+      ValueBits.number(f32.toF64(point[1])),
+    ]
+    let called = run Effect.result(promise.call(&mut engine, realm, function.borrow(), ui.borrow(), &arguments))
+    match move called {
+      Result<Value, JsException>.Success { value } => {
+        prevented = match value.borrow().view() {
+          ValueBits.Bool { value: flag } => flag
+          _ => false
+        }
+        realm.release(&mut engine, move value)
+      }
+      Result<Value, JsException>.Failure { error } => {
+        realm.release(&mut engine, move function)
+        realm.release(&mut engine, move ui)
+        fail move error
+      }
+    }
+  }
+  realm.release(&mut engine, move function)
+  realm.release(&mut engine, move ui)
+  return prevented
+}
+
+impl<'m> JsHost<'m> {
+  /// A realm with the standard intrinsics and the `__ui` native functions.
+  pub effect fn open(memory: &'m AllocationObserver, domain: Domain) -> JsHost<'m> ! OutOfMemoryError | JsError ? &mut Allocator {
+    let rt = run runtime.allocateRuntimeStorage(stack.currentFrameAddress())
+    let mut engine = Engine { memory: memory, domain: domain, services: Bridge.make() }
+    let created = run Effect.result(unsafe intrinsics.create(&mut engine, memory, rt))
+    let context = match move created {
+      Result<*mut HeapHeader, OutOfMemoryError | JsException>.Success { value } => value
+      Result<*mut HeapHeader, OutOfMemoryError | JsException>.Failure { .. } => {
+        run unsafe gc.destroyRuntime(&mut engine, rt)
+        fail JsError { message: run String.copy("the JavaScript realm could not be created") }
+      }
+    }
+    let mut host = JsHost { engine: move engine, runtime: rt, context: context, closed: false }
+    let installed = run Effect.result(install(&mut host.engine, unsafe lendRealm(&context, context)))
+    match move installed {
+      Result<(), OutOfMemoryError | JsException>.Success { .. } => ()
+      Result<(), OutOfMemoryError | JsException>.Failure { .. } => {
+        run host.close()
+        fail JsError { message: run String.copy("the __ui functions could not be installed") }
+      }
+    }
+    return move host
+  }
+
+  /// Runs `source` as a script. `name` is the file name stack traces show.
+  pub effect fn evaluate(self: &mut Self, source: &[u8], name: &[u8]) -> () ! OutOfMemoryError | JsError ? &mut Allocator {
+    let context = self.context
+    let realm = unsafe lendRealm(&context, context)
+    let ran = run Effect.result(evaluateIn(&mut self.engine, realm, source, name))
+    match move ran {
+      Result<(), JsException>.Success { .. } => ()
+      Result<(), JsException>.Failure { .. } => { fail run thrown(&mut self.engine, realm) }
+    }
+  }
+
+  /// How many mutations JavaScript queued since the last flush.
+  pub fn pending(self: &Self) -> usize {
+    return self.engine.services.batch.length()
+  }
+
+  /// Applies what JavaScript queued to `tree`.
+  pub effect fn flush(self: &mut Self, tree: &mut Tree<'_>) -> () ! ProtocolError | OutOfMemoryError ? &mut Allocator {
+    if self.engine.services.batch.length() == 0 { return }
+    run tree.apply(run self.engine.services.batch.take())
+  }
+
+  /// Hands the tree's queued event records to JavaScript now. Says whether a handler
+  /// prevented a default.
+  pub effect fn deliver(self: &mut Self, tree: &mut Tree<'_>) -> bool ! OutOfMemoryError | JsError ? &mut Allocator {
+    let context = self.context
+    let realm = unsafe lendRealm(&context, context)
+    let events = run tree.events()
+    let records = events.asSlice()
+    let mut prevented = false
+    let mut i: usize = 0
+    while i < records.length {
+      let outcome = run Effect.result(dispatchIn(&mut self.engine, realm, &records[i]))
+      match move outcome {
+        Result<bool, JsException>.Success { value } => { if value { prevented = true } }
+        Result<bool, JsException>.Failure { .. } => { fail run thrown(&mut self.engine, realm) }
+      }
+      i = i + 1
+    }
+    return prevented
+  }
+
+  /// One input, start to finish: the tree queues its event records, JavaScript handles them
+  /// and may prevent the default, the tree runs or skips the default, JavaScript handles what
+  /// that queued (a click, a focus change), and the mutations it made reach the tree.
+  pub effect fn input(self: &mut Self, tree: &mut Tree<'_>, value: Input) -> () ! ProtocolError | OutOfMemoryError | JsError ? &mut Allocator {
+    let pending = run tree.begin(move value)
+    let prevented = run self.deliver(&mut tree)
+    run tree.finish(move pending, prevented)
+    drop run self.deliver(&mut tree)
+    run self.flush(&mut tree)
+  }
+
+  /// Frees the realm and the runtime. Safe to call twice.
+  pub effect fn close(self: &mut Self) -> () ? &mut Allocator {
+    if self.closed { return }
+    unsafe gc.releaseHeader(&mut self.engine, self.runtime, self.context)
+    run unsafe gc.destroyRuntime(&mut self.engine, self.runtime)
+    self.closed = true
+  }
+}
