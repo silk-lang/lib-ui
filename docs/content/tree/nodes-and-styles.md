@@ -4,7 +4,7 @@ This page builds a card out of nodes, one call at a time: boxes, text, a word in
 
 ## A card
 
-::shot tree-card "The card, drawn from the code below."
+::shot tree-card "The card from the code below. Where the browser has WebGPU it is running: move the pointer over the button."
 
 ::source examples/src/tree/card.silk
 
@@ -77,7 +77,7 @@ Layout follows CSS: block and inline flow, flexbox, grid, absolute and fixed pos
 
 ## Looks for hover, press and focus
 
-::shot tree-card-hover "The same tree after the pointer moved over the button. No code ran for the color change."
+::shot tree-card-hover "The same tree with the pointer over the button. No code runs for the color change: try it."
 
 ```silk
 run tree.setStyleFor(button, StyleState.Hover, &[css.backgroundColor(rgb(0x0D5F58))])

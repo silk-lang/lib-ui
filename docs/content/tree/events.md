@@ -6,7 +6,7 @@ This page builds a counter that way.
 
 ## A counter
 
-::shot tree-clicker "After three clicks. The pointer is still over the button, so it has its hover look."
+::shot tree-clicker "The counter. Where the browser has WebGPU it is running: click it, or focus it and press Enter."
 
 ::source examples/src/tree/clicker.silk
 

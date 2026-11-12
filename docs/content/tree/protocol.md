@@ -6,7 +6,7 @@ That covers a host written in JavaScript, a client in another process, a recordi
 
 ## A tree as data
 
-::shot tree-remote "The tree the batches below describe, after its button was clicked."
+::shot tree-remote "The tree the batches below describe. Where the browser has WebGPU it is running: click the button, and the second batch is applied."
 
 ::source examples/src/tree/remote.silk
 
