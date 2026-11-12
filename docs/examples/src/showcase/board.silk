@@ -1,0 +1,946 @@
+//! Board: a task board. Cards are dragged between three columns with a captured pointer, moved
+//! with the arrow keys, added, removed, filtered by tag, and every change can be undone.
+//!
+//! It is one model, one `update` and view functions, like every Silk UI program. Nothing here
+//! knows whether it runs on a DOM or in a native window.
+import core.look { ACCENT, INK, LINE, MUTED, buttonLook, fieldLook, rgb }
+import ui_app.css
+import ui_app.css { px, Align, BorderStyle, BoxSizing, Overflow, Position, WhiteSpace }
+import ui_app.lib { Attr, Cursor, Document, Event, Node, NoCommand, NoOutput, Program, Reply, Role, Update }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.text.string { String }
+
+// The board's measures, in CSS pixels. Cards have one height, so where a card goes is
+// arithmetic, and the view needs to measure one thing only: the board's width.
+
+/// The bar with the filters.
+const BAR: f32 = 52.0
+
+/// A column's heading.
+const HEAD: f32 = 44.0
+
+/// A card, and the distance from one card's top to the next.
+const CARD: f32 = 52.0
+
+const STEP: f32 = 60.0
+
+/// The space between columns, and between a column's edge and its cards.
+const GUTTER: f32 = 12.0
+
+const INSET: f32 = 8.0
+
+/// The row at a column's foot that adds a card.
+const FOOT: f32 = 52.0
+
+pub const COLUMNS: u32 = 3
+
+const NAMES: [string<'static>; 3] = ["To do", "Doing", "Done"]
+
+/// Tag 0 is "every tag" in the filter. Cards have 1, 2 or 3.
+const TAGS: [string<'static>; 4] = ["All", "Design", "Code", "Docs"]
+
+const TAG_INK: [u32; 4] = [0x374151, 0x7C3AED, 0x2563EB, 0xB45309]
+
+const TAG_WASH: [u32; 4] = [0xE5E7EB, 0xEDE9FE, 0xDBEAFE, 0xFEF3C7]
+
+/// No column: the value of `adding` when no column is taking a new card.
+pub const NOWHERE: u32 = 3
+
+pub struct Card {
+  /// Never reused, so it can be the card's key.
+  pub id: u64,
+  pub title: String,
+  pub tag: u32,
+  pub column: u32,
+}
+
+pub struct Board {
+  /// Every card. A column shows its cards in the order they have here.
+  pub cards: List<Card>,
+  pub nextId: u64,
+  /// The tag being shown, or 0 for all of them.
+  pub filter: u32,
+  /// The column whose "add" row is open, or `NOWHERE`, and what is typed there.
+  pub adding: u32,
+  pub draft: String,
+  /// The card being dragged, or 0.
+  pub dragging: u64,
+  /// Where the drag started: the pointer, and the card's column and place in it.
+  pub fromX: f32,
+  pub fromY: f32,
+  pub fromColumn: u32,
+  pub fromIndex: usize,
+  /// How far the pointer has gone since.
+  pub movedX: f32,
+  pub movedY: f32,
+  /// Where the card would land if it were dropped now.
+  pub overColumn: u32,
+  pub overIndex: usize,
+  /// The card the keyboard moved last: it keeps the focus when it changes column.
+  pub held: u64,
+  /// The board's width, from the layout.
+  pub width: f32,
+  /// The cards as they were before each change, newest last.
+  pub past: List<List<Card>>,
+}
+
+/// The four ways the keyboard moves a card.
+pub enum Way {
+  Left,
+  Right,
+  Up,
+  Down,
+}
+
+pub union Message {
+  GrabbedCard { pub id: u64, pub x: f32, pub y: f32 },
+  MovedPointer { pub x: f32, pub y: f32 },
+  DroppedCard,
+  LostPointer,
+  PressedArrow { pub id: u64, pub way: Way },
+  ClickedRemove { pub id: u64 },
+  ClickedFilter { pub tag: u32 },
+  ClickedAdd { pub column: u32 },
+  ChangedDraft { pub value: String },
+  SubmittedDraft,
+  LeftDraft,
+  ClickedUndo,
+  MeasuredBoard { pub width: f32 },
+}
+
+type Next = Update<Board, NoCommand, NoOutput>
+
+// What the view and `update` both compute from the model. None of it is stored.
+
+/// Whether the filter lets `card` show.
+pub fn shown(model: &Board, card: &Card) -> bool {
+  return model.filter == 0 || card.tag == model.filter
+}
+
+/// How many cards `column` shows, not counting the card `without`.
+pub fn count(model: &Board, column: u32, without: u64) -> usize {
+  let cards = model.cards.asSlice()
+  let mut total: usize = 0
+  let mut i: usize = 0
+  while i < cards.length {
+    if cards[i].column == column && cards[i].id != without && shown(model, &cards[i]) {
+      total = total + 1
+    }
+    i = i + 1
+  }
+  return total
+}
+
+/// The place of the card `id` among the cards its column shows, not counting `without`.
+pub fn place(model: &Board, id: u64, without: u64) -> usize {
+  let cards = model.cards.asSlice()
+  let mut column: u32 = NOWHERE
+  let mut i: usize = 0
+  while i < cards.length {
+    if cards[i].id == id {
+      column = cards[i].column
+    }
+    i = i + 1
+  }
+  let mut at: usize = 0
+  i = 0
+  while i < cards.length {
+    if cards[i].id == id {
+      return at
+    }
+    if cards[i].column == column && cards[i].id != without && shown(model, &cards[i]) {
+      at = at + 1
+    }
+    i = i + 1
+  }
+  return at
+}
+
+/// The distance from one column's left edge to the next.
+fn pitch(model: &Board) -> f32 {
+  return (model.width - GUTTER * 2.0) / 3.0 + GUTTER
+}
+
+/// How many cards the tallest column must have room for.
+fn rows(model: &Board) -> usize {
+  let mut most: usize = 3
+  let mut column: u32 = 0
+  while column < COLUMNS {
+    let here = count(model, column, 0) + 1
+    if here > most {
+      most = here
+    }
+    column = column + 1
+  }
+  return most
+}
+
+/// How many whole `step`s fit in `distance`, to the nearest one.
+fn steps(distance: f32, step: f32) -> i32 {
+  let mut left = distance
+  let mut whole: i32 = 0
+  while left > step * 0.5 {
+    left = left - step
+    whole = whole + 1
+  }
+  while left < 0.0 - step * 0.5 {
+    left = left + step
+    whole = whole - 1
+  }
+  return whole
+}
+
+/// `start` moved by `by`, kept within 0 and `last`.
+fn shifted(start: usize, by: i32, last: usize) -> usize {
+  let mut at = start
+  let mut left = by
+  while left > 0 && at < last {
+    at = at + 1
+    left = left - 1
+  }
+  while left < 0 && at > 0 {
+    at = at - 1
+    left = left + 1
+  }
+  return if at > last {
+    last
+  } else {
+    at
+  }
+}
+
+// Changes.
+
+effect fn add(model: &mut Board, title: string, tag: u32, column: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let id = model.nextId
+  model.nextId = id + 1
+  run model.cards.append(Card { id: id, title: run String.copy(title), tag: tag, column: column })
+}
+
+/// Keeps the cards as they are now, so the change about to happen can be undone.
+effect fn remember(model: &mut Board) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let cards = model.cards.asSlice()
+  let mut copy = run List<Card>.makeWithCapacity(cards.length)
+  let mut i: usize = 0
+  while i < cards.length {
+    run copy.append(
+      Card {
+        id: cards[i].id,
+        title: run String.copy(String.view(&cards[i].title)),
+        tag: cards[i].tag,
+        column: cards[i].column,
+      },
+    )
+    i = i + 1
+  }
+  run model.past.append(move copy)
+  if model.past.length() > 50 {
+    drop model.past.remove(0)
+  }
+}
+
+/// Puts the card `id` in `column`, at place `index` among the cards that column shows.
+effect fn put(model: &mut Board, id: u64, column: u32, index: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut found: usize = model.cards.length()
+  let mut i: usize = 0
+  while i < model.cards.length() {
+    if model.cards.asSlice()[i].id == id {
+      found = i
+    }
+    i = i + 1
+  }
+  if found == model.cards.length() {
+    return
+  }
+  let mut card = model.cards.remove(found)
+  card.column = column
+
+  // The card goes before the card that has that place now, or last.
+  let mut before: usize = model.cards.length()
+  let mut at: usize = 0
+  i = 0
+  while i < model.cards.length() {
+    let other = &model.cards.asSlice()[i]
+    if other.column == column && shown(&model.*, other) {
+      if at == index && before == model.cards.length() {
+        before = i
+      }
+      at = at + 1
+    }
+    i = i + 1
+  }
+  run model.cards.insert(before, move card)
+}
+
+/// Where the dragged card would land: the column and place under the pointer.
+fn aim(model: &mut Board) -> () {
+  let across = steps(model.movedX, pitch(&model.*))
+  let mut column = model.fromColumn
+  if across > 0 {
+    column = if model.fromColumn + 1 < COLUMNS && across == 1 {
+      model.fromColumn + 1
+    } else {
+      COLUMNS - 1
+    }
+  }
+  if across < 0 {
+    column = if model.fromColumn > 0 && across == -1 {
+      model.fromColumn - 1
+    } else {
+      0
+    }
+  }
+  model.overColumn = column
+  model.overIndex = shifted(
+    model.fromIndex,
+    steps(model.movedY, STEP),
+    count(&model.*, column, model.dragging),
+  )
+}
+
+impl Program<Message, NoCommand> for Board {
+  effect fn init() -> Next
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut model = Board {
+      cards: List<Card>.make(),
+      nextId: 1,
+      filter: 0,
+      adding: NOWHERE,
+      draft: String.make(),
+      dragging: 0,
+      fromX: 0.0,
+      fromY: 0.0,
+      fromColumn: 0,
+      fromIndex: 0,
+      movedX: 0.0,
+      movedY: 0.0,
+      overColumn: 0,
+      overIndex: 0,
+      held: 0,
+      width: 660.0,
+      past: List<List<Card>>.make(),
+    }
+    run add(&mut model, "Sketch settings", 1, 0)
+    run add(&mut model, "Upgrade guide", 3, 0)
+    run add(&mut model, "Cache font atlas", 2, 0)
+    run add(&mut model, "Dark charts", 1, 1)
+    run add(&mut model, "Fix resize scroll", 2, 1)
+    run add(&mut model, "Release notes", 3, 2)
+    run add(&mut model, "Keyboard moves", 2, 2)
+    return Next.of(move model)
+  }
+
+  effect fn update(mut model: Board, message: Message) -> Next
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match move message {
+      Message.GrabbedCard { id, x, y } => {
+        // The card's place is read before the drag starts: once it is being dragged it is
+        // no longer in a column.
+        model.fromIndex = place(&model, id, 0)
+        let cards = model.cards.asSlice()
+        let mut i: usize = 0
+        while i < cards.length {
+          if cards[i].id == id {
+            model.fromColumn = cards[i].column
+          }
+          i = i + 1
+        }
+        model.dragging = id
+        model.fromX = x
+        model.fromY = y
+        model.movedX = 0.0
+        model.movedY = 0.0
+        model.held = 0
+        aim(&mut model)
+      }
+      Message.MovedPointer { x, y } => {
+        if model.dragging != 0 {
+          model.movedX = x - model.fromX
+          model.movedY = y - model.fromY
+          aim(&mut model)
+        }
+      }
+      Message.DroppedCard => {
+        let id = model.dragging
+        model.dragging = 0
+        if id != 0 && (model.overColumn != model.fromColumn || model.overIndex != model.fromIndex) {
+          let column = model.overColumn
+          let index = model.overIndex
+          run remember(&mut model)
+          run put(&mut model, id, column, index)
+        }
+      }
+      Message.LostPointer => {
+        // The press ended without a release: the card goes back where it was.
+        model.dragging = 0
+      }
+      Message.PressedArrow { id, way } => {
+        let mut column: u32 = 0
+        let cards = model.cards.asSlice()
+        let mut i: usize = 0
+        while i < cards.length {
+          if cards[i].id == id {
+            column = cards[i].column
+          }
+          i = i + 1
+        }
+        let at = place(&model, id, 0)
+        let mut toColumn = column
+        let mut to = at
+        match way {
+          Way.Left => {
+            if column > 0 {
+              toColumn = column - 1
+            }
+          }
+          Way.Right => {
+            if column + 1 < COLUMNS {
+              toColumn = column + 1
+            }
+          }
+          Way.Up => {
+            if at > 0 {
+              to = at - 1
+            }
+          }
+          Way.Down => {
+            to = at + 1
+          }
+        }
+        let last = count(&model, toColumn, id)
+        if to > last {
+          to = last
+        }
+        if toColumn != column || to != at {
+          run remember(&mut model)
+          run put(&mut model, id, toColumn, to)
+          model.held = id
+        }
+      }
+      Message.ClickedRemove { id } => {
+        run remember(&mut model)
+        let mut i: usize = 0
+        while i < model.cards.length() {
+          if model.cards.asSlice()[i].id == id {
+            drop model.cards.remove(i)
+          } else {
+            i = i + 1
+          }
+        }
+      }
+      Message.ClickedFilter { tag } => {
+        model.filter = tag
+      }
+      Message.ClickedAdd { column } => {
+        model.adding = column
+        model.draft = String.make()
+      }
+      Message.ChangedDraft { value } => {
+        model.draft = move value
+      }
+      Message.SubmittedDraft => {
+        let draft = move model.draft
+        model.draft = String.make()
+        let title = String.trim(String.view(&draft))
+        if String.byteLength(title) != 0 && model.adding != NOWHERE {
+          run remember(&mut model)
+          // A new card has the tag being shown, so it does not vanish as it is added.
+          let tag = if model.filter != 0 {
+            model.filter
+          } else {
+            u64.toU32(model.nextId % 3) + 1
+          }
+          let column = model.adding
+          run add(&mut model, title, tag, column)
+        }
+      }
+      Message.LeftDraft => {
+        model.adding = NOWHERE
+        model.draft = String.make()
+      }
+      Message.ClickedUndo => {
+        if model.past.length() != 0 {
+          let last = model.past.length() - 1
+          model.cards = model.past.remove(last)
+        }
+      }
+      Message.MeasuredBoard { width } => {
+        model.width = width
+      }
+    }
+    return Next.of(move model)
+  }
+
+  fn view(model: &Board, h: &Document<Message>) -> Node {
+    let dragging = model.dragging != 0
+    return h.column(
+      &[
+        h.testId("board"),
+        h.onLayout(|box| Message.MeasuredBoard { width: box.xMax - box.xMin }),
+        // While a card is dragged the board holds the pointer: the moves and the release
+        // reach it wherever the pointer goes, the window's edge included.
+        if dragging {
+          h.capturePointer()
+        } else {
+          h.none()
+        },
+        h.onPointerMove(
+          |event| if dragging {
+            Reply<Message>.Emit { message: Message.MovedPointer { x: event.x, y: event.y } }
+          } else {
+            Reply<Message>.Pass
+          },
+        ),
+        h.onPointerUp(
+          |event| if dragging {
+            Reply<Message>.Emit { message: Message.DroppedCard }
+          } else {
+            Reply<Message>.Pass
+          },
+        ),
+        h.onPointerCancel(Message.LostPointer),
+        h.style(
+          &[
+            css.position(Position.Relative),
+            css.minWidth(px(560.0)),
+            css.color(rgb(INK)),
+            css.fontSize(px(14.0)),
+            css.backgroundColor(rgb(0xF8FAFC)),
+          ],
+        ),
+      ],
+      &[
+        bar(h, model),
+        h.row(
+          &[h.style(&[css.columnGap(px(GUTTER)), css.alignItems(Align.Start)])],
+          &[column(h, model, 0), column(h, model, 1), column(h, model, 2)],
+        ),
+        // The dragged card is drawn last, so it is above everything else.
+        h.each(
+          model.cards.asSlice(),
+          |card| if card.id == model.dragging {
+            h.keyed(card.id, lifted(h, model, card))
+          } else {
+            h.empty()
+          },
+        ),
+      ],
+    )
+  }
+}
+
+/// The filters, the count and Undo.
+fn bar(h: &Document<Message>, model: &Board) -> Node {
+  return h.row(
+    &[
+      h.style(
+        &[
+          css.height(px(BAR)),
+          css.alignItems(Align.Center),
+          css.columnGap(px(6.0)),
+          css.paddingLeft(px(4.0)),
+          css.paddingRight(px(4.0)),
+        ],
+      ),
+    ],
+    &[
+      chip(h, model, 0),
+      chip(h, model, 1),
+      chip(h, model, 2),
+      chip(h, model, 3),
+      h.box(&[h.style(&[css.flexGrow(1.0)])], &[]),
+      h.button(
+        &[
+          h.testId("undo"),
+          h.onClick(Message.ClickedUndo),
+          h.disabled(model.past.length() == 0),
+          buttonLook<Message>(h, false),
+          if model.past.length() == 0 {
+            h.style(&[css.opacity(0.45)])
+          } else {
+            h.none()
+          },
+        ],
+        &[h.text("Undo")],
+      ),
+    ],
+  )
+}
+
+/// One filter: a tag's name, filled while it is the one being shown.
+fn chip(h: &Document<Message>, model: &Board, tag: u32) -> Node {
+  let chosen = model.filter == tag
+  let at = u32.toUsize(tag)
+  return h.button(
+    &[
+      h.onClick(Message.ClickedFilter { tag: tag }),
+      h.accessRole(Role.Button),
+      h.selected(chosen),
+      h.transition("background-color 120ms ease, color 120ms ease"),
+      h.style(
+        &[
+          css.paddingTop(px(5.0)),
+          css.paddingBottom(px(5.0)),
+          css.paddingLeft(px(12.0)),
+          css.paddingRight(px(12.0)),
+          css.borderRadius(px(999.0)),
+          css.borderWidth(px(1.0)),
+          css.borderStyle(BorderStyle.Solid),
+          css.borderColor(
+            if chosen {
+              rgb(TAG_INK[at])
+            } else {
+              rgb(LINE)
+            },
+          ),
+          css.backgroundColor(
+            if chosen {
+              rgb(TAG_INK[at])
+            } else {
+              rgb(0xFFFFFF)
+            },
+          ),
+          css.color(
+            if chosen {
+              rgb(0xFFFFFF)
+            } else {
+              rgb(INK)
+            },
+          ),
+        ],
+      ),
+      h.focusVisible(&[css.borderColor(rgb(ACCENT))]),
+    ],
+    &[h.text(TAGS[at])],
+  )
+}
+
+/// One column: its heading, its cards, the gap a dragged card would fill, and the row that
+/// adds a card. Cards are placed by arithmetic, so a card that changes place slides there.
+fn column(h: &Document<Message>, model: &Board, index: u32) -> Node {
+  let name = NAMES[u32.toUsize(index)]
+  let target = model.dragging != 0 && model.overColumn == index
+  return h.column(
+    &[
+      h.accessRole(Role.List),
+      h.label(name),
+      h.transition("background-color 120ms ease"),
+      h.style(
+        &[
+          css.position(Position.Relative),
+          css.flexGrow(1.0),
+          css.flexBasis(px(0.0)),
+          css.height(px(HEAD + usize.toF32(rows(model)) * STEP + FOOT)),
+          css.borderRadius(px(12.0)),
+          css.backgroundColor(
+            if target {
+              rgb(0xE0F2F1)
+            } else {
+              rgb(0xEEF1F5)
+            },
+          ),
+        ],
+      ),
+    ],
+    &[
+      h.row(
+        &[
+          h.style(
+            &[
+              css.height(px(HEAD)),
+              css.alignItems(Align.Center),
+              css.columnGap(px(8.0)),
+              css.paddingLeft(px(14.0)),
+              css.paddingRight(px(14.0)),
+              css.fontWeight(600.0),
+            ],
+          ),
+        ],
+        &[
+          h.box(&[h.style(&[css.flexGrow(1.0)])], &[h.text(name)]),
+          h.box(
+            &[h.style(&[css.color(rgb(MUTED)), css.fontWeight(400.0)])],
+            &[h.number(usize.toI64(count(model, index, 0)))],
+          ),
+        ],
+      ),
+      h.each(
+        model.cards.asSlice(),
+        |card| if card.column == index && card.id != model.dragging && shown(model, card) {
+          h.keyed(card.id, resting(h, model, card))
+        } else {
+          h.empty()
+        },
+      ),
+      if target {
+        gap(h, model.overIndex)
+      } else {
+        h.empty()
+      },
+      adder(h, model, index),
+    ],
+  )
+}
+
+/// Where a card at place `index` of a column starts, from the column's top.
+fn rung(index: usize) -> f32 {
+  return HEAD + usize.toF32(index) * STEP
+}
+
+/// A card in its column. While another card is dragged over the column, the cards from the
+/// gap down make room.
+fn resting(h: &Document<Message>, model: &Board, card: &Card) -> Node {
+  let mut index = place(model, card.id, model.dragging)
+  if model.dragging != 0 && model.overColumn == card.column && index >= model.overIndex {
+    index = index + 1
+  }
+  let id = card.id
+  return h.row(
+    &[
+      h.accessRole(Role.ListItem),
+      h.label(String.view(&card.title)),
+      h.tabIndex(0),
+      h.cursor(Cursor.Grab),
+      if model.held == id {
+        h.takeFocus()
+      } else {
+        h.none()
+      },
+      // The press starts a drag, and is kept from selecting the text under it.
+      h.onPointerDown(
+        |event| Reply<Message>.Custom {
+          message: Option<Message>.Some {
+            value: Message.GrabbedCard { id: id, x: event.x, y: event.y },
+          },
+          stopPropagation: false,
+          preventDefault: true,
+        },
+      ),
+      h.onKeyDown(|event| arrow(event, id)),
+      h.transition("top 160ms ease, box-shadow 120ms ease"),
+      cardLook(h),
+      h.style(&[css.position(Position.Absolute), css.top(px(rung(index)))]),
+      h.hover(&[css.borderColor(rgb(0x9CA3AF))]),
+      h.focusVisible(&[css.borderColor(rgb(ACCENT))]),
+    ],
+    &[
+      h.box(
+        &[
+          h.style(
+            &[
+              css.flexGrow(1.0),
+              css.minWidth(px(0.0)),
+              css.overflowX(Overflow.Hidden),
+              css.whiteSpace(WhiteSpace.NoWrap),
+            ],
+          ),
+        ],
+        &[h.text(String.view(&card.title))],
+      ),
+      tag(h, card.tag),
+      h.button(
+        &[
+          h.label("Remove"),
+          h.onClick(Message.ClickedRemove { id: id }),
+          // A press on the button is not the start of a drag.
+          h.onPointerDown(|event| Reply<Message>.Stop),
+          h.style(
+            &[
+              css.width(px(22.0)),
+              css.height(px(24.0)),
+              css.borderRadius(px(6.0)),
+              css.color(rgb(MUTED)),
+              css.backgroundColor(rgb(0xFFFFFF)),
+            ],
+          ),
+          h.hover(&[css.backgroundColor(rgb(0xF3F4F6)), css.color(rgb(INK))]),
+        ],
+        &[h.text("×")],
+      ),
+    ],
+  )
+}
+
+/// The card being dragged: it follows the pointer from the place it was picked up at.
+fn lifted(h: &Document<Message>, model: &Board, card: &Card) -> Node {
+  let left = u32.toF32(model.fromColumn) * pitch(model) + model.movedX
+  let top = BAR + rung(model.fromIndex) + model.movedY
+  return h.row(
+    &[
+      h.cursor(Cursor.Grabbing),
+      cardLook(h),
+      h.style(
+        &[
+          css.position(Position.Absolute),
+          css.top(px(top)),
+          css.left(px(left + INSET)),
+          css.right(css.auto()),
+          css.width(px(pitch(model) - GUTTER - INSET * 2.0)),
+          css.borderColor(rgb(ACCENT)),
+          css.opacity(0.95),
+        ],
+      ),
+    ],
+    &[
+      h.box(
+        &[
+          h.style(
+            &[
+              css.flexGrow(1.0),
+              css.minWidth(px(0.0)),
+              css.overflowX(Overflow.Hidden),
+              css.whiteSpace(WhiteSpace.NoWrap),
+            ],
+          ),
+        ],
+        &[h.text(String.view(&card.title))],
+      ),
+      tag(h, card.tag),
+    ],
+  )
+}
+
+/// What every card looks like, wherever it is.
+fn cardLook(h: &Document<Message>) -> Attr {
+  return h.style(
+    &[
+      css.left(px(INSET)),
+      css.right(px(INSET)),
+      css.height(px(CARD)),
+      css.boxSizing(BoxSizing.BorderBox),
+      css.alignItems(Align.Center),
+      css.columnGap(px(6.0)),
+      css.paddingLeft(px(12.0)),
+      css.paddingRight(px(6.0)),
+      css.borderWidth(px(1.0)),
+      css.borderStyle(BorderStyle.Solid),
+      css.borderColor(rgb(LINE)),
+      css.borderRadius(px(10.0)),
+      css.backgroundColor(rgb(0xFFFFFF)),
+    ],
+  )
+}
+
+/// A card's tag.
+fn tag(h: &Document<Message>, value: u32) -> Node {
+  let at = u32.toUsize(value)
+  return h.box(
+    &[
+      h.style(
+        &[
+          css.paddingTop(px(2.0)),
+          css.paddingBottom(px(2.0)),
+          css.paddingLeft(px(8.0)),
+          css.paddingRight(px(8.0)),
+          css.borderRadius(px(999.0)),
+          css.fontSize(px(12.0)),
+          css.color(rgb(TAG_INK[at])),
+          css.backgroundColor(rgb(TAG_WASH[at])),
+        ],
+      ),
+    ],
+    &[h.text(TAGS[at])],
+  )
+}
+
+/// The place a dragged card would take.
+fn gap(h: &Document<Message>, index: usize) -> Node {
+  return h.box(
+    &[
+      h.transition("top 160ms ease"),
+      h.style(
+        &[
+          css.position(Position.Absolute),
+          css.top(px(rung(index))),
+          css.left(px(INSET)),
+          css.right(px(INSET)),
+          css.height(px(CARD)),
+          css.boxSizing(BoxSizing.BorderBox),
+          css.borderWidth(px(2.0)),
+          css.borderStyle(BorderStyle.Dashed),
+          css.borderColor(rgb(ACCENT)),
+          css.borderRadius(px(10.0)),
+        ],
+      ),
+    ],
+    &[],
+  )
+}
+
+/// The foot of a column: a button that opens a field, and the field while it is open.
+fn adder(h: &Document<Message>, model: &Board, index: u32) -> Node {
+  let foot = h.style(
+    &[
+      css.position(Position.Absolute),
+      css.left(px(INSET)),
+      css.right(px(INSET)),
+      css.bottom(px(INSET)),
+    ],
+  )
+  if model.adding == index {
+    return h.input(
+      String.view(&model.draft),
+      &[
+        h.label("New card"),
+        h.placeholder("Name it, then press Enter"),
+        h.takeFocus(),
+        h.onInput(|value| Message.ChangedDraft { value: move value }),
+        h.onEnter(Message.SubmittedDraft),
+        h.onBlur(Message.LeftDraft),
+        fieldLook<Message>(h),
+        foot,
+      ],
+    )
+  }
+  return h.button(
+    &[
+      h.onClick(Message.ClickedAdd { column: index }),
+      foot,
+      h.style(
+        &[
+          css.paddingTop(px(8.0)),
+          css.paddingBottom(px(8.0)),
+          css.borderRadius(px(8.0)),
+          css.color(rgb(MUTED)),
+          css.backgroundColor(rgb(0xEEF1F5)),
+        ],
+      ),
+      h.hover(&[css.backgroundColor(rgb(0xE2E6EC)), css.color(rgb(INK))]),
+    ],
+    &[h.text("+ Add a card")],
+  )
+}
+
+/// What a key does to the focused card: the arrows move it, and the page does not scroll.
+fn arrow(event: &Event, id: u64) -> Reply<Message> {
+  let key = String.view(&event.key)
+  let way = if key == "ArrowLeft" {
+    Way.Left
+  } else if key == "ArrowRight" {
+    Way.Right
+  } else if key == "ArrowUp" {
+    Way.Up
+  } else if key == "ArrowDown" {
+    Way.Down
+  } else {
+    return Reply<Message>.Pass
+  }
+  return Reply<Message>.Custom {
+    message: Option<Message>.Some { value: Message.PressedArrow { id: id, way: way } },
+    stopPropagation: true,
+    preventDefault: true,
+  }
+}
