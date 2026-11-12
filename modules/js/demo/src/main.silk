@@ -1,7 +1,9 @@
 //! A counter written in JavaScript, in a native window with the SilkJS engine embedded.
 //! Run it from the repository root: it reads `@silk/ui` and `modules/js/demo/app.js` from
 //! there, as the fixture fonts are. Pass --check for a GPU smoke test, and the path of
-//! another entry module (a bundle, for example) to run that instead.
+//! another entry module (a bundle, for example) to run that instead. With --watch the entry
+//! is reloaded whenever the file `<entry>.stamp` changes, which `@silk/vite` writes after
+//! each build.
 import ui_js.lib { JsError }
 import ui_js_window.lib { JsApp, JsClient }
 import ui_tree.legacy { TreeError, Mutation }
@@ -25,7 +27,7 @@ import silk.core.result { Result }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.system.host_input { HostInput }
 
-effect fn program(check: bool, entry: &[u8], launched: Option<Launched>) -> i32
+effect fn program(check: bool, watch: bool, entry: &[u8], launched: Option<Launched>) -> i32
   ! TreeError | WindowError | GpuError | AtlasError | GeometryError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError
   ? &mut Allocator {
   let fonts = run fixtures.fonts()
@@ -41,6 +43,12 @@ effect fn program(check: bool, entry: &[u8], launched: Option<Launched>) -> i32
   let mut app = run JsApp.open(&memory, move allocator, domain.handle())
   run app.define(b"@silk/ui", library.asSlice())
   run app.entry(b"app.js", source.asSlice())
+  if watch && entry.length != 0 {
+    let mut stamp = List<u8>.make()
+    run stamp.appendSlice(entry)
+    run stamp.appendSlice(b".stamp")
+    run app.watch(entry, stamp.asSlice())
+  }
   let mut client = JsClient {}
   let options = RunOptions {
     title: "JavaScript on the tree",
@@ -67,9 +75,9 @@ effect fn failed<E>(error: E) -> i32 {
   return 2
 }
 
-fn runApp(check: bool, entry: Bytes, launched: Option<Launched>) -> i32 {
+fn runApp(check: bool, watch: bool, entry: Bytes, launched: Option<Launched>) -> i32 {
   let mut allocator = Allocator.systemAllocatorProvider()
-  return run Effect.catchAll(program(check, Bytes.asSlice(&entry), move launched), failed)
+  return run Effect.catchAll(program(check, watch, Bytes.asSlice(&entry), move launched), failed)
     |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
@@ -99,21 +107,29 @@ pub effect fn main() -> i32
   let mut allocator = Allocator.systemAllocatorProvider()
   let count = run Effect.catchAll(HostInput.argumentCount(), noArguments)
   let mut check = false
+  let mut watch = false
   let mut entry = Bytes.make()
   let mut i: usize = 1
   while i < count {
     if let Option<Bytes>.Some { value } = run Effect.catchAll(HostInput.argument(i), noArgument) |> Effect.provideMut<Allocator>(&mut allocator) {
-      if same(Bytes.asSlice(&value), b"--check") { check = true } else { entry = move value }
+      if same(Bytes.asSlice(&value), b"--check") {
+        check = true
+      } else if same(Bytes.asSlice(&value), b"--watch") {
+        watch = true
+      } else {
+        entry = move value
+      }
     }
     i = i + 1
   }
   let checking = check
+  let watching = watch
   let path = move entry
   // The main thread keeps the OS event loop; the app runs on its own thread.
   return run Effect.catchAll(
     launch(
       fn(launched: Option<Launched>) -> i32 {
-        return runApp(checking, move path, move launched)
+        return runApp(checking, watching, move path, move launched)
       },
     ),
     failed,

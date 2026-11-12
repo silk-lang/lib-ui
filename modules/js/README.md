@@ -1,9 +1,9 @@
 # ui-js
 
 Runs a JavaScript application on a UI tree, with the [SilkJS](https://github.com/silk-lang/lib-silkjs)
-engine embedded in the process. Three parts are here: the Silk host with its native bridge,
-`@silk/ui`, the node and event API, and `@silk/ui-react`, a React renderer on it. A Vite plugin
-with hot reload is not here yet.
+engine embedded in the process. Four parts are here: the Silk host with its native bridge,
+`@silk/ui`, the node and event API, `@silk/ui-react`, a React renderer on it, and `@silk/vite`,
+a Vite plugin that builds an application and reloads it in the window after each change.
 
 ## @silk/ui
 
@@ -98,6 +98,39 @@ silk run --manifest-path modules/js/demo/silk.toml modules/js/examples/react-cou
 React 19.3 with react-reconciler 0.34 runs on the engine as it is: the bundle needs only
 the web globals below.
 
+## @silk/vite
+
+[packages/vite](packages/vite) is the Vite plugin. A host evaluates one ES module, so the
+plugin sets up a library build with a single output file, the JSX runtime of
+`@silk/ui-react`, and `process.env.NODE_ENV` from the Vite mode.
+
+```js
+import { defineConfig } from "vite";
+import silk from "@silk/vite";
+
+export default defineConfig({
+  plugins: [silk({ entry: "src/main.jsx", host: { command: "path/to/host" } })],
+});
+```
+
+`vite build` writes `dist/app.js`. `vite build --watch --mode development` rebuilds on every
+change; with `host` set, the plugin starts that binary with `--watch <bundle>` after the
+first build, and the window reloads the application after each later one. A build that
+fails leaves the running application alone. Closing the window ends the session.
+
+The reload is a full one: the plugin writes `<bundle>.stamp` after a successful build, the
+window host looks at that file five times a second (`JsApp.watch`), and when it changed
+the host destroys the application's nodes, starts a new realm and runs the new bundle.
+JavaScript state does not survive. Replacing single modules with state kept, as Vite does in
+a browser, is not here yet.
+
+For the React example, from `modules/js/examples/react-counter`:
+
+```sh
+silk build --manifest-path ../../demo/silk.toml
+SILK_UI_HOST=$PWD/../../../../build/llvm/<target>/debug/ui-js-demo npm run dev
+```
+
 ## The host
 
 JavaScript runs on the thread that owns the tree.
@@ -169,5 +202,9 @@ Run it from the repository root. `silk task native check` runs it with `--check`
   against a stand-in for the native functions, and
   `silk test --manifest-path modules/js/examples/tests/silk.toml --root src/tests.silk` for
   the bundled examples on the engine (build them first).
-- Not here yet: unhandled rejection reports, images and canvas commands from JavaScript, and
-  the Vite plugin with hot reload.
+- Not here yet: unhandled rejection reports, images and canvas commands from JavaScript,
+  module replacement that keeps state, and choosing engine features for each build.
+- Memory, release builds on Linux x86-64 under Xvfb with a software GPU, resident after six
+  seconds: the Silk window demo 155 MB, the JavaScript counter 169 MB, the React counter
+  174 MB. The GPU stack is most of each; the engine with `@silk/ui` adds about 14 MB and
+  React about 5 MB more.

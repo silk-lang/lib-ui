@@ -23,6 +23,8 @@ import ui_tree_window.host { WindowClient }
 import ui_tree_window.console { StderrWriter }
 import silkjs.js_atomics_native { Domain }
 import silkjs.runtime_memory { RuntimeAllocator, AllocationObserver }
+import silkjs.js_libc_platform as platform
+import window.types { WindowError }
 import silk.collections.list { List }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
@@ -31,13 +33,53 @@ import silk.io.writer { Writer }
 import silk.mem.allocator { Allocator, OutOfMemoryError, SystemAllocator }
 import silk.text.string { String }
 
+/// A module given to [`JsApp.define`], kept to define it again after a reload.
+struct Defined {
+  name: List<u8>,
+  source: List<u8>,
+}
+
 /// A JavaScript application and what it runs on.
 pub struct JsApp<'m> {
   host: JsHost<'m>,
   /// JavaScript memory is counted here, apart from the tree's and the window's.
   allocator: RuntimeAllocator<SystemAllocator>,
+  memory: &'m AllocationObserver,
+  domain: Domain,
+  modules: List<Defined>,
   name: List<u8>,
   source: List<u8>,
+  /// The file the entry is read from again on a reload, and the stamp file whose content
+  /// changes when there is a new build. Both empty without [`JsApp.watch`].
+  path: List<u8>,
+  stampPath: List<u8>,
+  stamp: List<u8>,
+  nextCheck: f64,
+}
+
+/// How often a watching application looks at its stamp file, in seconds.
+const WATCH_INTERVAL: f64 = 0.2
+
+fn sameBytes(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut i: usize = 0
+  while i < left.length {
+    if left[i] != right[i] { return false }
+    i = i + 1
+  }
+  return true
+}
+
+/// The content of the file at `path`, or empty when it cannot be read.
+effect fn readOrEmpty(path: &[u8]) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+  let read = run Effect.result(platform.readFile(path))
+  return match move read {
+    Result<List<u8>, OutOfMemoryError | platform.PlatformError>.Success { value } => move value
+    Result<List<u8>, OutOfMemoryError | platform.PlatformError>.Failure { error } => match move error {
+      OutOfMemoryError allocation => { fail move allocation }
+      platform.PlatformError _ => List<u8>.make()
+    }
+  }
 }
 
 fn write(text: string) -> () {
@@ -59,12 +101,94 @@ impl<'m> JsApp<'m> {
     ? &mut Allocator {
     let mut own = move allocator
     let host = run JsHost.open(memory, domain) |> Effect.provideMut<Allocator>(&mut own)
-    return JsApp { host: move host, allocator: move own, name: List<u8>.make(), source: List<u8>.make() }
+    return JsApp {
+      host: move host,
+      allocator: move own,
+      memory: memory,
+      domain: domain,
+      modules: List<Defined>.make(),
+      name: List<u8>.make(),
+      source: List<u8>.make(),
+      path: List<u8>.make(),
+      stampPath: List<u8>.make(),
+      stamp: List<u8>.make(),
+      nextCheck: 0.0,
+    }
   }
 
   /// Makes `source` importable as `name` (see `JsHost.define`).
   pub effect fn define(self: &mut Self, name: &[u8], source: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
     run self.host.define(name, source) |> Effect.provideMut<Allocator>(&mut self.allocator)
+    let mut nameCopy = List<u8>.make()
+    run nameCopy.appendSlice(name)
+    let mut sourceCopy = List<u8>.make()
+    run sourceCopy.appendSlice(source)
+    run self.modules.append(Defined { name: move nameCopy, source: move sourceCopy })
+  }
+
+  /// Reloads the application when a new build arrives: the entry is read again from the
+  /// file at `path` whenever the content of the file at `stamp` changes. A bundler writes
+  /// the stamp after the bundle, as `@silk/vite` does. The window starts a new realm on an
+  /// empty tree; JavaScript state does not survive.
+  pub effect fn watch(self: &mut Self, path: &[u8], stamp: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+    self.path.clear()
+    run self.path.appendSlice(path)
+    self.stampPath.clear()
+    run self.stampPath.appendSlice(stamp)
+    self.stamp = run readOrEmpty(stamp)
+  }
+
+  /// Whether the stamp file changed since the last look. Looks at most every
+  /// `WATCH_INTERVAL` seconds.
+  effect fn changed(self: &mut Self, time: f64) -> bool ! OutOfMemoryError ? &mut Allocator {
+    if self.stampPath.length() == 0 || time < self.nextCheck { return false }
+    self.nextCheck = time + WATCH_INTERVAL
+    let now = run readOrEmpty(self.stampPath.asSlice())
+    // A stamp that cannot be read is a build in progress.
+    if now.length() == 0 || sameBytes(now.asSlice(), self.stamp.asSlice()) { return false }
+    self.stamp = move now
+    return true
+  }
+
+  /// Destroys the application's nodes, replaces the realm, and runs the entry read again
+  /// from the watched file.
+  effect fn reload(self: &mut Self, tree: &mut UiTree<'_>) -> () ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let fresh = run readOrEmpty(self.path.asSlice())
+    if fresh.length() == 0 {
+      write("reload: the entry could not be read\n")
+      return
+    }
+    self.source = move fresh
+    let unloaded = run Effect.result(self.host.unload()) |> Effect.provideMut<Allocator>(&mut self.allocator)
+    run self.settle(move unloaded)
+    run self.host.flushRaw(&mut tree)
+    run self.host.close() |> Effect.provideMut<Allocator>(&mut self.allocator)
+    let opened = run Effect.result(JsHost.open(self.memory, self.domain)) |> Effect.provideMut<Allocator>(&mut self.allocator)
+    match move opened {
+      Result<JsHost<'m>, OutOfMemoryError | JsError>.Success { value } => { self.host = move value }
+      Result<JsHost<'m>, OutOfMemoryError | JsError>.Failure { error } => match move error {
+        OutOfMemoryError allocation => { fail move allocation }
+        JsError { message } => {
+          uncaught(JsError { message: move message })
+          return
+        }
+      }
+    }
+    let items = self.modules.asSlice()
+    let mut i: usize = 0
+    while i < items.length {
+      run self.host.define(items[i].name.asSlice(), items[i].source.asSlice()) |> Effect.provideMut<Allocator>(&mut self.allocator)
+      i = i + 1
+    }
+    write("reloaded\n")
+    run self.startEntry(&mut tree)
+  }
+
+  /// Runs the entry module and applies what it built.
+  effect fn startEntry(self: &mut Self, tree: &mut UiTree<'_>) -> () ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let ran = run Effect.result(self.host.module(self.source.asSlice(), self.name.asSlice())) |> Effect.provideMut<Allocator>(&mut self.allocator)
+    run self.settle(move ran)
+    run self.host.flushRaw(&mut tree)
   }
 
   /// The ES module the window runs when it starts.
@@ -124,9 +248,20 @@ impl<'m> WindowClient<JsApp<'m>, never, never> for JsClient {
   effect fn start(self: &mut Self, state: &mut JsApp<'m>, tree: &mut UiTree<'_>) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
-    let ran = run Effect.result(state.host.module(state.source.asSlice(), state.name.asSlice())) |> Effect.provideMut<Allocator>(&mut state.allocator)
-    run state.settle(move ran)
-    run state.host.flushRaw(&mut tree)
+    run state.startEntry(&mut tree)
+  }
+
+  effect fn poll(self: &mut Self, state: &mut JsApp<'m>, tree: &mut UiTree<'_>, time: f64) -> bool
+    ! WindowError | TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if !(run state.changed(time)) { return false }
+    run state.reload(&mut tree)
+    return true
+  }
+
+  fn wakeAfter(self: &Self, state: &JsApp<'m>) -> Option<f64> {
+    if state.stampPath.length() == 0 { return Option<f64>.None }
+    return Option<f64>.some(WATCH_INTERVAL)
   }
 
   effect fn pump(self: &mut Self, state: &mut JsApp<'m>, tree: &mut UiTree<'_>) -> ()

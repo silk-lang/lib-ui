@@ -253,3 +253,53 @@ test effect fn timersFramesAndConsoleReachTheHost() -> ()
   let mut allocator = Allocator.systemAllocatorProvider()
   run withHost(2) |> Effect.provideMut<Allocator>(&mut allocator)
 }
+
+/// Runs the library fixture and shows its first frame.
+effect fn load(host: &mut JsHost<'_>, tree: &mut Tree<'_>) -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>
+  ? &mut Allocator {
+  let package = run platform.readFile(b"modules/js/packages/ui/src/index.js")
+  run host.define(b"@silk/ui", package.asSlice())
+  let source = run platform.readFile(b"modules/js/tests/fixtures/app.js")
+  run host.module(source.asSlice(), b"app.js")
+  run host.flush(&mut tree)
+  drop run tree.frame(viewport(), 0.0)
+  run Testing.expect(run labelIs(&tree.*, "Click me"), "the label holds its first text")
+}
+
+/// What a reload does to the first realm: unload destroys
+/// every node the application made.
+effect fn leave(host: &mut JsHost<'_>, tree: &mut Tree<'_>) -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>
+  ? &mut Allocator {
+  run load(&mut host, &mut tree)
+  run host.unload()
+  run host.flush(&mut tree)
+  drop run tree.frame(viewport(), 1.0)
+  run Testing.expect(tree.view(NodeId.of(1)).isNone() && tree.view(NodeId.of(4)).isNone(), "unload destroyed the application's nodes")
+}
+
+test effect fn reloadStartsANewRealmOnAnEmptyTree() -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static> {
+  let mut own = Allocator.systemAllocatorProvider()
+  let fonts = run fixtures.fonts() |> Effect.provideMut<Allocator>(&mut own)
+  let mut tree = run Tree.make(&fonts) |> Effect.provideMut<Allocator>(&mut own)
+  let domain = run WaiterDomain.make() |> Effect.provideMut<Allocator>(&mut own)
+  let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let memory = run allocator.observe()
+  let mut first = run JsHost.open(&memory, domain.handle()) |> Effect.provideMut<Allocator>(&mut allocator)
+  let left = run Effect.result(leave(&mut first, &mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
+  run first.close() |> Effect.provideMut<Allocator>(&mut allocator)
+  // The second realm numbers its nodes from 1 again, on the same tree.
+  let mut second = run JsHost.open(&memory, domain.handle()) |> Effect.provideMut<Allocator>(&mut allocator)
+  let again = run Effect.result(load(&mut second, &mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
+  run second.close() |> Effect.provideMut<Allocator>(&mut allocator)
+  match move left {
+    Result<(), TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>>.Success { .. } => ()
+    Result<(), TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>>.Failure { error } => { fail move error }
+  }
+  match move again {
+    Result<(), TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>>.Success { .. } => ()
+    Result<(), TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>>.Failure { error } => { fail move error }
+  }
+}

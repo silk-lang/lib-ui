@@ -112,3 +112,13 @@ test("a listener that throws does not stop the dispatch", () => {
   assert.deepEqual(errors, ["boom"]);
   setErrorHandler(null);
 });
+
+test("unload destroys every node, for a reload", () => {
+  const box = createBox({}, createText("bye"));
+  mount(box);
+  mock.take();
+  mock.native.unload();
+  const destroyed = mock.take().filter((call) => call[0] === "destroy").map((call) => call[1]);
+  assert.ok(destroyed.includes(box.id));
+  assert.equal(nodeById(box.id), undefined);
+});

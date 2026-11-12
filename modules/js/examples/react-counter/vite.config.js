@@ -1,13 +1,15 @@
 import { defineConfig } from "vite";
+import silk from "@silk/vite";
 
-// One self-contained ES module: the ui-js host evaluates it as the entry module.
+// `npm run build` writes dist/app.js. `npm run dev` rebuilds on every change and, when
+// SILK_UI_HOST names a ui-js host binary, opens it and reloads the app after each build.
+const host = process.env.SILK_UI_HOST;
+
 export default defineConfig({
-  define: { "process.env.NODE_ENV": JSON.stringify("production") },
-  oxc: { jsx: { runtime: "automatic", importSource: "@silk/ui-react" } },
-  build: {
-    target: "es2022",
-    minify: false,
-    lib: { entry: "src/main.jsx", formats: ["es"], fileName: () => "app.js" },
-    rolldownOptions: { output: { codeSplitting: false } },
-  },
+  plugins: [
+    silk({
+      // The demo host reads its fonts and @silk/ui from the repository root.
+      host: host ? { command: host, cwd: new URL("../../../..", import.meta.url).pathname } : undefined,
+    }),
+  ],
 });

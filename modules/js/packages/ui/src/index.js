@@ -511,6 +511,13 @@ native.dispatch = function (kind, id, a, b, modifiers, d, e, first, second) {
   return event.defaultPrevented;
 };
 
+// The host calls this before it replaces the realm, on a reload: every node goes, so the
+// next realm starts on an empty tree.
+native.unload = function () {
+  for (const node of [...nodes.values()]) if (!node.parentNode && nodes.has(node.id)) node.destroy();
+  rootNode = null;
+};
+
 // The host calls this after it handled an input: an exception a listener threw surfaces here.
 native.takeError = function () {
   if (!pendingError) return;
