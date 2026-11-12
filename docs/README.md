@@ -17,6 +17,7 @@ docs/build.sh serve   # builds into docs/dist and serves http://localhost:8017
 | `examples/apps` | The same programs with a `main`: native windows, a browser page, a headless tree |
 | `tests` | Tests of the examples. `silk task unit-tests` runs them |
 | `shots` | A tool that runs the examples with no window and writes the pictures the pages use |
+| `live` | The window examples as one wasm module for a WebGPU canvas. Where the browser can run it, `web/index.html` puts `live/?app=…` in a frame in place of the example's picture |
 | `src` | The site program: Markdown reader, code colors, page shell, live demos |
 | `web` | The HTML shell, fonts and favicon |
 | `wrangler.jsonc` | The Cloudflare deployment |
