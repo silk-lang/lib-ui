@@ -59,7 +59,11 @@ import ui_fixtures.fixtures as fixtures
 import ui_tree.legacy { TreeError, Batch }
 import atlas.atlas { AtlasError }
 import vector.geometry_error { GeometryError }
-import window.types { WindowError }
+import window.types { WindowError, WindowOptions, TitleBar }
+import window.event { Event, MouseButton }
+import ui_tree.node { NONE }
+import window.platform { Platform }
+import silk.num.f64
 import webgpu.runtime { GpuError }
 import silk.collections.bytes { Bytes }
 import silk.collections.list { List }
@@ -401,6 +405,27 @@ struct SessionContent {
   bell: Bell,
   relay: Arc<Mutex<Relay>>,
   views: ViewHost,
+  /// A press on the top bar waits to move the window.
+  windowDrag: bool,
+}
+
+/// The room the window controls take at the start of the top bar under a transparent title bar.
+const CONTROLS_INSET: f32 = 68.0
+
+/// Whether a press at (`x`, `y`) lands on the top bar itself, not on a control in it.
+fn onTopBar(tree: &UiTree<'_>, x: f32, y: f32) -> bool {
+  let mut slot = tree.slotOf(tree.hitTest(x, y))
+  while slot != NONE {
+    let node = tree.node(slot)
+    if String.view(&node.testId) == "toolbar" {
+      return true
+    }
+    if node.listeners != 0 {
+      return false
+    }
+    slot = node.parent
+  }
+  return false
 }
 
 impl SessionContent {
@@ -423,6 +448,49 @@ impl SessionContent {
 }
 
 impl WindowContent<Devtools, Message, Command> for SessionContent {
+  fn configure(self: &Self, options: &mut WindowOptions<'_>) -> () {
+    static if Intrinsic.targetOperatingSystem() == "darwin" {
+      // The top bar is the title bar: the window controls sit over its start.
+      options.titleBar = TitleBar.Transparent
+    }
+  }
+
+  effect fn event(
+    self: &mut Self,
+    app: &mut Runtime<Devtools, Message, Command>,
+    tree: &mut UiTree<'_>,
+    event: &Event,
+  ) -> bool
+    ! WindowError | TreeError | AtlasError | GeometryError | OutOfMemoryError
+    ? &mut Allocator {
+    static if Intrinsic.targetOperatingSystem() == "darwin" {
+      if let Event.MouseDown { button, position, .. } = &event.* {
+        if button == MouseButton.Left
+          && onTopBar(&tree.*, f64.toF32(position.x), f64.toF32(position.y)) {
+          self.windowDrag = true
+          return true
+        }
+      }
+    }
+    return false
+  }
+
+  effect fn update(
+    self: &mut Self,
+    app: &mut Runtime<Devtools, Message, Command>,
+    tree: &mut UiTree<'_>,
+    platform: &mut HostPlatform,
+    window: WindowId,
+  ) -> bool
+    ! WindowError | TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if self.windowDrag {
+      self.windowDrag = false
+      Platform.startWindowDrag(&mut platform.*, window)
+    }
+    return false
+  }
+
   effect fn opened(self: &mut Self, platform: &mut HostPlatform, window: WindowId) -> ()
     ! WindowError | OutOfMemoryError
     ? &mut Allocator {
@@ -545,7 +613,11 @@ effect fn program(args: Launch, platform: Option<Launched>) -> i32
   let mut batch = Batch.make()
   run batch.fontFamily(FONT, UI_FAMILIES)
   run batch.fontFamily(MONO, MONO_FAMILIES)
-  let mut app = Runtime<Devtools, Message, Command>.make(run Devtools.make(String.view(&target)))
+  let mut model = run Devtools.make(String.view(&target))
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    model.inset = CONTROLS_INSET
+  }
+  let mut app = Runtime<Devtools, Message, Command>.make(move model)
   app.send(Message.Refresh)
   let bell = run Bell.make()
   let relay = run makeRelay()
@@ -560,7 +632,12 @@ effect fn program(args: Launch, platform: Option<Launched>) -> i32
     subscription: String.make(),
     ended: false,
   }
-  let mut content = SessionContent { bell: move bell, relay: move relay, views: ViewHost.make() }
+  let mut content = SessionContent {
+    bell: move bell,
+    relay: move relay,
+    views: ViewHost.make(),
+    windowDrag: false,
+  }
   let options = RunOptions {
     title: "Silk devtools",
     width: 1280.0,
