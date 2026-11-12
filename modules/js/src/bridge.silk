@@ -8,6 +8,7 @@ import silk.collections.list { List }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
 import silk.core.option { Option }
+import silk.core.ownership { Copy }
 import silk.num.i32
 import silk.num.f64
 import ui_tree.css { Declaration }
@@ -58,8 +59,19 @@ pub const DESTROY: u32 = 12
 pub const SCROLL_TO: u32 = 13
 /// `__ui.select(id, anchor, focus)`: UTF-8 byte offsets in an input's value.
 pub const SELECT: u32 = 14
+/// `__ui.log(level, text)`: a console line. Level 0 is debug, 1 log, 2 warn, 3 error.
+pub const LOG: u32 = 15
+/// `__ui.now()`: the host's clock in milliseconds, as `performance.now()`.
+pub const NOW: u32 = 16
+/// `__ui.timer(id, delay)`: asks for `__ui.fire(id)` once, `delay` milliseconds from now.
+/// Asking again for the same id moves it.
+pub const TIMER: u32 = 17
+/// `__ui.cancelTimer(id)`.
+pub const CANCEL_TIMER: u32 = 18
+/// `__ui.requestFrame()`: asks for `__ui.frame(time)` before the next frame.
+pub const REQUEST_FRAME: u32 = 19
 /// The number of native functions, for the installer.
-pub const LAST: u32 = 14
+pub const LAST: u32 = 19
 
 /// The runtime's module loader callback: [`Bridge`] answers it from the defined modules.
 pub const MODULE_LOAD: u32 = 100
@@ -70,16 +82,58 @@ pub struct ModuleSource {
   pub source: List<u8>,
 }
 
-/// The engine's services for a UI host: the batch JavaScript appends to, and the modules it
-/// can import.
+/// A timer JavaScript asked for: `__ui.fire(id)` is due at `due`, in the host clock's
+/// milliseconds.
+pub struct Timer {
+  pub id: u32,
+  pub due: f64,
+}
+
+impl Copy for Timer {}
+
+/// A console line. `level` 0 is debug, 1 log, 2 warn, 3 error.
+pub struct LogEntry {
+  pub level: u32,
+  pub text: String,
+}
+
+/// The engine's services for a UI host: the batch JavaScript appends to, the modules it can
+/// import, and what its timers, frame requests and console calls left for the host.
 pub struct Bridge {
   pub batch: Batch,
   pub modules: List<ModuleSource>,
+  /// The host clock in milliseconds, as of the host's last `advance`.
+  pub now: f64,
+  pub timers: List<Timer>,
+  /// Whether JavaScript asked for an animation frame callback.
+  pub frame: bool,
+  pub logs: List<LogEntry>,
 }
 
 impl Bridge {
   pub fn make() -> Bridge {
-    return Bridge { batch: Batch.make(), modules: List<ModuleSource>.make() }
+    return Bridge {
+      batch: Batch.make(),
+      modules: List<ModuleSource>.make(),
+      now: 0.0,
+      timers: List<Timer>.make(),
+      frame: false,
+      logs: List<LogEntry>.make(),
+    }
+  }
+
+  /// Takes timer `id` out. Says whether it was there.
+  pub fn cancel(self: &mut Self, id: u32) -> bool {
+    let items = self.timers.asSlice()
+    let mut i: usize = 0
+    while i < items.length {
+      if items[i].id == id {
+        drop self.timers.remove(i)
+        return true
+      }
+      i = i + 1
+    }
+    return false
   }
 
   fn find(self: &Self, name: &[u8]) -> Option<usize> {
@@ -118,12 +172,18 @@ pub fn name(id: u32) -> &'static [u8] {
   if id == REMOVE { return b"remove" }
   if id == DESTROY { return b"destroy" }
   if id == SCROLL_TO { return b"scrollTo" }
-  return b"select"
+  if id == SELECT { return b"select" }
+  if id == LOG { return b"log" }
+  if id == NOW { return b"now" }
+  if id == TIMER { return b"timer" }
+  if id == CANCEL_TIMER { return b"cancelTimer" }
+  return b"requestFrame"
 }
 
 /// The declared argument count of native function `id`.
 pub fn arity(id: u32) -> i32 {
-  if id == ROOT || id == FOCUS || id == REMOVE || id == DESTROY { return 1 }
+  if id == NOW || id == REQUEST_FRAME { return 0 }
+  if id == ROOT || id == FOCUS || id == REMOVE || id == DESTROY || id == CANCEL_TIMER { return 1 }
   if id == INSERT_BEFORE || id == STYLE || id == ATTRIBUTE || id == SCROLL_TO || id == SELECT { return 3 }
   return 2
 }
@@ -259,6 +319,19 @@ impl EngineServices for Bridge {
       run engine.services.batch.push(Mutation.Destroy { id: first })
     } else if function == SCROLL_TO {
       run engine.services.batch.scrollTo(first, f64.toF32(number(argv.get(1).view())), f64.toF32(number(argv.get(2).view())))
+    } else if function == LOG {
+      let line = run text(argv.get(1))
+      run engine.services.logs.append(LogEntry { level: first, text: move line })
+    } else if function == NOW {
+      return ValueBits.number(engine.services.now)
+    } else if function == TIMER {
+      drop engine.services.cancel(first)
+      let delay = number(argv.get(1).view())
+      run engine.services.timers.append(Timer { id: first, due: engine.services.now + if delay > 0.0 { delay } else { 0.0 } })
+    } else if function == CANCEL_TIMER {
+      drop engine.services.cancel(first)
+    } else if function == REQUEST_FRAME {
+      engine.services.frame = true
     } else if function == SELECT {
       run engine.services.batch.select(first, f64.toUsize(number(argv.get(1).view())), f64.toUsize(number(argv.get(2).view())))
     }

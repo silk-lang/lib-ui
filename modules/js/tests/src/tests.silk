@@ -181,6 +181,31 @@ effect fn library(host: &mut JsHost<'_>, tree: &mut Tree<'_>) -> ()
   run host.evaluate(b"if (app.root.childNodes.length !== 1 || app.button.parentNode !== null) throw new Error('the JavaScript tree kept the button')", b"test")
 }
 
+/// Timers fire in order of their time when the host ticks, intervals repeat until cleared,
+/// animation frame callbacks run on a tick with animation, and console lines reach the host.
+effect fn globals(host: &mut JsHost<'_>) -> ()
+  ! OutOfMemoryError | JsError | AssertionError<'static>
+  ? &mut Allocator {
+  run host.evaluate(b"globalThis.order = []; setTimeout(() => order.push('b'), 20); setTimeout((x) => order.push(x), 10, 'a'); const every = setInterval(() => { order.push('i'); if (order.filter((x) => x === 'i').length === 2) clearInterval(every) }, 15); clearTimeout(setTimeout(() => order.push('never'), 5)); requestAnimationFrame((time) => order.push('frame ' + time)); queueMicrotask(() => order.push('micro')); console.log('hello', { a: [1, 'x'] }, 2); console.error(new TypeError('bad').message)", b"test")
+  let first = match host.nextDeadline() {
+    Option.Some { value } => value == 0.01
+    Option.None => false
+  }
+  run Testing.expect(first, "the earliest timer is 10 milliseconds away")
+  run Testing.expect(host.wantsFrame(), "the script asked for a frame")
+  run host.tick(0.012, false)
+  run host.tick(0.03, true)
+  run Testing.expect(!host.wantsFrame(), "the frame callback ran")
+  run host.tick(0.05, true)
+  run Testing.expect(host.nextDeadline().isNone(), "the cleared interval left no timer")
+  run host.evaluate(b"if (order.join() !== 'micro,a,i,b,frame 30,i') throw new Error('order was ' + order.join()); if (performance.now() !== 50) throw new Error('now was ' + performance.now())", b"test")
+  let logs = host.takeLogs()
+  let lines = logs.asSlice()
+  run Testing.expect(lines.length == 2, "two console lines reached the host")
+  run Testing.expect(lines[0].level == 1 && String.view(&lines[0].text) == "hello { a: [1, \"x\"] } 2", "console.log formats its values")
+  run Testing.expect(lines[1].level == 3 && String.view(&lines[1].text) == "bad", "console.error has the error level")
+}
+
 effect fn withHost(scenario: u32) -> ()
   ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static>
   ? &mut Allocator {
@@ -195,7 +220,11 @@ effect fn withHost(scenario: u32) -> ()
   } else {
     run Effect.result(library(&mut host, &mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
   }
-  let checked = run Effect.result(errors(&mut host)) |> Effect.provideMut<Allocator>(&mut allocator)
+  let checked = if scenario == 2 {
+    run Effect.result(globals(&mut host)) |> Effect.provideMut<Allocator>(&mut allocator)
+  } else {
+    run Effect.result(errors(&mut host)) |> Effect.provideMut<Allocator>(&mut allocator)
+  }
   run host.close() |> Effect.provideMut<Allocator>(&mut allocator)
   match move ran {
     Result<(), TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>>.Success { .. } => ()
@@ -217,4 +246,10 @@ test effect fn libraryModuleRunsDomStyleEvents() -> ()
   ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run withHost(1) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn timersFramesAndConsoleReachTheHost() -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run withHost(2) |> Effect.provideMut<Allocator>(&mut allocator)
 }
