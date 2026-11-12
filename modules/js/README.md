@@ -33,7 +33,5 @@ Provide the `RuntimeAllocator` that `memory` observes as the `Allocator` of thes
 
 ## Status
 
-- The package is outside the workspace because the engine does not link for Windows yet: its `std` and `os` modules call POSIX functions.
-  `silk task check` checks and tests it on Linux and macOS.
 - Tests: `silk test --manifest-path modules/js/tests/silk.toml --root src/tests.silk` from the
   repository root.
