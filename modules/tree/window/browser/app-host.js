@@ -46,10 +46,14 @@ export function unsupported() {
  * - `storage`: where the app's `ui_tree_window.browser.store` keeps text: the page's
  *   localStorage, except in check mode, which starts from nothing. Pass null to keep nothing.
  * - `storagePrefix`: put before each key, so apps on one origin can keep apart.
+ * - `focus`: give the canvas the keyboard at once (default). A page that embeds the app among
+ *   other content passes false, and the canvas takes the keyboard when it is clicked.
+ * - `imports`: more import modules, for functions the app declares itself
+ *   (`extern … as "name#function"` is `imports.name.function`).
  */
 export async function runApp({
   wasm, container = document.body, check = false, log = console.log,
-  storage = check ? null : pageStorage(), storagePrefix = 'silk-app:',
+  storage = check ? null : pageStorage(), storagePrefix = 'silk-app:', imports: more = {}, focus = true,
 }) {
   const problem = unsupported();
   if (problem) throw new Error(problem);
@@ -76,6 +80,7 @@ export async function runApp({
     while ((end = line.indexOf('\n')) >= 0) { log(line.slice(0, end)); line = line.slice(end + 1); }
   };
   const imports = {
+    ...more,
     window: windowHost.suspendingImports,
     webgpu: gpuHost.imports,
     math: { sin: Math.sin, cos: Math.cos, tan: Math.tan, hypot: Math.hypot, fmod: (x, y) => x % y },
@@ -115,7 +120,7 @@ export async function runApp({
   memory = instance.exports.memory;
   windowHost.attach(instance);
   gpuHost.attach(instance);
-  canvas.focus();
+  if (focus) canvas.focus();
   const report = () => {
     const length = instance.exports.silk_report_length?.() ?? 0;
     if (!length) return '';

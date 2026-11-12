@@ -6,6 +6,14 @@ The host runs the loop. Your part is a client: two functions it calls.
 
 ## A counter in a window
 
+::shot tree-window "The counter below. Where the browser has WebGPU this is the program itself, with a canvas in the page as its window, and you can click it."
+
+The program is two files. The client is the part that knows about the counter:
+
+::source examples/window/src/client.silk
+
+And `main` hands it to the host:
+
 ::source examples/apps/tree-window/src/main.silk
 
 ::source examples/apps/tree-window/silk.toml
@@ -16,7 +24,7 @@ silk task native demo docs/examples/apps/tree-window
 
 ## The client
 
-::source examples/apps/tree-window/src/main.silk "impl WindowClient"
+::source examples/window/src/client.silk "impl WindowClient"
 
 A `WindowClient` has two functions that matter:
 

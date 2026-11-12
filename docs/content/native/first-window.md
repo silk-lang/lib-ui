@@ -4,7 +4,9 @@ A native app is a Silk UI program plus one small file that opens a window. This 
 
 ## The app
 
-::shot native-hello "The counter in a window, after three clicks on +. The picture is drawn from the program by the docs build."
+::shot native-hello "The counter, as a window would show it."
+
+> **Note:** Where your browser has WebGPU (Chrome and Edge do), the box above is not a picture. It is this program, drawn by the same GPU renderer a native window uses, with a canvas in the page as its window. Click it. In other browsers you see a picture the docs build drew from the same program.
 
 It is two files. The manifest:
 

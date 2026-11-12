@@ -6,7 +6,7 @@ This page reads one app that uses every part of it.
 
 ## Pad
 
-::shot native-pad "Pad, with a note typed into it."
+::shot native-pad "Pad. Where the browser has WebGPU it runs here, and you can type in it. A page has no menu bar and no files, so those parts need the desktop."
 
 Pad edits one note. It has a menu bar, opens and saves files through the system's dialogs, copies to the clipboard, follows the system's dark appearance, and asks before it closes with unsaved work.
 
