@@ -82,9 +82,39 @@ Provide the `RuntimeAllocator` that `memory` observes as the `Allocator` of thes
 - **Errors.** An uncaught exception fails the call with a `JsError` that carries its message.
   The host stays usable, and an input that failed in JavaScript still finishes in the tree.
 
+## Web globals
+
+Every realm starts with the globals of [src/prelude.js](src/prelude.js) on top of the
+engine's ECMAScript: `setTimeout`, `setInterval`, `requestAnimationFrame`, `queueMicrotask`,
+`performance.now`, `console` and `reportError`. They sit on native timer, clock, frame and
+log functions, and the host decides what those mean:
+
+- `JsHost.tick(seconds, animation)` moves the clock, runs the timers that are due, and with
+  `animation` the frame callbacks. `nextDeadline` and `wantsFrame` tell a loop when to wake.
+- `JsHost.takeLogs` hands over the console lines.
+
+`silk task embed-assets` regenerates `src/generated_prelude.silk` after an edit to
+`prelude.js`.
+
+## In a window
+
+[window](window) is `ui-js-window`: `JsApp` and `JsClient`, a client of the window host
+(`ui-tree-window`). It runs the entry module at start, delivers event records between the
+tree's `begin` and `finish`, runs timers and animation frames on the host's clock, and
+prints console lines on standard error. An uncaught exception is printed as a browser
+console prints it, and the window keeps running.
+
+[demo](demo) is a counter in JavaScript:
+
+```sh
+silk run --manifest-path modules/js/demo/silk.toml
+```
+
+Run it from the repository root. `silk task native check` runs it with `--check`.
+
 ## Status
 
 - Tests: `silk test --manifest-path modules/js/tests/silk.toml --root src/tests.silk` from the
   repository root.
-- Not here yet: a console, timers, unhandled rejection reports, images and canvas commands
-  from JavaScript, the window host, the React renderer and the Vite plugin.
+- Not here yet: unhandled rejection reports, images and canvas commands from JavaScript, the
+  React renderer and the Vite plugin.

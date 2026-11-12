@@ -1,0 +1,159 @@
+//! A ui-js application as a client of the window host.
+//!
+//! [`JsApp`] holds the JavaScript host and the allocator its memory is counted on.
+//! [`JsClient`] is the `WindowClient` that runs it: the entry module at start, event records
+//! between the tree's `begin` and `finish`, timers and animation frames on the host's clock,
+//! and console lines on standard error. An uncaught exception is printed as the browser
+//! console prints it, and the window keeps running.
+//!
+//! ```silk
+//! let domain = run WaiterDomain.make()
+//! let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+//! let memory = run allocator.observe()
+//! let mut app = run JsApp.open(&memory, move allocator, domain.handle())
+//! run app.define(b"@silk/ui", library)
+//! run app.entry(b"app.js", source)
+//! let mut client = JsClient {}
+//! let status = run runWindow(&mut app, &fonts, List<Mutation>.make(), options, inspector, &mut client)
+//! run app.close()
+//! ```
+import ui_js.lib { JsHost, JsError }
+import ui_tree.legacy { UiTree, TreeError }
+import ui_tree_window.host { WindowClient }
+import ui_tree_window.console { StderrWriter }
+import silkjs.js_atomics_native { Domain }
+import silkjs.runtime_memory { RuntimeAllocator, AllocationObserver }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.io.writer { Writer }
+import silk.mem.allocator { Allocator, OutOfMemoryError, SystemAllocator }
+import silk.text.string { String }
+
+/// A JavaScript application and what it runs on.
+pub struct JsApp<'m> {
+  host: JsHost<'m>,
+  /// JavaScript memory is counted here, apart from the tree's and the window's.
+  allocator: RuntimeAllocator<SystemAllocator>,
+  name: List<u8>,
+  source: List<u8>,
+}
+
+fn write(text: string) -> () {
+  let mut out = StderrWriter.make()
+  drop run Writer.writeString(text) |> Effect.provideMut<Writer>(&mut out) |> Effect.result
+}
+
+/// Prints an uncaught exception as a browser console does.
+fn uncaught(error: JsError) -> () {
+  write("Uncaught ")
+  write(String.view(&error.message))
+  write("\n")
+}
+
+impl<'m> JsApp<'m> {
+  /// A realm for one application. `allocator` is the one `memory` observes.
+  pub effect fn open(memory: &'m AllocationObserver, allocator: RuntimeAllocator<SystemAllocator>, domain: Domain) -> JsApp<'m>
+    ! OutOfMemoryError | JsError
+    ? &mut Allocator {
+    let mut own = move allocator
+    let host = run JsHost.open(memory, domain) |> Effect.provideMut<Allocator>(&mut own)
+    return JsApp { host: move host, allocator: move own, name: List<u8>.make(), source: List<u8>.make() }
+  }
+
+  /// Makes `source` importable as `name` (see `JsHost.define`).
+  pub effect fn define(self: &mut Self, name: &[u8], source: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.host.define(name, source) |> Effect.provideMut<Allocator>(&mut self.allocator)
+  }
+
+  /// The ES module the window runs when it starts.
+  pub effect fn entry(self: &mut Self, name: &[u8], source: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+    self.name.clear()
+    run self.name.appendSlice(name)
+    self.source.clear()
+    run self.source.appendSlice(source)
+  }
+
+  /// Frees the realm.
+  pub effect fn close(self: &mut Self) -> () ? &mut Allocator {
+    run self.host.close() |> Effect.provideMut<Allocator>(&mut self.allocator)
+  }
+
+  /// Prints what JavaScript wrote to the console, and `outcome`'s exception when it failed.
+  effect fn settle(self: &mut Self, outcome: Result<(), OutOfMemoryError | JsError>) -> () ! OutOfMemoryError {
+    let logs = self.host.takeLogs()
+    let lines = logs.asSlice()
+    let mut i: usize = 0
+    while i < lines.length {
+      write(String.view(&lines[i].text))
+      write("\n")
+      i = i + 1
+    }
+    match move outcome {
+      Result<(), OutOfMemoryError | JsError>.Success { .. } => ()
+      Result<(), OutOfMemoryError | JsError>.Failure { error } => match move error {
+        OutOfMemoryError allocation => { fail move allocation }
+        JsError { message } => { uncaught(JsError { message: move message }) }
+      }
+    }
+  }
+
+  /// Delivers the tree's queued records and reports the listener exceptions. Says whether a
+  /// listener prevented a default.
+  effect fn handle(self: &mut Self, tree: &mut UiTree<'_>) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let delivered = run Effect.result(self.host.deliverRaw(&mut tree)) |> Effect.provideMut<Allocator>(&mut self.allocator)
+    let mut prevented = false
+    let outcome = match move delivered {
+      Result<bool, OutOfMemoryError | JsError>.Success { value } => {
+        prevented = value
+        run Effect.result(self.host.report()) |> Effect.provideMut<Allocator>(&mut self.allocator)
+      }
+      Result<bool, OutOfMemoryError | JsError>.Failure { error } => Result<(), OutOfMemoryError | JsError>.Failure { error: move error }
+    }
+    run self.settle(move outcome)
+    run self.host.flushRaw(&mut tree)
+    return prevented
+  }
+}
+
+/// The window client of a [`JsApp`].
+pub struct JsClient {}
+
+impl<'m> WindowClient<JsApp<'m>, never, never> for JsClient {
+  effect fn start(self: &mut Self, state: &mut JsApp<'m>, tree: &mut UiTree<'_>) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let ran = run Effect.result(state.host.module(state.source.asSlice(), state.name.asSlice())) |> Effect.provideMut<Allocator>(&mut state.allocator)
+    run state.settle(move ran)
+    run state.host.flushRaw(&mut tree)
+  }
+
+  effect fn pump(self: &mut Self, state: &mut JsApp<'m>, tree: &mut UiTree<'_>) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    drop run state.handle(&mut tree)
+  }
+
+  effect fn decide(self: &mut Self, state: &mut JsApp<'m>, tree: &mut UiTree<'_>) -> bool
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    return run state.handle(&mut tree)
+  }
+
+  effect fn tick(self: &mut Self, state: &mut JsApp<'m>, tree: &mut UiTree<'_>, time: f64, animation: bool) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let ran = run Effect.result(state.host.tick(time, animation)) |> Effect.provideMut<Allocator>(&mut state.allocator)
+    run state.settle(move ran)
+    run state.host.flushRaw(&mut tree)
+  }
+
+  fn nextDeadline(self: &Self, state: &JsApp<'m>) -> Option<f64> {
+    return state.host.nextDeadline()
+  }
+
+  fn wantsFrames(self: &Self, state: &JsApp<'m>) -> bool {
+    return state.host.wantsFrame()
+  }
+}

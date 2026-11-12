@@ -6,6 +6,8 @@ import silk.text.string { String }
 import silk.num.u32
 import silk.num.f32
 import ui_tree.lib { Tree, ProtocolError, Input, EventKind, EventRecord, Event }
+import ui_tree.legacy { UiTree, TreeError }
+import ui_tree.node { Event as RawEvent }
 import silkjs.js_engine { Engine }
 import silkjs.js_heap { HeapHeader }
 import silkjs.js_value { ValueBits }
@@ -379,13 +381,38 @@ impl<'m> JsHost<'m> {
     run tree.apply(run self.engine.services.batch.take())
   }
 
+  /// [`JsHost.flush`] for a host that holds the engine's tree, as the window host does.
+  pub effect fn flushRaw(self: &mut Self, tree: &mut UiTree<'_>) -> () ! TreeError | OutOfMemoryError ? &mut Allocator {
+    if self.engine.services.batch.length() == 0 { return }
+    run tree.apply(run self.engine.services.batch.take())
+  }
+
   /// Hands the tree's queued event records to JavaScript now, running promise jobs after
   /// each one. Says whether a handler prevented a default.
   pub effect fn deliver(self: &mut Self, tree: &mut Tree<'_>) -> bool ! OutOfMemoryError | JsError ? &mut Allocator {
+    let events = run tree.events()
+    return run self.dispatch(events.asSlice())
+  }
+
+  /// [`JsHost.deliver`] for a host that holds the engine's tree.
+  pub effect fn deliverRaw(self: &mut Self, tree: &mut UiTree<'_>) -> bool ! OutOfMemoryError | JsError ? &mut Allocator {
+    let mut raw = List<RawEvent>.make()
+    run tree.takeEvents(&mut raw)
+    let mut events = List<EventRecord>.make()
+    let items = raw.asSlice()
+    let mut i: usize = 0
+    while i < items.length {
+      run events.append(run EventRecord.lift(&items[i]))
+      i = i + 1
+    }
+    return run self.dispatch(events.asSlice())
+  }
+
+  /// Hands `records` to JavaScript in order, running promise jobs after each one. Says
+  /// whether a handler prevented a default.
+  pub effect fn dispatch(self: &mut Self, records: &[EventRecord]) -> bool ! OutOfMemoryError | JsError ? &mut Allocator {
     let context = self.context
     let realm = unsafe lendRealm(&context, context)
-    let events = run tree.events()
-    let records = events.asSlice()
     let mut prevented = false
     let mut i: usize = 0
     while i < records.length {
