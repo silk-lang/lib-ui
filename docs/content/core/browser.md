@@ -8,7 +8,7 @@ This page builds the dice program from [Commands](/core/commands/) for the web. 
 
 ## The program
 
-The program is `dice.silk`, unchanged. It asks for a `Random` service and knows nothing about browsers.
+The program is `dice.silk`, unchanged. It asks for the standard library's `Random` service and knows nothing about browsers.
 
 ## The entry point
 
@@ -17,15 +17,15 @@ The program is `dice.silk`, unchanged. It asks for a `Random` service and knows 
 This file is everything that is specific to the browser.
 
 - `open` and `call` are the two functions the page calls. `open` runs once and makes the program. `call` runs for everything after: an event, a timer, a new location. You write them once and never touch them again. The three type arguments are your model, message and command types.
-- `PageRandom` is the real die. It implements the `Random` service by calling a function the page provides.
-- The `static if` around them keeps this code out of any build that is not WebAssembly. The function the page provides does not exist anywhere else, and this way the package still type-checks on your machine.
+- `OsRandom` is the real die. It is the standard library's provider of `Random`, the same one a native program uses: in a page it asks the browser's `crypto.getRandomValues`. Nothing about it is specific to the browser.
+- The `static if` around the two functions keeps them out of any build that is not WebAssembly, because only a page calls them.
 - `Effect.provideMut<Random>(&mut random)` hands the program its service. A program with more services has one such line for each.
 
 ## The page
 
 ::source examples/apps/dice-web/web/index.html
 
-`mount` loads the program into an element. The `imports` are the JavaScript functions the program may call: `app.random` here is the `app#random` that `main.silk` declared.
+`mount` loads the program into an element. It supplies the functions the standard library's providers import, such as the random bytes `OsRandom` asks for, so this page passes nothing else. A program that calls functions of its own page passes them as `imports`, as the next section shows.
 
 | Option | What it is |
 | --- | --- |
@@ -56,7 +56,13 @@ The build makes three files: the program as `dice.wasm`, the page, and `silk-ui-
 
 There are two directions.
 
-**The program calls the page** through a service, as `Random` does above. The service's implementation calls an imported function.
+**The program calls the page** through a service. When the standard library has the service, such as `Random` above or a clock, its provider already works in a page. For something only your page can do, declare a service of your own and an implementation that calls an imported function:
+
+```silk
+unsafe extern "C" fn hostShare(bytes: ?[*]const u8, length: usize) -> () as "app#share"
+```
+
+and pass the function in `imports` as `app: { share: (pointer, length) => ... }`.
 
 **The page calls the program** through a port. `mount` returns a handle, and `page.post(name, text)` sends text to the program's `subs.port` of that name:
 

@@ -42,9 +42,14 @@ const page = await mount({
   images: { 1: "/logo.png" }, // h.image(1)
   icons: { 1: "/chevron.svg" }, // h.icon(1), drawn in the text color
   base: "", // "/docs" when the site is under /docs
-  imports: { app: { random: () => Math.random() } }, // the program's own host imports
+  imports: { app: { share: (pointer, length) => {} } }, // the program's own host imports
 });
 ```
+
+The standard library's providers need nothing here: `mount` supplies `silk.random` for
+`OsRandom` (from `crypto.getRandomValues`) and `silk.clock` for `OsSystemClock` and
+`OsMonotonicClock` (from `performance`), so a program provides those services the same way in a
+page as on a machine.
 
 ## Links and locations
 
