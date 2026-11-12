@@ -1,0 +1,74 @@
+//! The board, driven by messages: a drag, a move with the keyboard, a new card, and undo.
+import examples.showcase.board { Board, Message, Way, count, place }
+import ui_app.lib { drain, NoCommand, TreeError }
+import ui_app.program as program
+import ui_app_dom.html { Html }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+effect fn boardBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut page = Html.make()
+  let mut app = run program.make<Board, Message, NoCommand>()
+  run app.start(&mut page, 0.0)
+  run drain(&mut app, &mut page)
+  run Testing.expect(count(&app.model.value, 0, 0) == 3, "three cards to do")
+
+  // A drag is three messages: the press, the moves, the release. The board is 660 wide
+  // until a layout says otherwise, so a column is 224 across and a card 60 down.
+  app.send(Message.GrabbedCard { id: 1, x: 100.0, y: 120.0 })
+  app.send(Message.MovedPointer { x: 100.0 + 224.0, y: 120.0 + 60.0 })
+  run drain(&mut app, &mut page)
+  run Testing.expect(app.model.value.overColumn == 1, "the card is over the second column")
+  run Testing.expect(app.model.value.overIndex == 1, "at its second place")
+  app.send(Message.DroppedCard)
+  run drain(&mut app, &mut page)
+  run Testing.expect(count(&app.model.value, 0, 0) == 2, "it left the first column")
+  run Testing.expect(count(&app.model.value, 1, 0) == 3, "for the second")
+  run Testing.expect(place(&app.model.value, 1, 0) == 1, "between the two cards there")
+
+  // A press that ends without a release changes nothing.
+  app.send(Message.GrabbedCard { id: 2, x: 100.0, y: 120.0 })
+  app.send(Message.MovedPointer { x: 600.0, y: 120.0 })
+  app.send(Message.LostPointer)
+  run drain(&mut app, &mut page)
+  run Testing.expect(count(&app.model.value, 2, 0) == 2, "a lost drag moves nothing")
+
+  // The arrow keys move the focused card.
+  app.send(Message.PressedArrow { id: 1, way: Way.Right })
+  app.send(Message.PressedArrow { id: 1, way: Way.Up })
+  run drain(&mut app, &mut page)
+  run Testing.expect(count(&app.model.value, 2, 0) == 3, "right moves it to the last column")
+  run Testing.expect(place(&app.model.value, 1, 0) == 0, "up moves it to the top")
+
+  // A new card under a filter takes the filter's tag, so it stays in view.
+  app.send(Message.ClickedFilter { tag: 2 })
+  app.send(Message.ClickedAdd { column: 0 })
+  app.send(Message.ChangedDraft { value: run String.copy("  Profile the layout  ") })
+  app.send(Message.SubmittedDraft)
+  run drain(&mut app, &mut page)
+  let cards = app.model.value.cards.asSlice()
+  run Testing.expect(String.view(&cards[cards.length - 1].title) == "Profile the layout", "trimmed")
+  run Testing.expect(cards[cards.length - 1].tag == 2, "tagged like the filter")
+  run Testing.expect(count(&app.model.value, 0, 0) == 2, "the filter shows two cards to do")
+
+  // Undo takes the changes back one at a time: the card, the two key moves, the drag.
+  app.send(Message.ClickedFilter { tag: 0 })
+  app.send(Message.ClickedUndo)
+  app.send(Message.ClickedUndo)
+  app.send(Message.ClickedUndo)
+  app.send(Message.ClickedUndo)
+  run drain(&mut app, &mut page)
+  run Testing.expect(app.model.value.past.length() == 0, "nothing is left to undo")
+  run Testing.expect(count(&app.model.value, 0, 0) == 3, "the board is as it started")
+  run Testing.expect(place(&app.model.value, 1, 0) == 0, "with the first card first")
+}
+
+test effect fn aBoardSession() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run boardBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}

@@ -53,6 +53,16 @@ Desktop systems want their event loop on the main thread. `launch` keeps it ther
 
 `app` is where the program gets what it needs. Here that is memory, and a handler that turns a failure into an exit code. An app with [commands](/core/commands/) provides their services in the same place, as the next page shows.
 
+## A bigger program, the same way
+
+The counter is small on purpose. Nothing changes when the program is not. This is the task board from the [front page](/), the same file, opened with the same few lines:
+
+::shot native-board "The board in a window. Drag a card, or focus one and use the arrow keys. In the front page the DOM draws it. Here the GPU does."
+
+::source examples/src/showcase/board.silk "pub struct Board"
+
+The drag is a captured pointer, the sliding cards are positions computed from the model, and Undo is a list of earlier card lists. [Events and input](/core/events/) covers the pieces.
+
 ## What you get without writing it
 
 The window draws with the GPU and lays out with the same CSS rules as a browser. Because of that, things you expect from a web page work in the window too, without code in your program:

@@ -105,5 +105,6 @@ The biggest difference from component frameworks: there is no local state to lif
 
 - **Read code first?** [Your first program](/core/first-program/) is the smallest complete program, explained line by line.
 - **Learn by building?** The [tutorial](/core/tutorial/) writes Focus in five steps, each one running in the page.
+- **Want to see something bigger?** [A real app: the board](/core/board/) reads a task board with drag and drop, keyboard moves and undo.
 - **Starting your own app?** [Thinking in Silk UI](/core/thinking/) is a method for going from an idea to a model, messages and a view.
 - **Looking something up?** The Concepts pages each cover one row of the table above.

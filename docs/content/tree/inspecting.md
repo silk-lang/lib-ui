@@ -81,7 +81,7 @@ That text is a good thing to keep in a test. Save it, and compare it on every ru
 
 ::source examples/src/tree/picture.silk
 
-Every picture in this guide was made with this `Camera`, by the docs build, from the example code on the page. It draws on the CPU, so it needs no window and gives the same pixels on every machine.
+Every picture in this guide was made with this `Camera`, by the docs build, from the example code on the page. Where the examples run in the page instead, the pictures are what a browser without WebGPU shows. It draws on the CPU, so it needs no window and gives the same pixels on every machine.
 
 Pictures and `describe` text together are how the tree's own tests work: each scene has a saved `.txt` and a saved `.png`, and a change to either fails the test.
 

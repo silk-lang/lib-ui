@@ -6,7 +6,7 @@ The client's part is small. It hears what the value became.
 
 ## A greeting
 
-::shot tree-field "The field was clicked and “Grace” was typed. The caret, the focus border and the scrolled text are the tree's work."
+::shot tree-field "The field. Where the browser has WebGPU it is running, so click it and type. The caret, the focus border, selection and the scrolled text are the tree's work."
 
 ::source examples/src/tree/field.silk
 

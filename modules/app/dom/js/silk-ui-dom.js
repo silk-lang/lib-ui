@@ -232,7 +232,8 @@ class Page {
     this.layout = new ResizeObserver((entries) => {
       for (const entry of entries) {
         const id = this.idOf(entry.target);
-        if (id) this.send(this.record(EVENT.layout, entry.target, [entry.target]));
+        // The whole path, as for every other record: a handler under `h.map` is found along it.
+        if (id) this.send(this.record(EVENT.layout, entry.target, this.pathTo(entry.target)));
       }
     });
     this.canvases = new ResizeObserver((entries) => {
