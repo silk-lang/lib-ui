@@ -1,0 +1,139 @@
+//! The native half of the bridge: what the engine calls when JavaScript calls `__ui.*`.
+//!
+//! Every node call appends to one batch and returns; nothing reaches the tree until the host
+//! flushes. The functions take plain numbers and strings, so a call costs tens of nanoseconds.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.string { String }
+import silk.num.i32
+import silk.num.f64
+import ui_tree.css
+import ui_tree.css { px }
+import ui_tree.legacy { Batch, NodeKind, Attribute }
+import silkjs.js_engine { Engine }
+import silkjs.js_engine_host { EngineServices }
+import silkjs.js_value { ValueBits }
+import silkjs.js_realm { Realm, Arguments }
+import silkjs.js_owned_value { ValueRef }
+import silkjs.js_exceptions { JsException }
+import silkjs.js_strings { Strings }
+
+/// `__ui.create(id, kind)`: kind 0 is a box, 1 text, 2 an input.
+pub const CREATE: u32 = 1
+/// `__ui.append(parent, child)`.
+pub const APPEND: u32 = 2
+/// `__ui.insertBefore(parent, child, before)`.
+pub const INSERT_BEFORE: u32 = 3
+/// `__ui.root(id)`.
+pub const ROOT: u32 = 4
+/// `__ui.setText(id, value)`.
+pub const SET_TEXT: u32 = 5
+/// `__ui.listen(id, flags)`: the ui-protocol `LISTEN_*` flags.
+pub const LISTEN: u32 = 6
+/// `__ui.size(id, width, height)` in CSS pixels; a height of 0 leaves the height alone.
+pub const SIZE: u32 = 7
+/// `__ui.tabIndex(id, value)`.
+pub const TAB_INDEX: u32 = 8
+/// `__ui.focus(id)`.
+pub const FOCUS: u32 = 9
+/// The number of native functions, for the installer.
+pub const LAST: u32 = 9
+
+/// The engine's services for a UI host: the batch JavaScript appends to.
+pub struct Bridge {
+  pub batch: Batch,
+}
+
+impl Bridge {
+  pub fn make() -> Bridge {
+    return Bridge { batch: Batch.make() }
+  }
+}
+
+/// The JavaScript name of native function `id`.
+pub fn name(id: u32) -> &'static [u8] {
+  if id == CREATE { return b"create" }
+  if id == APPEND { return b"append" }
+  if id == INSERT_BEFORE { return b"insertBefore" }
+  if id == ROOT { return b"root" }
+  if id == SET_TEXT { return b"setText" }
+  if id == LISTEN { return b"listen" }
+  if id == SIZE { return b"size" }
+  if id == TAB_INDEX { return b"tabIndex" }
+  return b"focus"
+}
+
+/// The declared argument count of native function `id`.
+pub fn arity(id: u32) -> i32 {
+  if id == ROOT || id == FOCUS { return 1 }
+  if id == INSERT_BEFORE || id == SIZE { return 3 }
+  return 2
+}
+
+fn number(value: ValueBits) -> f64 {
+  return match value {
+    ValueBits.Int { value: integer } => i32.toF64(integer)
+    ValueBits.Float64 { value: float } => float
+    _ => 0.0
+  }
+}
+
+fn id(value: ValueBits) -> u32 {
+  return match value {
+    ValueBits.Int { value: integer } => i32.toU32(integer)
+    ValueBits.Float64 { value: float } => f64.toU32(float)
+    _ => 0
+  }
+}
+
+fn kind(code: u32) -> NodeKind {
+  if code == 1 { return NodeKind.Text }
+  if code == 2 { return NodeKind.Input }
+  return NodeKind.Box
+}
+
+effect fn text<'v>(value: ValueRef<'v>) -> String ! OutOfMemoryError ? &mut Allocator {
+  if !value.view().isString() { return String.make() }
+  let bytes = run Strings.toUtf8(value.view(), false)
+  return run String.copy(unsafe String.fromUtf8Unchecked(bytes.asSlice()))
+}
+
+impl EngineServices for Bridge {
+  /// No host globals: a shadow realm has its intrinsics alone.
+  effect fn initializeShadowRealm<'r, 's, 'm>(engine: &mut Engine<'m, Self>, caller: Realm<'r>, created: Realm<'s>) -> () ! JsException ? &mut Allocator {}
+
+  effect fn dynamicImportStarted<'r, 'v, 'w, 'x, 'm>(engine: &mut Engine<'m, Self>, realm: Realm<'r>, specifier: ValueRef<'v>, referrer: ValueRef<'w>, promise: ValueRef<'x>) -> ValueBits ! JsException ? &mut Allocator {
+    return promise.dup().intoBits()
+  }
+
+  effect fn nativeGeneric<'r, 'v, 'm, 'w>(engine: &mut Engine<'m, Self>, function: u32, realm: Realm<'r>,
+    receiver: ValueRef<'v>, argc: i32, argv: Arguments<'w>) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+    let first = id(argv.get(0).view())
+    if function == CREATE {
+      run engine.services.batch.create(first, kind(id(argv.get(1).view())))
+    } else if function == APPEND {
+      run engine.services.batch.append(first, id(argv.get(1).view()))
+    } else if function == INSERT_BEFORE {
+      run engine.services.batch.insertBefore(first, id(argv.get(1).view()), id(argv.get(2).view()))
+    } else if function == ROOT {
+      run engine.services.batch.root(first)
+    } else if function == SET_TEXT {
+      let value = run text(argv.get(1))
+      run engine.services.batch.setText(first, String.view(&value))
+    } else if function == LISTEN {
+      run engine.services.batch.listen(first, id(argv.get(1).view()))
+    } else if function == SIZE {
+      let width = f64.toF32(number(argv.get(1).view()))
+      let height = f64.toF32(number(argv.get(2).view()))
+      if height == 0.0 {
+        run engine.services.batch.style(first, &[css.width(px(width))])
+      } else {
+        run engine.services.batch.style(first, &[css.width(px(width)), css.height(px(height))])
+      }
+    } else if function == TAB_INDEX {
+      run engine.services.batch.attribute(first, Attribute.TabIndex { value: f64.toI32(number(argv.get(1).view())) })
+    } else if function == FOCUS {
+      run engine.services.batch.focus(first)
+    }
+    return ValueBits.Undefined
+  }
+}
