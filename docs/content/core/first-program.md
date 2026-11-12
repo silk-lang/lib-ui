@@ -52,7 +52,7 @@ Name messages as facts, in the past tense: `ClickedIncrement`, not `Increment`. 
 
 `view` describes the screen for a model. It is a plain function: the same model always gives the same screen. It never changes anything, it only describes.
 
-`h` is the builder you describe the screen with. `h.row` is a box that lays its children out in a row, `h.box` a plain box, `h.number` a number as text. Each takes a list of attributes and a list of children.
+`h` is the builder you describe the screen with. `h.row` is a box that lays its children out in a row, and `h.number` is a number as text. The count sits in a row of its own so that it can be centered in a fixed width, which keeps the buttons still while the number grows. Each takes a list of attributes and a list of children.
 
 The view is called again after every update. That sounds expensive and is not: Silk UI compares the new description with the last one and changes only what differs. Clicking `+` changes one text node.
 
