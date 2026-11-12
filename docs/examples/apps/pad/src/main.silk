@@ -1,0 +1,95 @@
+//! Pad in a native window. The window provides the `Shell` the program's commands ask for,
+//! and this file provides the `Disk`: the machine's files.
+import examples.native.pad { Command, Disk, Message, Pad }
+import ui_app.lib { Shell }
+import ui_app_window.program { Launched, Window, failed, launch, show, systemFonts }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.system.filesystem_machine { MachineFileSystem }
+import silk.text.string { InvalidUtf8, String }
+
+/// The machine's files.
+struct Files {
+  system: MachineFileSystem,
+}
+
+impl Files {
+  effect fn load(self: &mut Self, path: string) -> String
+    ! FileError | OutOfMemoryError
+    ? &mut Allocator {
+    let place = run Path.make(path)
+    let bytes = run FileSystem.readFile(&place) |> Effect.provideMut<FileSystem>(&mut self.system)
+    return String.fromBytes(move bytes) |> Result<String, InvalidUtf8>.unwrapOr(String.make())
+  }
+
+  effect fn store(self: &mut Self, path: string, text: string) -> bool
+    ! FileError | OutOfMemoryError
+    ? &mut Allocator {
+    let place = run Path.make(path)
+    run FileSystem.writeFile(&place, String.utf8Bytes(text))
+      |> Effect.provideMut<FileSystem>(&mut self.system)
+    return true
+  }
+}
+
+effect fn unread(error: FileError) -> String {
+  drop error
+  return String.make()
+}
+
+effect fn unwritten(error: FileError) -> bool {
+  drop error
+  return false
+}
+
+/// A command cannot fail, so a file that cannot be read or written is an answer, not an
+/// error.
+impl Disk for Files {
+  effect fn read(self: &mut Self, path: string) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run Effect.catch<FileError>(self.load(path), unread)
+  }
+
+  effect fn write(self: &mut Self, path: string, text: string) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run Effect.catch<FileError>(self.store(path, text), unwritten)
+  }
+}
+
+effect fn pad(platform: Option<Launched>) -> i32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut window = run Window.make("Pad", 640.0, 440.0)
+  run window.font(1, "system-ui, sans-serif")
+
+  // The shell of this window: its title, menu, dialogs and clipboard.
+  let mut shell = window.shell()
+  let mut files = Files { system: run MachineFileSystem.make() }
+  let fonts = run systemFonts()
+  return run show<Pad, Message, Command, &mut Shell | &mut Disk | &mut Allocator>(
+    move window,
+    &fonts,
+    move platform,
+  )
+    |> Effect.provideMut<Shell>(&mut shell)
+    |> Effect.provideMut<Disk>(&mut files)
+}
+
+fn app(platform: Option<Launched>) -> i32 {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(pad(move platform), failed)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+pub fn main() -> i32 {
+  return launch(
+    fn(platform: Option<Launched>) -> i32 {
+      return app(move platform)
+    },
+  )
+}

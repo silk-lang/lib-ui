@@ -1,0 +1,171 @@
+//! Tests for the programs of the Silk UI guide. None of them opens a window.
+import examples.core.counter { Counter, Message as CounterMessage }
+import examples.core.dice { Command as DiceCommand, Dice, Message as DiceMessage, Random }
+import examples.core.pages { Message as PagesMessage, Pages, Route, routeOf }
+import examples.core.stopwatch { Message as StopwatchMessage, Stopwatch }
+import examples.core.todo { Message as TodoMessage, Todo, remaining }
+import ui_app.harness { click, typeText, press }
+import ui_app.lib { drain, navigate, NoCommand, tick, TreeError }
+import ui_app.program as program
+import ui_app_dom.html { Html }
+import ui_fixtures.fixtures as fixtures
+import ui_tree.legacy { FrameInput, UiTree }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+// Messages in, model out. The page is markup in memory.
+
+effect fn counterBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut page = Html.make()
+  let mut app = run program.make<Counter, CounterMessage, NoCommand>()
+  run app.start(&mut page, 0.0)
+  run drain(&mut app, &mut page)
+  run Testing.expect(app.model.value.count == 0, "starts at zero")
+
+  app.send(CounterMessage.ClickedIncrement)
+  app.send(CounterMessage.ClickedIncrement)
+  app.send(CounterMessage.ClickedDecrement)
+  run drain(&mut app, &mut page)
+  run Testing.expect(app.model.value.count == 1, "two up and one down is one")
+
+  app.send(CounterMessage.ClickedReset)
+  run drain(&mut app, &mut page)
+  run Testing.expect(app.model.value.count == 0, "reset goes back to zero")
+}
+
+test effect fn theCounterCounts() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run counterBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// A command, with the service it needs replaced by one the test controls.
+
+/// A die that always lands on the same face, and counts how often it was asked.
+struct Loaded {
+  face: u32,
+  asked: u32,
+}
+
+impl Random for Loaded {
+  effect fn roll(self: &mut Self, sides: u32) -> u32 {
+    self.asked = self.asked + 1
+    return self.face
+  }
+}
+
+effect fn diceBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Random | &mut Allocator {
+  let mut page = Html.make()
+  let mut app = run program.make<Dice, DiceMessage, DiceCommand>()
+  run app.start(&mut page, 0.0)
+  run drain(&mut app, &mut page)
+
+  app.send(DiceMessage.ClickedRoll)
+  run drain(&mut app, &mut page)
+  run Testing.expect(app.model.value.face == 4, "the face is the one the die gave")
+  run Testing.expect(app.model.value.rolls == 1 && !app.model.value.rolling, "after one roll")
+}
+
+test effect fn aRollAsksTheDie() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut die = Loaded { face: 4, asked: 0 }
+  run diceBody()
+    |> Effect.provideMut<Random>(&mut die)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(die.asked == 1, "the command ran once")
+}
+
+// Subscriptions: the test moves the clock.
+
+effect fn stopwatchBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut page = Html.make()
+  let mut app = run program.make<Stopwatch, StopwatchMessage, NoCommand>()
+  run app.start(&mut page, 0.0)
+  run drain(&mut app, &mut page)
+  run Testing.expect(app.nextDeadline().isNone(), "no timer while the watch is stopped")
+
+  app.send(StopwatchMessage.ClickedStartStop)
+  run drain(&mut app, &mut page)
+  run tick(&mut app, &mut page, 0.15, false)
+  run tick(&mut app, &mut page, 0.25, false)
+  run tick(&mut app, &mut page, 0.35, false)
+  run Testing.expect(app.model.value.tenths == 3, "one tick for each tenth of a second")
+
+  app.send(StopwatchMessage.ClickedStartStop)
+  run drain(&mut app, &mut page)
+  run tick(&mut app, &mut page, 5.0, false)
+  run Testing.expect(app.model.value.tenths == 3, "a stopped watch does not tick")
+}
+
+test effect fn theStopwatchTicksOnlyWhileItRuns() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run stopwatchBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Routing: the test moves the location.
+
+effect fn pagesBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  run Testing.expect(routeOf("/about") == Route.About, "a path has a route")
+  run Testing.expect(routeOf("/nowhere") == Route.NotFound, "or it has none")
+
+  let mut page = Html.make()
+  let mut app = run program.make<Pages, PagesMessage, NoCommand>()
+  run app.start(&mut page, 0.0)
+  run drain(&mut app, &mut page)
+  run navigate(&mut app, &mut page, "/nowhere")
+  run Testing.expect(app.model.value.route == Route.NotFound, "the program hears a move")
+
+  app.send(PagesMessage.ClickedBackHome)
+  run drain(&mut app, &mut page)
+  run Testing.expect(app.location() == "/", "an update can move the location")
+  run Testing.expect(app.model.value.route == Route.Home, "and hears of its own move")
+}
+
+test effect fn theLocationIsState() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run pagesBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// The whole way: a real tree, real layout, a pointer and a keyboard.
+
+effect fn todoBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let viewport = FrameInput { width: 480.0, height: 360.0, scale: 1.0, time: 0.0 }
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut app = run program.make<Todo, TodoMessage, NoCommand>()
+  run app.start(&mut tree, 0.0)
+  run drain(&mut app, &mut tree)
+  run Testing.expect(remaining(&app.model.value) == 2, "starts with two things to do")
+
+  // Click the field, type, press Enter.
+  run Testing.expect(run click(&mut app, &mut tree, viewport, "draft"), "the field is there")
+  run typeText(&mut app, &mut tree, viewport, "Ship it")
+  run press(&mut app, &mut tree, viewport, "Enter", 0)
+  run Testing.expect(app.model.value.items.length() == 3, "Enter adds the item")
+  run Testing.expect(String.byteLength(String.view(&app.model.value.draft)) == 0, "and empties the field")
+
+  // A checkbox is found by its label, as a person finds it.
+  run Testing.expect(run click(&mut app, &mut tree, viewport, "Ship it"), "the new item shows")
+  run Testing.expect(remaining(&app.model.value) == 2, "checking it leaves two")
+}
+
+test effect fn typingAndClickingReachTheModel() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run todoBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}

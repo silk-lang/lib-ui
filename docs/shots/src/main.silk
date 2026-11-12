@@ -1,0 +1,309 @@
+//! Draws the pictures the docs show. Each one is an example program from `docs/examples`,
+//! run with no window, driven with real input, and drawn on the CPU.
+//!
+//!   ui-docs-shots <out directory>
+import examples.core.counter { Counter, Message as CounterMessage }
+import examples.native.pad { Command as PadCommand, Disk, Message as PadMessage, Pad }
+import examples.native.search {
+  Command as SearchCommand,
+  Message as SearchMessage,
+  PORT_DONE,
+  PORT_PROGRESS,
+  Search,
+  Worker
+}
+import examples.native.swatches { Message as SwatchesMessage, Swatches }
+import examples.tree.card as card
+import examples.tree.clicker as clicker
+import examples.tree.field as field
+import examples.tree.picture { Camera }
+import examples.tree.remote as remote
+import ui_app.harness { click, typeText }
+import ui_app.lib { drain, frameRoot, NoCommand, post, Shell, ShellLog }
+import ui_app.program as program
+import ui_app.shell { PORT_CLOSE }
+import ui_fixtures.fixtures as fixtures
+import ui_tree.inspect { CpuSnapshot, encodePng }
+import ui_tree.legacy { Batch, FrameInput, TreeError as EngineError, UiTree }
+import ui_tree.lib { Input, NodeId, ProtocolError, Tree, TreeError, Viewport }
+import ui_tree.mutation { FIRST_ROOT }
+import codec.image { ImageError }
+import font_collection.lib { FontCollection }
+import vector.geometry_error { GeometryError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.color.rgba { Rgba }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.geometry.rect { Rect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.system.filesystem_machine { MachineFileSystem }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.text.string { String }
+
+/// Device pixels per CSS pixel: the pictures are sharp on dense screens.
+const SCALE: f32 = 2.0
+
+/// Where the pictures go.
+struct Out {
+  files: MachineFileSystem,
+  directory: Path,
+}
+
+effect fn save(out: &mut Out, name: string, file: &Bytes) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut Allocator {
+  let place = run Path.join(&out.directory, name)
+  run FileSystem.writeFileWithParents(&place, Bytes.asSlice(file))
+    |> Effect.provideMut<FileSystem>(&mut out.files)
+}
+
+// Trees.
+
+fn view(width: f32, height: f32) -> Viewport {
+  return Viewport { width: width, height: height, scale: SCALE }
+}
+
+/// Moves the pointer to the middle of `node`, after a frame has laid it out.
+effect fn pointAt(tree: &mut Tree<'_>, node: NodeId, viewport: Viewport, down: bool) -> ()
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  drop run tree.frame(viewport, 0.0)
+  if let Option<Rect<f32>>.Some { value } = run tree.bounds(node) {
+    let x = (value.xMin + value.xMax) * 0.5
+    let y = (value.yMin + value.yMax) * 0.5
+    run tree.dispatch(Input.moveTo(x, y))
+    if down {
+      run tree.dispatch(Input.press(x, y))
+      run tree.dispatch(Input.release(x, y))
+    }
+  }
+}
+
+effect fn trees(out: &mut Out, fonts: &FontCollection) -> ()
+  ! TreeError | ProtocolError | GeometryError | ImageError | FileError | OutOfMemoryError
+  ? &mut Allocator {
+  // The card, and the card with the pointer over its button.
+  let mut tree = run Tree.make(fonts)
+  let sans = run tree.fontFamily("Noto Sans, sans-serif")
+  let built = run card.build(&mut tree, sans)
+  let mut camera = Camera.make()
+  run save(&mut out, "tree-card.png", &run camera.png(&mut tree, view(400.0, 240.0), 0.0))
+  run pointAt(&mut tree, built.button.id(), view(400.0, 240.0), false)
+  run save(&mut out, "tree-card-hover.png", &run camera.png(&mut tree, view(400.0, 240.0), 0.0))
+
+  // The counter, after three clicks.
+  let mut second = run Tree.make(fonts)
+  let family = run second.fontFamily("Noto Sans, sans-serif")
+  let mut counter = run clicker.build(&mut second, family)
+  let mut clicks: u32 = 0
+  while clicks < 3 {
+    run pointAt(&mut second, counter.button.id(), view(400.0, 160.0), true)
+    run counter.pump(&mut second)
+    clicks = clicks + 1
+  }
+  run save(&mut out, "tree-clicker.png", &run Camera.make().png(&mut second, view(400.0, 160.0), 0.0))
+
+  // The field, focused and typed into.
+  let mut third = run Tree.make(fonts)
+  let face = run third.fontFamily("Noto Sans, sans-serif")
+  let mut greeting = run field.build(&mut third, face)
+  run pointAt(&mut third, greeting.name.id(), view(400.0, 170.0), true)
+  run third.dispatch(run Input.text("Grace"))
+  run greeting.pump(&mut third)
+  run save(&mut out, "tree-field.png", &run Camera.make().png(&mut third, view(400.0, 170.0), 0.0))
+
+  // The tree a remote client described, after its click.
+  let mut fourth = run Tree.make(fonts)
+  run fourth.apply(run remote.first())
+  run pointAt(&mut fourth, NodeId.of(remote.BUTTON), view(400.0, 160.0), true)
+  drop run fourth.events()
+  run fourth.apply(run remote.sent())
+  run save(&mut out, "tree-remote.png", &run Camera.make().png(&mut fourth, view(400.0, 160.0), 0.0))
+}
+
+// Programs, on the tree a native window draws.
+
+fn window(width: f32, height: f32) -> FrameInput {
+  return FrameInput { width: width, height: height, scale: SCALE, time: 0.0 }
+}
+
+effect fn engine<'a>(fonts: &'a FontCollection) -> UiTree<'a>
+  ! EngineError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut tree = run UiTree.make(fonts)
+  let mut batch = Batch.make()
+  run batch.fontFamily(1, "Noto Sans, sans-serif")
+  run tree.apply(run batch.take())
+  return move tree
+}
+
+/// The tree's current root as it looks in `input`.
+effect fn shoot(
+  out: &mut Out,
+  snapshot: &mut CpuSnapshot,
+  name: string,
+  tree: &mut UiTree<'_>,
+  input: FrameInput,
+) -> ()
+  ! EngineError | GeometryError | ImageError | FileError | OutOfMemoryError
+  ? &mut Allocator {
+  run tree.frame(input)
+  run snapshot.sync(&mut tree)
+  let pixels = run snapshot.renderSceneOver(
+    &tree,
+    tree.scene(),
+    Rgba<f32> { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
+  )
+  run save(&mut out, name, &run encodePng(&pixels))
+}
+
+effect fn hello(out: &mut Out, fonts: &FontCollection) -> ()
+  ! EngineError | GeometryError | ImageError | FileError | OutOfMemoryError
+  ? &mut Allocator {
+  let size = window(360.0, 160.0)
+  let mut tree = run engine(fonts)
+  let mut snapshot = CpuSnapshot.make()
+  let mut app = run program.make<Counter, CounterMessage, NoCommand>()
+  run app.start(&mut tree, 0.0)
+  run drain(&mut app, &mut tree)
+  drop run click(&mut app, &mut tree, size, "+")
+  drop run click(&mut app, &mut tree, size, "+")
+  drop run click(&mut app, &mut tree, size, "+")
+  run shoot(&mut out, &mut snapshot, "native-hello.png", &mut tree, size)
+}
+
+effect fn swatches(out: &mut Out, fonts: &FontCollection) -> ()
+  ! EngineError | GeometryError | ImageError | FileError | OutOfMemoryError
+  ? &mut Allocator {
+  let size = window(320.0, 180.0)
+  let mut tree = run engine(fonts)
+  let mut snapshot = CpuSnapshot.make()
+  let mut app = run program.make<Swatches, SwatchesMessage, NoCommand>()
+  run app.start(&mut tree, 0.0)
+  run drain(&mut app, &mut tree)
+  drop run click(&mut app, &mut tree, size, "Open preview")
+  app.send(SwatchesMessage.ClickedSwatch { index: 2 })
+  run drain(&mut app, &mut tree)
+  run shoot(&mut out, &mut snapshot, "native-swatches.png", &mut tree, size)
+
+  // The window the model declared is another root of the same tree.
+  let mut roots = List<u32>.make()
+  run tree.openRoots(&mut roots)
+  let mut i: usize = 0
+  while i < roots.length() {
+    if roots.get(i) != FIRST_ROOT {
+      let small = window(240.0, 240.0)
+      run frameRoot(&mut app, &mut tree, roots.get(i), small)
+      run shoot(&mut out, &mut snapshot, "native-swatches-preview.png", &mut tree, small)
+    }
+    i = i + 1
+  }
+}
+
+/// A disk with nothing on it.
+struct NoDisk {}
+
+impl Disk for NoDisk {
+  effect fn read(self: &mut Self, path: string) -> String {
+    return String.make()
+  }
+
+  effect fn write(self: &mut Self, path: string, text: string) -> bool {
+    return true
+  }
+}
+
+effect fn pad(out: &mut Out, fonts: &FontCollection) -> ()
+  ! EngineError | GeometryError | ImageError | FileError | OutOfMemoryError
+  ? &mut Shell | &mut Disk | &mut Allocator {
+  let size = window(520.0, 300.0)
+  let mut tree = run engine(fonts)
+  let mut snapshot = CpuSnapshot.make()
+  let mut app = run program.make<Pad, PadMessage, PadCommand>()
+  run app.start(&mut tree, 0.0)
+  run drain(&mut app, &mut tree)
+  drop run click(&mut app, &mut tree, size, "note")
+  run typeText(&mut app, &mut tree, size, "Tide tables for Thursday")
+  run shoot(&mut out, &mut snapshot, "native-pad.png", &mut tree, size)
+
+  // What the window says when its close button is pressed.
+  run post(&mut app, &mut tree, PORT_CLOSE, "")
+  run shoot(&mut out, &mut snapshot, "native-pad-closing.png", &mut tree, size)
+}
+
+/// A worker that never starts: the pictures post its progress themselves.
+struct Idle {}
+
+impl Worker for Idle {
+  effect fn countPrimes(self: &mut Self, limit: u32) -> () {}
+
+  effect fn cancel(self: &mut Self) -> () {}
+}
+
+effect fn search(out: &mut Out, fonts: &FontCollection) -> ()
+  ! EngineError | GeometryError | ImageError | FileError | OutOfMemoryError
+  ? &mut Worker | &mut Allocator {
+  let size = window(420.0, 170.0)
+  let mut tree = run engine(fonts)
+  let mut snapshot = CpuSnapshot.make()
+  let mut app = run program.make<Search, SearchMessage, SearchCommand>()
+  run app.start(&mut tree, 0.0)
+  run drain(&mut app, &mut tree)
+  drop run click(&mut app, &mut tree, size, "Count them")
+  run post(&mut app, &mut tree, PORT_PROGRESS, "40")
+  run shoot(&mut out, &mut snapshot, "native-search.png", &mut tree, size)
+  run post(&mut app, &mut tree, PORT_DONE, "348513")
+  run shoot(&mut out, &mut snapshot, "native-search-done.png", &mut tree, size)
+}
+
+effect fn draw() -> i32
+  ! TreeError
+    | EngineError
+    | ProtocolError
+    | GeometryError
+    | ImageError
+    | FileError
+    | HostInputError
+    | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator {
+  let name = match run HostInput.argument(1) {
+    Option<Bytes>.Some { value } => move value
+    Option<Bytes>.None => {
+      return 2
+    }
+  }
+  // The directory as given when it is absolute, else from the working directory.
+  let given = Bytes.asSlice(&name)
+  let directory = if given.length != 0 && given[0] == 47 {
+    run Path.fromBytes(given)
+  } else {
+    let cwd = run Path.fromBytes(Bytes.asSlice(&run HostInput.workingDirectory()))
+    run Path.resolveBytes(&cwd, given)
+  }
+  let mut out = Out { files: run MachineFileSystem.make(), directory: move directory }
+  let fonts = run fixtures.fonts()
+  run trees(&mut out, &fonts)
+  run hello(&mut out, &fonts)
+  run swatches(&mut out, &fonts)
+  let mut shell = ShellLog.make()
+  let mut disk = NoDisk {}
+  run pad(&mut out, &fonts)
+    |> Effect.provideMut<Shell>(&mut shell)
+    |> Effect.provideMut<Disk>(&mut disk)
+  let mut idle = Idle {}
+  run search(&mut out, &fonts) |> Effect.provideMut<Worker>(&mut idle)
+  return 0
+}
+
+effect fn failed<E>(error: E) -> i32 {
+  drop error
+  return 1
+}
+
+pub effect fn main() -> i32
+  ? &mut HostInput {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(draw(), failed) |> Effect.provideMut<Allocator>(&mut allocator)
+}
