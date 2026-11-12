@@ -16,6 +16,7 @@ import font_collection.lib { Selection, continuesCluster }
 import silk.text.script_itemization
 import silk.text.script_itemization { ScriptRun }
 import silk.text.unicode_script { Script }
+import silk.num.u64
 import silk.text.unicode_properties { BidiClass }
 import silk.text.string { String }
 import silk.text.utf8_scan
@@ -80,6 +81,18 @@ struct Pending {
 
 impl Copy for Pending {}
 
+// One remembered face choice; `style` is usize.MAX in an empty slot.
+struct Choice {
+  style: usize,
+  script: u32,
+  scalar: u32,
+  selection: Selection,
+}
+
+impl Copy for Choice {}
+
+const CHOICES: usize = 512
+
 /// Reusable storage for [`shapeLine`].
 pub struct Shaping {
   pieces: List<Piece>,
@@ -93,6 +106,9 @@ pub struct Shaping {
   glyphs: List<PositionedGlyph>,
   // Per glyph in `glyphs`: whether justification may widen it.
   opportunities: List<bool>,
+  // Faces chosen before, in a direct-mapped table keyed by style, script and character. The
+  // choice is a pure function of the three, and text asks for the same few over and over.
+  choices: List<Choice>,
 }
 
 impl Shaping {
@@ -108,6 +124,7 @@ impl Shaping {
       pending: List<Pending>.make(),
       glyphs: List<PositionedGlyph>.make(),
       opportunities: List<bool>.make(),
+      choices: List<Choice>.make(),
     }
   }
 }
@@ -337,7 +354,12 @@ effect fn itemize<'a>(
   state.raw.clear()
   state.scripts.clear()
   state.orientations.clear()
-  run vertical_text.orientations(state.segment.view(), &mut state.orientations)
+  let sideways = mode == WritingMode.VerticalRl || mode == WritingMode.VerticalLr
+
+  // Only vertical text asks which characters stand upright.
+  if sideways {
+    run vertical_text.orientations(state.segment.view(), &mut state.orientations)
+  }
   run script_itemization.scripts(state.segment.view(), &mut state.scripts)
   if fonts.key(styleKey).instance == usize.MAX {
     return
@@ -361,19 +383,46 @@ effect fn itemize<'a>(
         && state.orientations.get(orientationIndex).end <= at {
         orientationIndex = orientationIndex + 1
       }
-      let nextUpright = (mode == WritingMode.VerticalRl || mode == WritingMode.VerticalLr)
+      let nextUpright = sideways
         && (orientation == TextOrientation.Upright
           || orientation == TextOrientation.Mixed
             && state.orientations.get(orientationIndex).orientation == Orientation.Upright)
-      if face == usize.MAX || !continuesCluster(decoded.scalar) {
+      // Nothing below U+0300 continues a cluster.
+      if face == usize.MAX || decoded.scalar < 0x300 || !continuesCluster(decoded.scalar) {
         let mut chosen = selection
-        if let Option<Selection>.Some { value } = run fonts.matcher.select(
+        if state.choices.length() == 0 {
+          let mut fill: usize = 0
+          while fill < CHOICES {
+            run state.choices.append(
+              Choice { style: usize.MAX, script: 0, scalar: 0, selection: selection },
+            )
+            fill = fill + 1
+          }
+        }
+        let script = scriptRun.script.value
+        // In u64 with wrapping products: a script tag times 31 does not fit a 32-bit usize.
+        let mixed = u64.wrappingAdd(
+          u64.wrappingAdd(
+            u32.toU64(decoded.scalar),
+            u64.wrappingMultiply(usize.toU64(style), 131),
+          ),
+          u64.wrappingMultiply(u32.toU64(script), 31),
+        )
+        let slot = u64.toUsize(mixed % 512)
+        let kept = state.choices.get(slot)
+        if kept.style == style && kept.script == script && kept.scalar == decoded.scalar {
+          chosen = kept.selection
+        } else if let Option<Selection>.Some { value } = run fonts.matcher.select(
           state.chain.asSlice(),
           request,
           decoded.scalar,
           scriptRun.script,
         ) {
           chosen = value
+          state.choices.set(
+            slot,
+            Choice { style: style, script: script, scalar: decoded.scalar, selection: value },
+          )
         }
         if face != usize.MAX && (chosen.face != face || nextUpright != upright) {
           run shapeItem(

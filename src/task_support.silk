@@ -74,11 +74,13 @@ pub effect fn hostPath(value: string) -> Path
   } else { return run Path.make(value) }
 }
 
-// Match every dependency declaration, including target/profile-specific tables.
-effect fn revisions(value: &Value, url: string, revision: &mut String) -> ()
+// Match every dependency declaration, including target/profile-specific tables. A non-empty
+// `package` narrows the match to that package of the repository.
+effect fn revisions(value: &Value, url: string, package: string, revision: &mut String) -> ()
   ! TaskError | OutOfMemoryError ? &mut Allocator {
   let git = Toml.field(value, "git") |> Toml.asString |> Option<string>.unwrapOr("")
-  if git == url {
+  let named = Toml.field(value, "package") |> Toml.asString |> Option<string>.unwrapOr("")
+  if git == url && (package == "" || named == package) {
     let pin = Toml.field(value, "rev") |> Toml.asString |> Option<string>.unwrapOr("")
     let bytes = String.utf8Bytes(pin)
     run require(bytes.length == 40, "Dependency must have an exact 40-character Git revision")
@@ -98,7 +100,7 @@ effect fn revisions(value: &Value, url: string, revision: &mut String) -> ()
       let mut at: usize = 0
       while at < children.length {
         match &children[at] {
-          TomlChild.Member { entry } => run revisions(&entry.value, url, &mut revision)
+          TomlChild.Member { entry } => run revisions(&entry.value, url, package, &mut revision)
           _ => {}
         }
         at = at + 1
@@ -110,7 +112,7 @@ effect fn revisions(value: &Value, url: string, revision: &mut String) -> ()
       let mut at: usize = 0
       while at < children.length {
         match &children[at] {
-          TomlChild.Item { value: child } => run revisions(&child, url, &mut revision)
+          TomlChild.Item { value: child } => run revisions(&child, url, package, &mut revision)
           _ => {}
         }
         at = at + 1
@@ -120,7 +122,7 @@ effect fn revisions(value: &Value, url: string, revision: &mut String) -> ()
   }
 }
 
-effect fn scanManifests(directory: &Path, url: string, revision: &mut String) -> ()
+effect fn scanManifests(directory: &Path, url: string, package: string, revision: &mut String) -> ()
   ! TaskError | FileError | OutOfMemoryError ? &mut Allocator | &mut FileSystem {
   let entries = run FileSystem.listDirectory(directory)
   let items = List<DirectoryEntry>.asSlice(&entries)
@@ -129,10 +131,10 @@ effect fn scanManifests(directory: &Path, url: string, revision: &mut String) ->
     let item = &items[at]
     let name = Path.name(&item.path) |> Option<string>.unwrapOr("")
     if item.kind.code == 1 && name != "build" && name != ".cache" && name != ".git" {
-      run scanManifests(&item.path, url, &mut revision)
+      run scanManifests(&item.path, url, package, &mut revision)
     } else if item.kind.code == 0 && name == "silk.toml" {
       let document = run readToml(&item.path)
-      run revisions(&document, url, &mut revision)
+      run revisions(&document, url, package, &mut revision)
     }
     at = at + 1
   }
@@ -147,7 +149,11 @@ pub effect fn repositoryRoot(name: string) -> Path
   run String.append(&mut url, ".git")
   let modules = run rootPath("modules")
   let mut revision = String.make()
-  run scanManifests(&modules, String.view(&url), &mut revision)
+
+  // lib-native's tasks run from the platform-window pin. That package moves ahead of the GPU
+  // packages, which stay on the revision lib-graphics pins, so the two may differ.
+  let package = if name == "lib-native" { "platform-window" } else { "" }
+  run scanManifests(&modules, String.view(&url), package, &mut revision)
   run require(String.view(&revision) != "", "No pinned revision for dependency")
   let mut home = run environment("SILK_HOME")
   if String.view(&home) == "" {
