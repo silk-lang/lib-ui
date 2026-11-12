@@ -93,6 +93,13 @@ pub struct Shaping {
   glyphs: List<PositionedGlyph>,
   // Per glyph in `glyphs`: whether justification may widen it.
   opportunities: List<bool>,
+  // The face chosen for each ASCII character under `asciiStyle` and `asciiScript`. The choice
+  // is a pure function of the style's chain, the script and the character, and ASCII text
+  // asks for the same few characters over and over.
+  ascii: List<Selection>,
+  asciiKnown: List<bool>,
+  asciiStyle: usize,
+  asciiScript: u32,
 }
 
 impl Shaping {
@@ -108,6 +115,10 @@ impl Shaping {
       pending: List<Pending>.make(),
       glyphs: List<PositionedGlyph>.make(),
       opportunities: List<bool>.make(),
+      ascii: List<Selection>.make(),
+      asciiKnown: List<bool>.make(),
+      asciiStyle: usize.MAX,
+      asciiScript: 0,
     }
   }
 }
@@ -337,7 +348,12 @@ effect fn itemize<'a>(
   state.raw.clear()
   state.scripts.clear()
   state.orientations.clear()
-  run vertical_text.orientations(state.segment.view(), &mut state.orientations)
+  let sideways = mode == WritingMode.VerticalRl || mode == WritingMode.VerticalLr
+
+  // Only vertical text asks which characters stand upright.
+  if sideways {
+    run vertical_text.orientations(state.segment.view(), &mut state.orientations)
+  }
   run script_itemization.scripts(state.segment.view(), &mut state.scripts)
   if fonts.key(styleKey).instance == usize.MAX {
     return
@@ -361,19 +377,40 @@ effect fn itemize<'a>(
         && state.orientations.get(orientationIndex).end <= at {
         orientationIndex = orientationIndex + 1
       }
-      let nextUpright = (mode == WritingMode.VerticalRl || mode == WritingMode.VerticalLr)
+      let nextUpright = sideways
         && (orientation == TextOrientation.Upright
           || orientation == TextOrientation.Mixed
             && state.orientations.get(orientationIndex).orientation == Orientation.Upright)
-      if face == usize.MAX || !continuesCluster(decoded.scalar) {
+      // Nothing below U+0300 continues a cluster.
+      if face == usize.MAX || decoded.scalar < 0x300 || !continuesCluster(decoded.scalar) {
         let mut chosen = selection
-        if let Option<Selection>.Some { value } = run fonts.matcher.select(
+        let slot = u32.toUsize(decoded.scalar)
+        let plain = decoded.scalar < 128
+        if plain && (state.asciiStyle != style || state.asciiScript != scriptRun.script.value) {
+          state.asciiStyle = style
+          state.asciiScript = scriptRun.script.value
+          state.asciiKnown.clear()
+          state.ascii.clear()
+          let mut fill: usize = 0
+          while fill < 128 {
+            run state.asciiKnown.append(false)
+            run state.ascii.append(selection)
+            fill = fill + 1
+          }
+        }
+        if plain && state.asciiKnown.get(slot) {
+          chosen = state.ascii.get(slot)
+        } else if let Option<Selection>.Some { value } = run fonts.matcher.select(
           state.chain.asSlice(),
           request,
           decoded.scalar,
           scriptRun.script,
         ) {
           chosen = value
+          if plain {
+            state.asciiKnown.set(slot, true)
+            state.ascii.set(slot, value)
+          }
         }
         if face != usize.MAX && (chosen.face != face || nextUpright != upright) {
           run shapeItem(
