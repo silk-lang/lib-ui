@@ -1,0 +1,159 @@
+//! Search in a native window. The `Worker` the program's commands ask for is here: it counts
+//! on a thread and posts to the program's ports.
+import examples.native.search { Command, Message, PORT_DONE, PORT_PROGRESS, Search, Worker }
+import ui_app_window.background { Background, Cancellation }
+import ui_app_window.program { Launched, Poster, Window, failed, launch, show, systemFonts }
+import silk.collections.bytes { Bytes }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.text.string { InvalidUtf8, String }
+
+/// `value` in decimal.
+fn decimal(value: u32) -> String {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut digits: [u8; 10] = [0; 10]
+  let mut count: usize = 0
+  let mut rest = value
+  while count == 0 || rest > 0 {
+    digits[count] = u32.toU8(rest % 10) + 48
+    rest = rest / 10
+    count = count + 1
+  }
+  let mut bytes = Bytes.make()
+  while count > 0 {
+    count = count - 1
+    run Effect.catchAll(bytes.append(Slice.view<u8>(&digits, count, 1)), ignored)
+      |> Effect.provideMut<Allocator>(&mut allocator)
+  }
+  return String.fromBytes(move bytes) |> Result<String, InvalidUtf8>.unwrapOr(String.make())
+}
+
+effect fn ignored<E>(error: E) -> () {
+  drop error
+}
+
+fn isPrime(value: u32) -> bool {
+  if value < 2 {
+    return false
+  }
+  let mut divisor: u32 = 2
+  while divisor * divisor <= value {
+    if value % divisor == 0 {
+      return false
+    }
+    divisor = divisor + 1
+  }
+  return true
+}
+
+/// The work itself. It runs on the worker thread and owns everything it touches.
+fn count(limit: u32, poster: Poster, cancellation: Cancellation) -> () {
+  let step = limit / 100
+  let mut found: u32 = 0
+  let mut value: u32 = 0
+  while value < limit {
+    if isPrime(value) {
+      found = found + 1
+    }
+    value = value + 1
+    if step != 0 && value % step == 0 {
+      if cancellation.cancelled() {
+        return ()
+      }
+      // A post wakes the window's loop: `subs.port` hears it on the UI thread.
+      poster.post(PORT_PROGRESS, String.view(&decimal(value / step)))
+    }
+  }
+  poster.post(PORT_DONE, String.view(&decimal(found)))
+}
+
+/// The worker of this app: one job at a time.
+struct Threads {
+  poster: Poster,
+  job: Option<Background<()>>,
+  cancellation: Option<Cancellation>,
+}
+
+effect fn unstarted<E>(error: E) -> Option<Background<()>> {
+  drop error
+  return Option<Background<()>>.None
+}
+
+effect fn started(job: Background<()>) -> Option<Background<()>> {
+  return Option<Background<()>>.some(move job)
+}
+
+impl Threads {
+  /// Tells the job that is running, if any, to stop.
+  fn stop(self: &Self) -> () {
+    if let Option<Cancellation>.Some { value } = &self.cancellation {
+      value.cancel()
+    }
+  }
+}
+
+impl Worker for Threads {
+  effect fn countPrimes(self: &mut Self, limit: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.stop()
+    let poster = self.poster.clone()
+    let cancellation = run Cancellation.make()
+    let seen = cancellation.clone()
+    self.cancellation = Option<Cancellation>.some(move cancellation)
+
+    // Dropping the job before this one waits for it, and it was just told to stop.
+    self.job = run Effect.catchAll(
+      Effect.flatMap(
+        Background<()>.start(
+          fn() -> () {
+            count(limit, move poster, move seen)
+          },
+        ),
+        started,
+      ),
+      unstarted,
+    )
+  }
+
+  effect fn cancel(self: &mut Self) -> () {
+    self.stop()
+  }
+}
+
+effect fn search(platform: Option<Launched>) -> i32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut window = run Window.make("Search", 420.0, 200.0)
+  run window.font(1, "system-ui, sans-serif")
+  let mut threads = Threads {
+    poster: window.poster(),
+    job: Option<Background<()>>.None,
+    cancellation: Option<Cancellation>.None,
+  }
+  let fonts = run systemFonts()
+  return run show<Search, Message, Command, &mut Worker | &mut Allocator>(
+    move window,
+    &fonts,
+    move platform,
+  )
+    |> Effect.provideMut<Worker>(&mut threads)
+}
+
+fn app(platform: Option<Launched>) -> i32 {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(search(move platform), failed)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+pub fn main() -> i32 {
+  return launch(
+    fn(platform: Option<Launched>) -> i32 {
+      return app(move platform)
+    },
+  )
+}

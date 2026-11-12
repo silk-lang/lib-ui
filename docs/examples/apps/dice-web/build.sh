@@ -1,0 +1,21 @@
+#!/bin/sh
+# Builds the page into dist/ and, with `serve`, serves it on http://localhost:8018.
+set -e
+here="$(cd "$(dirname "$0")" && pwd)"
+root="$(cd "$here/../../../.." && pwd)"
+
+cd "$root"
+silk build --manifest-path "$here/silk.toml" \
+  --profile-input '{"target":"wasm32-unknown-unknown","optimization":"size","debug":false}'
+
+rm -rf "$here/dist"
+mkdir -p "$here/dist"
+cp "$root/build/llvm/wasm32-unknown-unknown/release-size/dice-web" "$here/dist/dice.wasm"
+cp "$root/modules/app/dom/js/silk-ui-dom.js" "$here/dist/silk-ui-dom.js"
+cp "$here/web/index.html" "$here/dist/index.html"
+echo "Built $here/dist"
+
+if [ "$1" = "serve" ]; then
+  cd "$here/dist"
+  exec python3 -m http.server 8018
+fi

@@ -1,0 +1,353 @@
+//! Pad: one note in a native window. A menu bar, open and save dialogs, the clipboard, the
+//! system's dark appearance, and a close that asks before it loses work.
+//!
+//! Everything it asks of the window goes through the `Shell` service and the files through
+//! `Disk`, so the tests run it with no window at all.
+import core.look { button, primary, rgb }
+import ui_app.css
+import ui_app.css { px, percent, Align, BorderStyle, Overflow }
+import ui_app.keys { MOD_SHIFT }
+import ui_app.lib {
+  CommandSet,
+  Document,
+  FileDialog,
+  Menu,
+  Node,
+  NoOutput,
+  Program,
+  Shell,
+  StandardItem,
+  Subscriptions,
+  Update,
+  commandKey
+}
+import silk.collections.list { List }
+import silk.color.rgba { Rgba }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.string { String }
+
+// The menu's actions.
+pub const NEW: u32 = 1
+
+pub const OPEN: u32 = 2
+
+pub const SAVE: u32 = 3
+
+pub const COPY: u32 = 4
+
+// The dialogs.
+pub const OPENING: u32 = 1
+
+pub const SAVING: u32 = 2
+
+pub struct Pad {
+  pub text: String,
+  /// Whether there is work that was not saved.
+  pub dirty: bool,
+  pub dark: bool,
+  /// The user asked to close a note with unsaved work.
+  pub asking: bool,
+  pub status: String,
+}
+
+pub union Message {
+  ChangedText { pub value: String },
+  ChoseMenuItem { pub action: u32 },
+  ClosedDialog { pub request: u32, pub paths: List<String> },
+  LoadedFile { pub text: String },
+  SavedFile,
+  FailedToSave,
+  ChangedAppearance { pub dark: bool },
+  RequestedClose,
+  ClickedDiscard,
+  ClickedKeepEditing,
+  CompletedShellRequest,
+}
+
+/// Where notes are kept. The app provides the machine's files, and a test a file in memory.
+pub service Disk {
+  /// The text of the file at `path`; empty when it cannot be read.
+  effect fn read(path: string) -> String ! OutOfMemoryError ? &mut Disk | &mut Allocator
+
+  /// Whether `text` was written to `path`.
+  effect fn write(path: string, text: string) -> bool
+    ! OutOfMemoryError
+    ? &mut Disk | &mut Allocator
+}
+
+pub union Command {
+  /// Installs the menu and asks for the appearance.
+  SetUp,
+  SetTitle { pub dirty: bool },
+  AskOpen,
+  AskSave,
+  Read { pub path: String },
+  Write { pub path: String, pub text: String },
+  Copy { pub text: String },
+  Quit,
+}
+
+/// The menu bar. On macOS the first menu is the app's own.
+effect fn menu() -> Menu
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut menu = Menu.make()
+  run menu.begin("Pad")
+  run menu.standard(StandardItem.About)
+  run menu.separator()
+  run menu.standard(StandardItem.Quit)
+  run menu.end()
+  run menu.begin("File")
+  run menu.action("New", NEW, "n", commandKey())
+  run menu.action("Open…", OPEN, "o", commandKey())
+  run menu.action("Save As…", SAVE, "s", commandKey() | MOD_SHIFT)
+  run menu.separator()
+  run menu.standard(StandardItem.CloseWindow)
+  run menu.end()
+  run menu.begin("Edit")
+  run menu.action("Copy Note", COPY, "c", commandKey() | MOD_SHIFT)
+  run menu.end()
+  return move menu
+}
+
+impl CommandSet<Message ? &mut Shell | &mut Disk | &mut Allocator> for Command {
+  effect fn execute(self: Self) -> Message
+    ! OutOfMemoryError
+    ? &mut Shell | &mut Disk | &mut Allocator {
+    match move self {
+      Command.SetUp => {
+        run Shell.setMenu(run menu())
+        return Message.ChangedAppearance { dark: run Shell.dark() }
+      }
+      Command.SetTitle { dirty } => {
+        run Shell.setTitle(
+          if dirty {
+            "Pad (edited)"
+          } else {
+            "Pad"
+          },
+        )
+      }
+      Command.AskOpen => {
+        // The dialog opens and the command ends. The answer comes through `subs.files`.
+        run Shell.openFile(OPENING, FileDialog.file("Open a note", "txt,md"))
+      }
+      Command.AskSave => {
+        run Shell.saveFile(SAVING, FileDialog.saving("Save the note", "note.txt", "txt,md"))
+      }
+      Command.Read { path } => {
+        return Message.LoadedFile { text: run Disk.read(String.view(&path)) }
+      }
+      Command.Write { path, text } => {
+        if run Disk.write(String.view(&path), String.view(&text)) {
+          return Message.SavedFile
+        }
+        return Message.FailedToSave
+      }
+      Command.Copy { text } => {
+        run Shell.copy(String.view(&text))
+      }
+      Command.Quit => {
+        run Shell.quit()
+      }
+    }
+    return Message.CompletedShellRequest
+  }
+}
+
+type Next = Update<Pad, Command, NoOutput>
+
+effect fn say(model: &mut Pad, text: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  model.status = run String.copy(text)
+}
+
+impl Program<Message, Command> for Pad {
+  effect fn init() -> Next
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let model = Pad {
+      text: String.make(),
+      dirty: false,
+      dark: false,
+      asking: false,
+      status: run String.copy("Ready"),
+    }
+    return run Next.with(move model, Command.SetUp)
+  }
+
+  effect fn update(mut model: Pad, message: Message) -> Next
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match move message {
+      Message.ChangedText { value } => {
+        let was = model.dirty
+        model.text = move value
+        model.dirty = true
+        if !was {
+          return run Next.with(move model, Command.SetTitle { dirty: true })
+        }
+      }
+      Message.ChoseMenuItem { action } => {
+        if action == NEW {
+          model.text = String.make()
+          model.dirty = false
+          run say(&mut model, "New note")
+          return run Next.with(move model, Command.SetTitle { dirty: false })
+        }
+        if action == OPEN {
+          return run Next.with(move model, Command.AskOpen)
+        }
+        if action == SAVE {
+          return run Next.with(move model, Command.AskSave)
+        }
+        if action == COPY {
+          let text = run String.copy(String.view(&model.text))
+          run say(&mut model, "Copied")
+          return run Next.with(move model, Command.Copy { text: move text })
+        }
+      }
+      Message.ClosedDialog { request, paths } => {
+        let mut chosen = move paths
+        if chosen.length() == 0 {
+          run say(&mut model, "Cancelled")
+          return Next.of(move model)
+        }
+        let path = chosen.remove(0)
+        if request == OPENING {
+          return run Next.with(move model, Command.Read { path: move path })
+        }
+        let text = run String.copy(String.view(&model.text))
+        return run Next.with(move model, Command.Write { path: move path, text: move text })
+      }
+      Message.LoadedFile { text } => {
+        model.text = move text
+        model.dirty = false
+        run say(&mut model, "Opened")
+        return run Next.with(move model, Command.SetTitle { dirty: false })
+      }
+      Message.SavedFile => {
+        model.dirty = false
+        run say(&mut model, "Saved")
+        return run Next.with(move model, Command.SetTitle { dirty: false })
+      }
+      Message.FailedToSave => {
+        run say(&mut model, "Could not save the note")
+      }
+      Message.ChangedAppearance { dark } => {
+        model.dark = dark
+      }
+      Message.RequestedClose => {
+        if !model.dirty {
+          return run Next.with(move model, Command.Quit)
+        }
+        model.asking = true
+      }
+      Message.ClickedDiscard => {
+        return run Next.with(move model, Command.Quit)
+      }
+      Message.ClickedKeepEditing => {
+        model.asking = false
+      }
+      Message.CompletedShellRequest => {}
+    }
+    return Next.of(move model)
+  }
+
+  fn view(model: &Pad, h: &Document<Message>) -> Node {
+    let page = shade(model.dark, 0xFFFFFF, 0x16181D)
+    let ink = shade(model.dark, 0x1F2937, 0xE5E7EB)
+    let faint = shade(model.dark, 0x6B7280, 0x9CA3AF)
+    let line = shade(model.dark, 0xD1D5DB, 0x343944)
+    return h.column(
+      &[
+        h.style(
+          &[
+            css.height(percent(100.0)),
+            css.fontSize(px(14.0)),
+            css.color(ink),
+            css.backgroundColor(page),
+          ],
+        ),
+      ],
+      &[
+        if model.asking {
+          h.row(
+            &[
+              h.testId("unsaved"),
+              h.style(
+                &[
+                  css.alignItems(Align.Center),
+                  css.columnGap(px(8.0)),
+                  css.padding(px(8.0)),
+                  css.color(rgb(0x1F2937)),
+                  css.backgroundColor(rgb(0xFEF3C7)),
+                ],
+              ),
+            ],
+            &[
+              h.box(&[h.style(&[css.flexGrow(1.0)])], &[h.text("This note has unsaved work.")]),
+              button(h, "Keep editing", Message.ClickedKeepEditing),
+              primary(h, "Discard and close", Message.ClickedDiscard),
+            ],
+          )
+        } else {
+          h.empty()
+        },
+        h.input(
+          String.view(&model.text),
+          &[
+            h.testId("note"),
+            h.label("Note"),
+            h.multiline(true),
+            h.placeholder("Write something…"),
+            h.onInput(|value| Message.ChangedText { value: move value }),
+            h.style(
+              &[
+                css.flexGrow(1.0),
+                css.minHeight(px(0.0)),
+                css.padding(px(16.0)),
+                css.fontSize(px(15.0)),
+                css.lineHeight(px(22.0)),
+                css.color(ink),
+                css.overflowY(Overflow.Auto),
+              ],
+            ),
+          ],
+        ),
+        h.box(
+          &[
+            h.testId("status"),
+            h.style(
+              &[
+                css.padding(px(8.0)),
+                css.color(faint),
+                css.borderTopWidth(px(1.0)),
+                css.borderStyle(BorderStyle.Solid),
+                css.borderColor(line),
+              ],
+            ),
+          ],
+          &[h.text(String.view(&model.status))],
+        ),
+      ],
+    )
+  }
+
+  /// What the window has to say comes back as subscriptions.
+  fn subscriptions(model: &Pad, subs: &mut Subscriptions<Message>) -> () {
+    subs.menuAction(1, |action| Message.ChoseMenuItem { action: action })
+    subs.files(2, |request, paths| Message.ClosedDialog { request: request, paths: move paths })
+    subs.appearance(3, |dark| Message.ChangedAppearance { dark: dark })
+    subs.closeRequested(4, || Message.RequestedClose)
+  }
+}
+
+fn shade(dark: bool, light: u32, night: u32) -> Rgba<f32> {
+  return if dark {
+    rgb(night)
+  } else {
+    rgb(light)
+  }
+}

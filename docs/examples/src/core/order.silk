@@ -1,0 +1,197 @@
+//! An order: a parent program that embeds the same child twice. The child is a quantity
+//! stepper that knows nothing about its parent.
+import core.look { INK, LINE, MUTED, button, rgb }
+import ui_app.css
+import ui_app.css { px, Align, BorderStyle }
+import ui_app.lib {
+  Document,
+  fold,
+  foldInput,
+  Node,
+  NoCommand,
+  NoOutput,
+  Program,
+  Receives,
+  Submodel,
+  Update
+}
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+
+// The child.
+
+pub struct Stepper {
+  pub label: string<'static>,
+  pub quantity: i64,
+}
+
+pub union StepperMessage {
+  ClickedMore,
+  ClickedFewer,
+}
+
+/// What a stepper tells its parent.
+pub union StepperOutput {
+  Changed { pub by: i64 },
+}
+
+/// What a parent may ask of a stepper.
+pub union StepperInput {
+  Clear,
+}
+
+type Step = Update<Stepper, NoCommand, StepperOutput>
+
+impl Submodel<StepperMessage, NoCommand, StepperOutput> for Stepper {
+  effect fn start(model: &Stepper) -> List<NoCommand>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return List<NoCommand>.make()
+  }
+
+  effect fn update(mut model: Stepper, message: StepperMessage) -> Step
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match move message {
+      StepperMessage.ClickedMore => {
+        model.quantity = model.quantity + 1
+        return Step.of(move model).reporting(StepperOutput.Changed { by: 1 })
+      }
+      StepperMessage.ClickedFewer => {
+        if model.quantity > 0 {
+          model.quantity = model.quantity - 1
+          return Step.of(move model).reporting(StepperOutput.Changed { by: -1 })
+        }
+      }
+    }
+    return Step.of(move model)
+  }
+
+  fn view(model: &Stepper, h: &Document<StepperMessage>) -> Node {
+    return h.row(
+      &[h.style(&[css.alignItems(Align.Center), css.columnGap(px(10.0))])],
+      &[
+        h.box(&[h.style(&[css.flexGrow(1.0)])], &[h.text(model.label)]),
+        button(h, "-", StepperMessage.ClickedFewer),
+        h.box(
+          &[h.style(&[css.minWidth(px(24.0)), css.alignItems(Align.Center)])],
+          &[h.number(model.quantity)],
+        ),
+        button(h, "+", StepperMessage.ClickedMore),
+      ],
+    )
+  }
+}
+
+impl Receives<StepperInput, NoCommand, StepperOutput> for Stepper {
+  effect fn receive(mut model: Stepper, input: StepperInput) -> Step
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match move input {
+      StepperInput.Clear => {
+        model.quantity = 0
+      }
+    }
+    return Step.of(move model)
+  }
+}
+
+// The parent.
+
+pub struct Order {
+  pub coffee: Stepper,
+  pub croissant: Stepper,
+  /// How many things are in the order, kept up to date from what the steppers report.
+  pub pieces: i64,
+}
+
+pub union Message {
+  GotCoffeeMessage { pub message: StepperMessage },
+  GotCroissantMessage { pub message: StepperMessage },
+  ClickedClear,
+}
+
+type Next = Update<Order, NoCommand, NoOutput>
+
+/// Adds what a stepper reported to the order.
+fn count(model: &mut Order, out: Option<StepperOutput>) -> () {
+  if let Option<StepperOutput>.Some { value: StepperOutput.Changed { by } } = move out {
+    model.pieces = model.pieces + by
+  }
+}
+
+impl Program<Message, NoCommand> for Order {
+  effect fn init() -> Next
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return Next.of(
+      Order {
+        coffee: Stepper { label: "Coffee", quantity: 0 },
+        croissant: Stepper { label: "Croissant", quantity: 0 },
+        pieces: 0,
+      },
+    )
+  }
+
+  effect fn update(mut model: Order, message: Message) -> Next
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match move message {
+      Message.GotCoffeeMessage { message: inner } => {
+        let folded = run fold(&mut model.coffee, move inner)
+        count(&mut model, move folded.out)
+      }
+      Message.GotCroissantMessage { message: inner } => {
+        let folded = run fold(&mut model.croissant, move inner)
+        count(&mut model, move folded.out)
+      }
+      Message.ClickedClear => {
+        drop run foldInput(&mut model.coffee, StepperInput.Clear)
+        drop run foldInput(&mut model.croissant, StepperInput.Clear)
+        model.pieces = 0
+      }
+    }
+    return Next.of(move model)
+  }
+
+  fn view(model: &Order, h: &Document<Message>) -> Node {
+    return h.column(
+      &[
+        h.style(
+          &[css.padding(px(16.0)), css.rowGap(px(10.0)), css.color(rgb(INK)), css.maxWidth(px(320.0))],
+        ),
+      ],
+      &[
+        h.submodel(
+          &model.coffee,
+          |message: StepperMessage| Message.GotCoffeeMessage { message: move message },
+        ),
+        h.submodel(
+          &model.croissant,
+          |message: StepperMessage| Message.GotCroissantMessage { message: move message },
+        ),
+        h.row(
+          &[
+            h.style(
+              &[
+                css.alignItems(Align.Center),
+                css.columnGap(px(6.0)),
+                css.paddingTop(px(10.0)),
+                css.borderTopWidth(px(1.0)),
+                css.borderStyle(BorderStyle.Solid),
+                css.borderColor(rgb(LINE)),
+                css.color(rgb(MUTED)),
+              ],
+            ),
+          ],
+          &[
+            h.box(&[h.testId("pieces")], &[h.number(model.pieces)]),
+            h.box(&[h.style(&[css.flexGrow(1.0)])], &[h.text("in the order")]),
+            button(h, "Clear", Message.ClickedClear),
+          ],
+        ),
+      ],
+    )
+  }
+}

@@ -1,0 +1,258 @@
+//! A to-do list: a text field, a list that grows and shrinks, and a filter.
+import core.look { ACCENT, INK, LINE, MUTED, button, fieldLook, primary, rgb }
+import ui_app.css
+import ui_app.css { px, Align, BorderStyle, Keyword }
+import ui_app.lib { Document, Node, NoCommand, NoOutput, Program, Role, Update }
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.usize
+import silk.text.string { String }
+
+pub struct Item {
+  /// Never reused, so it can be the row's key.
+  pub id: u64,
+  pub title: String,
+  pub done: bool,
+}
+
+pub struct Todo {
+  pub items: List<Item>,
+  /// What is typed in the field and not added yet.
+  pub draft: String,
+  pub hideDone: bool,
+  pub nextId: u64,
+}
+
+pub union Message {
+  ChangedDraft { pub value: String },
+  SubmittedDraft,
+  ClickedToggle { pub id: u64 },
+  ClickedRemove { pub id: u64 },
+  ClickedHideDone,
+}
+
+type Next = Update<Todo, NoCommand, NoOutput>
+
+/// How many items are not done yet.
+pub fn remaining(model: &Todo) -> usize {
+  let items = model.items.asSlice()
+  let mut count: usize = 0
+  let mut i: usize = 0
+  while i < items.length {
+    if !items[i].done {
+      count = count + 1
+    }
+    i = i + 1
+  }
+  return count
+}
+
+effect fn add(model: &mut Todo, title: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let id = model.nextId
+  model.nextId = id + 1
+  run model.items.append(Item { id: id, title: run String.copy(title), done: false })
+}
+
+impl Program<Message, NoCommand> for Todo {
+  effect fn init() -> Next
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut model = Todo {
+      items: List<Item>.make(),
+      draft: String.make(),
+      hideDone: false,
+      nextId: 1,
+    }
+    run add(&mut model, "Read the first program")
+    run add(&mut model, "Write a view")
+    return Next.of(move model)
+  }
+
+  effect fn update(mut model: Todo, message: Message) -> Next
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match move message {
+      Message.ChangedDraft { value } => {
+        model.draft = move value
+      }
+      Message.SubmittedDraft => {
+        // The draft leaves the model, and an empty one takes its place.
+        let draft = move model.draft
+        model.draft = String.make()
+        let title = String.trim(String.view(&draft))
+        if String.byteLength(title) != 0 {
+          run add(&mut model, title)
+        }
+      }
+      Message.ClickedToggle { id } => {
+        let mut i: usize = 0
+        while i < model.items.length() {
+          if model.items.asSlice()[i].id == id {
+            let mut item = model.items.remove(i)
+            item.done = !item.done
+            run model.items.insert(i, move item)
+          }
+          i = i + 1
+        }
+      }
+      Message.ClickedRemove { id } => {
+        let mut i: usize = 0
+        while i < model.items.length() {
+          if model.items.asSlice()[i].id == id {
+            drop model.items.remove(i)
+          } else {
+            i = i + 1
+          }
+        }
+      }
+      Message.ClickedHideDone => {
+        model.hideDone = !model.hideDone
+      }
+    }
+    return Next.of(move model)
+  }
+
+  fn view(model: &Todo, h: &Document<Message>) -> Node {
+    return h.column(
+      &[h.style(&[css.padding(px(16.0)), css.rowGap(px(12.0)), css.color(rgb(INK))])],
+      &[
+        h.row(
+          &[h.style(&[css.columnGap(px(8.0))])],
+          &[
+            h.input(
+              String.view(&model.draft),
+              &[
+                h.testId("draft"),
+                h.label("New item"),
+                h.placeholder("What needs doing?"),
+                h.onInput(|value| Message.ChangedDraft { value: move value }),
+                h.onEnter(Message.SubmittedDraft),
+                fieldLook<Message>(h),
+                h.style(&[css.flexGrow(1.0)]),
+              ],
+            ),
+            primary(h, "Add", Message.SubmittedDraft),
+          ],
+        ),
+        h.column(
+          &[h.testId("items"), h.accessRole(Role.List)],
+          &[
+            h.each(
+              model.items.asSlice(),
+              |item| if model.hideDone && item.done {
+                h.empty()
+              } else {
+                h.keyed(item.id, row(h, item))
+              },
+            ),
+          ],
+        ),
+        h.row(
+          &[h.style(&[css.alignItems(Align.Center), css.columnGap(px(6.0)), css.color(rgb(MUTED))])],
+          &[
+            h.box(&[h.testId("remaining")], &[h.number(usize.toI64(remaining(model)))]),
+            h.box(&[h.style(&[css.flexGrow(1.0)])], &[h.text("left to do")]),
+            button(
+              h,
+              if model.hideDone {
+                "Show done"
+              } else {
+                "Hide done"
+              },
+              Message.ClickedHideDone,
+            ),
+          ],
+        ),
+      ],
+    )
+  }
+}
+
+/// One item: a checkbox, its title, and a button that removes it.
+fn row(h: &Document<Message>, item: &Item) -> Node {
+  return h.row(
+    &[
+      h.accessRole(Role.ListItem),
+      h.style(
+        &[
+          css.alignItems(Align.Center),
+          css.columnGap(px(10.0)),
+          css.paddingTop(px(8.0)),
+          css.paddingBottom(px(8.0)),
+          css.borderTopWidth(px(1.0)),
+          css.borderStyle(BorderStyle.Solid),
+          css.borderColor(rgb(LINE)),
+        ],
+      ),
+    ],
+    &[
+      h.button(
+        &[
+          h.accessRole(Role.Checkbox),
+          h.checked(item.done),
+          h.label(String.view(&item.title)),
+          h.onClick(Message.ClickedToggle { id: item.id }),
+          h.style(
+            &[
+              css.width(px(18.0)),
+              css.height(px(18.0)),
+              css.borderWidth(px(1.0)),
+              css.borderStyle(BorderStyle.Solid),
+              css.borderRadius(px(5.0)),
+              css.borderColor(
+                if item.done {
+                  rgb(ACCENT)
+                } else {
+                  rgb(LINE)
+                },
+              ),
+              css.backgroundColor(
+                if item.done {
+                  rgb(ACCENT)
+                } else {
+                  rgb(0xFFFFFF)
+                },
+              ),
+            ],
+          ),
+        ],
+        &[],
+      ),
+      h.box(
+        &[
+          h.style(
+            &[
+              css.flexGrow(1.0),
+              css.color(
+                if item.done {
+                  rgb(MUTED)
+                } else {
+                  rgb(INK)
+                },
+              ),
+              css.textDecorationLine(
+                if item.done {
+                  Keyword.LineThrough
+                } else {
+                  Keyword.None
+                },
+              ),
+            ],
+          ),
+        ],
+        &[h.text(String.view(&item.title))],
+      ),
+      h.button(
+        &[
+          h.label("Remove"),
+          h.onClick(Message.ClickedRemove { id: item.id }),
+          h.style(&[css.color(rgb(MUTED)), css.paddingLeft(px(6.0)), css.paddingRight(px(6.0))]),
+          h.hover(&[css.color(rgb(0xB91C1C))]),
+        ],
+        &[h.text("×")],
+      ),
+    ],
+  )
+}

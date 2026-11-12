@@ -1,0 +1,94 @@
+//! Tests for the UI tree examples: a tree is plain data in and plain data out, so a test
+//! drives it exactly as a window does.
+import examples.tree.card as card
+import examples.tree.clicker as clicker
+import examples.tree.field as field
+import examples.tree.remote as remote
+import ui_fixtures.fixtures as fixtures
+import ui_tree.lib {
+  DescribeOptions,
+  Event,
+  Input,
+  NodeId,
+  ProtocolError,
+  Tree,
+  TreeError,
+  Viewport
+}
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.geometry.rect { Rect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+fn viewport() -> Viewport {
+  return Viewport { width: 400.0, height: 240.0, scale: 1.0 }
+}
+
+/// Clicks the middle of `node`.
+effect fn click(tree: &mut Tree<'_>, node: NodeId) -> ()
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  drop run tree.frame(viewport(), 0.0)
+  if let Option<Rect<f32>>.Some { value } = run tree.bounds(node) {
+    let x = (value.xMin + value.xMax) * 0.5
+    let y = (value.yMin + value.yMax) * 0.5
+    run tree.dispatch(Input.press(x, y))
+    run tree.dispatch(Input.release(x, y))
+  }
+}
+
+effect fn treeBody() -> ()
+  ! AssertionError<'static> | TreeError | ProtocolError | OutOfMemoryError
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+
+  // Queries: find a node by its test id, and read where layout put it.
+  let mut tree = run Tree.make(&fonts)
+  let sans = run tree.fontFamily("Noto Sans, sans-serif")
+  let built = run card.build(&mut tree, sans)
+  drop run tree.frame(viewport(), 0.0)
+  let found = run tree.find("refresh")
+  run Testing.expect(found.length() == 1 && found.get(0).is(built.button), "find reads test ids")
+  let text = run tree.describe(DescribeOptions.plain())
+  run Testing.expect(String.contains(String.view(&text), "Tide tables"), "describe writes the tree")
+
+  // Events: input in, records out, and the client changes the tree.
+  let mut second = run Tree.make(&fonts)
+  let family = run second.fontFamily("Noto Sans, sans-serif")
+  let mut counter = run clicker.build(&mut second, family)
+  run click(&mut second, counter.button.id())
+  run click(&mut second, counter.button.id())
+  run counter.pump(&mut second)
+  run Testing.expect(counter.clicks == 2, "two clicks were recorded")
+  let after = run second.find("Clicked 2 times")
+  run Testing.expect(after.length() == 1, "and the label says so")
+
+  // Text: the tree edits, the client hears the new value.
+  let mut third = run Tree.make(&fonts)
+  let face = run third.fontFamily("Noto Sans, sans-serif")
+  let mut greeting = run field.build(&mut third, face)
+  run third.focus(greeting.name)
+  run third.dispatch(run Input.text("Ada"))
+  run greeting.pump(&mut third)
+  run Testing.expect((run third.find("Hello, Ada.")).length() == 1, "typing reaches the greeting")
+
+  // The protocol: the client's own numbers come back in the records.
+  let mut fourth = run Tree.make(&fonts)
+  run fourth.apply(run remote.first())
+  run click(&mut fourth, NodeId.of(remote.BUTTON))
+  let records = run fourth.events()
+  run Testing.expect(records.length() == 1, "one click")
+  run Testing.expect(records.asSlice()[0].target.raw() == remote.BUTTON, "on the client's node 2")
+  if let Event.Click { .. } = &records.asSlice()[0].event {
+    run fourth.apply(run remote.sent())
+  }
+  run Testing.expect((run fourth.find("Sent")).length() == 1, "the answer is one mutation")
+}
+
+test effect fn aTreeIsDataInAndDataOut() -> ()
+  ! AssertionError<'static> | TreeError | ProtocolError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run treeBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
