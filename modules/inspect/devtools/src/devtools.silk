@@ -1,10 +1,17 @@
-//! The devtools window as a ui-app app: the inspected app's element tree on the left, and on
-//! the right the selected node's styles (which can be edited), the changes made (style edits and
-//! comments, kept in the app for an agent to carry into the code), its box model, the event log,
-//! the frame timeline, an accessibility audit and the frame stats, then a tab for each panel the
-//! app's extensions add (`hello` lists them). It talks to the app only through the inspector
-//! protocol (the same requests ui-inspect-cli and ui-inspect-mcp send), over a [`Link`] the host
-//! provides.
+//! The devtools window as a ui-app app, in three columns under a top bar: the inspected app's
+//! element tree on the left; in the middle a tab for each panel the app's extensions add that
+//! the app renders (a silk-ui program's Program panel), the event log, the frame timeline with
+//! the frame stats, the accessibility audit, then the extensions' data panels; on the right the
+//! inspector of the selected node: its Design (fields for the common properties, edited in
+//! place), its Declarations (the node view, edited by typing declarations, and its box model)
+//! and the Edits (style edits and comments, kept in the app for an agent to carry into the
+//! code). It talks to the app only through the inspector protocol (the same requests
+//! ui-inspect-cli and ui-inspect-mcp send), over a [`Link`] the host provides. The look is
+//! `theme.silk`'s.
+//!
+//! The columns keep their designed widths in a wide window and narrow with it; below
+//! [`STACKED_BELOW`] the inspector shares the middle column as a tab of its own (see
+//! [`columnsFor`]). Each column scrolls on its own.
 //!
 //! An extension panel shows its data with a generic view of rows, or, when the panel has a
 //! view, what the app renders for it: the app's mutation batches, replayed by the host under the
@@ -23,10 +30,12 @@
 //! package's tables, and ArrowUp and ArrowDown in it step the last number (Shift by 10, Alt by
 //! 0.1), applying it at once.
 import ui_tree.css
-import ui_tree.css { px, percent, none, Property, Keyword }
+import ui_tree.css { px, none, Property, Keyword }
 import data {
   Row,
   Detail,
+  AppInfo,
+  readInfo,
   LogRow,
   Stat,
   Snapshot,
@@ -70,6 +79,35 @@ import data {
 }
 import link { Link }
 import remote { VIEW_HOST }
+import theme
+import theme { Look, Icon, rgb, rgba }
+import design {
+  FIELD_WIDTH,
+  FIELD_HEIGHT,
+  FIELD_DIRECTION,
+  FIELD_GAP,
+  FIELD_PADDING,
+  FIELD_ALIGN,
+  FIELD_FILL,
+  FIELD_BORDER,
+  FIELD_RADIUS,
+  FIELD_FONT,
+  FIELD_TEXT,
+  FIELD_WEIGHT,
+  NO_FIELD,
+  fieldText,
+  fieldCss,
+  fieldEdited,
+  fieldLabel,
+  fieldName,
+  fieldTestId,
+  computed,
+  covered,
+  nameOf,
+  valueOf,
+  swatchOf,
+  shortValue
+}
 import ui_inspect_server.topics {
   TOPIC_TREE,
   TOPIC_FRAME,
@@ -87,13 +125,14 @@ import ui_inspect_server.reply { textField, flagField, idField, writeString }
 import ui_tree.inspect { writeInt }
 import ui_tree.mutation {
   Align,
+  BoxSizing,
   Role,
   Cursor,
   BorderStyle,
   Overflow,
   WhiteSpace,
   TextAlign,
-  FlexWrap
+  ScrollbarWidth
 }
 import ui_tree.input { MOD_SHIFT, MOD_ALT }
 import ui_tree.node { Event, EventKind }
@@ -105,6 +144,7 @@ import silk.core.result { Result }
 import silk.json.scanner { JsonError }
 import silk.json.value { Json, Value }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
 import silk.num.u32
 import silk.num.u64
 import silk.num.usize
@@ -113,26 +153,64 @@ import silk.text.string { String }
 /// Seconds between tries while the app cannot be reached.
 pub const RETRY_INTERVAL: f64 = 1.0
 
+/// Seconds between the Frames panel's reads while the app draws: an app that draws every
+/// frame would otherwise have the devtools read its timeline as often.
+pub const FRAMES_INTERVAL: f64 = 0.1
+
 /// How many event records the log keeps.
 pub const MAX_LOG: usize = 200
 
-/// The font family the host defines for the window (`Noto Sans, sans-serif` in the window and
-/// the tests). Devtools in the app's own tree use one of their own (`Devtools.font`).
+/// The font families the host defines for the window: [`FONT`] for the interface
+/// (`theme.UI_FAMILIES`) and [`MONO`] for code and data (`theme.MONO_FAMILIES`). Devtools in
+/// the app's own tree use ids of their own (`Devtools.look`).
 pub const FONT: u32 = 1
 
-/// The tabs of the side panel.
+pub const MONO: u32 = 2
+
+/// The tabs of the middle column.
 pub enum Panel {
-  Styles,
-  /// The edit log: style edits and comments.
-  Changes,
-  BoxModel,
   Events,
-  /// The frame timeline.
+  /// The frame timeline and the last frame's stats.
   Frames,
   Audit,
-  Stats,
   /// A panel an extension of the app adds (`Devtools.shown` says which).
   Extension,
+}
+
+/// The segments of the inspector.
+pub enum Segment {
+  /// Fields for the common properties, the other declarations and the node's edits.
+  Design,
+  /// The node view, edited by typing declarations, and the box model.
+  Declarations,
+  /// The edit log: style edits and comments, to resolve, reopen or take back.
+  Edits,
+}
+
+/// Below this width (in CSS pixels) the inspector is a tab of the middle column.
+pub const STACKED_BELOW: f32 = 820.0
+
+/// How wide the columns are in a window `width` wide: the tree and the inspector at their
+/// designed 320 and 340 from 1180 up, narrower below, and under [`STACKED_BELOW`] the
+/// inspector in the middle column (`inspector` 0, `stacked`). 0 (not laid out yet) is wide.
+pub struct Columns {
+  pub tree: f32,
+  pub inspector: f32,
+  pub stacked: bool,
+}
+
+pub fn columnsFor(width: f32) -> Columns {
+  if width <= 0.0 || width >= 1180.0 {
+    return Columns { tree: 320.0, inspector: 340.0, stacked: false }
+  }
+  if width >= 980.0 {
+    return Columns { tree: 280.0, inspector: 320.0, stacked: false }
+  }
+  if width >= STACKED_BELOW {
+    return Columns { tree: 240.0, inspector: 300.0, stacked: false }
+  }
+  let tree = f32.max(180.0, f32.min(260.0, f32.floor(width * 0.36)))
+  return Columns { tree: tree, inspector: 0.0, stacked: true }
 }
 
 /// How many frames the timeline shows.
@@ -144,7 +222,8 @@ const BAR_HEIGHT: f32 = 96.0
 pub union Message {
   /// Read everything again.
   Refresh,
-  /// The timer that tries again while the app cannot be reached.
+  /// The timer that tries again while the app cannot be reached, and reads the frames the app
+  /// drew since the Frames panel last did.
   Tick { pub time: f64 },
   /// Notifications from the app wait: read what they say changed.
   Pull,
@@ -161,6 +240,18 @@ pub union Message {
   Show { pub panel: Panel },
   /// Show the extension panel at `index` of `Devtools.panels`.
   ShowPanel { pub index: usize },
+  /// Show a segment of the inspector.
+  ShowSegment { pub segment: Segment },
+  /// In a narrow window, show the inspector in the middle column (or the panel again).
+  ShowInspector { pub shown: bool },
+  /// The devtools' box is `width` wide.
+  Resized { pub width: f32 },
+  /// Text typed into Design field `field` (`design.FIELD_*`).
+  FieldInput { pub field: u32, pub value: String },
+  /// Set what field `field` holds on the selected node.
+  ApplyField { pub field: u32 },
+  /// Step the last number of field `field` by `by`, and set it.
+  StepField { pub field: u32, pub by: f32 },
   SelectNext,
   SelectPrevious,
   ClearSelection,
@@ -216,13 +307,16 @@ pub union Command {
   },
   /// Take the app's notifications and read again what they say changed.
   Pull { pub since: u64, pub selected: u32, pub panel: Panel },
+  /// Read the last frame's stats and the timeline.
+  Frames,
   /// Subscribe to exactly `topics` and `names`.
   Subscribe { pub topics: u32, pub names: List<String> },
   /// Send request `line` without waiting; its reply comes with the notifications.
   Ask { pub line: String, pub purpose: u32, pub index: usize },
-  /// Highlight node `node` alone, or nothing for NO_PARENT, without waiting for an answer.
-  Highlight { pub node: u32 },
-  /// Highlight node `node` and inspect it.
+  /// Highlight node `node` as pointed at (nothing for NO_PARENT) and ring `selected` (nothing
+  /// for NO_PARENT), without waiting for an answer.
+  Highlight { pub node: u32, pub selected: u32 },
+  /// Ring node `node` as selected and inspect it.
   Inspect { pub node: u32 },
   /// Clear the highlight.
   Unhighlight,
@@ -242,6 +336,16 @@ pub struct Devtools {
   pub target: String,
   pub live: bool,
   pub panel: Panel,
+  pub segment: Segment,
+  /// In a narrow window: whether the middle column shows the inspector.
+  pub inspector: bool,
+  /// How wide the devtools' box is, once laid out (0 before).
+  pub width: f32,
+  /// The Design field being typed into (`design.NO_FIELD` for none), and what it holds.
+  pub field: u32,
+  pub fieldDraft: String,
+  /// What the top bar says about the app.
+  pub info: AppInfo,
   pub rows: List<Row>,
   /// Nodes whose children are folded.
   pub collapsed: List<u32>,
@@ -273,6 +377,8 @@ pub struct Devtools {
   /// Why the app refused the last style edit, or empty.
   pub styleError: String,
   pub frames: FrameView,
+  /// The app drew frames the Frames panel has yet to read; it does every [`FRAMES_INTERVAL`].
+  pub framesDue: bool,
   pub issues: List<Issue>,
   /// The audit's summary, or empty before the first one.
   pub auditLine: String,
@@ -280,8 +386,9 @@ pub struct Devtools {
   pub hovered: u32,
   /// The topics subscribed to, as `TOPIC_*` bits.
   pub topics: u32,
-  /// The font family the devtools draw with: [`FONT`] unless they share the app's tree.
-  pub font: u32,
+  /// The font families the devtools draw with: [`FONT`] and [`MONO`] unless they share the
+  /// app's tree.
+  pub look: Look,
   /// The ids of the app's extensions, and the panels they add.
   pub extensions: List<String>,
   pub panels: List<PanelInfo>,
@@ -303,7 +410,13 @@ impl Devtools {
     return Devtools {
       target: run String.copy(target),
       live: true,
-      panel: Panel.Styles,
+      panel: Panel.Events,
+      segment: Segment.Design,
+      inspector: false,
+      width: 0.0,
+      field: NO_FIELD,
+      fieldDraft: String.make(),
+      info: AppInfo.none(),
       rows: List<Row>.make(),
       collapsed: List<u32>.make(),
       selected: NO_PARENT,
@@ -323,11 +436,12 @@ impl Devtools {
       openChanges: 0,
       styleError: String.make(),
       frames: FrameView.none(),
+      framesDue: false,
       issues: List<Issue>.make(),
       auditLine: String.make(),
       hovered: NO_PARENT,
       topics: 0,
-      font: FONT,
+      look: Look { ui: FONT, mono: MONO },
       extensions: List<String>.make(),
       panels: List<PanelInfo>.make(),
       names: List<String>.make(),
@@ -562,7 +676,7 @@ impl Devtools {
       return TOPIC_PICK
     }
     let mut topics = TOPIC_TREE | TOPIC_ROOTS | TOPIC_EVENTS | TOPIC_PICK | TOPIC_EDITS
-    if self.panel == Panel.Stats || self.panel == Panel.Frames {
+    if self.panel == Panel.Frames {
       topics = topics | TOPIC_FRAME
     }
     return topics
@@ -629,7 +743,25 @@ impl Devtools {
       return ()
     }
     self.selected = id
+    self.field = NO_FIELD
     cx.command(Command.Inspect { node: id })
+  }
+
+  /// The Design field `field` as shown: what is typed into it, or the node's value.
+  effect fn fieldShown(self: &Self, field: u32) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.field == field {
+      return run String.copy(String.view(&self.fieldDraft))
+    }
+    let mut text = String.make()
+    run fieldText(&self.detail, field, &mut text)
+    return move text
+  }
+
+  /// The columns of the window as wide as the devtools are now.
+  pub fn columns(self: &Self) -> Columns {
+    return columnsFor(self.width)
   }
 }
 
@@ -779,6 +911,7 @@ fn emptySnapshot(since: u64) -> Snapshot {
   return Snapshot {
     parts: 0,
     status: String.make(),
+    info: AppInfo.none(),
     rows: List<Row>.make(),
     stats: List<Stat>.make(),
     events: List<LogRow>.make(),
@@ -789,6 +922,7 @@ fn emptySnapshot(since: u64) -> Snapshot {
     news: List<String>.make(),
     replies: List<String>.make(),
     frames: Option<FrameView>.None,
+    drew: false,
     picking: false,
     picked: NO_PARENT,
     changes: List<ChangeRow>.make(),
@@ -811,6 +945,7 @@ effect fn syncAll(
   match run ask("{\"cmd\":\"hello\"}", &mut error) {
     Option<Value>.Some { value } => {
       run parseStatus(&value, &mut snapshot.status)
+      snapshot.info = readInfo(&value)
       let mut ids = List<String>.make()
       run parseExtensions(&value, &mut ids, &mut snapshot.panels)
       snapshot.extensions = Option<List<String>>.some(move ids)
@@ -892,8 +1027,9 @@ fn pickedOf(reply: &Value) -> u32 {
 }
 
 /// Takes the app's notifications and reads again what they say changed: the element tree and
-/// the selected node after `tree` or `roots`, the event log after `events`, what `panel` shows
-/// after `frame`, the picker after `pick`. The status line comes with `tree` and `frame`
+/// the selected node after `tree` or `roots`, the event log after `events`, the picker after
+/// `pick`. A `frame` only marks the snapshot (`drew`) while `panel` is the Frames panel, which
+/// reads at its own pace. The status line comes with `tree` and `frame`
 /// notifications themselves; extension topics and the replies to `ask` go into the snapshot.
 effect fn pull(since: u64, selected: u32, panel: Panel) -> Message
   ! OutOfMemoryError
@@ -919,6 +1055,7 @@ effect fn pull(since: u64, selected: u32, panel: Panel) -> Message
         changed = changed | topic
         if topic == TOPIC_TREE || topic == TOPIC_FRAME {
           run parseStatus(&value, &mut snapshot.status)
+          snapshot.info.take(readInfo(&value))
           snapshot.parts = snapshot.parts | PART_STATUS
         }
       }
@@ -962,26 +1099,7 @@ effect fn pull(since: u64, selected: u32, panel: Panel) -> Message
   }
   let mut quiet = String.make()
   if u32.bitAnd(changed, TOPIC_FRAME | TOPIC_TREE) != 0 {
-    if panel == Panel.Stats {
-      match run ask("{\"cmd\":\"stats\"}", &mut error) {
-        Option<Value>.Some { value } => {
-          run parseStats(&value, &mut snapshot.stats)
-          snapshot.parts = snapshot.parts | PART_STATS
-        }
-        Option<Value>.None => {
-          return Message.Failed { error: move error }
-        }
-      }
-    }
-    if panel == Panel.Frames {
-      let frames = run requestLine("frames", "limit", MAX_FRAMES)
-      match run ask(String.view(&frames), &mut quiet) {
-        Option<Value>.Some { value } => {
-          snapshot.frames = Option<FrameView>.Some { value: run parseFrames(&value) }
-        }
-        Option<Value>.None => {}
-      }
-    }
+    snapshot.drew = panel == Panel.Frames
   }
   if u32.bitAnd(changed, TOPIC_PICK) != 0 {
     match run ask("{\"cmd\":\"pickMode\"}", &mut quiet) {
@@ -1005,17 +1123,57 @@ effect fn pull(since: u64, selected: u32, panel: Panel) -> Message
   return Message.Synced { snapshot: move snapshot }
 }
 
-/// highlight, as a notification: hovering rows sends many, and none waits for an answer.
-effect fn highlightNode(node: u32) -> Message
+/// Reads the last frame's stats and the timeline.
+effect fn readFrames() -> Message
   ! OutOfMemoryError
   ? &mut Link | &mut Allocator {
+  let mut error = String.make()
+  let mut snapshot = emptySnapshot(0)
+  match run ask("{\"cmd\":\"stats\"}", &mut error) {
+    Option<Value>.Some { value } => {
+      run parseStats(&value, &mut snapshot.stats)
+      snapshot.parts = snapshot.parts | PART_STATS
+    }
+    Option<Value>.None => {
+      return Message.Failed { error: move error }
+    }
+  }
+  let mut quiet = String.make()
+  let frames = run requestLine("frames", "limit", MAX_FRAMES)
+  match run ask(String.view(&frames), &mut quiet) {
+    Option<Value>.Some { value } => {
+      snapshot.frames = Option<FrameView>.Some { value: run parseFrames(&value) }
+    }
+    Option<Value>.None => {}
+  }
+  return Message.Synced { snapshot: move snapshot }
+}
+
+/// `{"cmd":"highlight",...}` pointing at `node` and ringing `selected` (either NO_PARENT for
+/// none).
+effect fn highlightLine(node: u32, selected: u32) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
   let mut line = run String.copy("{\"cmd\":\"highlight\"")
   if node != NO_PARENT {
     run line.append(",\"nodes\":[")
     run writeInt(&mut line, u32.toU64(node))
     run line.append("]")
   }
+  if selected != NO_PARENT {
+    run line.append(",\"selected\":[")
+    run writeInt(&mut line, u32.toU64(selected))
+    run line.append("]")
+  }
   run line.append("}")
+  return move line
+}
+
+/// highlight, as a notification: hovering rows sends many, and none waits for an answer.
+effect fn highlightNode(node: u32, selected: u32) -> Message
+  ! OutOfMemoryError
+  ? &mut Link | &mut Allocator {
+  let line = run highlightLine(node, selected)
   if !run Link.notify(String.view(&line)) {
     return Message.Failed { error: run String.copy("cannot reach the app") }
   }
@@ -1116,9 +1274,7 @@ effect fn highlightAndInspect(node: u32) -> Message
   ! OutOfMemoryError
   ? &mut Link | &mut Allocator {
   let mut error = String.make()
-  let mut line = run String.copy("{\"cmd\":\"highlight\",\"nodes\":[")
-  run writeInt(&mut line, u32.toU64(node))
-  run line.append("]}")
+  let line = run highlightLine(NO_PARENT, node)
   match run ask(String.view(&line), &mut error) {
     Option<Value>.Some { value: _ } => {}
     Option<Value>.None => {
@@ -1154,9 +1310,10 @@ impl Perform<Message, OutOfMemoryError ? &mut Link | &mut Allocator> for Command
         &names,
       )
       Command.Pull { since, selected, panel } => run pull(since, selected, panel)
+      Command.Frames => run readFrames()
       Command.Subscribe { topics, names } => run subscribed(topics, &names)
       Command.Ask { line, purpose, index } => run askLater(String.view(&line), purpose, index)
-      Command.Highlight { node } => run highlightNode(node)
+      Command.Highlight { node, selected } => run highlightNode(node, selected)
       Command.Inspect { node } => run highlightAndInspect(node)
       Command.Unhighlight => run unhighlight()
       Command.Pick { on } => run pick(on)
@@ -1171,79 +1328,26 @@ impl Perform<Message, OutOfMemoryError ? &mut Link | &mut Allocator> for Command
   }
 }
 
-// The look: Chrome's devtools, light.
+// The look: `theme.silk`'s palette and helpers.
 
-fn rgb(hex: u32) -> Rgba<f32> {
-  let r = u32.toF32(u32.bitAnd(u32.shiftRight(hex, 16), 255)) / 255.0
-  let g = u32.toF32(u32.bitAnd(u32.shiftRight(hex, 8), 255)) / 255.0
-  let b = u32.toF32(u32.bitAnd(hex, 255)) / 255.0
-  return Rgba<f32> { r: r, g: g, b: b, a: 1.0 }
+/// The box model's layers on the instrument black: amber outside the border, cyan inside it,
+/// as the highlight in the app draws a node.
+fn layerColor(name: string) -> Rgba<f32> {
+  if name == "margin" {
+    return rgba(theme.ACCENT, 0x14)
+  }
+  if name == "border" {
+    return rgba(theme.ACCENT, 0x2E)
+  }
+  return rgba(theme.HOVER, 0x1A)
 }
 
-const TEXT: u32 = 0x1F2937
-
-const MUTED: u32 = 0x6B7280
-
-const LINE: u32 = 0xD1D5DB
-
-const BAR: u32 = 0xF3F4F6
-
-const HOVER: u32 = 0xEEF2FF
-
-const SELECTED: u32 = 0xDBEAFE
-
-const ACCENT: u32 = 0x2563EB
-
-const TAG: u32 = 0x881280
-
-const ATTRIBUTE: u32 = 0xC80000
-
-const ERROR: u32 = 0xB91C1C
-
-const MARGIN: u32 = 0xF9CC9D
-
-const BORDER: u32 = 0xFDDD9B
-
-const PADDING: u32 = 0xC3D08B
-
-const CONTENT: u32 = 0x8CB6C0
-
-const LAYOUT_BAR: u32 = 0xF59E0B
-
-const WARNING: u32 = 0xB45309
-
-/// The background of an edit's declarations in the Styles panel.
-const EDITED: u32 = 0xEFF6FF
-
-/// The look of the one-line text fields.
-fn fieldLook(ui: &mut Ui<Message>) -> () {
-  ui.style(
-    &[
-      css.flexGrow(1.0),
-      css.flexShrink(1.0),
-      css.flexBasis(px(0.0)),
-      css.minWidth(px(0.0)),
-      css.height(px(22.0)),
-      css.paddingLeft(px(6.0)),
-      css.paddingRight(px(6.0)),
-      css.borderTopWidth(px(1.0)),
-      css.borderRightWidth(px(1.0)),
-      css.borderBottomWidth(px(1.0)),
-      css.borderLeftWidth(px(1.0)),
-      css.borderStyle(BorderStyle.Solid),
-      css.borderColor(rgb(LINE)),
-      css.backgroundColor(rgb(0xFFFFFF)),
-    ],
-  )
-  ui.focused(&[css.borderColor(rgb(ACCENT))])
-}
-
-/// What ArrowUp and ArrowDown do in the declarations field: step the last number by 1, by 10
-/// with Shift, by 0.1 with Alt, instead of moving the caret.
-fn stepKey(event: &Event) -> Reply<Message> {
+/// What ArrowUp and ArrowDown do in a field that holds numbers: step the last number by 1, by
+/// 10 with Shift, by 0.1 with Alt, instead of moving the caret. The step, or 0 for another key.
+fn stepOf(event: &Event) -> f32 {
   let key = String.view(&event.key)
   if key != "ArrowUp" && key != "ArrowDown" {
-    return Reply<Message>.Pass
+    return 0.0
   }
   let mut by: f32 = 1.0
   if u32.bitAnd(event.modifiers, MOD_SHIFT) != 0 {
@@ -1254,179 +1358,65 @@ fn stepKey(event: &Event) -> Reply<Message> {
   if key == "ArrowDown" {
     by = -by
   }
+  return by
+}
+
+/// The declarations field's keys: the arrows step the last number; Tab takes the first
+/// completion while there are some.
+fn draftKey(event: &Event, completions: bool) -> Reply<Message> {
+  let by = stepOf(event)
+  if by != 0.0 {
+    return Reply<Message>.Custom {
+      message: Option<Message>.some(Message.StepStyle { by: by }),
+      stopPropagation: true,
+      preventDefault: true,
+    }
+  }
+  if completions && String.view(&event.key) == "Tab" && event.modifiers == 0 {
+    return Reply<Message>.Custom {
+      message: Option<Message>.some(Message.Complete { index: 0 }),
+      stopPropagation: true,
+      preventDefault: true,
+    }
+  }
+  return Reply<Message>.Pass
+}
+
+/// A Design field's keys: the arrows step its last number and set it.
+fn fieldKey(event: &Event, field: u32) -> Reply<Message> {
+  let by = stepOf(event)
+  if by == 0.0 {
+    return Reply<Message>.Pass
+  }
   return Reply<Message>.Custom {
-    message: Option<Message>.some(Message.StepStyle { by: by }),
+    message: Option<Message>.some(Message.StepField { field: field, by: by }),
     stopPropagation: true,
     preventDefault: true,
   }
 }
 
-/// The declarations field of the Styles panel.
-fn draftField(ui: &mut Ui<Message>, value: string) -> () {
-  ui.input(
-    value,
-    |ui| {
-      ui.testId("style-draft")
-      ui.label("Declarations to set")
-      ui.placeholder("Try a style: width: 200px; color: red (arrows step numbers)")
-      fieldLook(&mut ui)
-      ui.onInput(|value| Message.StyleDraft { value: move value })
-      ui.onKeyDown(|event| stepKey(event))
-    },
-  )
-}
-
-/// A small button with test id `<kind>-<id>`.
-fn smallButton(
-  ui: &mut Ui<Message>,
-  kind: string,
-  id: u64,
-  label: string,
-  onPress: fn() -> Message,
-) -> () {
-  ui.pressable(
-    onPress,
-    |ui| {
-      let testId = ui.alloc(kindTestId(kind, id))
-      ui.testId(String.view(&testId))
-      ui.style(&[css.flexShrink(0.0)])
-      paddings(&mut ui, 1.0, 6.0)
-      ui.color(rgb(ACCENT))
-      ui.hover(&[css.backgroundColor(rgb(0xE5E7EB))])
-      ui.focusVisible(&[css.backgroundColor(rgb(SELECTED))])
-      ui.text(label)
-    },
-  )
-}
-
-/// A one-line text field in the look of the toolbar.
-fn field(
-  ui: &mut Ui<Message>,
-  testId: string,
-  label: string,
-  hint: string,
-  value: string,
-  onChange: fn(String) -> Message,
-) -> () {
-  ui.input(
-    value,
-    |ui| {
-      ui.testId(testId)
-      ui.label(label)
-      ui.placeholder(hint)
-      fieldLook(&mut ui)
-      ui.onInput(onChange)
-    },
-  )
-}
-
-/// A swatch and what it stands for, in the timeline's legend.
-fn legend(ui: &mut Ui<Message>, hex: u32, text: string) -> () {
-  ui.row(
-    |ui| {
-      ui.style(&[css.alignItems(Align.Center)])
-      ui.gap(4.0)
-      ui.box(
-        |ui| {
-          ui.background(rgb(hex))
-          ui.style(&[css.width(px(8.0)), css.height(px(8.0))])
-        },
-      )
-      muted(&mut ui, text)
-    },
-  )
-}
-
-fn ruleColor(rule: string) -> u32 {
-  if rule == "contrast" || rule == "small-target" {
-    return WARNING
-  }
-  return ERROR
-}
-
-fn border(ui: &mut Ui<Message>, side: Property, hex: u32) -> () {
-  ui.style(
-    &[css.declare(side, px(1.0)), css.borderStyle(BorderStyle.Solid), css.borderColor(rgb(hex))],
-  )
-}
-
-fn paddings(ui: &mut Ui<Message>, vertical: f32, horizontal: f32) -> () {
+/// The look of a text input inside a field: Geist Mono 12 on nothing, the field draws the box.
+fn bareInput(ui: &mut Ui<Message>, look: Look) -> () {
+  theme.mono(&mut ui, look, theme.SIZE_BODY, theme.LINE_BODY)
+  theme.fill(&mut ui)
   ui.style(
     &[
-      css.paddingTop(px(vertical)),
-      css.paddingBottom(px(vertical)),
-      css.paddingLeft(px(horizontal)),
-      css.paddingRight(px(horizontal)),
+      css.height(px(theme.LINE_BODY)),
+      css.paddingTop(px(0.0)),
+      css.paddingBottom(px(0.0)),
+      css.paddingLeft(px(0.0)),
+      css.paddingRight(px(0.0)),
+      css.borderTopWidth(px(0.0)),
+      css.borderRightWidth(px(0.0)),
+      css.borderBottomWidth(px(0.0)),
+      css.borderLeftWidth(px(0.0)),
+      css.backgroundColor(theme.clear()),
+      css.color(rgb(theme.TEXT)),
+      css.caretColor(rgb(theme.ACCENT)),
+      css.selectionColor(rgba(theme.ACCENT, 0x55)),
+      css.placeholderColor(rgb(theme.MUTED)),
+      css.whiteSpace(WhiteSpace.Pre),
     ],
-  )
-}
-
-/// A flat toolbar button; `selected` underlines it in the accent color.
-fn barButton(ui: &mut Ui<Message>, label: string, selected: bool, onPress: fn() -> Message) -> () {
-  flatButton(&mut ui, label, selected, 10.0, onPress)
-}
-
-/// A tab of the side panel: a flat button a little narrower, so every tab fits.
-fn tabButton(ui: &mut Ui<Message>, label: string, selected: bool, onPress: fn() -> Message) -> () {
-  flatButton(&mut ui, label, selected, 8.0, onPress)
-}
-
-fn flatButton(
-  ui: &mut Ui<Message>,
-  label: string,
-  selected: bool,
-  side: f32,
-  onPress: fn() -> Message,
-) -> () {
-  ui.pressable(
-    onPress,
-    |ui| {
-      paddings(&mut ui, 4.0, side)
-      ui.style(&[css.whiteSpace(WhiteSpace.NoWrap), css.flexShrink(0.0)])
-      ui.style(
-        &[
-          css.borderBottomWidth(px(2.0)),
-          css.borderStyle(BorderStyle.Solid),
-          css.borderColor(
-            if selected {
-              rgb(ACCENT)
-            } else {
-              Rgba<f32> { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }
-            },
-          ),
-        ],
-      )
-      if selected {
-        ui.color(rgb(ACCENT))
-      }
-      ui.hover(&[css.backgroundColor(rgb(0xE5E7EB))])
-      ui.focusVisible(&[css.backgroundColor(rgb(SELECTED))])
-      ui.text(label)
-    },
-  )
-}
-
-/// A scrolling region that fills what is left of its flex parent.
-fn scrolling(ui: &mut Ui<Message>) -> () {
-  ui.style(
-    &[
-      css.flexGrow(1.0),
-      css.flexShrink(1.0),
-      css.flexBasis(px(0.0)),
-      css.minHeight(px(0.0)),
-      css.minWidth(px(0.0)),
-      css.overflowY(Overflow.Scroll),
-      css.overflowX(Overflow.Hidden),
-    ],
-  )
-}
-
-fn muted(ui: &mut Ui<Message>, text: string) -> () {
-  ui.box(
-    |ui| {
-      ui.color(rgb(MUTED))
-      ui.text(text)
-    },
   )
 }
 
@@ -1461,10 +1451,27 @@ effect fn contentText(box: &BoxNumbers) -> String
   return move text
 }
 
+/// The border box's size, `88 × 28`.
+effect fn borderBoxText(box: &BoxNumbers) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = String.make()
+  run writeSize(
+    &mut text,
+    box.width + box.padding.left + box.padding.right + box.border.left + box.border.right,
+  )
+  run text.append(" × ")
+  run writeSize(
+    &mut text,
+    box.height + box.padding.top + box.padding.bottom + box.border.top + box.border.bottom,
+  )
+  return move text
+}
+
 effect fn positionText(box: &BoxNumbers) -> String
   ! OutOfMemoryError
   ? &mut Allocator {
-  let mut text = run String.copy("position ")
+  let mut text = run String.copy("at ")
   run writeSize(&mut text, box.x)
   run text.append(", ")
   run writeSize(&mut text, box.y)
@@ -1491,28 +1498,11 @@ effect fn changeTestId(id: u64) -> String
   return run kindTestId("change", id)
 }
 
-effect fn nodeText(id: u32) -> String
-  ! OutOfMemoryError
-  ? &mut Allocator {
-  let mut text = run String.copy("#")
-  run writeInt(&mut text, u32.toU64(id))
-  return move text
-}
-
 effect fn authorText(author: string) -> String
   ! OutOfMemoryError
   ? &mut Allocator {
   let mut text = run String.copy("— ")
   run text.append(author)
-  return move text
-}
-
-effect fn stateText(state: string) -> String
-  ! OutOfMemoryError
-  ? &mut Allocator {
-  let mut text = run String.copy("(")
-  run text.append(state)
-  run text.append(")")
   return move text
 }
 
@@ -1524,7 +1514,7 @@ effect fn replyText(reply: string) -> String
   return move text
 }
 
-/// The Changes panel's summary line.
+/// The Edits segment's summary line.
 effect fn changesLine(open: usize, all: usize) -> String
   ! OutOfMemoryError
   ? &mut Allocator {
@@ -1535,6 +1525,33 @@ effect fn changesLine(open: usize, all: usize) -> String
   run text.append(
     ". Edits stay over the app until resolved or reset; agents read them with ui_edits.",
   )
+  return move text
+}
+
+/// "Edits · <n>".
+effect fn countedText(label: string, count: usize) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = run String.copy(label)
+  run text.append(" · ")
+  run writeInt(&mut text, usize.toU64(count))
+  return move text
+}
+
+/// An edit's title on its card: `button "Add" · padding-left`, with its state when not base.
+effect fn changeTitle(row: &ChangeRow) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = run String.copy(String.view(&row.label))
+  if !row.comment {
+    run text.append(" · ")
+    run text.append(String.view(&row.property))
+    if String.view(&row.state) != "base" && row.state.ownedByteLength() != 0 {
+      run text.append(" (")
+      run text.append(String.view(&row.state))
+      run text.append(")")
+    }
+  }
   return move text
 }
 
@@ -1591,11 +1608,120 @@ effect fn seqText(seq: u64) -> String
   return move text
 }
 
-fn centered(ui: &mut Ui<Message>, text: string) -> () {
+/// The top bar's facts: where the app is, its viewport, its nodes and its protocol.
+effect fn factsText(target: string, info: AppInfo) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = run String.copy(target)
+  if info.width != 0.0 {
+    run text.append(" · ")
+    run writeSize(&mut text, info.width)
+    run text.append("×")
+    run writeSize(&mut text, info.height)
+  }
+  if info.nodes != 0 {
+    run text.append(" · ")
+    run writeInt(&mut text, info.nodes)
+    run text.append(" nodes")
+  }
+  if info.protocol != 0 {
+    run text.append(" · protocol ")
+    run writeInt(&mut text, info.protocol)
+  }
+  return move text
+}
+
+/// "<index> of <count>" for the window chip.
+effect fn ofText(index: u64, count: u64) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = String.make()
+  run writeInt(&mut text, index)
+  run text.append(" of ")
+  run writeInt(&mut text, count)
+  return move text
+}
+
+/// A node title (`button "Add" [add]`) in its two parts: the role or kind, and the rest.
+fn titleParts(title: string) -> [string; 2] {
+  return match String.find(title, " ") {
+    Option<usize>.Some { value: at } => [
+      String.slice(title, 0, at),
+      String.slice(title, at, String.byteLength(title) - at),
+    ]
+    Option<usize>.None => [title, ""]
+  }
+}
+
+/// A name in two inks on one line: `first` in `lead`, `rest` after it in `follow`.
+fn twoInks(
+  ui: &mut Ui<Message>,
+  first: string,
+  rest: string,
+  lead: u32,
+  follow: u32,
+  strong: bool,
+) -> () {
   ui.box(
     |ui| {
-      ui.style(&[css.textAlign(TextAlign.Center)])
-      ui.text(text)
+      theme.fill(&mut ui)
+      theme.oneLine(&mut ui)
+      ui.color(rgb(lead))
+      if strong {
+        theme.weight(&mut ui, theme.WEIGHT_MEDIUM)
+      }
+      ui.text(first)
+      if rest != "" {
+        ui.box(
+          |ui| {
+            ui.style(&[css.display(Keyword.Inline)])
+            ui.color(rgb(follow))
+            if strong {
+              theme.weight(&mut ui, theme.WEIGHT_REGULAR)
+            }
+            ui.text(rest)
+          },
+        )
+      }
+    },
+  )
+}
+
+fn ruleColor(rule: string) -> u32 {
+  if rule == "contrast" || rule == "small-target" {
+    return theme.ACCENT
+  }
+  return theme.REMOVED
+}
+
+/// The height of a bar for `value` when `scale` fills the timeline, at least `least` pixels.
+fn barHeight(value: f32, scale: f32, least: f32) -> f32 {
+  let mut height: f32 = 0.0
+  if scale > 0.0 {
+    height = value / scale * BAR_HEIGHT
+  }
+  if height < least {
+    return least
+  }
+  if height > BAR_HEIGHT {
+    return BAR_HEIGHT
+  }
+  return height
+}
+
+/// A swatch and what it stands for, in the timeline's legend.
+fn legend(ui: &mut Ui<Message>, color: Rgba<f32>, text: string) -> () {
+  ui.row(
+    |ui| {
+      ui.style(&[css.alignItems(Align.Center), css.columnGap(px(6.0))])
+      ui.box(
+        |ui| {
+          theme.size(&mut ui, 8.0, 8.0)
+          ui.style(&[css.borderRadius(px(2.0))])
+          ui.background(color)
+        },
+      )
+      theme.ink(&mut ui, theme.MUTED, text)
     },
   )
 }
@@ -1603,8 +1729,8 @@ fn centered(ui: &mut Ui<Message>, text: string) -> () {
 /// One layer of the box model diagram: `name` in the corner, the side widths around `inner`.
 fn layer(
   ui: &mut Ui<Message>,
+  look: Look,
   name: string,
-  hex: u32,
   sides: Sides,
   dashed: bool,
   inner: fn(&mut Ui<Message>) -> (),
@@ -1612,32 +1738,21 @@ fn layer(
   ui.column(
     |ui| {
       ui.testId(name)
-      ui.background(rgb(hex))
-      ui.style(
-        &[
-          css.borderTopWidth(px(1.0)),
-          css.borderRightWidth(px(1.0)),
-          css.borderBottomWidth(px(1.0)),
-          css.borderLeftWidth(px(1.0)),
-          css.borderStyle(
-            if dashed {
-              BorderStyle.Dashed
-            } else {
-              BorderStyle.Solid
-            },
-          ),
-          css.borderColor(rgb(0x808080)),
-          css.alignItems(Align.Stretch),
-        ],
-      )
-      paddings(&mut ui, 2.0, 6.0)
+      ui.background(layerColor(name))
+      theme.outline(&mut ui, theme.LINE_STRONG, 4.0)
+      if dashed {
+        ui.style(&[css.borderStyle(BorderStyle.Dashed)])
+      }
+      ui.style(&[css.alignItems(Align.Stretch)])
+      theme.pad(&mut ui, 2.0, 6.0)
+      theme.mono(&mut ui, look, theme.SIZE_LABEL, theme.LINE_TIGHT)
       ui.row(
         |ui| {
           ui.box(
             |ui| {
-              ui.style(&[css.flexBasis(px(0.0))])
-              ui.grow(1.0)
-              ui.color(rgb(0x404040))
+              theme.fill(&mut ui)
+              theme.sans(&mut ui, look, theme.SIZE_SMALL, theme.LINE_TIGHT)
+              ui.color(rgb(theme.MUTED))
               ui.text(name)
             },
           )
@@ -1647,18 +1762,12 @@ fn layer(
               ui.text(String.view(&text))
             },
           )
-          ui.box(
-            |ui| {
-              ui.style(&[css.flexBasis(px(0.0))])
-              ui.grow(1.0)
-            },
-          )
+          ui.box(|ui| theme.fill(&mut ui))
         },
       )
       ui.row(
         |ui| {
-          ui.style(&[css.alignItems(Align.Center)])
-          ui.gap(6.0)
+          ui.style(&[css.alignItems(Align.Center), css.columnGap(px(6.0))])
           ui.box(
             |ui| {
               let text = ui.alloc(sizeText(sides.left))
@@ -1694,84 +1803,375 @@ fn layer(
   )
 }
 
-/// The height of a bar for `value` when `scale` fills the timeline, at least `least` pixels.
-fn barHeight(value: f32, scale: f32, least: f32) -> f32 {
-  let mut height: f32 = 0.0
-  if scale > 0.0 {
-    height = value / scale * BAR_HEIGHT
-  }
-  if height < least {
-    return least
-  }
-  if height > BAR_HEIGHT {
-    return BAR_HEIGHT
-  }
-  return height
+/// A section of the inspector: rules under it, 10 above and 12 below, its lines 8 apart.
+fn group(ui: &mut Ui<Message>, gap: f32, body: fn(&mut Ui<Message>) -> ()) -> () {
+  ui.column(
+    |ui| {
+      ui.style(
+        &[
+          css.flexShrink(0.0),
+          css.rowGap(px(gap)),
+          css.paddingTop(px(10.0)),
+          css.paddingBottom(px(12.0)),
+          css.paddingLeft(px(12.0)),
+          css.paddingRight(px(12.0)),
+        ],
+      )
+      theme.rule(&mut ui, Property.BorderBottomWidth, theme.LINE)
+      body(&mut ui)
+    },
+  )
+}
+
+/// A line of fields 8 apart.
+fn fieldLine(ui: &mut Ui<Message>, body: fn(&mut Ui<Message>) -> ()) -> () {
+  ui.row(
+    |ui| {
+      ui.style(&[css.columnGap(px(8.0)), css.flexShrink(0.0)])
+      body(&mut ui)
+    },
+  )
+}
+
+/// The head of a list in the middle column: a section label, and at the right its count and
+/// what else `trailing` adds.
+fn listHead(
+  ui: &mut Ui<Message>,
+  look: Look,
+  label: string,
+  count: string,
+  inline: f32,
+  trailing: fn(&mut Ui<Message>) -> (),
+) -> () {
+  ui.row(
+    |ui| {
+      ui.style(
+        &[
+          css.alignItems(Align.Center),
+          css.justifyContent(Align.SpaceBetween),
+          css.height(px(theme.SECTION_HEAD)),
+          css.flexShrink(0.0),
+          css.columnGap(px(10.0)),
+          css.paddingLeft(px(inline)),
+          css.paddingRight(px(inline)),
+        ],
+      )
+      theme.sectionLabel(&mut ui, look, label)
+      ui.row(
+        |ui| {
+          ui.style(&[css.alignItems(Align.Center), css.columnGap(px(10.0))])
+          if count != "" {
+            ui.box(
+              |ui| {
+                theme.mono(&mut ui, look, theme.SIZE_LABEL, theme.LINE_TIGHT)
+                ui.color(rgb(theme.MUTED))
+                ui.text(count)
+              },
+            )
+          }
+          trailing(&mut ui)
+        },
+      )
+    },
+  )
+}
+
+/// Muted text in a padded box: what a panel says when it has nothing to show.
+fn hint(ui: &mut Ui<Message>, look: Look, text: string) -> () {
+  ui.box(
+    |ui| {
+      theme.pad(&mut ui, 10.0, 12.0)
+      theme.sans(&mut ui, look, theme.SIZE_BODY, theme.LINE_BODY)
+      ui.color(rgb(theme.MUTED))
+      ui.text(text)
+    },
+  )
 }
 
 impl Devtools {
-  fn toolbar(self: &Self, ui: &mut Ui<Message>) -> () {
+  fn topBar(self: &Self, ui: &mut Ui<Message>) -> () {
+    let look = self.look
     ui.row(
       |ui| {
         ui.accessRole(Role.Toolbar)
         ui.testId("toolbar")
-        ui.background(rgb(BAR))
-        border(&mut ui, Property.BorderBottomWidth, LINE)
-        ui.style(&[css.alignItems(Align.Center)])
-        paddings(&mut ui, 2.0, 8.0)
-        ui.gap(8.0)
-        ui.box(
-          |ui| {
-            ui.style(&[css.fontWeight(700.0)])
-            ui.text("Silk devtools")
-          },
+        ui.style(
+          &[
+            css.alignItems(Align.Center),
+            css.justifyContent(Align.SpaceBetween),
+            css.columnGap(px(14.0)),
+            css.height(px(theme.TOP_BAR)),
+            css.flexShrink(0.0),
+            css.boxSizing(BoxSizing.BorderBox),
+            css.paddingLeft(px(12.0)),
+            css.paddingRight(px(12.0)),
+            css.overflowX(Overflow.Hidden),
+          ],
         )
-        ui.box(
+        ui.background(rgb(theme.SURFACE))
+        theme.rule(&mut ui, Property.BorderBottomWidth, theme.LINE)
+        ui.row(
           |ui| {
-            ui.testId("status")
-            ui.grow(1.0)
-            ui.style(&[css.whiteSpace(WhiteSpace.NoWrap)])
-            if self.error.ownedByteLength() != 0 {
-              ui.color(rgb(ERROR))
-              ui.text(String.view(&self.error))
-            } else {
-              ui.color(rgb(MUTED))
-              ui.text(String.view(&self.target))
-              ui.text("  ·  ")
-              ui.text(String.view(&self.status))
+            ui.style(&[css.alignItems(Align.Center), css.columnGap(px(14.0)), css.flexShrink(0.0)])
+            ui.row(
+              |ui| {
+                ui.style(&[css.alignItems(Align.Center), css.columnGap(px(8.0))])
+                theme.dot(&mut ui, theme.ACCENT, 8.0, 2.0)
+                ui.box(
+                  |ui| {
+                    theme.sans(&mut ui, look, theme.SIZE_BODY, theme.LINE_BODY)
+                    theme.weight(&mut ui, theme.WEIGHT_STRONG)
+                    ui.style(&[css.whiteSpace(WhiteSpace.Pre)])
+                    ui.color(rgb(theme.TEXT))
+                    ui.text("silk-ui devtools")
+                  },
+                )
+              },
+            )
+            theme.separator(&mut ui, 16.0, 0.0)
+            self.pickButton(&mut ui)
+            if self.info.roots != 0 {
+              self.windowChip(&mut ui)
             }
           },
         )
-        barButton(&mut ui, "Pick", self.picking, || Message.TogglePick)
-        barButton(&mut ui, "Refresh", false, || Message.Refresh)
-        barButton(&mut ui, "Live", self.live, || Message.ToggleLive)
+        ui.row(
+          |ui| {
+            ui.style(
+              &[css.alignItems(Align.Center), css.columnGap(px(14.0)), css.minWidth(px(0.0))],
+            )
+            ui.box(
+              |ui| {
+                ui.testId("status")
+                theme.mono(&mut ui, look, theme.SIZE_LABEL, theme.LINE_BODY)
+                theme.oneLine(&mut ui)
+                ui.style(&[css.flexShrink(1.0), css.minWidth(px(0.0))])
+                if self.error.ownedByteLength() != 0 {
+                  ui.color(rgb(theme.REMOVED))
+                  ui.text(String.view(&self.error))
+                } else {
+                  ui.color(rgb(theme.MUTED))
+                  let facts = ui.alloc(factsText(String.view(&self.target), self.info))
+                  ui.label(String.view(&self.status))
+                  ui.text(String.view(&facts))
+                }
+              },
+            )
+            theme.ghostButton(&mut ui, look, "refresh", "Refresh", || Message.Refresh)
+            ui.pressable(
+              || Message.ToggleLive,
+              |ui| {
+                ui.label("Live")
+                ui.style(
+                  &[
+                    css.display(Keyword.Flex),
+                    css.alignItems(Align.Center),
+                    css.columnGap(px(6.0)),
+                    css.flexShrink(0.0),
+                    css.borderRadius(px(4.0)),
+                  ],
+                )
+                theme.pad(&mut ui, 2.0, 4.0)
+                ui.hover(&[css.backgroundColor(rgb(theme.LINE))])
+                ui.focusVisible(&[css.backgroundColor(rgb(theme.LINE))])
+                theme.dot(
+                  &mut ui,
+                  if self.live {
+                    theme.ACCENT
+                  } else {
+                    theme.FAINT
+                  },
+                  6.0,
+                  3.0,
+                )
+                ui.box(
+                  |ui| {
+                    theme.sans(&mut ui, look, theme.SIZE_BODY, theme.LINE_BODY)
+                    theme.weight(&mut ui, theme.WEIGHT_MEDIUM)
+                    ui.color(
+                      rgb(
+                        if self.live {
+                          theme.TEXT
+                        } else {
+                          theme.MUTED
+                        },
+                      ),
+                    )
+                    ui.text("Live")
+                  },
+                )
+              },
+            )
+            if self.info.frame != 0 {
+              ui.box(
+                |ui| {
+                  theme.mono(&mut ui, look, theme.SIZE_LABEL, theme.LINE_BODY)
+                  ui.style(&[css.flexShrink(0.0), css.whiteSpace(WhiteSpace.Pre)])
+                  ui.color(rgb(theme.MUTED))
+                  let frame = ui.alloc(seqText(self.info.frame))
+                  ui.text("frame ")
+                  ui.text(String.view(&frame))
+                },
+              )
+            }
+          },
+        )
       },
     )
   }
 
-  fn elements(self: &Self, ui: &mut Ui<Message>) -> () {
+  /// Pick: amber on a wash; lit while the app waits for the pick.
+  fn pickButton(self: &Self, ui: &mut Ui<Message>) -> () {
+    let look = self.look
+    let on = self.picking
+    ui.pressable(
+      || Message.TogglePick,
+      |ui| {
+        ui.label("Pick")
+        ui.style(
+          &[
+            css.display(Keyword.Flex),
+            css.alignItems(Align.Center),
+            css.columnGap(px(6.0)),
+            css.height(px(24.0)),
+            css.flexShrink(0.0),
+            css.borderRadius(px(5.0)),
+            css.paddingLeft(px(8.0)),
+            css.paddingRight(px(8.0)),
+          ],
+        )
+        if on {
+          ui.background(rgb(theme.ACCENT))
+        } else {
+          ui.background(rgba(theme.ACCENT, theme.ACCENT_WASH))
+          ui.hover(&[css.backgroundColor(rgba(theme.ACCENT, 0x33))])
+        }
+        ui.focusVisible(&[css.backgroundColor(rgba(theme.ACCENT, 0x33))])
+        theme.icon(
+          &mut ui,
+          Icon.Pointer,
+          if on {
+            theme.INK
+          } else {
+            theme.ACCENT
+          },
+        )
+        ui.box(
+          |ui| {
+            theme.sans(&mut ui, look, theme.SIZE_BODY, theme.LINE_BODY)
+            theme.weight(&mut ui, theme.WEIGHT_MEDIUM)
+            ui.color(
+              rgb(
+                if on {
+                  theme.INK
+                } else {
+                  theme.ACCENT
+                },
+              ),
+            )
+            ui.text("Pick")
+          },
+        )
+      },
+    )
+  }
+
+  /// Which of the app's open roots the tree shows, and how many there are.
+  fn windowChip(self: &Self, ui: &mut Ui<Message>) -> () {
+    let look = self.look
+    ui.row(
+      |ui| {
+        ui.testId("window")
+        ui.style(
+          &[
+            css.alignItems(Align.Center),
+            css.columnGap(px(6.0)),
+            css.height(px(24.0)),
+            css.flexShrink(0.0),
+            css.boxSizing(BoxSizing.BorderBox),
+            css.paddingLeft(px(8.0)),
+            css.paddingRight(px(8.0)),
+            css.whiteSpace(WhiteSpace.Pre),
+          ],
+        )
+        theme.outline(&mut ui, theme.LINE, 5.0)
+        ui.box(
+          |ui| {
+            theme.sans(&mut ui, look, theme.SIZE_BODY, theme.LINE_BODY)
+            ui.color(rgb(theme.MUTED))
+            ui.text("window")
+          },
+        )
+        ui.box(
+          |ui| {
+            theme.mono(&mut ui, look, theme.SIZE_BODY, theme.LINE_BODY)
+            ui.color(rgb(theme.TEXT))
+            let root = ui.alloc(seqText(self.info.root))
+            ui.text("#")
+            ui.text(String.view(&root))
+          },
+        )
+        ui.box(
+          |ui| {
+            theme.mono(&mut ui, look, theme.SIZE_BODY, theme.LINE_BODY)
+            ui.color(rgb(theme.MUTED))
+            let of = ui.alloc(ofText(1, self.info.roots))
+            ui.text(String.view(&of))
+          },
+        )
+      },
+    )
+  }
+
+  /// The element tree: the filter, then a row per node.
+  fn elements(self: &Self, ui: &mut Ui<Message>, width: f32) -> () {
+    let look = self.look
     ui.column(
       |ui| {
         ui.style(
           &[
-            css.flexBasis(percent(45.0)),
+            css.width(px(width)),
             css.flexShrink(0.0),
             css.minHeight(px(0.0)),
-            css.minWidth(px(0.0)),
+            css.boxSizing(BoxSizing.BorderBox),
           ],
         )
-        border(&mut ui, Property.BorderRightWidth, LINE)
+        ui.background(rgb(theme.INK))
+        theme.rule(&mut ui, Property.BorderRightWidth, theme.LINE)
         ui.row(
           |ui| {
-            paddings(&mut ui, 4.0, 6.0)
-            border(&mut ui, Property.BorderBottomWidth, BAR)
-            field(
-              &mut ui,
-              "search",
-              "Filter elements",
-              "Filter by role, name or test id",
+            ui.style(
+              &[
+                css.alignItems(Align.Center),
+                css.columnGap(px(8.0)),
+                css.height(px(theme.TAB_BAR)),
+                css.flexShrink(0.0),
+                css.boxSizing(BoxSizing.BorderBox),
+                css.paddingLeft(px(12.0)),
+                css.paddingRight(px(12.0)),
+              ],
+            )
+            theme.rule(&mut ui, Property.BorderBottomWidth, theme.LINE)
+            theme.icon(&mut ui, Icon.Search, theme.MUTED)
+            ui.input(
               String.view(&self.search),
-              |value| Message.Search { value: move value },
+              |ui| {
+                ui.testId("search")
+                ui.label("Filter elements")
+                ui.placeholder("Filter elements")
+                bareInput(&mut ui, look)
+                theme.sans(&mut ui, look, theme.SIZE_BODY, theme.LINE_BODY)
+                ui.onInput(|value| Message.Search { value: move value })
+              },
+            )
+            ui.box(
+              |ui| {
+                theme.mono(&mut ui, look, theme.SIZE_LABEL, theme.LINE_BODY)
+                ui.style(&[css.flexShrink(0.0)])
+                ui.color(rgb(theme.MUTED))
+                let count = ui.alloc(seqText(usize.toU64(self.shownRows())))
+                ui.text(String.view(&count))
+              },
             )
           },
         )
@@ -1780,16 +2180,11 @@ impl Devtools {
             ui.testId("elements")
             ui.accessRole(Role.List)
             ui.label("Elements")
-            scrolling(&mut ui)
-            ui.style(&[css.whiteSpace(WhiteSpace.NoWrap)])
-            paddings(&mut ui, 4.0, 0.0)
+            theme.scrolling(&mut ui)
+            theme.mono(&mut ui, look, theme.SIZE_BODY, theme.LINE_BODY)
+            ui.style(&[css.paddingTop(px(6.0)), css.paddingBottom(px(6.0))])
             if self.rows.length() == 0 {
-              ui.box(
-                |ui| {
-                  paddings(&mut ui, 4.0, 8.0)
-                  muted(&mut ui, "No elements yet.")
-                },
-              )
+              hint(&mut ui, look, "No elements yet.")
             }
             ui.each(
               self.rows.asSlice(),
@@ -1806,8 +2201,24 @@ impl Devtools {
     )
   }
 
+  /// How many rows show.
+  fn shownRows(self: &Self) -> usize {
+    let rows = self.rows.asSlice()
+    let mut count: usize = 0
+    let mut i: usize = 0
+    while i < rows.length {
+      if rows[i].visible {
+        count = count + 1
+      }
+      i = i + 1
+    }
+    return count
+  }
+
   fn elementRow(self: &Self, ui: &mut Ui<Message>, row: &Row) -> () {
+    let look = self.look
     let selected = row.id == self.selected
+    let hovered = row.id == self.hovered && !selected
     let folded = self.isCollapsed(row.id)
     ui.row(
       |ui| {
@@ -1827,410 +2238,802 @@ impl Devtools {
           EventKind.PointerLeave,
           |event| Reply<Message>.Emit { message: Message.Unhover { id: row.id } },
         )
-        ui.style(
-          &[
-            css.alignItems(Align.Center),
-            css.columnGap(px(6.0)),
-            css.paddingTop(px(1.0)),
-            css.paddingBottom(px(1.0)),
-            css.paddingLeft(px(4.0 + u32.toF32(row.depth) * 12.0)),
-            css.paddingRight(px(8.0)),
-          ],
-        )
+        theme.rowLook(&mut ui, theme.TREE_ROW, 12.0 + u32.toF32(row.depth) * 14.0, 12.0, selected)
+        if hovered {
+          ui.background(rgba(theme.HOVER, theme.HOVER_WASH))
+        }
+        ui.style(&[css.columnGap(px(6.0))])
         if selected {
-          ui.background(rgb(SELECTED))
           ui.reveal()
-        } else {
-          ui.hover(&[css.backgroundColor(rgb(HOVER))])
         }
         ui.box(
           |ui| {
-            ui.style(&[css.width(px(10.0)), css.flexShrink(0.0)])
-            ui.color(rgb(MUTED))
+            theme.size(&mut ui, 10.0, 10.0)
             if row.children > 0 {
+              ui.label(
+                if folded {
+                  "Unfold"
+                } else {
+                  "Fold"
+                },
+              )
               ui.on(
                 EventKind.Click,
                 |event| Reply<Message>.EmitAndStop { message: Message.Collapse { id: row.id } },
               )
-              ui.text(
+              theme.icon(
+                &mut ui,
                 if folded {
-                  "+"
+                  Icon.Folded
                 } else {
-                  "-"
+                  Icon.Open
+                },
+                if selected {
+                  theme.ACCENT_DIM
+                } else {
+                  theme.MUTED
                 },
               )
             }
           },
         )
-        ui.box(
-          |ui| {
-            ui.color(rgb(TAG))
-            ui.text(String.view(&row.label))
+        twoInks(
+          &mut ui,
+          String.view(&row.kind),
+          String.view(&row.name),
+          if selected {
+            theme.ACCENT
+          } else {
+            theme.TEXT
           },
+          if selected {
+            theme.ACCENT_DIM
+          } else {
+            theme.MUTED
+          },
+          selected,
         )
         ui.box(
           |ui| {
-            ui.color(rgb(MUTED))
-            ui.text(String.view(&row.detail))
+            theme.sans(&mut ui, look, theme.SIZE_LABEL, theme.LINE_TIGHT)
+            ui.style(
+              &[
+                css.width(px(72.0)),
+                css.flexShrink(0.0),
+                css.textAlign(TextAlign.Right),
+                css.whiteSpace(WhiteSpace.Pre),
+              ],
+            )
+            ui.color(
+              rgb(
+                if selected {
+                  theme.ACCENT_DIM
+                } else if hovered {
+                  theme.HOVER
+                } else {
+                  theme.FAINT
+                },
+              ),
+            )
+            ui.text(String.view(&row.size))
           },
         )
       },
     )
   }
 
-  fn side(self: &Self, ui: &mut Ui<Message>) -> () {
-    ui.column(
+  /// The middle column's tabs: the panels the app renders, the devtools' own, then the
+  /// extensions' data panels after a rule, each with its extension's id.
+  fn tabs(self: &Self, ui: &mut Ui<Message>, stacked: bool) -> () {
+    let look = self.look
+    let onPanel = !(stacked && self.inspector)
+    ui.row(
       |ui| {
-        ui.grow(1.0)
-        ui.style(&[css.flexBasis(px(0.0)), css.minWidth(px(0.0)), css.minHeight(px(0.0))])
-        ui.row(
-          |ui| {
-            ui.accessRole(Role.TabList)
-            ui.background(rgb(BAR))
-            border(&mut ui, Property.BorderBottomWidth, LINE)
-            tabButton(
-              &mut ui,
-              "Styles",
-              self.panel == Panel.Styles,
-              || Message.Show { panel: Panel.Styles },
-            )
-            ui.row(
-              |ui| {
-                ui.testId("changes-tab")
-                ui.style(&[css.alignItems(Align.Center)])
-                tabButton(
-                  &mut ui,
-                  "Changes",
-                  self.panel == Panel.Changes,
-                  || Message.Show { panel: Panel.Changes },
-                )
-                if self.openChanges != 0 {
-                  ui.box(
-                    |ui| {
-                      ui.testId("changes-count")
-                      ui.background(rgb(ACCENT))
-                      ui.color(rgb(0xFFFFFF))
-                      ui.style(
-                        &[css.marginRight(px(6.0)), css.fontSize(px(10.0)), css.fontWeight(700.0)],
-                      )
-                      paddings(&mut ui, 0.0, 5.0)
-                      let count = ui.alloc(seqText(usize.toU64(self.openChanges)))
-                      ui.text(String.view(&count))
-                    },
-                  )
-                }
-              },
-            )
-            tabButton(
-              &mut ui,
-              "Box model",
-              self.panel == Panel.BoxModel,
-              || Message.Show { panel: Panel.BoxModel },
-            )
-            tabButton(
-              &mut ui,
-              "Events",
-              self.panel == Panel.Events,
-              || Message.Show { panel: Panel.Events },
-            )
-            tabButton(
-              &mut ui,
-              "Frames",
-              self.panel == Panel.Frames,
-              || Message.Show { panel: Panel.Frames },
-            )
-            tabButton(
-              &mut ui,
-              "Audit",
-              self.panel == Panel.Audit,
-              || Message.Show { panel: Panel.Audit },
-            )
-            tabButton(
-              &mut ui,
-              "Stats",
-              self.panel == Panel.Stats,
-              || Message.Show { panel: Panel.Stats },
-            )
-
-            // The tabs of the app's extensions, as `hello` lists them.
-            ui.enumerate(
-              self.panels.asSlice(),
-              |panel| 0,
-              |ui, index, panel| {
-                ui.key(usize.toU64(index) + 1)
-                tabButton(
-                  &mut ui,
-                  String.view(&panel.title),
-                  self.panel == Panel.Extension && self.shown == index,
-                  || Message.ShowPanel { index: index },
-                )
-              },
-            )
-          },
+        ui.accessRole(Role.TabList)
+        ui.style(
+          &[
+            css.height(px(theme.TAB_BAR)),
+            css.flexShrink(0.0),
+            css.boxSizing(BoxSizing.BorderBox),
+            css.paddingLeft(px(8.0)),
+            css.paddingRight(px(8.0)),
+            css.overflowX(Overflow.Auto),
+            css.overflowY(Overflow.Hidden),
+            css.scrollbarWidth(ScrollbarWidth.None),
+          ],
         )
-        ui.column(
-          |ui| {
-            ui.accessRole(Role.TabPanel)
-            ui.testId("panel")
-            scrolling(&mut ui)
-            paddings(&mut ui, 6.0, 10.0)
-            match self.panel {
-              Panel.Styles => self.styles(&mut ui)
-              Panel.Changes => self.changesPanel(&mut ui)
-              Panel.BoxModel => self.boxModel(&mut ui)
-              Panel.Events => self.eventLog(&mut ui)
-              Panel.Frames => self.framesPanel(&mut ui)
-              Panel.Audit => self.auditPanel(&mut ui)
-              Panel.Stats => self.statsPanel(&mut ui)
-              Panel.Extension => self.extensionPanel(&mut ui)
+        theme.rule(&mut ui, Property.BorderBottomWidth, theme.LINE)
+        if stacked {
+          ui.key(9001)
+          theme.tab(
+            &mut ui,
+            look,
+            "Inspector",
+            "",
+            "",
+            self.inspector,
+            || Message.ShowInspector { shown: true },
+          )
+        }
+        ui.enumerate(
+          self.panels.asSlice(),
+          |panel| 0,
+          |ui, index, panel| {
+            if panel.view.ownedByteLength() != 0 {
+              ui.key(usize.toU64(index) + 1)
+              theme.tab(
+                &mut ui,
+                look,
+                String.view(&panel.title),
+                "",
+                "",
+                onPanel && self.panel == Panel.Extension && self.shown == index,
+                || Message.ShowPanel { index: index },
+              )
             }
           },
         )
+        ui.key(9002)
+        theme.tab(
+          &mut ui,
+          look,
+          "Events",
+          "",
+          "",
+          onPanel && self.panel == Panel.Events,
+          || Message.Show { panel: Panel.Events },
+        )
+        ui.key(9003)
+        theme.tab(
+          &mut ui,
+          look,
+          "Frames",
+          "",
+          "",
+          onPanel && self.panel == Panel.Frames,
+          || Message.Show { panel: Panel.Frames },
+        )
+        let issues = if self.issues.length() != 0 {
+          ui.alloc(seqText(usize.toU64(self.issues.length())))
+        } else {
+          String.make()
+        }
+        ui.key(9004)
+        theme.tab(
+          &mut ui,
+          look,
+          "Audit",
+          "",
+          String.view(&issues),
+          onPanel && self.panel == Panel.Audit,
+          || Message.Show { panel: Panel.Audit },
+        )
+        if self.hasDataPanels() {
+          ui.key(9005)
+          theme.separator(&mut ui, 14.0, 4.0)
+        }
+        ui.enumerate(
+          self.panels.asSlice(),
+          |panel| 0,
+          |ui, index, panel| {
+            if panel.view.ownedByteLength() == 0 {
+              ui.key(usize.toU64(index) + 1)
+              theme.tab(
+                &mut ui,
+                look,
+                String.view(&panel.title),
+                String.view(&panel.extension),
+                "",
+                onPanel && self.panel == Panel.Extension && self.shown == index,
+                || Message.ShowPanel { index: index },
+              )
+            }
+          },
+        )
+      },
+    )
+  }
+
+  fn hasDataPanels(self: &Self) -> bool {
+    let panels = self.panels.asSlice()
+    let mut i: usize = 0
+    while i < panels.length {
+      if panels[i].view.ownedByteLength() == 0 {
+        return true
+      }
+      i = i + 1
+    }
+    return false
+  }
+
+  /// The middle column: its tabs and the panel that shows (or, stacked, the inspector).
+  fn centre(self: &Self, ui: &mut Ui<Message>, stacked: bool) -> () {
+    ui.column(
+      |ui| {
+        theme.fill(&mut ui)
+        ui.style(&[css.minHeight(px(0.0))])
+        ui.background(rgb(theme.INK))
+        self.tabs(&mut ui, stacked)
+        if stacked && self.inspector {
+          ui.key(1)
+          self.inspectorBody(&mut ui)
+        } else {
+          ui.key(2)
+          self.panelBody(&mut ui)
+        }
+      },
+    )
+  }
+
+  /// The panel the middle column shows.
+  fn panelBody(self: &Self, ui: &mut Ui<Message>) -> () {
+    ui.column(
+      |ui| {
+        ui.accessRole(Role.TabPanel)
+        ui.testId("panel")
+        if self.panel == Panel.Extension && self.showsView() {
+          // The app's view fills the column and scrolls its own lists.
+          theme.fill(&mut ui)
+          ui.style(&[css.minHeight(px(0.0)), css.overflowY(Overflow.Hidden)])
+        } else {
+          theme.scrolling(&mut ui)
+        }
+        match self.panel {
+          Panel.Events => self.eventLog(&mut ui)
+          Panel.Frames => self.framesPanel(&mut ui)
+          Panel.Audit => self.auditPanel(&mut ui)
+          Panel.Extension => self.extensionPanel(&mut ui)
+        }
+      },
+    )
+  }
+
+  fn showsView(self: &Self) -> bool {
+    return match self.shownPanel() {
+      Option<&PanelInfo>.Some { value: panel } => panel.view.ownedByteLength() != 0
+      Option<&PanelInfo>.None => false
+    }
+  }
+
+  /// The inspector column.
+  fn inspectorColumn(self: &Self, ui: &mut Ui<Message>, width: f32) -> () {
+    ui.column(
+      |ui| {
+        ui.style(
+          &[
+            css.width(px(width)),
+            css.flexShrink(0.0),
+            css.minHeight(px(0.0)),
+            css.boxSizing(BoxSizing.BorderBox),
+          ],
+        )
+        ui.background(rgb(theme.SURFACE))
+        theme.rule(&mut ui, Property.BorderLeftWidth, theme.LINE)
+        self.inspectorBody(&mut ui)
+      },
+    )
+  }
+
+  /// The inspector: the selected node, its segments, and the one that shows.
+  fn inspectorBody(self: &Self, ui: &mut Ui<Message>) -> () {
+    let look = self.look
+    ui.column(
+      |ui| {
+        ui.testId("inspector")
+        ui.style(
+          &[
+            css.flexShrink(0.0),
+            css.rowGap(px(8.0)),
+            css.paddingTop(px(10.0)),
+            css.paddingBottom(px(10.0)),
+            css.paddingLeft(px(12.0)),
+            css.paddingRight(px(12.0)),
+          ],
+        )
+        theme.rule(&mut ui, Property.BorderBottomWidth, theme.LINE)
+        ui.row(
+          |ui| {
+            ui.style(
+              &[
+                css.alignItems(Align.Center),
+                css.justifyContent(Align.SpaceBetween),
+                css.columnGap(px(8.0)),
+              ],
+            )
+            ui.box(
+              |ui| {
+                ui.testId("detail-title")
+                theme.mono(&mut ui, look, theme.SIZE_TITLE, theme.LINE_BODY)
+                theme.fill(&mut ui)
+                ui.style(&[css.display(Keyword.Flex)])
+                if self.detail.id == NO_PARENT {
+                  ui.box(
+                    |ui| {
+                      theme.sans(&mut ui, look, theme.SIZE_BODY, theme.LINE_BODY)
+                      ui.color(rgb(theme.MUTED))
+                      ui.text("No selection")
+                    },
+                  )
+                } else {
+                  let parts = titleParts(String.view(&self.detail.title))
+                  twoInks(&mut ui, parts[0], parts[1], theme.TEXT, theme.MUTED, true)
+                }
+              },
+            )
+            if self.detail.hasBox {
+              let size = ui.alloc(borderBoxText(&self.detail.box))
+              ui.box(
+                |ui| {
+                  theme.mono(&mut ui, look, theme.SIZE_LABEL, theme.LINE_BODY)
+                  ui.style(&[css.flexShrink(0.0), css.whiteSpace(WhiteSpace.Pre)])
+                  ui.color(rgb(theme.MUTED))
+                  ui.text(String.view(&size))
+                },
+              )
+            }
+          },
+        )
+        theme.segmented(
+          &mut ui,
+          true,
+          |ui| {
+            ui.accessRole(Role.TabList)
+            theme.segment(
+              &mut ui,
+              look,
+              true,
+              "Design",
+              "",
+              self.segment == Segment.Design,
+              || Message.ShowSegment { segment: Segment.Design },
+            )
+            theme.segment(
+              &mut ui,
+              look,
+              true,
+              "Declarations",
+              "",
+              self.segment == Segment.Declarations,
+              || Message.ShowSegment { segment: Segment.Declarations },
+            )
+            let count = if self.openChanges != 0 {
+              ui.alloc(seqText(usize.toU64(self.openChanges)))
+            } else {
+              String.make()
+            }
+            ui.row(
+              |ui| {
+                ui.testId("changes-tab")
+                theme.fill(&mut ui)
+                ui.style(&[css.display(Keyword.Flex)])
+                theme.segment(
+                  &mut ui,
+                  look,
+                  true,
+                  "Edits",
+                  String.view(&count),
+                  self.segment == Segment.Edits,
+                  || Message.ShowSegment { segment: Segment.Edits },
+                )
+              },
+            )
+          },
+        )
+      },
+    )
+    ui.column(
+      |ui| {
+        ui.accessRole(Role.TabPanel)
+        ui.testId("segment")
+        theme.scrolling(&mut ui)
+        match self.segment {
+          Segment.Design => self.designSegment(&mut ui)
+          Segment.Declarations => self.declarationsSegment(&mut ui)
+          Segment.Edits => self.editsSegment(&mut ui)
+        }
       },
     )
   }
 
   fn nothingSelected(self: &Self, ui: &mut Ui<Message>) -> bool {
     if self.detail.id == NO_PARENT {
-      muted(&mut ui, "Select an element on the left, or press the down arrow.")
+      hint(&mut ui, self.look, "Select an element on the left, or press the down arrow.")
       return true
     }
     return false
   }
 
-  fn styles(self: &Self, ui: &mut Ui<Message>) -> () {
+  /// One Design field: its label (or swatch), its value to type over, the edited mark.
+  fn designField(self: &Self, ui: &mut Ui<Message>, field: u32, labelWidth: f32, width: f32) -> () {
+    let look = self.look
+    let edited = fieldEdited(&self.detail, field)
+    ui.row(
+      |ui| {
+        theme.fieldLook(&mut ui, edited)
+        if width == 0.0 {
+          theme.fill(&mut ui)
+        } else {
+          ui.style(&[css.width(px(width)), css.flexShrink(0.0)])
+        }
+        ui.onEnter(|| Message.ApplyField { field: field })
+        if field == FIELD_FILL || field == FIELD_BORDER {
+          let value = if field == FIELD_FILL {
+            computed(&self.detail, "background-color")
+          } else {
+            computed(&self.detail, "border-color")
+          }
+          let mut shown = Option<Rgba<f32>>.None
+          if field == FIELD_FILL || computed(&self.detail, "border-style") != "none" {
+            shown = swatchOf(value)
+          }
+          match shown {
+            Option<Rgba<f32>>.Some { value: color } => theme.swatch(&mut ui, color, false)
+            Option<Rgba<f32>>.None => theme.swatch(&mut ui, theme.clear(), true)
+          }
+        } else if fieldLabel(field) != "" {
+          ui.box(
+            |ui| {
+              theme.sans(&mut ui, look, theme.SIZE_BODY, theme.LINE_BODY)
+              ui.style(
+                &[css.width(px(labelWidth)), css.flexShrink(0.0), css.whiteSpace(WhiteSpace.Pre)],
+              )
+              ui.color(rgb(theme.MUTED))
+              ui.text(fieldLabel(field))
+            },
+          )
+        }
+        let text = ui.alloc(self.fieldShown(field))
+        ui.input(
+          String.view(&text),
+          |ui| {
+            ui.testId(fieldTestId(field))
+            ui.label(fieldName(field))
+            bareInput(&mut ui, look)
+            let quiet = String.view(&text) == "none" || String.view(&text) == "-"
+            if quiet && self.field != field {
+              ui.style(&[css.color(rgb(theme.MUTED))])
+            }
+            if field == FIELD_FONT {
+              ui.readOnly(true)
+            }
+            ui.onInput(|value| Message.FieldInput { field: field, value: move value })
+            ui.onKeyDown(|event| fieldKey(event, field))
+          },
+        )
+        if edited {
+          theme.editedDot(&mut ui)
+        }
+      },
+    )
+  }
+
+  /// Design: Layout, Fill · Border and Text fields, the other declarations, and this node's
+  /// edits.
+  fn designSegment(self: &Self, ui: &mut Ui<Message>) -> () {
     if self.nothingSelected(&mut ui) {
       return ()
     }
-    ui.box(
+    let look = self.look
+    group(
+      &mut ui,
+      8.0,
       |ui| {
-        ui.testId("detail-title")
-        ui.style(&[css.fontWeight(700.0)])
-        ui.color(rgb(TAG))
-        ui.text(String.view(&self.detail.title))
+        ui.testId("design")
+        theme.sectionLabel(&mut ui, look, "Layout")
+        fieldLine(
+          &mut ui,
+          |ui| {
+            self.designField(&mut ui, FIELD_WIDTH, 12.0, 0.0)
+            self.designField(&mut ui, FIELD_HEIGHT, 12.0, 0.0)
+          },
+        )
+        fieldLine(
+          &mut ui,
+          |ui| {
+            self.designField(&mut ui, FIELD_DIRECTION, 12.0, 0.0)
+            self.designField(&mut ui, FIELD_GAP, 24.0, 0.0)
+          },
+        )
+        fieldLine(
+          &mut ui,
+          |ui| {
+            self.designField(&mut ui, FIELD_PADDING, 24.0, 0.0)
+            self.designField(&mut ui, FIELD_ALIGN, 36.0, 0.0)
+          },
+        )
       },
     )
-    ui.row(
+    group(
+      &mut ui,
+      8.0,
       |ui| {
-        ui.style(&[css.alignItems(Align.Center), css.marginTop(px(4.0)), css.marginBottom(px(4.0))])
-        ui.gap(4.0)
-        ui.onEnter(|| Message.ApplyStyle)
-        draftField(&mut ui, String.view(&self.draft))
-        barButton(&mut ui, "Apply", false, || Message.ApplyStyle)
-        barButton(&mut ui, "Reset", false, || Message.ResetStyles)
+        theme.sectionLabel(&mut ui, look, "Fill · Border")
+        self.designField(&mut ui, FIELD_FILL, 0.0, 0.0)
+        fieldLine(
+          &mut ui,
+          |ui| {
+            self.designField(&mut ui, FIELD_BORDER, 0.0, 0.0)
+            self.designField(&mut ui, FIELD_RADIUS, 40.0, 0.0)
+          },
+        )
       },
     )
-    if self.suggestions.length() != 0 {
-      ui.row(
+    group(
+      &mut ui,
+      8.0,
+      |ui| {
+        theme.sectionLabel(&mut ui, look, "Text")
+        fieldLine(
+          &mut ui,
+          |ui| {
+            self.designField(&mut ui, FIELD_FONT, 0.0, 0.0)
+            self.designField(&mut ui, FIELD_TEXT, 0.0, 72.0)
+            self.designField(&mut ui, FIELD_WEIGHT, 0.0, 56.0)
+          },
+        )
+      },
+    )
+    group(
+      &mut ui,
+      2.0,
+      |ui| {
+        ui.box(
+          |ui| {
+            ui.style(&[css.paddingBottom(px(6.0))])
+            theme.sectionLabel(&mut ui, look, "Other declarations")
+          },
+        )
+        self.otherDeclarations(&mut ui)
+        ui.box(
+          |ui| {
+            ui.style(&[css.paddingTop(px(4.0))])
+            self.draftEditor(&mut ui)
+          },
+        )
+      },
+    )
+    self.nodeEdits(&mut ui)
+  }
+
+  /// The declarations the app sets on the node's base state that no field shows.
+  fn otherDeclarations(self: &Self, ui: &mut Ui<Message>) -> () {
+    let look = self.look
+    let lines = self.detail.lines.asSlice()
+    let marks = self.detail.marks.asSlice()
+    let mut base = false
+    let mut shown: usize = 0
+    let mut i: usize = 0
+    while i < lines.length {
+      let line = String.view(&lines[i])
+      if String.startsWith(line, "style ") {
+        base = line == "style base {" || line == "style base edited {"
+      } else if line == "}" {
+        base = false
+      } else if base {
+        let name = nameOf(line)
+        let mark = if i < marks.length {
+          marks[i]
+        } else {
+          0
+        }
+        if name != "" && !covered(name) && mark != MARK_OVERRIDDEN {
+          ui.key(usize.toU64(i) + 1)
+          ui.row(
+            |ui| {
+              ui.style(&[css.alignItems(Align.Center), css.height(px(22.0)), css.flexShrink(0.0)])
+              theme.mono(&mut ui, look, theme.SIZE_BODY, theme.LINE_BODY)
+              theme.oneLine(&mut ui)
+              let edited = mark == MARK_EDITED
+              theme.fixed(
+                &mut ui,
+                if edited {
+                  theme.ACCENT_DIM
+                } else {
+                  theme.MUTED
+                },
+                name,
+              )
+              theme.fixed(&mut ui, theme.MUTED, ": ")
+              theme.ink(
+                &mut ui,
+                if edited {
+                  theme.ACCENT
+                } else {
+                  theme.TEXT
+                },
+                valueOf(line),
+              )
+            },
+          )
+          shown = shown + 1
+        }
+      }
+      i = i + 1
+    }
+    if shown == 0 {
+      ui.box(
         |ui| {
-          ui.testId("suggestions")
-          ui.accessRole(Role.List)
-          ui.label("Completions")
-          ui.style(&[css.marginBottom(px(4.0)), css.flexWrap(FlexWrap.Wrap)])
-          ui.gap(4.0)
-          ui.enumerate(
-            self.suggestions.asSlice(),
-            |suggestion| 0,
-            |ui, index, suggestion| {
-              ui.key(usize.toU64(index))
-              ui.pressable(
-                || Message.Complete { index: index },
-                |ui| {
-                  ui.accessRole(Role.Option)
-                  paddings(&mut ui, 1.0, 6.0)
-                  ui.background(rgb(BAR))
-                  ui.color(rgb(ATTRIBUTE))
-                  ui.hover(&[css.backgroundColor(rgb(SELECTED))])
-                  ui.text(String.view(&suggestion))
+          theme.sans(&mut ui, look, theme.SIZE_BODY, theme.LINE_BODY)
+          ui.style(&[css.height(px(22.0))])
+          ui.color(rgb(theme.FAINT))
+          ui.text("None beyond the fields above.")
+        },
+      )
+    }
+  }
+
+  /// The field declarations are typed into, its completions in a popup under it, and why the
+  /// app refused the last ones.
+  fn draftEditor(self: &Self, ui: &mut Ui<Message>) -> () {
+    let look = self.look
+    let completions = self.suggestions.length() != 0
+    ui.column(
+      |ui| {
+        ui.style(&[css.rowGap(px(4.0)), css.flexShrink(0.0)])
+        ui.row(
+          |ui| {
+            ui.style(&[css.alignItems(Align.Center), css.columnGap(px(6.0))])
+            ui.onEnter(|| Message.ApplyStyle)
+            ui.input(
+              String.view(&self.draft),
+              |ui| {
+                ui.testId("style-draft")
+                ui.label("Declarations to set")
+                ui.placeholder("property: value  (arrows step numbers)")
+                bareInput(&mut ui, look)
+                ui.style(
+                  &[
+                    css.height(px(20.0)),
+                    css.boxSizing(BoxSizing.BorderBox),
+                    css.paddingTop(px(1.0)),
+                    css.paddingBottom(px(1.0)),
+                    css.paddingLeft(px(4.0)),
+                    css.paddingRight(px(4.0)),
+                    css.placeholderColor(rgb(theme.FAINT)),
+                    css.backgroundColor(rgb(theme.INK)),
+                  ],
+                )
+                theme.outline(
+                  &mut ui,
+                  if self.draft.ownedByteLength() != 0 {
+                    theme.ACCENT
+                  } else {
+                    theme.LINE
+                  },
+                  3.0,
+                )
+                ui.focused(&[css.borderColor(rgb(theme.ACCENT))])
+                ui.onInput(|value| Message.StyleDraft { value: move value })
+                ui.onKeyDown(|event| draftKey(event, completions))
+              },
+            )
+          },
+        )
+        if completions {
+          ui.column(
+            |ui| {
+              ui.testId("suggestions")
+              ui.accessRole(Role.List)
+              ui.label("Completions")
+              ui.style(&[css.width(px(200.0)), css.flexShrink(0.0)])
+              theme.pad(&mut ui, 4.0, 4.0)
+              theme.outline(&mut ui, theme.LINE_STRONG, 6.0)
+              ui.background(rgb(theme.INK))
+              theme.mono(&mut ui, look, theme.SIZE_BODY, theme.LINE_BODY)
+              ui.enumerate(
+                self.suggestions.asSlice(),
+                |suggestion| 0,
+                |ui, index, suggestion| {
+                  ui.key(usize.toU64(index))
+                  ui.pressable(
+                    || Message.Complete { index: index },
+                    |ui| {
+                      ui.accessRole(Role.Option)
+                      ui.label(String.view(&suggestion))
+                      ui.style(
+                        &[
+                          css.display(Keyword.Flex),
+                          css.alignItems(Align.Center),
+                          css.justifyContent(Align.SpaceBetween),
+                          css.height(px(24.0)),
+                          css.flexShrink(0.0),
+                          css.paddingLeft(px(8.0)),
+                          css.paddingRight(px(8.0)),
+                          css.borderRadius(px(4.0)),
+                        ],
+                      )
+                      if index == 0 {
+                        ui.background(rgba(theme.ACCENT, theme.ACCENT_CHOSEN))
+                        ui.color(rgb(theme.ACCENT))
+                      } else {
+                        ui.color(rgb(theme.TEXT))
+                        ui.hover(&[css.backgroundColor(rgba(theme.HOVER, theme.HOVER_WASH))])
+                      }
+                      ui.box(|ui| ui.text(String.view(&suggestion)))
+                      if index == 0 {
+                        ui.box(
+                          |ui| {
+                            theme.sans(&mut ui, look, theme.SIZE_SMALL, theme.LINE_BODY)
+                            ui.color(rgb(theme.ACCENT_DIM))
+                            ui.text("tab")
+                          },
+                        )
+                      }
+                    },
+                  )
                 },
               )
             },
           )
-        },
-      )
-    }
-    if self.styleError.ownedByteLength() != 0 {
-      ui.box(
-        |ui| {
-          ui.testId("style-error")
-          ui.color(rgb(ERROR))
-          ui.text(String.view(&self.styleError))
-        },
-      )
-    }
-    ui.row(
-      |ui| {
-        ui.style(&[css.alignItems(Align.Center), css.marginBottom(px(4.0))])
-        ui.gap(4.0)
-        ui.onEnter(|| Message.AddComment)
-        field(
-          &mut ui,
-          "comment-draft",
-          "Comment on this element",
-          "Comment on this element, for whoever changes the code",
-          String.view(&self.comment),
-          |value| Message.CommentDraft { value: move value },
-        )
-        barButton(&mut ui, "Comment", false, || Message.AddComment)
-      },
-    )
-    let marks = self.detail.marks.asSlice()
-    ui.enumerate(
-      self.detail.lines.asSlice(),
-      |line| 0,
-      |ui, index, line| {
-        let text = String.view(&line)
-        let mark = if index < marks.length {
-          marks[index]
-        } else {
-          0
         }
-        ui.key(usize.toU64(index))
-        ui.row(
-          |ui| {
-            ui.style(&[css.whiteSpace(WhiteSpace.Pre)])
-            if mark == MARK_EDITED || mark == MARK_EDIT_HEAD {
-              // An edit laid over the app's declarations: marked down its left side.
-              ui.background(rgb(EDITED))
-              border(&mut ui, Property.BorderLeftWidth, ACCENT)
-            }
-            if String.startsWith(text, "style ") {
-              ui.style(&[css.fontWeight(700.0), css.marginTop(px(6.0))])
-              if mark == MARK_EDIT_HEAD {
-                ui.testId("edited-styles")
-                ui.color(rgb(ACCENT))
-              }
-              ui.text(text)
-            } else if String.startsWith(text, "  ") {
-              if mark == MARK_OVERRIDDEN {
-                // The app's own declaration, hidden by an edit.
-                ui.style(&[css.textDecorationLine(Keyword.LineThrough)])
-                ui.color(rgb(MUTED))
-                ui.label("overridden")
-                ui.text(text)
-              } else {
-                match String.find(text, ": ") {
-                  Option<usize>.Some { value: colon } => {
-                    ui.box(
-                      |ui| {
-                        ui.color(
-                          rgb(
-                            if mark == MARK_EDITED {
-                              ACCENT
-                            } else {
-                              ATTRIBUTE
-                            },
-                          ),
-                        )
-                        ui.text(String.slice(text, 0, colon))
-                      },
-                    )
-                    ui.text(String.slice(text, colon, String.byteLength(text) - colon))
-                  }
-                  Option<usize>.None => {
-                    ui.text(text)
-                  }
-                }
-              }
-            } else {
-              ui.color(rgb(MUTED))
-              ui.text(text)
-            }
-          },
-        )
-      },
-    )
-  }
-
-  /// The edit log: the style edits and comments, by node, each with what it changed, and
-  /// buttons to resolve, reopen or take back.
-  fn changesPanel(self: &Self, ui: &mut Ui<Message>) -> () {
-    ui.row(
-      |ui| {
-        ui.style(&[css.alignItems(Align.Center)])
-        ui.box(
-          |ui| {
-            ui.testId("changes-line")
-            ui.grow(1.0)
-            ui.color(rgb(MUTED))
-            let line = ui.alloc(changesLine(self.openChanges, self.changes.length()))
-            ui.text(String.view(&line))
-          },
-        )
-        barButton(&mut ui, "Reset all", false, || Message.ResetAll)
-      },
-    )
-    if self.changes.length() == 0 {
-      muted(
-        &mut ui,
-        "No changes yet. Edit a style or comment on an element in the Styles panel; an agent reads them with ui_edits.",
-      )
-      return ()
-    }
-    ui.column(
-      |ui| {
-        ui.testId("changes")
-        ui.accessRole(Role.List)
-        let rows = self.changes.asSlice()
-        let mut i: usize = 0
-        while i < rows.length {
-          // One group per node, in the order its first entry came.
-          let node = rows[i].node
-          let mut first = true
-          let mut j: usize = 0
-          while j < i {
-            if rows[j].node == node {
-              first = false
-            }
-            j = j + 1
-          }
-          if first {
-            ui.key(u32.toU64(node) + 1)
-            self.changeGroup(&mut ui, node)
-          }
-          i = i + 1
+        if self.styleError.ownedByteLength() != 0 {
+          ui.box(
+            |ui| {
+              ui.testId("style-error")
+              theme.sans(&mut ui, look, theme.SIZE_BODY, theme.LINE_BODY)
+              ui.color(rgb(theme.REMOVED))
+              ui.text(String.view(&self.styleError))
+            },
+          )
         }
       },
     )
   }
 
-  /// The entries of node `node` (NO_PARENT: the app), under the node's label.
-  fn changeGroup(self: &Self, ui: &mut Ui<Message>, node: u32) -> () {
+  /// This node's edits and comments, as cards, under the Design fields.
+  fn nodeEdits(self: &Self, ui: &mut Ui<Message>) -> () {
+    let look = self.look
     let rows = self.changes.asSlice()
+    let mut count: usize = 0
+    let mut i: usize = 0
+    while i < rows.length {
+      if rows[i].node == self.selected && rows[i].open {
+        count = count + 1
+      }
+      i = i + 1
+    }
     ui.column(
       |ui| {
-        ui.style(&[css.marginTop(px(6.0))])
+        ui.style(
+          &[
+            css.flexShrink(0.0),
+            css.rowGap(px(8.0)),
+            css.paddingTop(px(10.0)),
+            css.paddingBottom(px(12.0)),
+            css.paddingLeft(px(12.0)),
+            css.paddingRight(px(12.0)),
+          ],
+        )
         ui.row(
           |ui| {
-            ui.gap(6.0)
-            border(&mut ui, Property.BorderBottomWidth, LINE)
-            if node != NO_PARENT {
-              ui.cursor(Cursor.Pointer)
-              ui.onClick(|| Message.Select { id: node })
-            }
-            let mut k: usize = 0
-            while k < rows.length && rows[k].node != node {
-              k = k + 1
-            }
+            ui.style(&[css.alignItems(Align.Center), css.justifyContent(Align.SpaceBetween)])
+            let head = ui.alloc(countedText("Edits", count))
+            theme.sectionLabel(&mut ui, look, String.view(&head))
             ui.box(
               |ui| {
-                ui.style(&[css.fontWeight(700.0)])
-                ui.color(rgb(TAG))
-                ui.text(String.view(&rows[k].label))
+                theme.sans(&mut ui, look, theme.SIZE_LABEL, theme.LINE_BODY)
+                ui.style(&[css.whiteSpace(WhiteSpace.Pre)])
+                ui.color(rgb(theme.MUTED))
+                ui.text("shared with agents over MCP")
               },
             )
-            if node != NO_PARENT {
-              let id = ui.alloc(nodeText(node))
-              muted(&mut ui, String.view(&id))
-            }
           },
         )
+        if count == 0 {
+          ui.box(
+            |ui| {
+              theme.sans(&mut ui, look, theme.SIZE_BODY, theme.LINE_BODY)
+              ui.color(rgb(theme.FAINT))
+              ui.text("Type over a field, or a declaration above; the app keeps the edit.")
+            },
+          )
+        }
         ui.enumerate(
           rows,
           |row| row.id,
           |ui, index, row| {
-            if row.node == node {
-              self.changeRow(&mut ui, index, row)
+            if row.node == self.selected && row.open {
+              self.changeCard(&mut ui, index, row, false)
             }
           },
         )
@@ -2238,101 +3041,106 @@ impl Devtools {
     )
   }
 
-  fn changeRow(self: &Self, ui: &mut Ui<Message>, index: usize, row: &ChangeRow) -> () {
-    ui.column(
+  /// A card of the edit log: what changed, from what to what, or a comment, its replies, and
+  /// with `actions` the buttons that resolve, reopen or take it back.
+  fn changeCard(
+    self: &Self,
+    ui: &mut Ui<Message>,
+    index: usize,
+    row: &ChangeRow,
+    actions: bool,
+  ) -> () {
+    let look = self.look
+    let open = row.open
+    theme.card(
+      &mut ui,
       |ui| {
-        let testId = ui.alloc(changeTestId(row.id))
-        ui.testId(String.view(&testId))
-        ui.accessRole(Role.ListItem)
-        border(&mut ui, Property.BorderBottomWidth, BAR)
-        paddings(&mut ui, 2.0, 0.0)
+        if actions {
+          let testId = ui.alloc(changeTestId(row.id))
+          ui.testId(String.view(&testId))
+          ui.accessRole(Role.ListItem)
+        }
         ui.row(
           |ui| {
-            ui.style(&[css.alignItems(Align.Center), css.whiteSpace(WhiteSpace.NoWrap)])
-            ui.gap(6.0)
+            ui.style(&[css.alignItems(Align.Center), css.columnGap(px(8.0))])
+            theme.mono(&mut ui, look, theme.SIZE_BODY, theme.LINE_BODY)
+            let title = ui.alloc(changeTitle(row))
             ui.box(
               |ui| {
-                ui.grow(1.0)
-                ui.style(
-                  &[css.flexBasis(px(0.0)), css.minWidth(px(0.0)), css.overflowX(Overflow.Hidden)],
+                theme.fill(&mut ui)
+                theme.oneLine(&mut ui)
+                ui.color(
+                  rgb(
+                    if open {
+                      theme.TEXT
+                    } else {
+                      theme.MUTED
+                    },
+                  ),
                 )
-                if !row.open {
-                  ui.color(rgb(MUTED))
+                if row.node != NO_PARENT {
+                  ui.cursor(Cursor.Pointer)
+                  ui.onClick(|| Message.Select { id: row.node })
                 }
-                if row.comment {
-                  ui.row(
-                    |ui| {
-                      ui.gap(6.0)
-                      ui.box(
-                        |ui| {
-                          ui.color(rgb(ACCENT))
-                          ui.text("comment")
-                        },
-                      )
-                      ui.text(String.view(&row.text))
-                      if row.author.ownedByteLength() != 0 {
-                        let author = ui.alloc(authorText(String.view(&row.author)))
-                        muted(&mut ui, String.view(&author))
-                      }
-                    },
-                  )
-                } else {
-                  ui.row(
-                    |ui| {
-                      ui.gap(6.0)
-                      ui.box(
-                        |ui| {
-                          ui.color(rgb(ATTRIBUTE))
-                          ui.text(String.view(&row.property))
-                        },
-                      )
-                      ui.box(
-                        |ui| {
-                          ui.color(rgb(MUTED))
-                          ui.style(&[css.textDecorationLine(Keyword.LineThrough)])
-                          ui.text(String.view(&row.before))
-                        },
-                      )
-                      ui.text("→")
-                      ui.text(String.view(&row.after))
-                      if String.view(&row.state) != "base" {
-                        let state = ui.alloc(stateText(String.view(&row.state)))
-                        muted(&mut ui, String.view(&state))
-                      }
-                      if row.open && !row.applied {
-                        muted(&mut ui, "(not applied: the node is gone)")
-                      }
-                    },
-                  )
-                }
+                ui.text(String.view(&title))
               },
             )
-            if !row.open {
-              muted(&mut ui, "resolved")
-            }
-            let id = row.id
-            if row.open {
-              smallButton(
-                &mut ui,
-                "resolve",
-                id,
-                "Resolve",
-                || Message.Resolve { id: id, reopen: false },
+            if !row.comment {
+              ui.box(
+                |ui| {
+                  ui.style(&[css.flexShrink(0.0), css.whiteSpace(WhiteSpace.Pre)])
+                  ui.color(rgb(theme.MUTED))
+                  if !open {
+                    ui.style(&[css.textDecorationLine(Keyword.LineThrough)])
+                  }
+                  let mut before = String.make()
+                  ui.alloc(shortValue(String.view(&row.before), &mut before))
+                  ui.text(String.view(&before))
+                },
               )
-              if !row.comment {
-                smallButton(&mut ui, "reset", id, "Reset", || Message.ResetChange { index: index })
-              }
-            } else {
-              smallButton(
+              theme.fixed(&mut ui, theme.FAINT, "→")
+              let mut after = String.make()
+              ui.alloc(shortValue(String.view(&row.after), &mut after))
+              theme.fixed(
                 &mut ui,
-                "reopen",
-                id,
-                "Reopen",
-                || Message.Resolve { id: id, reopen: true },
+                if open {
+                  theme.ACCENT
+                } else {
+                  theme.ACCENT_DIM
+                },
+                String.view(&after),
               )
             }
           },
         )
+        if row.comment {
+          ui.box(
+            |ui| {
+              theme.sans(&mut ui, look, theme.SIZE_BODY, theme.LINE_BODY)
+              ui.color(
+                rgb(
+                  if open {
+                    theme.TEXT
+                  } else {
+                    theme.MUTED
+                  },
+                ),
+              )
+              ui.text(String.view(&row.text))
+              if row.author.ownedByteLength() != 0 {
+                let author = ui.alloc(authorText(String.view(&row.author)))
+                ui.box(
+                  |ui| {
+                    ui.style(&[css.display(Keyword.Inline)])
+                    ui.color(rgb(theme.FAINT))
+                    ui.text("  ")
+                    ui.text(String.view(&author))
+                  },
+                )
+              }
+            },
+          )
+        }
         ui.enumerate(
           row.thread.asSlice(),
           |reply| 0,
@@ -2340,69 +3148,360 @@ impl Devtools {
             ui.key(usize.toU64(k))
             ui.box(
               |ui| {
-                ui.style(&[css.paddingLeft(px(16.0))])
-                ui.color(rgb(MUTED))
+                theme.sans(&mut ui, look, theme.SIZE_BODY, theme.LINE_BODY)
+                ui.style(&[css.paddingLeft(px(12.0))])
+                ui.color(rgb(theme.MUTED))
                 let line = ui.alloc(replyText(String.view(&reply)))
                 ui.text(String.view(&line))
               },
             )
           },
         )
+        if open && !row.applied && !row.comment {
+          ui.box(
+            |ui| {
+              theme.sans(&mut ui, look, theme.SIZE_LABEL, theme.LINE_BODY)
+              ui.color(rgb(theme.REMOVED))
+              ui.text("Not applied: the node is gone.")
+            },
+          )
+        }
+        if actions {
+          let id = row.id
+          ui.row(
+            |ui| {
+              ui.style(
+                &[
+                  css.alignItems(Align.Center),
+                  css.justifyContent(Align.FlexEnd),
+                  css.columnGap(px(4.0)),
+                ],
+              )
+              if !open {
+                ui.box(
+                  |ui| {
+                    theme.fill(&mut ui)
+                    theme.sans(&mut ui, look, theme.SIZE_LABEL, theme.LINE_BODY)
+                    ui.color(rgb(theme.FAINT))
+                    ui.text("resolved")
+                  },
+                )
+              }
+              if open {
+                let resolve = ui.alloc(kindTestId("resolve", id))
+                theme.ghostButton(
+                  &mut ui,
+                  look,
+                  String.view(&resolve),
+                  "Resolve",
+                  || Message.Resolve { id: id, reopen: false },
+                )
+                if !row.comment {
+                  let reset = ui.alloc(kindTestId("reset", id))
+                  theme.ghostButton(
+                    &mut ui,
+                    look,
+                    String.view(&reset),
+                    "Reset",
+                    || Message.ResetChange { index: index },
+                  )
+                }
+              } else {
+                let reopen = ui.alloc(kindTestId("reopen", id))
+                theme.ghostButton(
+                  &mut ui,
+                  look,
+                  String.view(&reopen),
+                  "Reopen",
+                  || Message.Resolve { id: id, reopen: true },
+                )
+              }
+            },
+          )
+        }
+      },
+    )
+  }
+
+  /// Declarations: the field to type them into, the box model, then the node view.
+  fn declarationsSegment(self: &Self, ui: &mut Ui<Message>) -> () {
+    if self.nothingSelected(&mut ui) {
+      return ()
+    }
+    let look = self.look
+    group(
+      &mut ui,
+      8.0,
+      |ui| {
+        ui.row(
+          |ui| {
+            ui.style(&[css.alignItems(Align.Center), css.justifyContent(Align.SpaceBetween)])
+            theme.sectionLabel(&mut ui, look, "Set declarations")
+            ui.row(
+              |ui| {
+                ui.style(&[css.columnGap(px(2.0))])
+                theme.ghostButton(&mut ui, look, "apply", "Apply", || Message.ApplyStyle)
+                theme.ghostButton(&mut ui, look, "reset-styles", "Reset", || Message.ResetStyles)
+              },
+            )
+          },
+        )
+        self.draftEditor(&mut ui)
+      },
+    )
+    if self.detail.hasBox {
+      group(
+        &mut ui,
+        8.0,
+        |ui| {
+          theme.sectionLabel(&mut ui, look, "Box model")
+          self.boxModel(&mut ui)
+        },
+      )
+    }
+    ui.column(
+      |ui| {
+        ui.testId("declarations")
+        ui.style(
+          &[
+            css.flexShrink(0.0),
+            css.paddingTop(px(8.0)),
+            css.paddingBottom(px(12.0)),
+            css.paddingLeft(px(12.0)),
+            css.paddingRight(px(12.0)),
+          ],
+        )
+        theme.mono(&mut ui, look, theme.SIZE_BODY, theme.LINE_BODY)
+        let marks = self.detail.marks.asSlice()
+        ui.enumerate(
+          self.detail.lines.asSlice(),
+          |line| 0,
+          |ui, index, line| {
+            let text = String.view(&line)
+            let mark = if index < marks.length {
+              marks[index]
+            } else {
+              0
+            }
+            ui.key(usize.toU64(index))
+            self.declarationLine(&mut ui, text, mark)
+          },
+        )
+      },
+    )
+  }
+
+  /// A line of the node view: a section heading, a declaration (an edit's in amber down a bar,
+  /// one an edit hides struck through), or a fact about the node.
+  fn declarationLine(self: &Self, ui: &mut Ui<Message>, text: string, mark: u8) -> () {
+    ui.row(
+      |ui| {
+        ui.style(
+          &[
+            css.whiteSpace(WhiteSpace.Pre),
+            css.minHeight(px(20.0)),
+            css.alignItems(Align.Center),
+            css.flexShrink(0.0),
+            css.overflowX(Overflow.Hidden),
+          ],
+        )
+        if mark == MARK_EDITED || mark == MARK_EDIT_HEAD {
+          // An edit laid over the app's declarations: marked down its left side.
+          ui.background(rgba(theme.ACCENT, theme.ACCENT_WASH))
+          ui.style(
+            &[
+              css.borderLeftWidth(px(2.0)),
+              css.borderStyle(BorderStyle.Solid),
+              css.borderColor(rgb(theme.ACCENT)),
+              css.paddingLeft(px(4.0)),
+            ],
+          )
+        }
+        if String.startsWith(text, "style ") {
+          ui.style(&[css.marginTop(px(6.0))])
+          if mark == MARK_EDIT_HEAD {
+            ui.testId("edited-styles")
+            ui.color(rgb(theme.ACCENT))
+          } else {
+            ui.color(rgb(theme.MUTED))
+          }
+          ui.text(text)
+        } else if String.startsWith(text, "  ") {
+          if mark == MARK_OVERRIDDEN {
+            // The app's own declaration, hidden by an edit.
+            ui.style(&[css.textDecorationLine(Keyword.LineThrough)])
+            ui.color(rgb(theme.FAINT))
+            ui.label("overridden")
+            ui.text(text)
+          } else {
+            match String.find(text, ": ") {
+              Option<usize>.Some { value: colon } => {
+                ui.box(
+                  |ui| {
+                    ui.color(
+                      rgb(
+                        if mark == MARK_EDITED {
+                          theme.ACCENT_DIM
+                        } else {
+                          theme.MUTED
+                        },
+                      ),
+                    )
+                    ui.text(String.slice(text, 0, colon))
+                  },
+                )
+                ui.box(
+                  |ui| {
+                    ui.color(
+                      rgb(
+                        if mark == MARK_EDITED {
+                          theme.ACCENT
+                        } else {
+                          theme.TEXT
+                        },
+                      ),
+                    )
+                    ui.text(String.slice(text, colon, String.byteLength(text) - colon))
+                  },
+                )
+              }
+              Option<usize>.None => {
+                ui.color(rgb(theme.MUTED))
+                ui.text(text)
+              }
+            }
+          }
+        } else {
+          ui.color(rgb(theme.MUTED))
+          ui.text(text)
+        }
+      },
+    )
+  }
+
+  /// Edits: the whole edit log, a comment on the selected node, and taking everything back.
+  fn editsSegment(self: &Self, ui: &mut Ui<Message>) -> () {
+    let look = self.look
+    group(
+      &mut ui,
+      8.0,
+      |ui| {
+        ui.row(
+          |ui| {
+            ui.style(&[css.alignItems(Align.Center), css.justifyContent(Align.SpaceBetween)])
+            let head = ui.alloc(countedText("Edits", self.openChanges))
+            theme.sectionLabel(&mut ui, look, String.view(&head))
+            theme.ghostButton(&mut ui, look, "reset-all", "Reset all", || Message.ResetAll)
+          },
+        )
+        ui.box(
+          |ui| {
+            ui.testId("changes-line")
+            theme.sans(&mut ui, look, theme.SIZE_LABEL, theme.LINE_BODY)
+            ui.color(rgb(theme.MUTED))
+            let line = ui.alloc(changesLine(self.openChanges, self.changes.length()))
+            ui.text(String.view(&line))
+          },
+        )
+        ui.row(
+          |ui| {
+            ui.style(&[css.alignItems(Align.Center), css.columnGap(px(6.0))])
+            ui.onEnter(|| Message.AddComment)
+            ui.row(
+              |ui| {
+                theme.fieldLook(&mut ui, false)
+                theme.fill(&mut ui)
+                ui.input(
+                  String.view(&self.comment),
+                  |ui| {
+                    ui.testId("comment-draft")
+                    ui.label("Comment on this element")
+                    ui.placeholder(
+                      if self.selected == NO_PARENT {
+                        "Comment on the app"
+                      } else {
+                        "Comment on this element"
+                      },
+                    )
+                    bareInput(&mut ui, look)
+                    theme.sans(&mut ui, look, theme.SIZE_BODY, theme.LINE_BODY)
+                    ui.onInput(|value| Message.CommentDraft { value: move value })
+                  },
+                )
+              },
+            )
+            theme.ghostButton(&mut ui, look, "add-comment", "Comment", || Message.AddComment)
+          },
+        )
+      },
+    )
+    if self.changes.length() == 0 {
+      hint(
+        &mut ui,
+        look,
+        "No edits yet. Type over a Design field or a declaration, or comment on an element; an agent reads them with ui_edits.",
+      )
+      return ()
+    }
+    ui.column(
+      |ui| {
+        ui.testId("changes")
+        ui.accessRole(Role.List)
+        ui.style(
+          &[
+            css.flexShrink(0.0),
+            css.rowGap(px(8.0)),
+            css.paddingTop(px(10.0)),
+            css.paddingBottom(px(12.0)),
+            css.paddingLeft(px(12.0)),
+            css.paddingRight(px(12.0)),
+          ],
+        )
+        ui.enumerate(
+          self.changes.asSlice(),
+          |row| row.id,
+          |ui, index, row| self.changeCard(&mut ui, index, row, true),
+        )
       },
     )
   }
 
   fn boxModel(self: &Self, ui: &mut Ui<Message>) -> () {
-    if self.nothingSelected(&mut ui) {
-      return ()
-    }
-    if !self.detail.hasBox {
-      muted(&mut ui, "This node has no box (display: none, or not laid out).")
-      return ()
-    }
+    let look = self.look
     let b = self.detail.box
     ui.column(
       |ui| {
         ui.testId("box-model")
-        ui.gap(8.0)
-        ui.style(&[css.maxWidth(px(420.0))])
+        ui.style(&[css.rowGap(px(6.0)), css.flexShrink(0.0)])
         layer(
           &mut ui,
+          look,
           "margin",
-          MARGIN,
           b.margin,
           true,
           |ui| {
             layer(
               &mut ui,
+              look,
               "border",
-              BORDER,
               b.border,
               false,
               |ui| {
                 layer(
                   &mut ui,
+                  look,
                   "padding",
-                  PADDING,
                   b.padding,
                   true,
                   |ui| {
                     ui.box(
                       |ui| {
                         ui.testId("content")
-                        ui.background(rgb(CONTENT))
-                        ui.style(
-                          &[
-                            css.borderTopWidth(px(1.0)),
-                            css.borderRightWidth(px(1.0)),
-                            css.borderBottomWidth(px(1.0)),
-                            css.borderLeftWidth(px(1.0)),
-                            css.borderStyle(BorderStyle.Solid),
-                            css.borderColor(rgb(0x808080)),
-                            css.textAlign(TextAlign.Center),
-                          ],
-                        )
-                        paddings(&mut ui, 6.0, 6.0)
+                        ui.background(rgba(theme.HOVER, 0x33))
+                        theme.outline(&mut ui, theme.HOVER, 3.0)
+                        ui.style(&[css.textAlign(TextAlign.Center)])
+                        theme.pad(&mut ui, 4.0, 6.0)
+                        ui.color(rgb(theme.TEXT))
                         let size = ui.alloc(contentText(&b))
                         ui.text(String.view(&size))
                       },
@@ -2413,34 +3512,38 @@ impl Devtools {
             )
           },
         )
-        let position = ui.alloc(positionText(&b))
-        muted(&mut ui, String.view(&position))
+        ui.box(
+          |ui| {
+            theme.mono(&mut ui, look, theme.SIZE_LABEL, theme.LINE_BODY)
+            ui.color(rgb(theme.MUTED))
+            let position = ui.alloc(positionText(&b))
+            ui.text(String.view(&position))
+          },
+        )
       },
     )
   }
 
   fn eventLog(self: &Self, ui: &mut Ui<Message>) -> () {
-    ui.row(
-      |ui| {
-        ui.style(&[css.alignItems(Align.Center)])
-        ui.box(
-          |ui| {
-            ui.grow(1.0)
-            ui.color(rgb(MUTED))
-            ui.text("Records the app took from the tree, newest first")
-          },
-        )
-        barButton(&mut ui, "Clear", false, || Message.ClearEvents)
-      },
+    let look = self.look
+    let count = ui.alloc(seqText(usize.toU64(self.events.length())))
+    listHead(
+      &mut ui,
+      look,
+      "Events, newest first",
+      String.view(&count),
+      12.0,
+      |ui| theme.ghostButton(&mut ui, look, "clear-events", "Clear", || Message.ClearEvents),
     )
     if self.events.length() == 0 {
-      muted(&mut ui, "No events yet. Use the app, then look here.")
+      hint(&mut ui, look, "No events yet. Use the app, then look here.")
       return ()
     }
     ui.column(
       |ui| {
         ui.testId("event-log")
         ui.accessRole(Role.List)
+        theme.mono(&mut ui, look, theme.SIZE_BODY, theme.LINE_BODY)
         let rows = self.events.asSlice()
         let mut i = rows.length
         while i > 0 {
@@ -2450,34 +3553,35 @@ impl Devtools {
           ui.row(
             |ui| {
               ui.accessRole(Role.ListItem)
-              ui.gap(8.0)
-              ui.style(&[css.whiteSpace(WhiteSpace.NoWrap)])
-              border(&mut ui, Property.BorderBottomWidth, BAR)
-              paddings(&mut ui, 1.0, 0.0)
+              theme.rowLook(&mut ui, theme.LIST_ROW, 12.0, 12.0, false)
+              ui.style(&[css.columnGap(px(10.0)), css.whiteSpace(WhiteSpace.Pre)])
               ui.box(
                 |ui| {
-                  ui.style(&[css.width(px(36.0))])
-                  ui.color(rgb(MUTED))
+                  theme.mono(&mut ui, look, theme.SIZE_LABEL, theme.LINE_BODY)
                   let seq = ui.alloc(seqText(e.seq))
-                  ui.text(String.view(&seq))
+                  theme.slot(&mut ui, 24.0, theme.FAINT, String.view(&seq))
                 },
               )
               ui.box(
                 |ui| {
-                  ui.style(&[css.width(px(84.0))])
-                  ui.color(rgb(ACCENT))
+                  ui.style(&[css.width(px(96.0)), css.flexShrink(0.0)])
+                  ui.color(rgb(theme.TEXT))
                   ui.text(String.view(&e.kind))
                 },
               )
               ui.box(
                 |ui| {
-                  ui.color(rgb(TAG))
+                  theme.fill(&mut ui)
+                  theme.oneLine(&mut ui)
+                  ui.color(rgb(theme.MUTED))
                   ui.text(self.labelOf(e.target))
                 },
               )
               ui.box(
                 |ui| {
-                  ui.color(rgb(MUTED))
+                  theme.mono(&mut ui, look, theme.SIZE_LABEL, theme.LINE_BODY)
+                  ui.style(&[css.flexShrink(0.0)])
+                  ui.color(rgb(theme.FAINT))
                   ui.text(String.view(&e.text))
                 },
               )
@@ -2489,128 +3593,191 @@ impl Devtools {
   }
 
   fn framesPanel(self: &Self, ui: &mut Ui<Message>) -> () {
+    let look = self.look
+    listHead(&mut ui, look, "Frames, oldest first", "", 12.0, |ui| {})
     if self.frames.bars.length() == 0 {
-      muted(&mut ui, "No frames yet.")
+      hint(&mut ui, look, "No frames yet.")
+    } else {
+      let timed = self.frames.timed
+      let scale = self.frames.scale
+      ui.column(
+        |ui| {
+          ui.style(
+            &[
+              css.flexShrink(0.0),
+              css.rowGap(px(8.0)),
+              css.paddingLeft(px(12.0)),
+              css.paddingRight(px(12.0)),
+            ],
+          )
+          ui.row(
+            |ui| {
+              ui.testId("frame-bars")
+              ui.label("Frames, oldest first")
+              ui.style(
+                &[
+                  css.height(px(BAR_HEIGHT)),
+                  css.flexShrink(0.0),
+                  css.alignItems(Align.FlexEnd),
+                  css.columnGap(px(1.0)),
+                  css.overflowX(Overflow.Hidden),
+                  css.overflowY(Overflow.Hidden),
+                  css.borderRadius(px(4.0)),
+                ],
+              )
+              theme.pad(&mut ui, 0.0, 4.0)
+              ui.background(rgb(theme.SURFACE))
+              theme.rule(&mut ui, Property.BorderBottomWidth, theme.LINE)
+              ui.each(
+                self.frames.bars.asSlice(),
+                |bar| bar.frame,
+                |ui, bar| {
+                  ui.column(
+                    |ui| {
+                      ui.style(&[css.width(px(3.0)), css.flexShrink(0.0)])
+                      if timed {
+                        let over = bar.layout + bar.paint > FRAME_BUDGET
+                        ui.box(
+                          |ui| {
+                            ui.background(
+                              rgb(
+                                if over {
+                                  theme.REMOVED
+                                } else {
+                                  theme.ACCENT_DIM
+                                },
+                              ),
+                            )
+                            ui.style(&[css.height(px(barHeight(bar.layout, scale, 0.0)))])
+                          },
+                        )
+                        ui.box(
+                          |ui| {
+                            ui.background(
+                              rgb(
+                                if over {
+                                  theme.REMOVED
+                                } else {
+                                  theme.ACCENT
+                                },
+                              ),
+                            )
+                            ui.style(&[css.height(px(barHeight(bar.paint, scale, 1.0)))])
+                          },
+                        )
+                      } else {
+                        ui.box(
+                          |ui| {
+                            ui.background(
+                              rgb(
+                                if bar.skipped {
+                                  theme.FAINT
+                                } else {
+                                  theme.ACCENT
+                                },
+                              ),
+                            )
+                            ui.style(&[css.height(px(barHeight(bar.fragments, scale, 1.0)))])
+                          },
+                        )
+                      }
+                    },
+                  )
+                },
+              )
+            },
+          )
+          ui.row(
+            |ui| {
+              ui.style(&[css.columnGap(px(14.0))])
+              theme.sans(&mut ui, look, theme.SIZE_LABEL, theme.LINE_BODY)
+              if timed {
+                legend(&mut ui, rgb(theme.ACCENT_DIM), "layout")
+                legend(&mut ui, rgb(theme.ACCENT), "paint")
+                legend(&mut ui, rgb(theme.REMOVED), "over 16.7 ms")
+              } else {
+                legend(&mut ui, rgb(theme.ACCENT), "laid out and painted")
+                legend(&mut ui, rgb(theme.FAINT), "layout skipped")
+              }
+            },
+          )
+          ui.box(
+            |ui| {
+              ui.testId("frame-line")
+              theme.mono(&mut ui, look, theme.SIZE_LABEL, theme.LINE_BODY)
+              ui.color(rgb(theme.MUTED))
+              ui.text(String.view(&self.frames.line))
+            },
+          )
+        },
+      )
+    }
+    ui.box(|ui| ui.style(&[css.height(px(8.0)), css.flexShrink(0.0)]))
+    listHead(&mut ui, look, "Last frame", "", 12.0, |ui| {})
+    if self.stats.length() == 0 {
+      hint(&mut ui, look, "No frame stats yet.")
       return ()
     }
-    let timed = self.frames.timed
-    let scale = self.frames.scale
-    ui.row(
+    ui.column(
       |ui| {
-        ui.testId("frame-bars")
-        ui.label("Frames, oldest first")
-        ui.background(rgb(0xF9FAFB))
-        border(&mut ui, Property.BorderBottomWidth, LINE)
-        ui.style(
-          &[
-            css.height(px(BAR_HEIGHT)),
-            css.flexShrink(0.0),
-            css.alignItems(Align.FlexEnd),
-            css.columnGap(px(1.0)),
-            css.overflowX(Overflow.Hidden),
-            css.overflowY(Overflow.Hidden),
-          ],
-        )
-        ui.each(
-          self.frames.bars.asSlice(),
-          |bar| bar.frame,
-          |ui, bar| {
-            ui.column(
+        ui.testId("stats")
+        theme.mono(&mut ui, look, theme.SIZE_BODY, theme.LINE_BODY)
+        ui.style(&[css.flexShrink(0.0), css.paddingBottom(px(8.0))])
+        ui.enumerate(
+          self.stats.asSlice(),
+          |stat| 0,
+          |ui, index, stat| {
+            ui.key(usize.toU64(index))
+            ui.row(
               |ui| {
-                ui.style(&[css.width(px(3.0)), css.flexShrink(0.0)])
-                if timed {
-                  let over = bar.layout + bar.paint > FRAME_BUDGET
-                  ui.box(
-                    |ui| {
-                      ui.background(
-                        rgb(
-                          if over {
-                            ERROR
-                          } else {
-                            LAYOUT_BAR
-                          },
-                        ),
-                      )
-                      ui.style(&[css.height(px(barHeight(bar.layout, scale, 0.0)))])
-                    },
-                  )
-                  ui.box(
-                    |ui| {
-                      ui.background(
-                        rgb(
-                          if over {
-                            ERROR
-                          } else {
-                            ACCENT
-                          },
-                        ),
-                      )
-                      ui.style(&[css.height(px(barHeight(bar.paint, scale, 1.0)))])
-                    },
-                  )
-                } else {
-                  ui.box(
-                    |ui| {
-                      ui.background(
-                        rgb(
-                          if bar.skipped {
-                            CONTENT
-                          } else {
-                            ACCENT
-                          },
-                        ),
-                      )
-                      ui.style(&[css.height(px(barHeight(bar.fragments, scale, 1.0)))])
-                    },
-                  )
-                }
+                ui.style(
+                  &[
+                    css.alignItems(Align.Center),
+                    css.height(px(22.0)),
+                    css.flexShrink(0.0),
+                    css.paddingLeft(px(12.0)),
+                    css.paddingRight(px(12.0)),
+                  ],
+                )
+                ui.box(
+                  |ui| {
+                    ui.style(&[css.width(px(220.0)), css.flexShrink(0.0)])
+                    ui.color(rgb(theme.MUTED))
+                    ui.text(String.view(&stat.name))
+                  },
+                )
+                theme.ink(&mut ui, theme.TEXT, String.view(&stat.value))
               },
             )
           },
         )
       },
     )
-    ui.row(
-      |ui| {
-        ui.style(&[css.marginTop(px(6.0))])
-        ui.gap(12.0)
-        if timed {
-          legend(&mut ui, LAYOUT_BAR, "layout")
-          legend(&mut ui, ACCENT, "paint")
-          legend(&mut ui, ERROR, "over 16.7 ms")
-        } else {
-          legend(&mut ui, ACCENT, "laid out and painted")
-          legend(&mut ui, CONTENT, "layout skipped")
-        }
-      },
-    )
-    ui.box(
-      |ui| {
-        ui.testId("frame-line")
-        ui.style(&[css.marginTop(px(4.0))])
-        ui.color(rgb(MUTED))
-        ui.text(String.view(&self.frames.line))
-      },
-    )
   }
 
   fn auditPanel(self: &Self, ui: &mut Ui<Message>) -> () {
-    ui.row(
+    let look = self.look
+    listHead(
+      &mut ui,
+      look,
+      "Audit",
+      "",
+      12.0,
+      |ui| theme.ghostButton(&mut ui, look, "run-audit", "Run audit", || Message.RunAudit),
+    )
+    ui.box(
       |ui| {
-        ui.style(&[css.alignItems(Align.Center)])
-        ui.box(
-          |ui| {
-            ui.testId("audit-line")
-            ui.grow(1.0)
-            ui.color(rgb(MUTED))
-            if self.auditLine.ownedByteLength() == 0 {
-              ui.text("Checks names, roles, keyboard reach, target sizes and text contrast.")
-            } else {
-              ui.text(String.view(&self.auditLine))
-            }
-          },
+        ui.testId("audit-line")
+        theme.sans(&mut ui, look, theme.SIZE_BODY, theme.LINE_BODY)
+        ui.style(
+          &[css.paddingLeft(px(12.0)), css.paddingRight(px(12.0)), css.paddingBottom(px(6.0))],
         )
-        barButton(&mut ui, "Run audit", false, || Message.RunAudit)
+        ui.color(rgb(theme.MUTED))
+        if self.auditLine.ownedByteLength() == 0 {
+          ui.text("Checks names, roles, keyboard reach, target sizes and text contrast.")
+        } else {
+          ui.text(String.view(&self.auditLine))
+        }
       },
     )
     ui.column(
@@ -2629,35 +3796,64 @@ impl Devtools {
                 ui.cursor(Cursor.Pointer)
                 ui.onClick(|| Message.Select { id: issue.node })
                 ui.onEnter(|| Message.Select { id: issue.node })
-                ui.gap(8.0)
-                border(&mut ui, Property.BorderBottomWidth, BAR)
-                paddings(&mut ui, 2.0, 0.0)
-                if issue.node == self.selected {
-                  ui.background(rgb(SELECTED))
+                let chosen = issue.node == self.selected
+                ui.style(
+                  &[
+                    css.columnGap(px(10.0)),
+                    css.flexShrink(0.0),
+                    css.paddingTop(px(6.0)),
+                    css.paddingBottom(px(6.0)),
+                    css.paddingRight(px(12.0)),
+                  ],
+                )
+                if chosen {
+                  ui.style(
+                    &[
+                      css.paddingLeft(px(10.0)),
+                      css.borderLeftWidth(px(2.0)),
+                      css.borderStyle(BorderStyle.Solid),
+                      css.borderColor(rgb(theme.ACCENT)),
+                      css.backgroundColor(rgba(theme.ACCENT, theme.ACCENT_WASH)),
+                    ],
+                  )
                 } else {
-                  ui.hover(&[css.backgroundColor(rgb(HOVER))])
+                  ui.style(&[css.paddingLeft(px(12.0))])
+                  ui.hover(&[css.backgroundColor(rgba(theme.HOVER, theme.HOVER_WASH))])
                 }
-                ui.focusVisible(&[css.backgroundColor(rgb(SELECTED))])
+                ui.focusVisible(&[css.backgroundColor(rgba(theme.HOVER, theme.HOVER_WASH))])
                 ui.box(
                   |ui| {
-                    ui.style(&[css.width(px(88.0)), css.flexShrink(0.0)])
+                    theme.mono(&mut ui, look, theme.SIZE_LABEL, theme.LINE_BODY)
+                    ui.style(
+                      &[css.width(px(96.0)), css.flexShrink(0.0), css.alignSelf(Align.FlexStart)],
+                    )
                     ui.color(rgb(ruleColor(String.view(&issue.rule))))
                     ui.text(String.view(&issue.rule))
                   },
                 )
                 ui.column(
                   |ui| {
-                    ui.grow(1.0)
-                    ui.style(&[css.flexBasis(px(0.0)), css.minWidth(px(0.0))])
+                    theme.fill(&mut ui)
                     ui.box(
                       |ui| {
-                        ui.color(rgb(TAG))
+                        theme.mono(&mut ui, look, theme.SIZE_BODY, theme.LINE_BODY)
+                        theme.oneLine(&mut ui)
+                        ui.color(
+                          rgb(
+                            if issue.node == self.selected {
+                              theme.ACCENT
+                            } else {
+                              theme.TEXT
+                            },
+                          ),
+                        )
                         ui.text(String.view(&issue.label))
                       },
                     )
                     ui.box(
                       |ui| {
-                        ui.color(rgb(MUTED))
+                        theme.sans(&mut ui, look, theme.SIZE_BODY, theme.LINE_BODY)
+                        ui.color(rgb(theme.MUTED))
                         ui.text(String.view(&issue.message))
                       },
                     )
@@ -2671,8 +3867,10 @@ impl Devtools {
     )
   }
 
-  /// An extension's panel: its data, members and elements in rows, nested ones indented.
+  /// An extension's panel: the app's view of it, or its data, members and elements in rows,
+  /// nested ones indented.
   fn extensionPanel(self: &Self, ui: &mut Ui<Message>) -> () {
+    let look = self.look
     if let Option<&PanelInfo>.Some { value: panel } = self.shownPanel() {
       if panel.view.ownedByteLength() != 0 {
         // The app renders the panel: its batches are replayed under this box (see `remote`).
@@ -2680,21 +3878,26 @@ impl Devtools {
         ui.column(
           |ui| {
             ui.testId(VIEW_HOST)
+            theme.fill(&mut ui)
+            ui.style(&[css.minHeight(px(0.0)), css.alignSelf(Align.Stretch)])
             ui.grow(1.0)
-            ui.style(&[css.minHeight(px(0.0))])
           },
         )
         return ()
       }
+      let title = String.view(&panel.title)
+      ui.key(2)
+      listHead(&mut ui, look, title, String.view(&panel.extension), 12.0, |ui| {})
     }
     if self.data.length() == 0 {
-      muted(&mut ui, "No data yet.")
+      hint(&mut ui, look, "No data yet.")
       return ()
     }
     ui.column(
       |ui| {
         ui.testId("panel-data")
         ui.accessRole(Role.List)
+        theme.mono(&mut ui, look, theme.SIZE_BODY, theme.LINE_BODY)
         ui.enumerate(
           self.data.asSlice(),
           |row| 0,
@@ -2703,59 +3906,17 @@ impl Devtools {
             ui.row(
               |ui| {
                 ui.accessRole(Role.ListItem)
-                ui.style(
-                  &[
-                    css.whiteSpace(WhiteSpace.NoWrap),
-                    css.paddingLeft(px(u32.toF32(row.depth) * 12.0)),
-                    css.columnGap(px(6.0)),
-                  ],
-                )
-                border(&mut ui, Property.BorderBottomWidth, BAR)
+                theme.rowLook(&mut ui, 22.0, 12.0 + u32.toF32(row.depth) * 14.0, 12.0, false)
+                ui.style(&[css.whiteSpace(WhiteSpace.Pre), css.columnGap(px(8.0))])
+                theme.fixed(&mut ui, theme.MUTED, String.view(&row.key))
                 ui.box(
                   |ui| {
-                    ui.color(rgb(ATTRIBUTE))
-                    ui.text(String.view(&row.key))
-                  },
-                )
-                ui.box(
-                  |ui| {
-                    ui.color(rgb(TEXT))
+                    theme.fill(&mut ui)
+                    theme.oneLine(&mut ui)
+                    ui.color(rgb(theme.TEXT))
                     ui.text(String.view(&row.value))
                   },
                 )
-              },
-            )
-          },
-        )
-      },
-    )
-  }
-
-  fn statsPanel(self: &Self, ui: &mut Ui<Message>) -> () {
-    if self.stats.length() == 0 {
-      muted(&mut ui, "No frame stats yet.")
-      return ()
-    }
-    ui.column(
-      |ui| {
-        ui.testId("stats")
-        ui.enumerate(
-          self.stats.asSlice(),
-          |stat| 0,
-          |ui, index, stat| {
-            ui.key(usize.toU64(index))
-            ui.row(
-              |ui| {
-                border(&mut ui, Property.BorderBottomWidth, BAR)
-                paddings(&mut ui, 1.0, 0.0)
-                ui.box(
-                  |ui| {
-                    ui.style(&[css.width(px(170.0))])
-                    ui.color(rgb(MUTED))
-                    ui.text(String.view(&stat.name))
-                  },
-                )
-                ui.text(String.view(&stat.value))
               },
             )
           },
@@ -2767,21 +3928,38 @@ impl Devtools {
 
 impl App<Message, Command> for Devtools {
   fn view(self: &Self, ui: &mut Ui<Message>) -> () {
+    let look = self.look
+    let columns = self.columns()
     ui.style(
       &[
-        css.fontFamily(self.font),
-        css.fontSize(px(12.0)),
-        css.color(rgb(TEXT)),
-        css.backgroundColor(rgb(0xFFFFFF)),
+        css.fontFamily(look.ui),
+        css.fontSize(px(theme.SIZE_BODY)),
+        css.lineHeight(px(theme.LINE_BODY)),
+        css.color(rgb(theme.TEXT)),
+        css.backgroundColor(rgb(theme.INK)),
       ],
     )
-    self.toolbar(&mut ui)
+    ui.onLayout(|bounds| Message.Resized { width: bounds.xMax - bounds.xMin })
+    self.topBar(&mut ui)
     ui.row(
       |ui| {
-        scrolling(&mut ui)
-        ui.style(&[css.overflowY(Overflow.Hidden)])
-        self.elements(&mut ui)
-        self.side(&mut ui)
+        ui.testId("columns")
+        ui.style(
+          &[
+            css.flexGrow(1.0),
+            css.flexShrink(1.0),
+            css.flexBasis(px(0.0)),
+            css.minHeight(px(0.0)),
+            css.minWidth(px(0.0)),
+            css.overflowX(Overflow.Hidden),
+            css.overflowY(Overflow.Hidden),
+          ],
+        )
+        self.elements(&mut ui, columns.tree)
+        self.centre(&mut ui, columns.stacked)
+        if !columns.stacked {
+          self.inspectorColumn(&mut ui, columns.inspector)
+        }
       },
     )
   }
@@ -2793,7 +3971,13 @@ impl App<Message, Command> for Devtools {
       }
       Message.Tick { time: _ } => {
         if self.error.ownedByteLength() != 0 {
+          self.framesDue = false
           self.sync(&mut cx)
+        } else if self.framesDue {
+          self.framesDue = false
+          if self.panel == Panel.Frames {
+            cx.command(Command.Frames)
+          }
         }
       }
       Message.Pull => {
@@ -2801,13 +3985,22 @@ impl App<Message, Command> for Devtools {
       }
       Message.Hover { id } => {
         self.hovered = id
-        cx.command(Command.Highlight { node: id })
+        cx.command(
+          Command.Highlight {
+            node: if id == self.selected {
+              NO_PARENT
+            } else {
+              id
+            },
+            selected: self.selected,
+          },
+        )
       }
       Message.Unhover { id } => {
-        // The selection keeps its highlight; the pointer may already be on another row.
+        // The selection keeps its ring; the pointer may already be on another row.
         if self.hovered == id {
           self.hovered = NO_PARENT
-          cx.command(Command.Highlight { node: self.selected })
+          cx.command(Command.Highlight { node: NO_PARENT, selected: self.selected })
         }
       }
       Message.Sent => {}
@@ -2840,13 +4033,60 @@ impl App<Message, Command> for Devtools {
       }
       Message.Show { panel } => {
         self.panel = panel
+        self.inspector = false
         self.sync(&mut cx)
       }
       Message.ShowPanel { index } => {
         self.panel = Panel.Extension
         self.shown = index
+        self.inspector = false
         self.data.clear()
         self.sync(&mut cx)
+      }
+      Message.ShowSegment { segment } => {
+        self.segment = segment
+      }
+      Message.ShowInspector { shown } => {
+        self.inspector = shown
+      }
+      Message.Resized { width } => {
+        self.width = width
+      }
+      Message.FieldInput { field, value } => {
+        self.field = field
+        self.fieldDraft = move value
+      }
+      Message.ApplyField { field } => {
+        if self.field == field && self.selected != NO_PARENT {
+          let mut declarations = String.make()
+          if cx.alloc(fieldCss(field, String.view(&self.fieldDraft), &mut declarations)) {
+            cx.command(
+              Command.SetStyle { node: self.selected, css: move declarations, draft: false },
+            )
+          }
+          self.field = NO_FIELD
+          self.fieldDraft.clear()
+        }
+      }
+      Message.StepField { field, by } => {
+        if self.selected != NO_PARENT {
+          // Stepped as the value of a declaration, so the declarations field's rules apply.
+          let shown = cx.alloc(self.fieldShown(field))
+          let mut typed = cx.alloc(String.copy("v: "))
+          cx.alloc(typed.append(String.view(&shown)))
+          let mut stepped = String.make()
+          if cx.alloc(step(String.view(&typed), by, &mut stepped)) {
+            let value = String.slice(String.view(&stepped), 3, stepped.ownedByteLength() - 3)
+            let mut declarations = String.make()
+            if cx.alloc(fieldCss(field, value, &mut declarations)) {
+              cx.command(
+                Command.SetStyle { node: self.selected, css: move declarations, draft: false },
+              )
+            }
+            self.field = field
+            self.fieldDraft = cx.alloc(String.copy(value))
+          }
+        }
       }
       Message.Search { value } => {
         self.search = move value
@@ -2959,6 +4199,7 @@ impl App<Message, Command> for Devtools {
       Message.ClearSelection => {
         self.selected = NO_PARENT
         self.detail = Detail.none()
+        self.field = NO_FIELD
         cx.command(Command.Unhighlight)
       }
       Message.ClearEvents => {
@@ -2978,12 +4219,15 @@ impl App<Message, Command> for Devtools {
           self.extensions = move value
           self.panels = Intrinsic.replace(s.panels, List<PanelInfo>.make())
           if self.panel == Panel.Extension && self.shown >= self.panels.length() {
-            self.panel = Panel.Styles
+            self.panel = Panel.Events
           }
           self.resubscribe(&mut cx)
         }
         if full || self.panelNews(&s.news) {
           self.readPanel(&mut cx)
+        }
+        if s.drew {
+          self.framesDue = true
         }
         if s.parts == 0 && s.frames.isNone() {
           return ()
@@ -2992,6 +4236,7 @@ impl App<Message, Command> for Devtools {
         self.error.clear()
         if u32.bitAnd(s.parts, PART_STATUS) != 0 {
           self.status = Intrinsic.replace(s.status, String.make())
+          self.info.take(s.info)
         }
         if u32.bitAnd(s.parts, PART_ROWS) != 0 {
           self.rows = Intrinsic.replace(s.rows, List<Row>.make())
@@ -3069,6 +4314,8 @@ impl App<Message, Command> for Devtools {
   fn subscriptions(self: &Self, subs: &mut Subscriptions<Message>) -> () {
     if self.error.ownedByteLength() != 0 {
       subs.every(1, RETRY_INTERVAL, |time| Message.Tick { time: time })
+    } else if self.framesDue {
+      subs.every(6, FRAMES_INTERVAL, |time| Message.Tick { time: time })
     }
     subs.keyBinding(2, "ArrowDown", 0, || Message.SelectNext)
     subs.keyBinding(3, "ArrowUp", 0, || Message.SelectPrevious)

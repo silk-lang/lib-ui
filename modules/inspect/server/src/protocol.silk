@@ -160,6 +160,9 @@ pub struct Protocol {
   pub dispatched: bool,
   /// Set when the highlight changed: the app must draw a frame.
   pub repaint: bool,
+  /// Set when the request served last only replaced the highlight: whatever waits behind it
+  /// can be served before a frame is drawn, so a burst of highlights draws the last one.
+  pub latestWins: bool,
   /// The last [`LOG_LIMIT`] event records the app took (see [`Protocol.observe`]).
   pub log: List<LoggedEvent>,
   /// The number the next logged record gets.
@@ -196,6 +199,7 @@ impl Protocol {
       heldModifiers: 0,
       dispatched: false,
       repaint: false,
+      latestWins: false,
       log: List<LoggedEvent>.make(),
       nextSeq: 1,
       timeline: Timeline.make(),
@@ -414,14 +418,14 @@ impl Protocol {
       // A node destroyed took its overrides along: its edits are no longer applied.
       self.edits.sweep(tree)
     }
-    if self.highlight.nodes.length() != 0 {
+    if self.highlight.any() {
       run self.composeOverlay(tree)
     }
   }
 
   /// Whether the app should draw [`Protocol.overlayScene`] instead of `tree.scene()`.
   pub fn highlighting(self: &Self) -> bool {
-    return self.highlight.nodes.length() != 0
+    return self.highlight.any()
   }
 
   /// The tree's last frame with the highlight on top (valid after [`Protocol.afterFrame`]
@@ -585,6 +589,7 @@ impl Protocol {
     run putIds(&mut out, "hidden", &self.hidden)
     run putInt(&mut out, "nodes", usize.toU64(run self.nodeCount(tree)))
     run putIds(&mut out, "highlight", &self.highlight.nodes)
+    run putIds(&mut out, "selected", &self.highlight.selected)
     run finish(&mut out)
   }
 
@@ -678,6 +683,7 @@ impl Protocol {
       run rootMembers(tree, self.hidden.asSlice(), &mut out)
     } else if topic == TOPIC_HIGHLIGHT {
       run putIds(&mut out, "nodes", &self.highlight.nodes)
+      run putIds(&mut out, "selected", &self.highlight.selected)
     } else if topic == TOPIC_EDITS {
       run putInt(&mut out, "seq", self.edits.seq)
       run putInt(&mut out, "open", usize.toU64(self.edits.openCount()))
@@ -1085,6 +1091,8 @@ impl Protocol {
     self.highlight.nodes.clear()
     if id != NONE {
       run self.highlight.nodes.append(id)
+    }
+    if self.highlight.any() {
       run self.composeOverlay(tree)
     }
     self.repaint = true
@@ -1295,7 +1303,12 @@ impl Protocol {
         }
       }
     }
+    let mut chosen = List<u32>.make()
+    if has(request, "selected") {
+      run idsField(request, "selected", &mut chosen)
+    }
     self.highlight.nodes.clear()
+    self.highlight.selected.clear()
     let list = ids.asSlice()
     let mut i: usize = 0
     while i < list.length {
@@ -1304,13 +1317,23 @@ impl Protocol {
       }
       i = i + 1
     }
+    let picked = chosen.asSlice()
+    let mut k: usize = 0
+    while k < picked.length {
+      if tree.contains(picked[k]) && !self.hides(tree, picked[k]) {
+        run self.highlight.selected.append(picked[k])
+      }
+      k = k + 1
+    }
     self.repaint = true
+    self.latestWins = true
     self.changes.highlight = true
-    if self.highlight.nodes.length() != 0 {
+    if self.highlight.any() {
       run self.composeOverlay(tree)
     }
     run begin(&mut out, request)
     run putIds(&mut out, "nodes", &self.highlight.nodes)
+    run putIds(&mut out, "selected", &self.highlight.selected)
     run finish(&mut out)
   }
 

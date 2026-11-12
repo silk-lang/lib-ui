@@ -140,7 +140,7 @@ topic per frame:
 | `frame` | a frame of the current root was drawn | `width`, `height`, `scale`, `nodes` |
 | `events` | the event log has new records | `next`: the `seq` the next record gets |
 | `roots` | a root opened or closed | `roots`, as `tree` lists them |
-| `highlight` | the highlight changed | `nodes` |
+| `highlight` | the highlight changed | `nodes`, `selected` |
 | `pick` | the picker turned on or off, or picked | `on`, `picked` (an id) |
 | `edits` | the edit log changed (see Style edits and the edit log) | `seq` (the log's), `open` (entries open) |
 
@@ -156,14 +156,14 @@ Node objects in replies are `{"id", "kind", "role", "name", "testId", "x", "y", 
 
 | cmd | members | reply |
 | --- | --- | --- |
-| `hello` | `protocol` (3 opens a session), `client`, `wants` (topics) | `protocol` (3), `commands`, `capabilities` (`commands`, `topics`, `sessions`; the extensions' with their full names), `mutationFormat` (1), `extensions` (see Extensions), `width`, `height`, `scale`, `frame`, `root`, `roots`, `hidden` (roots left out), `nodes`, `highlight` |
+| `hello` | `protocol` (3 opens a session), `client`, `wants` (topics) | `protocol` (3), `commands`, `capabilities` (`commands`, `topics`, `sessions`; the extensions' with their full names), `mutationFormat` (1), `extensions` (see Extensions), `width`, `height`, `scale`, `frame`, `root`, `roots`, `hidden` (roots left out), `nodes`, `highlight`, `selected` |
 | `subscribe` | `topics` | `topics`: subscribed now (sessions only) |
 | `unsubscribe` | `topics` | `topics`: subscribed now (sessions only) |
 | `snapshot` | target (optional, a subtree), `styles` | `text`: `describe` output, `frame` |
 | `query` | target, `limit` | `count`, `nodes` (node objects, tree order) |
 | `inspect` | target, `patches`, `computed` | `node`, `text`: the devtools-style node view; `box`: the `margin`, `border`, `padding` and `content` rects of the first fragment and the `fragments` count (left out when the node has no box) |
 | `pick` | `x`, `y` | `node` (what the element picker selects), `path` (ids hit testing reaches) |
-| `highlight` | `nodes` (ids) or a target (all matches); none clears it | `nodes` highlighted |
+| `highlight` | `nodes` (ids) or a target (all matches), washed and outlined; `selected` (ids), ringed; none clears it | `nodes` and `selected` highlighted |
 | `screenshot` | target (optional: that node alone, cropped), `highlight` (default true), `maxWidth` (optional 1–4096, reduce before encoding) | `png` (Base64), `width`, `height` (device pixels), `scale`, `frame`, `node` |
 | `click` | target or `x`, `y`; `count`, `modifiers` | `node`, `x`, `y` |
 | `hover` | target or `x`, `y`; `modifiers` | `node`, `x`, `y` |
@@ -176,7 +176,7 @@ Node objects in replies are `{"id", "kind", "role", "name", "testId", "x", "y", 
 | `stats` | | the last frame's `FrameStats`: nodes, fragments, layout counters, replayed and repainted subtrees, glyphs, primitives |
 | `tree` | target (optional, a subtree) | `nodes`: node objects in tree order, each with `parent` (left out at the top), `depth` and `children` (the count); `roots`: the open roots, `{"root", "node"}`, the current one first; `width`, `height`, `scale`, `frame` |
 | `events` | `since` (a `seq`, default 0), `limit` (the newest N) | `events`: the logged records after `since`, oldest first, each `{"seq", "frame", "kind", "target", "path"}` plus `x`, `y` (pointer, wheel and scroll records), `modifiers`, `key` and `value` (input records) where they apply; `next`: the `seq` the next record gets |
-| `frames` | `since` (a frame number), `limit` | `frames`: one per frame drawn, `{"frame", "layoutMs", "paintMs", "layoutSkipped", "layoutPasses", "repainted", "replayed", "fragments", "primitives", "glyphs", "nodes"}`; `count`, `slowestMs`, `averageMs` (times are 0 when the host does not time frames) |
+| `frames` | `since` (a frame number), `limit` | `frames`: one per frame drawn, `{"frame", "layoutMs", "paintMs", "layoutSkipped", "layoutPasses", "repainted", "replayed", "fragments", "primitives", "glyphs", "nodes"}`; `count`, `timed` (whether the host times its frames; times are 0 when it does not), `slowestMs`, `averageMs` |
 | `styles` | target | `node`; the declarations it shows per state (`base`, `hover`, `active`, `focus`, `focus-visible`): the client's with the style edits over them; for the states with edits, `overrides` (the edits' declarations), `client` (the client's own underneath) and `replacing` (states whose edit leaves the client's out) |
 | `setStyle` | target, `style` (`"width: 200px; color: red"`), `state` (default `base`), `replace` | `node`, `state`, `style` (what it shows now), `edited` (node and state pairs with edits), `edits` (the ids of the node's open edits in that state), `seq`; a declaration that does not parse is an error and changes nothing |
 | `resetStyles` | target (optional), `state`, `property` (with a target) | `restored` (pairs or properties showing the client's declarations again), `removed` (open edits taken out of the log), `seq` |
@@ -376,7 +376,8 @@ silk task native inspect      # the CLI drives the demo in a window
   the wire yet; sessions are still in memory
   (ui-inspect's `Session`).
 - Screenshots come from the CPU renderer, not a GPU readback.
-- The highlight has no name tag over the node.
+- The highlight has no name tag over the node: text needs glyphs in the tree's atlas, and the
+  overlay, composed over a finished frame, does not touch it.
 - The edit log lives as long as the app: it is not saved anywhere, and an app started again
   starts with none. Edits have no source location.
 - `edits` with `since` lists what changed after a seq, but not the entries that left the log
