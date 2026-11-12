@@ -1,0 +1,222 @@
+//! Focus, step 3: a countdown on the task being worked on. A subscription makes it tick.
+import core.look { INK, MUTED, button, fieldLook, primary, rgb }
+import focus.look { check, pair, rowLook, titleLook }
+import ui_app.css
+import ui_app.css { px, Align }
+import ui_app.lib { Document, Node, NoCommand, NoOutput, Program, Role, Subscriptions, Update }
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.usize
+import silk.text.string { String }
+
+/// How long a session lasts, in seconds. A real one would be 25 minutes: this one is short
+/// so that you can watch it end.
+pub const SESSION: i64 = 15
+
+pub struct Task {
+  /// Never reused, so it can be the row's key.
+  pub id: u64,
+  pub title: String,
+  pub done: bool,
+  /// How many sessions were finished on this task.
+  pub sessions: i64,
+}
+
+pub struct Focus {
+  pub tasks: List<Task>,
+  /// What is typed in the field and not added yet.
+  pub draft: String,
+  pub nextId: u64,
+  /// The id of the task being worked on, or zero when there is none.
+  pub focused: u64,
+  pub secondsLeft: i64,
+}
+
+pub union Message {
+  ChangedDraft { pub value: String },
+  SubmittedDraft,
+  ClickedToggle { pub id: u64 },
+  ClickedFocus { pub id: u64 },
+  ClickedStop,
+  Ticked,
+}
+
+type Next = Update<Focus, NoCommand, NoOutput>
+
+/// How many tasks are not done yet. Nothing stores this number: it is counted when asked.
+pub fn open(model: &Focus) -> usize {
+  let tasks = model.tasks.asSlice()
+  let mut count: usize = 0
+  let mut i: usize = 0
+  while i < tasks.length {
+    if !tasks[i].done {
+      count = count + 1
+    }
+    i = i + 1
+  }
+  return count
+}
+
+effect fn add(model: &mut Focus, title: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let id = model.nextId
+  model.nextId = id + 1
+  run model.tasks.append(Task { id: id, title: run String.copy(title), done: false, sessions: 0 })
+}
+
+/// Checks or unchecks the task with this id.
+effect fn toggle(model: &mut Focus, id: u64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut i: usize = 0
+  while i < model.tasks.length() {
+    if model.tasks.asSlice()[i].id == id {
+      let mut task = model.tasks.remove(i)
+      task.done = !task.done
+      run model.tasks.insert(i, move task)
+    }
+    i = i + 1
+  }
+}
+
+/// Counts one more session on the task with this id.
+effect fn finish(model: &mut Focus, id: u64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut i: usize = 0
+  while i < model.tasks.length() {
+    if model.tasks.asSlice()[i].id == id {
+      let mut task = model.tasks.remove(i)
+      task.sessions = task.sessions + 1
+      run model.tasks.insert(i, move task)
+    }
+    i = i + 1
+  }
+}
+
+impl Program<Message, NoCommand> for Focus {
+  effect fn init() -> Next
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut model = Focus {
+      tasks: List<Task>.make(),
+      draft: String.make(),
+      nextId: 1,
+      focused: 0,
+      secondsLeft: 0,
+    }
+    run add(&mut model, "Read the tutorial")
+    run add(&mut model, "Build something small")
+    return Next.of(move model)
+  }
+
+  effect fn update(mut model: Focus, message: Message) -> Next
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match move message {
+      Message.ChangedDraft { value } => {
+        model.draft = move value
+      }
+      Message.SubmittedDraft => {
+        let draft = move model.draft
+        model.draft = String.make()
+        let title = String.trim(String.view(&draft))
+        if String.byteLength(title) != 0 {
+          run add(&mut model, title)
+        }
+      }
+      Message.ClickedToggle { id } => {
+        run toggle(&mut model, id)
+      }
+      Message.ClickedFocus { id } => {
+        model.focused = id
+        model.secondsLeft = SESSION
+      }
+      Message.ClickedStop => {
+        model.focused = 0
+      }
+      Message.Ticked => {
+        model.secondsLeft = model.secondsLeft - 1
+        if model.secondsLeft <= 0 {
+          // The session is over: count it, and stop focusing. The timer stops by itself.
+          let id = model.focused
+          model.focused = 0
+          run finish(&mut model, id)
+        }
+      }
+    }
+    return Next.of(move model)
+  }
+
+  fn view(model: &Focus, h: &Document<Message>) -> Node {
+    return h.column(
+      &[h.style(&[css.padding(px(16.0)), css.rowGap(px(12.0)), css.color(rgb(INK))])],
+      &[
+        h.row(
+          &[h.style(&[css.columnGap(px(8.0))])],
+          &[
+            h.input(
+              String.view(&model.draft),
+              &[
+                h.testId("draft"),
+                h.label("New task"),
+                h.placeholder("What will you work on?"),
+                h.onInput(|value| Message.ChangedDraft { value: move value }),
+                h.onEnter(Message.SubmittedDraft),
+                fieldLook<Message>(h),
+                h.style(&[css.flexGrow(1.0)]),
+              ],
+            ),
+            primary(h, "Add", Message.SubmittedDraft),
+          ],
+        ),
+        h.column(
+          &[h.accessRole(Role.List)],
+          &[h.each(model.tasks.asSlice(), |task| h.keyed(task.id, row(h, model, task)))],
+        ),
+        h.row(
+          &[h.style(&[css.columnGap(px(6.0)), css.color(rgb(MUTED))])],
+          &[h.box(&[h.testId("open")], &[h.number(usize.toI64(open(model)))]), h.text("open")],
+        ),
+      ],
+    )
+  }
+
+  /// The timer runs only while a task is focused.
+  fn subscriptions(model: &Focus, subs: &mut Subscriptions<Message>) -> () {
+    if model.focused != 0 {
+      subs.every(1, 1.0, |time| Message.Ticked)
+    }
+  }
+}
+
+/// One task. What is on its right depends on the model: the countdown and Stop on the task
+/// being worked on, Focus on the others while nothing is running.
+fn row(h: &Document<Message>, model: &Focus, task: &Task) -> Node {
+  return h.row(
+    &[h.accessRole(Role.ListItem), rowLook<Message>(h)],
+    &[
+      check(h, task.done, String.view(&task.title), Message.ClickedToggle { id: task.id }),
+      h.box(&[titleLook<Message>(h, task.done)], &[h.text(String.view(&task.title))]),
+      if task.sessions > 0 {
+        h.row(&[h.style(&[css.color(rgb(MUTED))])], &[h.text("×"), h.number(task.sessions)])
+      } else {
+        h.empty()
+      },
+      if model.focused == task.id {
+        h.row(
+          &[h.style(&[css.alignItems(Align.Center), css.columnGap(px(10.0))])],
+          &[
+            pair(h, model.secondsLeft / 60, model.secondsLeft % 60),
+            button(h, "Stop", Message.ClickedStop),
+          ],
+        )
+      } else if model.focused == 0 && !task.done {
+        button(h, "Focus", Message.ClickedFocus { id: task.id })
+      } else {
+        h.empty()
+      },
+    ],
+  )
+}

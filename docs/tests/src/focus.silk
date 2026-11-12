@@ -1,0 +1,65 @@
+//! The test of the tutorial's finished app: a whole session, from typing a task to the log.
+import examples.focus.step4 { Clock, Command, Focus, Message, SESSION, open }
+import ui_app.lib { drain, tick, TreeError }
+import ui_app.program as program
+import ui_app_dom.html { Html }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.i64
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+/// A clock that always says the same time.
+struct Stopped {
+  minutes: u32,
+}
+
+impl Clock for Stopped {
+  effect fn minutes(self: &mut Self) -> u32 {
+    return self.minutes
+  }
+}
+
+effect fn sessionBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Clock | &mut Allocator {
+  let mut page = Html.make()
+  let mut app = run program.make<Focus, Message, Command>()
+  run app.start(&mut page, 0.0)
+  run drain(&mut app, &mut page)
+  run Testing.expect(open(&app.model.value) == 2, "starts with two open tasks")
+
+  // Typing and adding are messages, exactly as the view would send them.
+  app.send(Message.ChangedDraft { value: run String.copy("Write the report") })
+  app.send(Message.SubmittedDraft)
+  run drain(&mut app, &mut page)
+  run Testing.expect(open(&app.model.value) == 3, "the new task is open")
+  run Testing.expect(app.nextDeadline().isNone(), "no timer while nothing is focused")
+
+  // Focus on it, and let the whole session pass.
+  app.send(Message.ClickedFocus { id: 3 })
+  run drain(&mut app, &mut page)
+  let mut second: i64 = 1
+  while second <= SESSION {
+    run tick(&mut app, &mut page, i64.toF64(second) + 0.05, false)
+    second = second + 1
+  }
+  run drain(&mut app, &mut page)
+
+  run Testing.expect(app.model.value.focused == 0, "the session ended by itself")
+  run Testing.expect(app.nextDeadline().isNone(), "and the timer with it")
+  run Testing.expect(app.model.value.tasks.asSlice()[2].sessions == 1, "the task counts it")
+  let log = app.model.value.log.asSlice()
+  run Testing.expect(log.length == 1, "the log has one line")
+  run Testing.expect(log[0].minutes == 872, "stamped with the clock's time")
+  run Testing.expect(String.view(&log[0].title) == "Write the report", "and the task's title")
+}
+
+test effect fn aWholeSession() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut clock = Stopped { minutes: 872 }
+  run sessionBody()
+    |> Effect.provideMut<Clock>(&mut clock)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}

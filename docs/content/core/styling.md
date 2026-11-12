@@ -2,6 +2,8 @@
 
 Styles are CSS, written as Silk values. If you know CSS you know the names already: `css.padding`, `css.borderRadius`, `css.backgroundColor`.
 
+> **Note:** Styling is part of the view: a look is a value computed from the model, like the nodes are. Hover, press and focus are tracked by the runtime, so they stay out of your model.
+
 ## A plan picker
 
 ::demo plans
@@ -78,3 +80,12 @@ A design system in Silk UI is a module of functions. This is the one the example
 `buttonLook` returns an `Attr`. `h.attrs` joins several attributes into one, so a look can be a base style plus its hover, press and focus variants, and still be one value to pass around.
 
 The functions are generic over the message type `M`, which is why any program can use them.
+
+## Recap
+
+- Styles are CSS properties written as values, in `h.style`.
+- A style that depends on your data is an `if`. A style that depends on the pointer or focus is a variant: `h.hover`, `h.active`, `h.focusVisible`.
+- Share a look by writing a function that returns an `Attr`.
+- `css.raw` passes any CSS through when there is no helper for it.
+
+Next: [Events and input](/core/events/).

@@ -2,6 +2,8 @@
 
 A view is a function from the model to a description of the screen. This page builds one out of smaller functions, shows a list, and shows part of it only sometimes.
 
+> **Note:** In the loop, the view is the step from the model to the screen. It is step 1 of the [tutorial](/core/tutorial/), and question 4 of [Thinking in Silk UI](/core/thinking/).
+
 ## A menu
 
 ::demo menu
@@ -81,3 +83,12 @@ Three attributes give a node a name that is not its look.
 | `h.testId("dishes")` | Tests and the inspector |
 
 The menu gives its list `h.testId("dishes")`, and a test finds it by that name. [Testing](/core/testing/) shows how.
+
+## Recap
+
+- A view is a function from the model to nodes. It runs after every update.
+- Split a view into functions. That is the unit of reuse.
+- Show a list with `h.each`, and give rows that can move a key.
+- To show something only sometimes, use an `if`. To hide it, leave it out.
+
+Next: [Styling](/core/styling/).

@@ -2,6 +2,8 @@
 
 Most of the time, splitting a program means splitting its view into functions, as in [Views](/core/views/). Sometimes a part of the screen is a small program of its own, with its own model and messages, and you want to use it more than once. That is a **submodel**.
 
+> **Note:** This is question 6 of [Thinking in Silk UI](/core/thinking/), and it comes last for a reason: most apps need few submodels or none.
+
 ## An order
 
 ::demo order
@@ -78,3 +80,12 @@ The other direction is a request. The child says which requests it takes, and th
 A child with commands or subscriptions passes those through its parent as well: `lift` wraps the child's commands as the parent's, and `subs.submodel` does the same for subscriptions.
 
 > **Note:** Reach for a submodel when a part has state of its own *and* is used in more than one place. For everything else, a view function and a few fields in the parent's model are simpler.
+
+## Recap
+
+- A submodel is a program used inside another: its own model, messages and view.
+- The parent holds the child's model and passes its messages through.
+- A child tells its parent something with an output, and the parent asks the child with an input.
+- Prefer view functions until a part has private state and several uses.
+
+Next: [Testing](/core/testing/).

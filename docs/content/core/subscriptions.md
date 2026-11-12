@@ -2,6 +2,8 @@
 
 Some messages come from neither the view nor a command: a timer ticks, a key is pressed while nothing has focus, the window changes size. A program gets those by **subscribing**.
 
+> **Note:** A [command](/core/commands/) is for something that happens once because you asked. A subscription is for something that keeps happening while a condition holds. Step 3 of the [tutorial](/core/tutorial/) shows one driving a countdown.
+
 ## A stopwatch
 
 ::demo stopwatch
@@ -55,3 +57,12 @@ subs.port(1, "news", |text| Message.GotNews { text: move text })
 ```
 
 The host posts a string to the port's name, and the program gets a message. In a page that is `page.post("news", text)` from JavaScript. In a native app a worker thread posts through a `Poster`. [Background work](/native/background-work/) shows the native side from start to end.
+
+## Recap
+
+- `subscriptions` is a function of the model. It runs after every update.
+- The runtime starts what the function newly asks for and stops what it no longer asks for. There is no cleanup to write.
+- Timers, frames, keys, window size and the address are all subscriptions.
+- A port brings in messages from code outside the program.
+
+Next: [Routing](/core/routing/).
