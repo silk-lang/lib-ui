@@ -8,7 +8,7 @@ Most of the time, splitting a program means splitting its view into functions, a
 
 ::demo order
 
-The two rows are the same stepper, used twice. The total and the Clear button belong to the parent.
+The three lines are the same stepper, used three times. Each knows its own price and quantity. The count, the total, the delivery bar and the Clear button belong to the parent.
 
 ::source examples/src/core/order.silk
 
@@ -56,7 +56,7 @@ Everything the child does goes through the parent this way. Nothing is hidden: w
 A child sometimes has news for its parent. It does not call the parent. It attaches a **report** to what its `update` returns:
 
 ```silk
-return Step.of(move model).reporting(StepperOutput.Changed { by: 1 })
+return Step.of(move model).reporting(StepperOutput.Changed { by: 1, cost: cost })
 ```
 
 `fold` gives the report to the parent, in `folded.out`, and the parent does what it likes with it:
@@ -67,7 +67,7 @@ return Step.of(move model).reporting(StepperOutput.Changed { by: 1 })
 
 ::source examples/src/core/order.silk "impl Receives"
 
-The other direction is a request. The child says which requests it takes, and the parent sends one with `foldInput`. That is how Clear empties both steppers.
+The other direction is a request. The child says which requests it takes, and the parent sends one with `foldInput`. That is how Clear empties every line.
 
 ## Three channels
 

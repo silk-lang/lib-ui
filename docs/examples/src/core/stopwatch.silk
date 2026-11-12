@@ -1,18 +1,31 @@
 //! A stopwatch: a timer subscription that exists only while the watch runs.
-import core.look { INK, button, primary, rgb }
+import core.look { ACCENT, INK, LINE, MUTED, button, primary, rgb }
 import ui_app.css
-import ui_app.css { px, Align }
+import ui_app.css { px, BorderStyle, Overflow }
 import ui_app.lib { Document, Node, NoCommand, NoOutput, Program, Subscriptions, Update }
+import silk.collections.list { List }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.i64
+import silk.num.usize
 
 pub struct Stopwatch {
   /// Tenths of a second.
   pub tenths: i64,
   pub running: bool,
+  pub laps: List<Lap>,
+}
+
+pub struct Lap {
+  pub number: i64,
+  /// What the watch showed when the lap ended.
+  pub at: i64,
+  /// How long the lap took: `at`, less the `at` of the lap before.
+  pub took: i64,
 }
 
 pub union Message {
   ClickedStartStop,
+  ClickedLap,
   ClickedReset,
   Ticked,
 }
@@ -23,7 +36,7 @@ impl Program<Message, NoCommand> for Stopwatch {
   effect fn init() -> Next
     ! OutOfMemoryError
     ? &mut Allocator {
-    return Next.of(Stopwatch { tenths: 0, running: false })
+    return Next.of(Stopwatch { tenths: 0, running: false, laps: List<Lap>.make() })
   }
 
   effect fn update(mut model: Stopwatch, message: Message) -> Next
@@ -33,9 +46,20 @@ impl Program<Message, NoCommand> for Stopwatch {
       Message.ClickedStartStop => {
         model.running = !model.running
       }
+      Message.ClickedLap => {
+        let count = model.laps.length()
+        let before = if count == 0 {
+          0
+        } else {
+          model.laps.asSlice()[count - 1].at
+        }
+        let now = model.tenths
+        run model.laps.append(Lap { number: usize.toI64(count) + 1, at: now, took: now - before })
+      }
       Message.ClickedReset => {
         model.tenths = 0
         model.running = false
+        model.laps.clear()
       }
       Message.Ticked => {
         model.tenths = model.tenths + 1
@@ -45,15 +69,10 @@ impl Program<Message, NoCommand> for Stopwatch {
   }
 
   fn view(model: &Stopwatch, h: &Document<Message>) -> Node {
-    return h.row(
+    return h.column(
       &[
         h.style(
-          &[
-            css.alignItems(Align.Center),
-            css.columnGap(px(12.0)),
-            css.padding(px(16.0)),
-            css.color(rgb(INK)),
-          ],
+          &[css.padding(px(16.0)), css.rowGap(px(12.0)), css.color(rgb(INK)), css.maxWidth(px(320.0))],
         ),
       ],
       &[
@@ -62,25 +81,46 @@ impl Program<Message, NoCommand> for Stopwatch {
             h.testId("time"),
             h.style(
               &[
-                css.fontSize(px(28.0)),
+                css.fontSize(px(40.0)),
                 css.fontWeight(700.0),
-                css.minWidth(px(96.0)),
                 css.fontVariantNumeric("tabular-nums"),
               ],
             ),
           ],
-          &[h.number(model.tenths / 10), h.text("."), h.number(model.tenths % 10), h.text(" s")],
+          &[clock(h, model.tenths)],
         ),
-        primary(
-          h,
-          if model.running {
-            "Stop"
-          } else {
-            "Start"
-          },
-          Message.ClickedStartStop,
+        h.row(
+          &[h.style(&[css.columnGap(px(8.0))])],
+          &[
+            primary(
+              h,
+              if model.running {
+                "Stop"
+              } else {
+                "Start"
+              },
+              Message.ClickedStartStop,
+            ),
+            if model.running {
+              button(h, "Lap", Message.ClickedLap)
+            } else {
+              button(h, "Reset", Message.ClickedReset)
+            },
+          ],
         ),
-        button(h, "Reset", Message.ClickedReset),
+        h.column(
+          &[
+            h.testId("laps"),
+            h.style(
+              &[
+                css.maxHeight(px(132.0)),
+                css.overflowY(Overflow.Auto),
+                css.fontVariantNumeric("tabular-nums"),
+              ],
+            ),
+          ],
+          &[h.each(model.laps.asSlice(), |lap| h.keyed(i64.toU64(lap.number), row(h, model, lap)))],
+        ),
       ],
     )
   }
@@ -92,4 +132,80 @@ impl Program<Message, NoCommand> for Stopwatch {
       subs.every(1, 0.1, |time| Message.Ticked)
     }
   }
+}
+
+/// Whether a lap is the quickest of them (`quickest`) or the slowest. With fewer than two
+/// laps there is nothing to compare.
+fn extreme(model: &Stopwatch, lap: &Lap, quickest: bool) -> bool {
+  if model.laps.length() < 2 {
+    return false
+  }
+  let laps = model.laps.asSlice()
+  let mut i: usize = 0
+  while i < laps.length {
+    let other = laps[i].took
+    if quickest && other < lap.took || !quickest && other > lap.took {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+/// One lap: its number, how long it took, and what the watch showed.
+fn row(h: &Document<Message>, model: &Stopwatch, lap: &Lap) -> Node {
+  let ink = if extreme(model, lap, true) {
+    ACCENT
+  } else if extreme(model, lap, false) {
+    0xB91C1C
+  } else {
+    INK
+  }
+  return h.row(
+    &[
+      h.style(
+        &[
+          css.columnGap(px(12.0)),
+          css.paddingTop(px(6.0)),
+          css.paddingBottom(px(6.0)),
+          css.borderTopWidth(px(1.0)),
+          css.borderStyle(BorderStyle.Solid),
+          css.borderColor(rgb(LINE)),
+          css.fontSize(px(14.0)),
+        ],
+      ),
+    ],
+    &[
+      h.row(
+        &[h.style(&[css.columnGap(px(4.0)), css.color(rgb(MUTED)), css.minWidth(px(56.0))])],
+        &[h.box(&[], &[h.text("Lap")]), h.box(&[], &[h.number(lap.number)])],
+      ),
+      h.box(&[h.style(&[css.flexGrow(1.0), css.color(rgb(ink))])], &[clock(h, lap.took)]),
+      h.box(&[h.style(&[css.color(rgb(MUTED))])], &[clock(h, lap.at)]),
+    ],
+  )
+}
+
+/// Tenths of a second as minutes, seconds and tenths: `01:07.3`.
+fn clock(h: &Document<Message>, tenths: i64) -> Node {
+  let minutes = tenths / 600
+  let seconds = tenths / 10 % 60
+  return h.row(
+    &[],
+    &[
+      two(h, minutes),
+      h.text(":"),
+      two(h, seconds),
+      h.text("."),
+      h.number(tenths % 10),
+    ],
+  )
+}
+
+/// A number in two digits.
+fn two(h: &Document<Message>, value: i64) -> Node {
+  if value < 10 {
+    return h.row(&[], &[h.text("0"), h.number(value)])
+  }
+  return h.number(value)
 }

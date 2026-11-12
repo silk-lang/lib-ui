@@ -8,6 +8,8 @@ Some messages come from neither the view nor a command: a timer ticks, a key is 
 
 ::demo stopwatch
 
+Start it and press Lap a few times. The quickest lap turns green and the slowest red.
+
 ::source examples/src/core/stopwatch.silk
 
 ## Subscriptions are a function of the model
