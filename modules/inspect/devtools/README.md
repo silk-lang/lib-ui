@@ -51,6 +51,11 @@ SILK_UI_INSPECT=1 ui-app-demo &                            # or any app, then:
 silk task native devtools run --connect 1   # 1, tcp:<port> or a socket path
 ```
 
+These build the devtools optimized (the inspected app stays a debug build): an unoptimized
+build redraws about ten times slower, which shows as lag while the app draws. `--debug` builds
+them unoptimized, which links in a second and makes the devtools inspectable themselves;
+`silk task native devtools check` always does, to drive them through their own inspector.
+
 ### In the app's own process
 
 Every app the native window host runs with the devtools as its companion can show them in its
