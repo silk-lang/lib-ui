@@ -1,0 +1,828 @@
+//! The tree benchmarks: a wall of tiles built, attached, laid out, detached and cleared;
+//! inherited styles changed on an attached wall; many short labels; and FerroUI's layout
+//! subsystem scenes (panels, invalidation, nesting, size changes). The names, scene sizes and
+//! operations follow FerroUI's `trees` and `layout_subsystem` benchmarks.
+//!
+//! Where FerroUI's operation leaves work for its next layout pass (setting an inherited
+//! property, detaching), the operation here includes that layout, so it measures at least as
+//! much work.
+import harness { Bench }
+import walls {
+  Fixture,
+  TILES,
+  WIDTH,
+  HEIGHT,
+  digits,
+  tileParts,
+  wall,
+  leaf,
+  blue,
+  teal
+}
+import ui_tree.css
+import ui_tree.css { px, Keyword, Declaration }
+import ui_tree.lib {
+  Tree,
+  TreeError,
+  BoxNode,
+  TextNode,
+  FontFamily,
+  FlexDirection,
+  FlexWrap,
+  Position,
+  Align,
+  Direction
+}
+import ui_tree.mutation { Visibility }
+import ui_tree.grid { Grid, GridTrack, GridBreadth }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.usize
+import silk.text.string { String }
+
+// Lifetime: a wall of 2,000 tiles (12,000 nodes).
+
+pub enum LifetimeStep {
+  /// Make the nodes of a detached wall.
+  Build,
+  /// Put a built, detached wall under the root.
+  Attach,
+  /// Put each tile under an attached canvas, then its parts under it, from the top down.
+  AttachTopDown,
+  /// Lay out an attached wall that was never laid out (styles and layout).
+  LayOut,
+  /// Take a laid-out wall from the root, and lay the root out.
+  Detach,
+  /// Destroy the tiles of a detached wall.
+  Clear,
+  /// The first frame of an attached wall: styles, layout and paint.
+  FirstFrame,
+}
+
+pub struct Lifetime<'a> {
+  pub fixture: Fixture<'a>,
+  pub step: LifetimeStep,
+  canvas: Option<BoxNode>,
+  attached: bool,
+}
+
+impl<'a> Lifetime<'a> {
+  pub fn make(fixture: Fixture<'a>, step: LifetimeStep) -> Lifetime<'a> {
+    return Lifetime { fixture: move fixture, step: step, canvas: Option<BoxNode>.None, attached: false }
+  }
+
+  effect fn discard(self: &mut Self) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if let Option<BoxNode>.Some { value } = self.canvas {
+      run self.fixture.tree.destroy(value)
+      self.canvas = Option<BoxNode>.None
+      if self.attached {
+        run self.fixture.layOut()
+      }
+      self.attached = false
+    }
+  }
+
+  effect fn built(self: &mut Self) -> BoxNode
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    run self.discard()
+    let canvas = run wall(&mut self.fixture.tree, TILES)
+    self.canvas = Option<BoxNode>.some(canvas)
+    return canvas
+  }
+
+  effect fn attachedWall(self: &mut Self) -> BoxNode
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let canvas = run self.built()
+    run self.fixture.tree.append(self.fixture.root, canvas)
+    self.attached = true
+    return canvas
+  }
+
+  fn canvasNode(self: &Self) -> BoxNode {
+    return some(self.canvas)
+  }
+}
+
+impl<'a> Bench for Lifetime<'a> {
+  effect fn prepare(self: &mut Self) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    match self.step {
+      LifetimeStep.Build => run self.discard()
+      LifetimeStep.Attach => {
+        drop run self.built()
+      }
+      LifetimeStep.AttachTopDown => {
+        run self.discard()
+        let canvas = run self.fixture.tree.box(
+          &[css.position(Position.Relative), css.width(px(WIDTH)), css.height(px(HEIGHT))],
+        )
+        run self.fixture.tree.append(self.fixture.root, canvas)
+        self.canvas = Option<BoxNode>.some(canvas)
+        self.attached = true
+      }
+      LifetimeStep.LayOut => {
+        drop run self.attachedWall()
+      }
+      LifetimeStep.FirstFrame => {
+        drop run self.attachedWall()
+      }
+      LifetimeStep.Detach => {
+        drop run self.attachedWall()
+        run self.fixture.layOut()
+      }
+      LifetimeStep.Clear => {
+        drop run self.built()
+      }
+    }
+  }
+
+  effect fn body(self: &mut Self) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    match self.step {
+      LifetimeStep.Build => {
+        let canvas = run wall(&mut self.fixture.tree, TILES)
+        self.canvas = Option<BoxNode>.some(canvas)
+      }
+      LifetimeStep.Attach => {
+        let root = self.fixture.root
+        let canvas = self.canvasNode()
+        run self.fixture.tree.append(root, canvas)
+        self.attached = true
+      }
+      LifetimeStep.AttachTopDown => {
+        let canvas = self.canvasNode()
+        let tree = &mut self.fixture.tree
+        let mut i: usize = 0
+        while i < TILES {
+          let parts = run tileParts(&mut tree, i)
+          run tree.append(canvas, parts.tile)
+          run tree.append(parts.tile, parts.content)
+          run tree.append(parts.content, parts.name)
+          run tree.append(parts.content, parts.line)
+          run tree.append(parts.line, parts.spot)
+          run tree.append(parts.line, parts.value)
+          i = i + 1
+        }
+      }
+      LifetimeStep.LayOut => run self.fixture.layOut()
+      LifetimeStep.FirstFrame => run self.fixture.frame()
+      LifetimeStep.Detach => {
+        let canvas = self.canvasNode()
+        run self.fixture.tree.remove(canvas)
+        self.attached = false
+        run self.fixture.layOut()
+      }
+      LifetimeStep.Clear => {
+        let canvas = self.canvasNode()
+        let children = run self.fixture.tree.children(canvas)
+        let mut i: usize = 0
+        while i < children.length() {
+          run self.fixture.tree.destroy(BoxNode.of(children.get(i)))
+          i = i + 1
+        }
+      }
+    }
+  }
+}
+
+fn some(found: Option<BoxNode>) -> BoxNode {
+  return match found {
+    Option<BoxNode>.Some { value } => value
+    Option<BoxNode>.None => Intrinsic.trap("ui-bench: the scene has no such node")
+  }
+}
+
+// Propagation: an inherited or cascading property changed on the canvas of an attached,
+// laid-out wall, then the layout that follows.
+
+pub enum Change {
+  FontFamily,
+  FontWeight,
+  Visible,
+  Direction,
+  FontSize,
+  Color,
+}
+
+pub struct Propagation<'a> {
+  pub fixture: Fixture<'a>,
+  pub change: Change,
+  canvas: BoxNode,
+  other: FontFamily,
+  flip: bool,
+}
+
+impl<'a> Propagation<'a> {
+  pub effect fn make(fixture: Fixture<'a>, change: Change) -> Propagation<'a>
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut fixture = move fixture
+    let canvas = run wall(&mut fixture.tree, TILES)
+    run fixture.tree.append(fixture.root, canvas)
+    let other = run fixture.tree.fontFamily("serif")
+    run fixture.frame()
+    return Propagation { fixture: move fixture, change: change, canvas: canvas, other: other, flip: false }
+  }
+}
+
+impl<'a> Bench for Propagation<'a> {
+  effect fn body(self: &mut Self) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    self.flip = !self.flip
+    let on = self.flip
+    let mut style = List<Declaration>.make()
+    run style.append(css.position(Position.Relative))
+    run style.append(css.width(px(WIDTH)))
+    run style.append(css.height(px(HEIGHT)))
+    if on {
+      match self.change {
+        Change.FontFamily => run style.append(css.fontFamily(self.other.raw()))
+        Change.FontWeight => run style.append(css.fontWeight(700.0))
+        Change.Visible => run style.append(css.visibility(Visibility.Hidden))
+        Change.Direction => run style.append(css.direction(Direction.Rtl))
+        Change.FontSize => run style.append(css.fontSize(px(20.0)))
+        Change.Color => run style.append(css.color(teal()))
+      }
+    }
+    run self.fixture.tree.setStyle(self.canvas, style.asSlice())
+    run self.fixture.layOut()
+  }
+}
+
+// Text: 2,000 labels of five digits.
+
+pub const LABELS: usize = 2000
+
+pub enum TextStep {
+  /// Make 2,000 labels, lay them out and read their widths.
+  CreateAndMeasure,
+  /// Change the text of every label of a column of 2,000, and lay out.
+  ChangeAndLayOut,
+  /// Narrow a wrapping panel of 500 paragraphs by 20 pixels, and lay out.
+  NarrowAndLayOut,
+}
+
+pub struct Labels<'a> {
+  pub fixture: Fixture<'a>,
+  pub step: TextStep,
+  panel: Option<BoxNode>,
+  labels: List<TextNode>,
+  frame: usize,
+  pub total: f32,
+}
+
+impl<'a> Labels<'a> {
+  pub effect fn make(fixture: Fixture<'a>, step: TextStep) -> Labels<'a>
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut this = Labels {
+      fixture: move fixture,
+      step: step,
+      panel: Option<BoxNode>.None,
+      labels: List<TextNode>.make(),
+      frame: 0,
+      total: 0.0,
+    }
+    match step {
+      TextStep.CreateAndMeasure => {}
+      TextStep.ChangeAndLayOut => {
+        let tree = &mut this.fixture.tree
+        let panel = run tree.box(
+          &[
+            css.display(Keyword.Flex),
+            css.flexDirection(FlexDirection.Column),
+            css.alignItems(Align.FlexStart),
+            css.fontSize(px(12.0)),
+          ],
+        )
+        let mut i: usize = 0
+        while i < LABELS {
+          let label = run tree.box(&[])
+          let value = run digits(i, 5)
+          let text = run tree.text(String.view(&value))
+          run tree.append(label, text)
+          run tree.append(panel, label)
+          run this.labels.append(text)
+          i = i + 1
+        }
+        run tree.append(this.fixture.root, panel)
+        this.panel = Option<BoxNode>.some(panel)
+        run this.fixture.frame()
+      }
+      TextStep.NarrowAndLayOut => {
+        let tree = &mut this.fixture.tree
+        let panel = run tree.box(
+          &[
+            css.display(Keyword.Flex),
+            css.flexDirection(FlexDirection.Row),
+            css.flexWrap(FlexWrap.Wrap),
+            css.alignItems(Align.FlexStart),
+            css.width(px(1200.0)),
+            css.fontSize(px(11.0)),
+          ],
+        )
+        let mut i: usize = 0
+        while i < LABELS / 4 {
+          let paragraph = run tree.box(
+            &[css.width(px(150.0 + usize.toF32(i % 5) * 10.0)), css.flexShrink(0.0)],
+          )
+          let text = run tree.text(
+            "A paragraph that wraps over a few lines and keeps its layout while its width holds.",
+          )
+          run tree.append(paragraph, text)
+          run tree.append(panel, paragraph)
+          i = i + 1
+        }
+        run tree.append(this.fixture.root, panel)
+        this.panel = Option<BoxNode>.some(panel)
+        run this.fixture.frame()
+      }
+    }
+    return move this
+  }
+}
+
+impl<'a> Bench for Labels<'a> {
+  effect fn prepare(self: &mut Self) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if self.step == TextStep.CreateAndMeasure {
+      if let Option<BoxNode>.Some { value } = self.panel {
+        run self.fixture.tree.destroy(value)
+        run self.fixture.layOut()
+        self.panel = Option<BoxNode>.None
+      }
+    }
+  }
+
+  effect fn body(self: &mut Self) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    match self.step {
+      TextStep.CreateAndMeasure => {
+        let tree = &mut self.fixture.tree
+        let panel = run tree.box(
+          &[
+            css.display(Keyword.Flex),
+            css.flexDirection(FlexDirection.Column),
+            css.alignItems(Align.FlexStart),
+            css.fontSize(px(12.0)),
+          ],
+        )
+        let mut labels = List<BoxNode>.make()
+        let mut i: usize = 0
+        while i < LABELS {
+          let label = run tree.box(&[])
+          let value = run digits(i, 5)
+          let text = run tree.text(String.view(&value))
+          run tree.append(label, text)
+          run tree.append(panel, label)
+          run labels.append(label)
+          i = i + 1
+        }
+        run tree.append(self.fixture.root, panel)
+        self.panel = Option<BoxNode>.some(panel)
+        run self.fixture.layOut()
+        let mut total: f32 = 0.0
+        let mut j: usize = 0
+        while j < labels.length() {
+          if let Option.Some { value } = run self.fixture.tree.bounds(labels.get(j)) {
+            total = total + value.xMax - value.xMin
+          }
+          j = j + 1
+        }
+        self.total = total
+      }
+      TextStep.ChangeAndLayOut => {
+        self.frame = self.frame + 1
+        let mut i: usize = 0
+        while i < self.labels.length() {
+          let value = run digits((i + self.frame * 7) % 100000, 5)
+          run self.fixture.tree.setText(self.labels.get(i), String.view(&value))
+          i = i + 1
+        }
+        run self.fixture.layOut()
+      }
+      TextStep.NarrowAndLayOut => {
+        self.frame = self.frame + 1
+        let width: f32 = if self.frame % 2 == 0 {
+          1200.0
+        } else {
+          1180.0
+        }
+        run self.fixture.tree.setStyle(
+          some(self.panel),
+          &[
+            css.display(Keyword.Flex),
+            css.flexDirection(FlexDirection.Row),
+            css.flexWrap(FlexWrap.Wrap),
+            css.alignItems(Align.FlexStart),
+            css.width(px(width)),
+            css.fontSize(px(11.0)),
+          ],
+        )
+        run self.fixture.layOut()
+      }
+    }
+  }
+}
+
+// Layout subsystem: panels of 1,000 leaves measured and arranged again from scratch.
+
+pub enum Panel {
+  StackVertical,
+  StackHorizontal,
+  Grid,
+  Wrap,
+  Canvas,
+  UniformGrid,
+}
+
+pub struct Panels<'a> {
+  pub fixture: Fixture<'a>,
+}
+
+pub const CHILDREN: usize = 1000
+
+impl<'a> Panels<'a> {
+  pub effect fn make(fixture: Fixture<'a>, panel: Panel) -> Panels<'a>
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut fixture = move fixture
+    let tree = &mut fixture.tree
+    let node = match panel {
+      Panel.StackVertical => run tree.box(&[css.display(Keyword.Flex), css.flexDirection(FlexDirection.Column), css.alignItems(Align.FlexStart)])
+      Panel.StackHorizontal => run tree.box(&[css.display(Keyword.Flex), css.flexDirection(FlexDirection.Row), css.alignItems(Align.FlexStart)])
+      Panel.Wrap => run tree.box(&[css.display(Keyword.Flex), css.flexDirection(FlexDirection.Row), css.flexWrap(FlexWrap.Wrap), css.alignItems(Align.FlexStart)])
+      Panel.Canvas => run tree.box(&[css.position(Position.Relative), css.width(px(WIDTH)), css.height(px(HEIGHT))])
+      Panel.Grid => run tree.box(&[css.display(Keyword.Grid)])
+      Panel.UniformGrid => run tree.box(&[css.display(Keyword.Grid)])
+    }
+    if panel == Panel.UniformGrid {
+      let grid = run Grid.columns(40)
+      run tree.setGrid(node, &grid)
+    }
+    if panel == Panel.Grid {
+      let mut grid = Grid.make()
+      let mut c: usize = 0
+      while c < 25 {
+        run grid.template.columns.tracks.append(GridTrack.breadth(track(c, 12.0)))
+        c = c + 1
+      }
+      let mut r: usize = 0
+      while r < CHILDREN / 25 {
+        run grid.template.rows.tracks.append(GridTrack.breadth(track(r, 6.0)))
+        r = r + 1
+      }
+      run tree.setGrid(node, &grid)
+    }
+    let mut i: usize = 0
+    while i < CHILDREN {
+      let child = match panel {
+        Panel.StackVertical => run leaf(&mut tree, 10.0, 4.0, &[])
+        Panel.StackHorizontal => run leaf(&mut tree, 10.0, 4.0, &[css.flexShrink(0.0)])
+        Panel.Wrap => run leaf(&mut tree, 20.0, 10.0, &[css.flexShrink(0.0)])
+        Panel.Canvas => run leaf(
+          &mut tree,
+          10.0,
+          4.0,
+          &[
+            css.position(Position.Absolute),
+            css.left(px(usize.toF32(i % 100) * 12.0)),
+            css.top(px(usize.toF32(i / 100) * 6.0)),
+          ],
+        )
+        Panel.Grid => run leaf(&mut tree, 10.0, 4.0, &[])
+        Panel.UniformGrid => run leaf(&mut tree, 10.0, 4.0, &[])
+      }
+      run tree.append(node, child)
+      i = i + 1
+    }
+    run tree.append(fixture.root, node)
+    run fixture.frame()
+    return Panels { fixture: move fixture }
+  }
+}
+
+fn track(index: usize, pixels: f32) -> GridBreadth {
+  return match index % 3 {
+    0 => GridBreadth.fixed(pixels)
+    1 => GridBreadth.auto()
+    _ => GridBreadth.flex(1.0)
+  }
+}
+
+impl<'a> Bench for Panels<'a> {
+  effect fn body(self: &mut Self) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    run self.fixture.invalidateLayout()
+    run self.fixture.layOut()
+  }
+}
+
+// Invalidation: 4,000 leaves in ten framed sections of ten rows of forty.
+
+pub enum InvalidationStep {
+  /// Make one leaf wider (the next of a round of 1,000) and lay out.
+  ResizeOneLeaf,
+  /// Every kept layout result forgotten, then a layout.
+  MeasureEveryLeaf,
+}
+
+pub struct Invalidation<'a> {
+  pub fixture: Fixture<'a>,
+  pub step: InvalidationStep,
+  leaves: List<BoxNode>,
+  next: usize,
+  wide: bool,
+}
+
+pub const LEAVES: usize = 4000
+
+impl<'a> Invalidation<'a> {
+  pub effect fn make(fixture: Fixture<'a>, step: InvalidationStep) -> Invalidation<'a>
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut fixture = move fixture
+    let mut leaves = List<BoxNode>.make()
+    let tree = &mut fixture.tree
+    let screen = run tree.box(&[css.display(Keyword.Flex), css.flexDirection(FlexDirection.Column), css.alignItems(Align.FlexStart)])
+    let mut section: usize = 0
+    while section < 10 {
+      let frame = run tree.box(&[css.padding(px(2.0))])
+      let rows = run tree.box(&[css.display(Keyword.Flex), css.flexDirection(FlexDirection.Column), css.alignItems(Align.FlexStart)])
+      let mut row: usize = 0
+      while row < 10 {
+        let line = run tree.box(&[css.display(Keyword.Flex), css.flexDirection(FlexDirection.Row)])
+        let mut i: usize = 0
+        while i < 40 {
+          let node = run leaf(&mut tree, 5.0, 4.0, &[css.flexShrink(0.0)])
+          run tree.append(line, node)
+          run leaves.append(node)
+          i = i + 1
+        }
+        run tree.append(rows, line)
+        row = row + 1
+      }
+      run tree.append(frame, rows)
+      run tree.append(screen, frame)
+      section = section + 1
+    }
+    run tree.append(fixture.root, screen)
+    run fixture.frame()
+    return Invalidation { fixture: move fixture, step: step, leaves: move leaves, next: 0, wide: false }
+  }
+}
+
+impl<'a> Bench for Invalidation<'a> {
+  effect fn body(self: &mut Self) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    match self.step {
+      InvalidationStep.ResizeOneLeaf => {
+        let node = self.leaves.get(self.next)
+        self.wide = !self.wide
+        if !self.wide {
+          self.next = (self.next + LEAVES / 1000) % LEAVES
+        }
+        let width: f32 = if self.wide {
+          6.0
+        } else {
+          5.0
+        }
+        run self.fixture.tree.setStyle(
+          node,
+          &[css.width(px(width)), css.height(px(4.0)), css.backgroundColor(blue()), css.flexShrink(0.0)],
+        )
+        run self.fixture.layOut()
+      }
+      InvalidationStep.MeasureEveryLeaf => {
+        run self.fixture.invalidateLayout()
+        run self.fixture.layOut()
+      }
+    }
+  }
+}
+
+// Nested depth: 200 boxes inside each other, alternating borders and padding, with margins,
+// alignments and min and max sizes.
+
+pub enum DepthStep {
+  RemeasureRearrange,
+  LeafResized,
+}
+
+pub struct Nested<'a> {
+  pub fixture: Fixture<'a>,
+  pub step: DepthStep,
+  innermost: BoxNode,
+  flip: bool,
+}
+
+pub const DEPTH: usize = 200
+
+impl<'a> Nested<'a> {
+  pub effect fn make(fixture: Fixture<'a>, step: DepthStep) -> Nested<'a>
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut fixture = move fixture
+    let tree = &mut fixture.tree
+    let innermost = run leaf(&mut tree, 8.0, 8.0, &[])
+    let mut child = innermost
+    let aligns: [Align; 4] = [Align.Stretch, Align.FlexStart, Align.Center, Align.FlexEnd]
+    let mut level: usize = 0
+    while level < DEPTH {
+      let mut style = List<Declaration>.make()
+      run style.append(css.display(Keyword.Flex))
+      run style.append(css.flexDirection(FlexDirection.Column))
+      run style.append(css.margin(px(1.0)))
+      run style.append(css.alignItems(aligns[level % 4]))
+      run style.append(css.justifyContent(aligns[(level / 2) % 4]))
+      if level % 2 == 0 {
+        run style.append(css.borderWidth(px(1.0)))
+      } else {
+        run style.append(css.padding(px(1.0)))
+      }
+      if level % 3 == 0 {
+        run style.append(css.minWidth(px(4.0)))
+        run style.append(css.minHeight(px(4.0)))
+        run style.append(css.maxWidth(px(4000.0)))
+        run style.append(css.maxHeight(px(4000.0)))
+      }
+      let parent = run tree.box(style.asSlice())
+      run tree.append(parent, child)
+      child = parent
+      level = level + 1
+    }
+    run tree.append(fixture.root, child)
+    run fixture.frame()
+    return Nested { fixture: move fixture, step: step, innermost: innermost, flip: false }
+  }
+}
+
+impl<'a> Bench for Nested<'a> {
+  effect fn body(self: &mut Self) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    match self.step {
+      DepthStep.RemeasureRearrange => {
+        run self.fixture.invalidateLayout()
+        run self.fixture.layOut()
+      }
+      DepthStep.LeafResized => {
+        self.flip = !self.flip
+        let width: f32 = if self.flip {
+          6.0
+        } else {
+          8.0
+        }
+        run self.fixture.tree.setStyle(
+          self.innermost,
+          &[css.width(px(width)), css.height(px(8.0)), css.backgroundColor(blue())],
+        )
+        run self.fixture.layOut()
+      }
+    }
+  }
+}
+
+// Size change: the root goes from 1,280 to 960 pixels wide and back, over 1,000 leaves.
+
+pub enum Sized {
+  Wrap,
+  StretchStack,
+  StarGrid,
+  Canvas,
+}
+
+pub struct SizeChange<'a> {
+  pub fixture: Fixture<'a>,
+  flip: bool,
+}
+
+impl<'a> SizeChange<'a> {
+  pub effect fn make(fixture: Fixture<'a>, scene: Sized) -> SizeChange<'a>
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut fixture = move fixture
+    let tree = &mut fixture.tree
+    let stretch = run tree.box(&[css.display(Keyword.Flex), css.flexDirection(FlexDirection.Column)])
+    match scene {
+      Sized.Wrap => {
+        let panel = run wrapOf(&mut tree, 1000)
+        run tree.append(stretch, panel)
+      }
+      Sized.StretchStack => {
+        let line = run wrapOf(&mut tree, 64)
+        run tree.append(stretch, line)
+        let mut i: usize = 0
+        while i < 1000 {
+          let node = run tree.box(&[css.height(px(2.0)), css.backgroundColor(blue())])
+          run tree.append(stretch, node)
+          i = i + 1
+        }
+      }
+      Sized.StarGrid => {
+        let line = run wrapOf(&mut tree, 64)
+        run tree.append(stretch, line)
+        let grid = run tree.box(&[css.display(Keyword.Grid)])
+        let mut template = Grid.make()
+        let mut c: usize = 0
+        while c < 4 {
+          let shares: f32 = if c == 1 {
+            2.0
+          } else {
+            1.0
+          }
+          run template.template.columns.tracks.append(GridTrack.breadth(GridBreadth.flex(shares)))
+          c = c + 1
+        }
+        let mut r: usize = 0
+        while r < 250 {
+          run template.template.rows.tracks.append(GridTrack.breadth(GridBreadth.auto()))
+          r = r + 1
+        }
+        run tree.setGrid(grid, &template)
+        let mut i: usize = 0
+        while i < 1000 {
+          let node = run tree.box(&[css.height(px(4.0)), css.backgroundColor(blue())])
+          run tree.append(grid, node)
+          i = i + 1
+        }
+        run tree.append(stretch, grid)
+      }
+      Sized.Canvas => {
+        let canvas = run tree.box(&[css.position(Position.Relative), css.height(px(HEIGHT))])
+        let mut i: usize = 0
+        while i < 1000 {
+          let node = run leaf(
+            &mut tree,
+            10.0,
+            4.0,
+            &[
+              css.position(Position.Absolute),
+              css.left(px(usize.toF32(i % 100) * 12.0)),
+              css.top(px(usize.toF32(i / 100) * 6.0)),
+            ],
+          )
+          run tree.append(canvas, node)
+          i = i + 1
+        }
+        run tree.append(stretch, canvas)
+      }
+    }
+    run tree.append(fixture.root, stretch)
+    run fixture.frame()
+    return SizeChange { fixture: move fixture, flip: false }
+  }
+}
+
+effect fn wrapOf(tree: &mut Tree<'_>, count: usize) -> BoxNode
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let panel = run tree.box(
+    &[css.display(Keyword.Flex), css.flexDirection(FlexDirection.Row), css.flexWrap(FlexWrap.Wrap)],
+  )
+  let mut i: usize = 0
+  while i < count {
+    let node = run leaf(&mut tree, 20.0, 10.0, &[css.flexShrink(0.0)])
+    run tree.append(panel, node)
+    i = i + 1
+  }
+  return panel
+}
+
+impl<'a> Bench for SizeChange<'a> {
+  effect fn body(self: &mut Self) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    self.flip = !self.flip
+    let width: f32 = if self.flip {
+      960.0
+    } else {
+      WIDTH
+    }
+    let root = self.fixture.root
+    let family = self.fixture.family.raw()
+    run self.fixture.tree.setStyle(
+      root,
+      &[
+        css.fontFamily(family),
+        css.position(Position.Relative),
+        css.width(px(width)),
+        css.height(px(HEIGHT)),
+      ],
+    )
+    run self.fixture.layOut()
+  }
+}

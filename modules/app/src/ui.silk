@@ -446,6 +446,8 @@ pub struct Ui<M> {
   pub previous: Arena,
   lookup: HashMap<Word, u32>,
   claimed: List<bool>,
+  /// The lazy records of the last render by parent and ordinal (see `lazyKey`).
+  lazyIndex: HashMap<Word, u32>,
   current: u32,
   hasPendingKey: bool,
   pendingKey: u64,
@@ -518,6 +520,11 @@ fn slotKey(parent: u32, identity: Identity) -> u64 {
   return mix(u64.bitXor(mix(u32.toU64(parent) * 4 + tag), identity.value))
 }
 
+/// The key of the lazy record of `parent`'s `ordinal`-th `lazy` call: exact, no hashing.
+fn lazyKey(parent: u32, ordinal: u32) -> Word {
+  return Hash.word(u64.bitOr(u64.shiftLeft(u32.toU64(parent), 32), u32.toU64(ordinal)))
+}
+
 /// A 64-bit key for text, for `ui.key` and `ui.each` (FNV-1a).
 pub fn textKey(value: string) -> u64 {
   let bytes = String.utf8Bytes(value)
@@ -538,6 +545,7 @@ impl<M> Ui<M> {
       previous: Arena.make(),
       lookup: HashMap<Word, u32>.make(Hash.seed(0x5EED)),
       claimed: List<bool>.make(),
+      lazyIndex: HashMap<Word, u32>.make(Hash.seed(0x6C617A79)),
       current: 0,
       hasPendingKey: false,
       pendingKey: 0,
@@ -599,6 +607,13 @@ impl<M> Ui<M> {
       i = i + 1
     }
     run self.claimed.appendRepeated(false, u32.toUsize(count))
+    self.lazyIndex.clear()
+    let lazies = self.previous.lazies.asSlice()
+    let mut l: usize = 0
+    while l < lazies.length {
+      drop run self.lazyIndex.insert(lazyKey(lazies[l].parent, lazies[l].ordinal), usize.toU32(l))
+      l = l + 1
+    }
     let mut root = Entry.make(NodeKind.Box, NO_ENTRY, Identity { keyed: false, value: 0 })
     root.id = self.rootId
     if count > 0 {
@@ -1289,10 +1304,10 @@ impl<M> Ui<M> {
     self.arena.setEntry(parent, up)
     let oldParent = up.old
     if oldParent != NO_ENTRY {
-      let records = self.previous.lazies.asSlice()
-      let mut i: usize = 0
-      while i < records.length {
-        let record = records[i]
+      // At most one record has this parent and ordinal.
+      if let Option<u32>.Some { value: found } = self.lazyIndex.get(lazyKey(oldParent, ordinal)) {
+        let at = u32.toUsize(found)
+        let record = self.previous.lazies.get(at)
         if record.parent == oldParent && record.ordinal == ordinal && record.hash == hash
           && self.unclaimedRange(record.entryStart, record.entryEnd) {
           let mut containsVirtual = false
@@ -1307,11 +1322,10 @@ impl<M> Ui<M> {
             v = v + 1
           }
           if !containsVirtual {
-            self.copyLazy(record, parent)
+            self.copyLazy(record, at, parent)
             return ()
           }
         }
-        i = i + 1
       }
     }
     let entryStart = self.arena.length()
@@ -1351,8 +1365,8 @@ impl<M> Ui<M> {
     return true
   }
 
-  /// Copies lazy region `record` of the last render under `parent`.
-  fn copyLazy(self: &mut Self, record: LazyRecord, parent: u32) -> () {
+  /// Copies lazy region `record` (record `at` of the last render) under `parent`.
+  fn copyLazy(self: &mut Self, record: LazyRecord, at: usize, parent: u32) -> () {
     let entryStart = self.arena.length()
     let styleStart = usize.toU32(self.arena.styles.length())
     let byteStart = usize.toU32(self.arena.bytes.length())
@@ -1464,10 +1478,14 @@ impl<M> Ui<M> {
       ),
     )
 
-    // Lazy regions nested in this one move with it.
-    let nested = self.previous.lazies.length()
-    let mut n: usize = 0
-    while n < nested {
+    // Lazy regions nested in this one move with it. They were recorded while its body ran,
+    // so they are among the records just before it whose regions start inside it.
+    let mut first = at
+    while first > 0 && self.previous.lazies.get(first - 1).entryStart >= record.entryStart {
+      first = first - 1
+    }
+    let mut n: usize = first
+    while n < at {
       let inner = self.previous.lazies.get(n)
       if inside(inner.parent) {
         let moved = LazyRecord {
