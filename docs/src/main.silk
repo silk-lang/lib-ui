@@ -1,0 +1,385 @@
+//! The Silk UI docs: a `Program` that runs in a page through `ui-app-dom`.
+//!
+//! Built for wasm it is the program the page runs. Built for the machine it is the static
+//! build: it draws every page as markup and writes each as an `index.html`, which the wasm
+//! program then hydrates.
+import model { Browser, Command, Message }
+import examples.core.dice { Random }
+import pages
+import shots
+import site { Docs }
+import theme { MONO, SANS }
+import ui_app_dom.html { Html, render }
+import ui_app_dom.page
+import ui_app.lib { TreeError }
+import silk.collections.bytes { Bytes }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.io.writer { Writer, WriterError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.num.f64
+import silk.num.u32
+import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.text.string { String, InvalidUtf8 }
+
+static if Intrinsic.targetArchitecture() == "wasm32" {
+  /// The [`Browser`] the page provides: the functions `web/index.html` passes to `mount`.
+  struct PageBrowser {}
+
+  @foreign(noCapture: .("bytes"))
+  unsafe extern "C" fn hostSetTitle(bytes: ?[*]const u8, length: usize) -> () as "site#setTitle"
+
+  @foreign(noCapture: .("bytes"))
+  unsafe extern "C" fn hostCopy(bytes: ?[*]const u8, length: usize) -> () as "site#copy"
+
+  unsafe extern "C" fn hostToggleTheme() -> () as "site#toggleTheme"
+
+  unsafe extern "C" fn hostScrollToTop() -> () as "site#scrollToTop"
+
+  impl Browser for PageBrowser {
+    effect fn setTitle(self: &mut Self, title: string) -> () {
+      let bytes = String.utf8Bytes(title)
+      unsafe hostSetTitle(Pointer.fromSlice(bytes), bytes.length)
+    }
+
+    effect fn copy(self: &mut Self, text: string) -> () {
+      let bytes = String.utf8Bytes(text)
+      unsafe hostCopy(Pointer.fromSlice(bytes), bytes.length)
+    }
+
+    effect fn toggleTheme(self: &mut Self) -> () {
+      unsafe hostToggleTheme()
+    }
+
+    effect fn scrollToTop(self: &mut Self) -> () {
+      unsafe hostScrollToTop()
+    }
+  }
+
+  /// The [`Random`] the dice example asks for: the page's `Math.random`.
+  struct PageRandom {}
+
+  unsafe extern "C" fn hostRandom() -> f64 as "site#random"
+
+  impl Random for PageRandom {
+    effect fn roll(self: &mut Self, sides: u32) -> u32 {
+      let face = f64.toU32(unsafe hostRandom() * u32.toF64(sides))
+      return if face >= sides {
+        sides
+      } else {
+        face + 1
+      }
+    }
+  }
+
+  export "C" fn open() -> ?*mut u8 as "silk_ui_open" {
+    let mut allocator = Allocator.systemAllocatorProvider()
+    return run Effect.catchAll(page.open<Docs, Message, Command>(), page.unopened)
+      |> Effect.provideMut<Allocator>(&mut allocator)
+  }
+
+  export "C" fn call(token: ?*mut u8, op: u32, a: f64, b: f64, c: f64) -> f64 as "silk_ui_call" {
+    let mut allocator = Allocator.systemAllocatorProvider()
+    let mut browser = PageBrowser {}
+    let mut random = PageRandom {}
+    return run Effect.catchAll(page.call<Docs, Message, Command>(token, op, a, b, c), page.failed)
+      |> Effect.provideMut<Browser>(&mut browser)
+      |> Effect.provideMut<Random>(&mut random)
+      |> Effect.provideMut<Allocator>(&mut allocator)
+  }
+}
+
+static if Intrinsic.targetArchitecture() == "wasm32" {
+  pub fn main() -> i32 {
+    return 0
+  }
+} else {
+  import silk.io.writer_native { StderrWriter }
+  import silk.system.filesystem_machine { MachineFileSystem }
+
+  /// The [`Browser`] of a static build: there is no page yet, so nothing to do.
+  struct StaticBrowser {}
+
+  impl Browser for StaticBrowser {
+    effect fn setTitle(self: &mut Self, title: string) -> () {}
+
+    effect fn copy(self: &mut Self, text: string) -> () {}
+
+    effect fn toggleTheme(self: &mut Self) -> () {}
+
+    effect fn scrollToTop(self: &mut Self) -> () {}
+  }
+
+  /// The [`Random`] of a static build: nobody rolls before the page is open.
+  struct StaticRandom {}
+
+  impl Random for StaticRandom {
+    effect fn roll(self: &mut Self, sides: u32) -> u32 {
+      return 1
+    }
+  }
+
+  /// Where the markup goes in the page template, and the other slots a page fills.
+  const MARKUP: string = "<!--silk-ui-->"
+
+  const BASE: string = "%BASE%"
+
+  const TITLE: string = "%TITLE%"
+
+  const IMAGES: string = "%IMAGES%"
+
+  // The same families `web/index.html` gives `mount`.
+  const SANS_FAMILY: string = "\"Inter Tight\", Inter, ui-sans-serif, system-ui, -apple-system, \"Segoe UI\", sans-serif"
+
+  const MONO_FAMILY: string = "\"JetBrains Mono\", ui-monospace, \"SF Mono\", Menlo, Consolas, monospace"
+
+  effect fn say(text: string) -> ()
+    ! WriterError {
+    let mut writer = StderrWriter.make()
+    run Writer.writeString(text) |> Effect.provideMut<Writer>(&mut writer)
+    run Writer.flush() |> Effect.provideMut<Writer>(&mut writer)
+  }
+
+  fn startsWith(text: &[u8], at: usize, token: &[u8]) -> bool {
+    if at + token.length > text.length {
+      return false
+    }
+    let mut i: usize = 0
+    while i < token.length {
+      if text[at + i] != token[i] {
+        return false
+      }
+      i = i + 1
+    }
+    return true
+  }
+
+  effect fn argument(index: usize) -> Bytes
+    ! HostInputError | OutOfMemoryError
+    ? &mut HostInput | &mut Allocator {
+    return match run HostInput.argument(index) {
+      Option<Bytes>.Some { value } => move value
+      Option<Bytes>.None => Bytes.make()
+    }
+  }
+
+  /// The path an argument names: itself when absolute, else from the working directory.
+  effect fn place(name: &[u8]) -> Path
+    ! FileError | HostInputError | OutOfMemoryError
+    ? &mut HostInput | &mut Allocator {
+    if name.length != 0 && name[0] == 47 {
+      return run Path.fromBytes(name)
+    }
+    let cwd = run Path.fromBytes(Bytes.asSlice(&run HostInput.workingDirectory()))
+    return run Path.resolveBytes(&cwd, name)
+  }
+
+  /// How long the slot `token` is when `template` has it at `at`, else zero.
+  fn slotAt(template: &[u8], at: usize, token: string) -> usize {
+    if startsWith(template, at, String.utf8Bytes(token)) {
+      return String.byteLength(token)
+    }
+    return 0
+  }
+
+  /// `template` with each slot filled.
+  effect fn fill(template: &[u8], markup: &[u8], base: &[u8], title: &[u8], images: &[u8]) -> Bytes
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut out = Bytes.make()
+    let mut from: usize = 0
+    let mut i: usize = 0
+    while i < template.length {
+      let mut slot = slotAt(template, i, MARKUP)
+      if slot > 0 {
+        run out.append(Slice.view<u8>(template, from, i - from))
+        run out.append(markup)
+      } else {
+        slot = slotAt(template, i, BASE)
+        if slot > 0 {
+          run out.append(Slice.view<u8>(template, from, i - from))
+          run out.append(base)
+        } else {
+          slot = slotAt(template, i, TITLE)
+          if slot > 0 {
+            run out.append(Slice.view<u8>(template, from, i - from))
+            run out.append(title)
+          } else {
+            slot = slotAt(template, i, IMAGES)
+            if slot > 0 {
+              run out.append(Slice.view<u8>(template, from, i - from))
+              run out.append(images)
+            }
+          }
+        }
+      }
+      if slot == 0 {
+        i = i + 1
+      } else {
+        i = i + slot
+        from = i
+      }
+    }
+    run out.append(Slice.view<u8>(template, from, template.length - from))
+    return move out
+  }
+
+  /// The address of picture `index`: `/shots/<name>` after the base.
+  effect fn shotAddress(base: &[u8], index: u32) -> Bytes
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut address = Bytes.make()
+    run address.append(base)
+    run address.append(b"/shots/")
+    run address.append(String.utf8Bytes(shots.name(index)))
+    return move address
+  }
+
+  fn textOf(bytes: &Bytes) -> string {
+    return String.fromUtf8(Bytes.asSlice(bytes)) |> Result<string, InvalidUtf8>.unwrapOr("")
+  }
+
+  /// The pictures as the object `mount` takes: `{1:"/shots/a.png",2:"/shots/b.png"}`.
+  effect fn imageMap(base: &[u8]) -> Bytes
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut out = Bytes.make()
+    run out.append(b"{")
+    let mut index: u32 = 0
+    while index < shots.COUNT {
+      if index > 0 {
+        run out.append(b",")
+      }
+      run appendNumber(&mut out, index + 1)
+      run out.append(b":\"")
+      run out.append(Bytes.asSlice(&run shotAddress(base, index)))
+      run out.append(b"\"")
+      index = index + 1
+    }
+    run out.append(b"}")
+    return move out
+  }
+
+  effect fn appendNumber(out: &mut Bytes, value: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if value >= 10 {
+      run appendNumber(&mut out, value / 10)
+    }
+    let digit: [u8; 1] = [u32.toU8(value % 10) + 48]
+    run out.append(&digit)
+  }
+
+  /// Draws the page at `path` and writes it to `file` under the out directory.
+  effect fn write(
+    files: &mut MachineFileSystem,
+    template: &[u8],
+    out: &Path,
+    base: &Bytes,
+    path: string,
+    file: &[u8],
+    title: string,
+  ) -> ()
+    ! TreeError | OutOfMemoryError | WriterError | FileError
+    ? &mut Allocator {
+    let mut browser = StaticBrowser {}
+    let mut random = StaticRandom {}
+    let mut html = Html.make()
+    run html.font(SANS, SANS_FAMILY)
+    run html.font(MONO, MONO_FAMILY)
+    run html.setBase(textOf(base))
+    let mut index: u32 = 0
+    while index < shots.COUNT {
+      let address = run shotAddress(Bytes.asSlice(base), index)
+      run html.image(index + 1, textOf(&address))
+      index = index + 1
+    }
+    let markup = run render<Docs, Message, Command>(&mut html, path)
+      |> Effect.provideMut<Browser>(&mut browser)
+      |> Effect.provideMut<Random>(&mut random)
+    let images = run imageMap(Bytes.asSlice(base))
+    let filled = run fill(
+      template,
+      Bytes.asSlice(&markup),
+      Bytes.asSlice(base),
+      String.utf8Bytes(title),
+      Bytes.asSlice(&images),
+    )
+    let place = run Path.resolveBytes(out, file)
+    run FileSystem.writeFileWithParents(&place, Bytes.asSlice(&filled))
+      |> Effect.provideMut<FileSystem>(&mut files)
+    run say("wrote ")
+    run say(path)
+    run say("\n")
+  }
+
+  effect fn build() -> i32
+    ! TreeError | OutOfMemoryError | WriterError | FileError | HostInputError
+    ? &mut HostInput | &mut Allocator {
+    let count = run HostInput.argumentCount()
+    if count < 3 {
+      run say("usage: ui-docs-site <template.html> <out directory> [base]\n")
+      return 2
+    }
+    let template = run place(Bytes.asSlice(&run argument(1)))
+    let out = run place(Bytes.asSlice(&run argument(2)))
+    let base = run argument(3)
+
+    let mut files = run MachineFileSystem.make()
+    let page = run FileSystem.readFile(&template) |> Effect.provideMut<FileSystem>(&mut files)
+    let mut index: u32 = 0
+    while index < pages.COUNT {
+      let path = pages.page(index).path
+
+      // "/core/views/" is core/views/index.html under the out directory.
+      let mut name = Bytes.make()
+      run name.append(Slice.view<u8>(String.utf8Bytes(path), 1, String.byteLength(path) - 1))
+      run name.append(b"index.html")
+      run write(
+        &mut files,
+        Bytes.asSlice(&page),
+        &out,
+        &base,
+        path,
+        Bytes.asSlice(&name),
+        pages.title(index),
+      )
+      index = index + 1
+    }
+
+    // What the host serves for an address that is no page.
+    run write(
+      &mut files,
+      Bytes.asSlice(&page),
+      &out,
+      &base,
+      "/404/",
+      b"404.html",
+      pages.title(pages.NOT_FOUND),
+    )
+    return 0
+  }
+
+  effect fn failed<E>(error: E) -> i32
+    ! WriterError {
+    drop error
+    run say("ui-docs-site: drawing a page or writing it failed\n")
+    return 2
+  }
+
+  effect fn failedQuietly<E>(error: E) -> i32 {
+    drop error
+    return 2
+  }
+
+  pub effect fn main() -> i32
+    ? &mut HostInput {
+    let mut allocator = Allocator.systemAllocatorProvider()
+    return run Effect.catchAll(Effect.catchAll(build(), failed), failedQuietly)
+      |> Effect.provideMut<Allocator>(&mut allocator)
+  }
+}

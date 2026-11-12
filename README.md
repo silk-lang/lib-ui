@@ -2,6 +2,16 @@
 
 Standalone retained UI, application framework, components, native/browser hosts, and inspection tools for Silk.
 
+## Documentation
+
+The guides live in [`docs/`](docs/README.md) and are published from `main`. There are three:
+Silk UI (the framework), native apps, and the UI tree. Every example in them is a real
+program under `docs/examples`, tested by `docs/tests`.
+
+```sh
+docs/build.sh serve   # builds the site and serves it on http://localhost:8017
+```
+
 ## Run a demo locally
 
 Run commands from the **lib-ui repository root**, including when using a Git worktree.

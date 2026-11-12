@@ -80,13 +80,13 @@ Put the markup inside the element `mount` gets as `root`. `mount` then adopts th
 their ids instead of making new ones, applies everything the program says (so a different
 viewport or saved state is put right), and removes what the program did not claim.
 
-A static build is that in a loop. `modules/app/site` is a whole program built this way, the
-silk-ui docs: its wasm build is the program, and its native build writes an `index.html` per
+A static build is that in a loop. `docs` is a whole program built this way, the
+Silk UI docs: its wasm build is the program, and its native build writes an `index.html` per
 route.
 
 ```sh
-modules/app/site/build.sh serve          # http://localhost:8017
-modules/app/site/build.sh --base /docs   # for a site under /docs
+docs/build.sh serve          # http://localhost:8017
+docs/build.sh --base /docs   # for a site under /docs
 ```
 
 ## What the page does not do

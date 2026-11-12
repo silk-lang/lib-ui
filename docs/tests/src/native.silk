@@ -1,0 +1,146 @@
+//! Tests for the native programs. There is no window: a `ShellLog` writes down what the
+//! program asked of it, and the test says what a window would say back.
+import examples.native.pad { Command, Disk, Message, Pad, OPEN, SAVE }
+import examples.native.search {
+  Command as SearchCommand,
+  Message as SearchMessage,
+  PORT_DONE,
+  PORT_PROGRESS,
+  Search,
+  Worker
+}
+import ui_app.lib { drain, post, Shell, ShellLog, TreeError }
+import ui_app.program as program
+import ui_app.shell { PORT_APPEARANCE, PORT_CLOSE, PORT_FILES, PORT_MENU }
+import ui_app_dom.html { Html }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+/// A disk that holds one file.
+struct OneFile {
+  path: String,
+  text: String,
+}
+
+impl Disk for OneFile {
+  effect fn read(self: &mut Self, path: string) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if String.view(&self.path) == path {
+      return run String.copy(String.view(&self.text))
+    }
+    return String.make()
+  }
+
+  effect fn write(self: &mut Self, path: string, text: string) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.path = run String.copy(path)
+    self.text = run String.copy(text)
+    return true
+  }
+}
+
+effect fn padBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Shell | &mut Disk | &mut Allocator {
+  let mut page = Html.make()
+  let mut app = run program.make<Pad, Message, Command>()
+  run app.start(&mut page, 0.0)
+  run drain(&mut app, &mut page)
+
+  // The window speaks through ports. The test posts what it would say.
+  run post(&mut app, &mut page, PORT_APPEARANCE, "dark")
+  run Testing.expect(app.model.value.dark, "the appearance arrives")
+
+  // Typing makes the note dirty, and then a close asks first.
+  app.send(Message.ChangedText { value: run String.copy("two words") })
+  run drain(&mut app, &mut page)
+  run post(&mut app, &mut page, PORT_CLOSE, "")
+  run Testing.expect(app.model.value.asking, "a dirty note asks before it closes")
+  app.send(Message.ClickedKeepEditing)
+  run drain(&mut app, &mut page)
+
+  // Save: the menu item, then the dialog's answer, which is the request and a path.
+  run post(&mut app, &mut page, PORT_MENU, "3")
+  run post(&mut app, &mut page, PORT_FILES, "2\n/tmp/note.txt")
+  run Testing.expect(!app.model.value.dirty, "a save cleans the note")
+
+  // Open it again: a cancelled dialog first, then a chosen file.
+  run post(&mut app, &mut page, PORT_MENU, "2")
+  run post(&mut app, &mut page, PORT_FILES, "1")
+  run Testing.expect(String.view(&app.model.value.status) == "Cancelled", "a dialog may be cancelled")
+  run post(&mut app, &mut page, PORT_FILES, "1\n/tmp/note.txt")
+  run Testing.expect(String.view(&app.model.value.text) == "two words", "the file opens")
+
+  // A clean note closes at once.
+  run post(&mut app, &mut page, PORT_CLOSE, "")
+  run Testing.expect(!app.model.value.asking, "a clean note does not ask")
+}
+
+test effect fn aNativeAppWithoutAWindow() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut shell = ShellLog.make()
+  let mut disk = OneFile { path: String.make(), text: String.make() }
+  run padBody()
+    |> Effect.provideMut<Shell>(&mut shell)
+    |> Effect.provideMut<Disk>(&mut disk)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+
+  // What the program asked of its window, in order, one line each.
+  run Testing.expect(shell.has("setMenu"), "the menu was installed")
+  run Testing.expect(shell.has("setTitle Pad (edited)"), "the title was marked")
+  run Testing.expect(shell.has("saveFile Save the note"), "the save dialog was asked for")
+  run Testing.expect(shell.has("quit"), "and the window let go")
+  run Testing.expect(String.view(&disk.text) == "two words", "the disk has the note")
+  run Testing.expect(OPEN == 2 && SAVE == 3, "the menu's numbers are the ones posted above")
+}
+
+/// A worker that only counts how often it was asked.
+struct Counted {
+  started: u32,
+  cancelled: u32,
+}
+
+impl Worker for Counted {
+  effect fn countPrimes(self: &mut Self, limit: u32) -> () {
+    self.started = self.started + 1
+  }
+
+  effect fn cancel(self: &mut Self) -> () {
+    self.cancelled = self.cancelled + 1
+  }
+}
+
+effect fn searchBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Worker | &mut Allocator {
+  let mut page = Html.make()
+  let mut app = run program.make<Search, SearchMessage, SearchCommand>()
+  run app.start(&mut page, 0.0)
+  run drain(&mut app, &mut page)
+
+  app.send(SearchMessage.ClickedStart)
+  run drain(&mut app, &mut page)
+  run post(&mut app, &mut page, PORT_PROGRESS, "40")
+  run Testing.expect(String.view(&app.model.value.progress) == "40", "progress arrives")
+
+  // Cancel, and a post that was already on its way changes nothing.
+  app.send(SearchMessage.ClickedCancel)
+  run drain(&mut app, &mut page)
+  run post(&mut app, &mut page, PORT_DONE, "348513")
+  run Testing.expect(app.model.value.found.ownedByteLength() == 0, "a late answer is dropped")
+}
+
+test effect fn aWorkerThatIsNotAThread() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut worker = Counted { started: 0, cancelled: 0 }
+  run searchBody()
+    |> Effect.provideMut<Worker>(&mut worker)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(worker.started == 1 && worker.cancelled == 1, "started once, cancelled once")
+}

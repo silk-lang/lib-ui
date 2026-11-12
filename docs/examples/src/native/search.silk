@@ -1,0 +1,141 @@
+//! Search: slow work on another thread. A command starts it and returns at once, and the
+//! worker posts its progress and its answer to ports the program subscribes to.
+import core.look { INK, MUTED, button, primary, rgb }
+import ui_app.css
+import ui_app.css { px, Align }
+import ui_app.lib { CommandSet, Document, Node, NoOutput, Program, Subscriptions, Update }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.string { String }
+
+/// The ports the worker posts to.
+pub const PORT_PROGRESS: string = "search:progress"
+
+pub const PORT_DONE: string = "search:done"
+
+/// Work that takes a while. The app's `Worker` runs it on a thread; a test's answers at once.
+pub service Worker {
+  /// Starts counting the primes below `limit` and returns without waiting. Progress, in
+  /// percent, is posted to `PORT_PROGRESS` and the count to `PORT_DONE`.
+  effect fn countPrimes(limit: u32) -> () ! OutOfMemoryError ? &mut Worker | &mut Allocator
+
+  /// Asks the work that is running to stop.
+  effect fn cancel() -> () ? &mut Worker
+}
+
+pub struct Search {
+  pub running: bool,
+  /// How far the work is, in text: "40".
+  pub progress: String,
+  /// The answer, in text; empty until there is one.
+  pub found: String,
+}
+
+pub union Message {
+  ClickedStart,
+  ClickedCancel,
+  StartedWork,
+  GotProgress { pub percent: String },
+  GotAnswer { pub count: String },
+}
+
+pub union Command {
+  Start { pub limit: u32 },
+  Cancel,
+}
+
+impl CommandSet<Message ? &mut Worker | &mut Allocator> for Command {
+  effect fn execute(self: Self) -> Message
+    ! OutOfMemoryError
+    ? &mut Worker | &mut Allocator {
+    match move self {
+      Command.Start { limit } => {
+        run Worker.countPrimes(limit)
+      }
+      Command.Cancel => {
+        run Worker.cancel()
+      }
+    }
+    return Message.StartedWork
+  }
+}
+
+type Next = Update<Search, Command, NoOutput>
+
+impl Program<Message, Command> for Search {
+  effect fn init() -> Next
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return Next.of(Search { running: false, progress: String.make(), found: String.make() })
+  }
+
+  effect fn update(mut model: Search, message: Message) -> Next
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match move message {
+      Message.ClickedStart => {
+        model.running = true
+        model.progress = run String.copy("0")
+        model.found = String.make()
+        return run Next.with(move model, Command.Start { limit: 5000000 })
+      }
+      Message.ClickedCancel => {
+        model.running = false
+        return run Next.with(move model, Command.Cancel)
+      }
+      Message.StartedWork => {}
+      Message.GotProgress { percent } => {
+        // A worker that was cancelled may still have a post on its way.
+        if model.running {
+          model.progress = move percent
+        }
+      }
+      Message.GotAnswer { count } => {
+        if model.running {
+          model.running = false
+          model.found = move count
+        }
+      }
+    }
+    return Next.of(move model)
+  }
+
+  fn view(model: &Search, h: &Document<Message>) -> Node {
+    return h.column(
+      &[h.style(&[css.padding(px(20.0)), css.rowGap(px(12.0)), css.color(rgb(INK))])],
+      &[
+        h.text("How many primes are there below five million?"),
+        h.row(
+          &[h.style(&[css.alignItems(Align.Center), css.columnGap(px(10.0))])],
+          &[
+            if model.running {
+              button(h, "Cancel", Message.ClickedCancel)
+            } else {
+              primary(h, "Count them", Message.ClickedStart)
+            },
+            if model.running {
+              h.row(
+                &[h.testId("progress"), h.style(&[css.color(rgb(MUTED))])],
+                &[h.text(String.view(&model.progress)), h.text("%")],
+              )
+            } else {
+              h.empty()
+            },
+          ],
+        ),
+        if String.byteLength(String.view(&model.found)) != 0 {
+          h.row(
+            &[h.testId("found"), h.style(&[css.fontWeight(700.0)])],
+            &[h.text(String.view(&model.found)), h.text(" primes")],
+          )
+        } else {
+          h.empty()
+        },
+      ],
+    )
+  }
+
+  fn subscriptions(model: &Search, subs: &mut Subscriptions<Message>) -> () {
+    subs.port(1, PORT_PROGRESS, |text| Message.GotProgress { percent: move text })
+    subs.port(2, PORT_DONE, |text| Message.GotAnswer { count: move text })
+  }
+}
