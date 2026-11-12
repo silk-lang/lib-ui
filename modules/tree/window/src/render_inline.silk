@@ -29,9 +29,11 @@ import webgpu_sys.generated_webgpu as flags
 import silk.collections.list { List }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
+import silk.core.result { Result }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.text.string { String }
 import silk.num.u64
+import silk.num.usize
 
 static if Intrinsic.targetArchitecture() == "wasm32" {
   unsafe extern "C" fn hostYield() -> () as "silk_browser#yield"
@@ -55,11 +57,24 @@ fn canvasId(handle: u32) -> Option<&'static [u8]> {
   }
 }
 
-/// The GPU side of one window, on the window host's own thread.
+/// The canvas of a window past the first, with the size it is configured for.
+struct ExtraSurface {
+  id: u32,
+  surface: Surface<'static>,
+  width: u32,
+  height: u32,
+}
+
+/// The GPU side of the app's windows, on the window host's own thread.
 pub struct InlineRenderer {
+  instance: Instance,
   device: Device,
   queue: Queue,
   surface: Surface<'static>,
+  /// The canvases of the windows past the first. They share the device, the renderer and the
+  /// atlas textures with the first.
+  others: List<ExtraSurface>,
+  nextSurface: u32,
   renderer: UiRenderer,
   textures: GpuAtlas,
   /// The canvas configuration's usage and alpha mode (a configuration borrows the device, so
@@ -125,9 +140,12 @@ impl InlineRenderer {
       0
     }
     return InlineRenderer {
+      instance: move instance,
       device: move device,
       queue: move queue,
       surface: move surface,
+      others: List<ExtraSurface>.make(),
+      nextSurface: 1,
       renderer: move renderer,
       textures: GpuAtlas.make(),
       usage: usage,
@@ -195,20 +213,7 @@ impl InlineRenderer {
       self.configuredHeight = height
     }
     let start = run self.clock.seconds()
-    self.infos.clear()
-    let mut t: usize = 0
-    while t < atlas.textureCount() {
-      run self.infos.append(atlas.texture(t)) |> Effect.provideMut<Allocator>(&mut heap)
-      t = t + 1
-    }
-    run self.textures.syncInfos(&self.device, self.infos.asSlice())
-      |> Effect.provideMut<Allocator>(&mut heap)
-    let list = uploads.entries()
-    let mut i: usize = 0
-    while i < list.length {
-      self.textures.write(&self.queue, list[i].tile, uploads.pixels(list[i]))
-      i = i + 1
-    }
+    run self.upload(atlas, uploads) |> Effect.provideMut<Allocator>(&mut heap)
     let uploaded = run self.clock.seconds()
     let texture = run self.surface.getCurrentTexture()
     let view = run texture.texture.createView(&TextureViewDescriptor.default())
@@ -306,13 +311,63 @@ impl InlineRenderer {
     }
   }
 
-  /// The browser host shows the first window only: a surface for another cannot be made.
-  pub effect fn openSurface(self: &mut Self, raw: RawSurface, window: WindowId) -> Option<u32>
-    ! GpuError | OutOfMemoryError {
-    return Option<u32>.None
+  /// Brings the atlas textures up to date with `atlas`, and writes the pixels that wait.
+  effect fn upload(self: &mut Self, atlas: &Atlas, uploads: &Pending) -> ()
+    ! GpuError | OutOfMemoryError
+    ? &mut Allocator {
+    self.infos.clear()
+    let mut t: usize = 0
+    while t < atlas.textureCount() {
+      run self.infos.append(atlas.texture(t))
+      t = t + 1
+    }
+    run self.textures.syncInfos(&self.device, self.infos.asSlice())
+    let list = uploads.entries()
+    let mut i: usize = 0
+    while i < list.length {
+      self.textures.write(&self.queue, list[i].tile, uploads.pixels(list[i]))
+      i = i + 1
+    }
   }
 
-  /// Never called: no surface for another window is made.
+  /// Makes the surface of another window's canvas `raw`, and returns the number to draw on it
+  /// with. `None` when the canvas cannot be a surface: its window then shows nothing.
+  pub effect fn openSurface(self: &mut Self, raw: RawSurface, window: WindowId) -> Option<u32>
+    ! GpuError | OutOfMemoryError {
+    drop window
+    let handle = match raw {
+      RawSurface.Canvas { handle } => handle
+      _ => {
+        return Option<u32>.None
+      }
+    }
+    let id = match canvasId(handle) {
+      Option<&'static [u8]>.Some { value } => value
+      Option<&'static [u8]>.None => {
+        StderrWriter.print("ui-tree: window {} has no known canvas id\n", &.(handle))
+        return Option<u32>.None
+      }
+    }
+    let target = SurfaceTarget.canvasId(id)
+    let created = run Effect.result(
+      Surface.create(&self.instance, &target, String.utf8Bytes("ui tree window")),
+    )
+    let surface = match move created {
+      Result.Success { value } => move value
+      Result.Failure { error } => {
+        drop error
+        return Option<u32>.None
+      }
+    }
+    let number = self.nextSurface
+    self.nextSurface = self.nextSurface + 1
+    let mut heap = Allocator.systemAllocatorProvider()
+    run self.others.append(ExtraSurface { id: number, surface: move surface, width: 0, height: 0 })
+      |> Effect.provideMut<Allocator>(&mut heap)
+    return Option<u32>.some(number)
+  }
+
+  /// Draws `scene` on the canvas of another window and presents it before returning.
   pub effect fn submitTo(
     self: &mut Self,
     surface: u32,
@@ -322,9 +377,67 @@ impl InlineRenderer {
     width: u32,
     height: u32,
   ) -> ()
-    ! GpuError | OutOfMemoryError {}
+    ! GpuError | OutOfMemoryError {
+    let mut heap = Allocator.systemAllocatorProvider()
+    let mut at = usize.MAX
+    let mut i: usize = 0
+    while i < self.others.length() {
+      if self.others.asSlice()[i].id == surface {
+        at = i
+      }
+      i = i + 1
+    }
+    if at == usize.MAX || width == 0 || height == 0 {
+      return ()
+    }
+    run self.upload(atlas, uploads) |> Effect.provideMut<Allocator>(&mut heap)
+    let target = &mut self.others.asMutSlice()[at]
+    if width != target.width || height != target.height {
+      let mut configuration = SurfaceConfiguration.make(
+        &self.device,
+        self.textureFormat,
+        width,
+        height,
+      )
+      configuration.setUsage(self.usage)
+      if self.alphaMode != 0 {
+        configuration.setAlphaMode(self.alphaMode)
+      }
+      target.surface.configure(&configuration)
+      target.width = width
+      target.height = height
+    }
+    let texture = run target.surface.getCurrentTexture()
+    let view = run texture.texture.createView(&TextureViewDescriptor.default())
+    run self.renderer.setScrolls(&[]) |> Effect.provideMut<Allocator>(&mut heap)
+    run self.renderer.draw(
+      &self.device,
+      &self.queue,
+      scene,
+      &self.textures,
+      &view,
+      width,
+      height,
+      color.white(),
+    )
+      |> Effect.provideMut<Allocator>(&mut heap)
+    run target.surface.present()
+    run self.device.checkErrors()
+  }
 
-  pub fn closeSurface(self: &mut Self, surface: u32) -> () {}
+  /// Lets go of another window's canvas.
+  pub fn closeSurface(self: &mut Self, surface: u32) -> () {
+    let mut i: usize = 0
+    while i < self.others.length() {
+      if self.others.asSlice()[i].id == surface {
+        let leaving = self.others.remove(i)
+        leaving.surface.unconfigure()
+        drop leaving
+      } else {
+        i = i + 1
+      }
+    }
+  }
 
   /// What the last frame took.
   pub fn report(self: &Self) -> RenderReport {

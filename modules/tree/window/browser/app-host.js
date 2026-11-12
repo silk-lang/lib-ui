@@ -18,6 +18,9 @@ import { WebGPUHost } from '/native/gpu/webgpu/browser/host.ts';
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
 
+/** modules/platform/window's number for the system menu item that closes a window. */
+const CLOSE_WINDOW = 6;
+
 /** The page's localStorage, or null where it is blocked (some private windows, sandboxed frames). */
 function pageStorage() {
   try {
@@ -50,10 +53,15 @@ export function unsupported() {
  *   other content passes false, and the canvas takes the keyboard when it is clicked.
  * - `imports`: more import modules, for functions the app declares itself
  *   (`extern … as "name#function"` is `imports.name.function`).
+ * - `windows(control)`: called before the app starts, for a page that stands in for the desktop
+ *   around the app's windows (a title bar with a close button, say). `control.close(id)` asks
+ *   window `id` to close, as a desktop's close button does: the app hears a close request and
+ *   decides. Window 1 is the first window. Later windows get canvases of their own, added to
+ *   `container` in the order they open, with the id `silk-window-<id>`.
  */
 export async function runApp({
   wasm, container = document.body, check = false, log = console.log,
-  storage = check ? null : pageStorage(), storagePrefix = 'silk-app:', imports: more = {}, focus = true,
+  storage = check ? null : pageStorage(), storagePrefix = 'silk-app:', imports: more = {}, focus = true, windows,
 }) {
   const problem = unsupported();
   if (problem) throw new Error(problem);
@@ -71,6 +79,16 @@ export async function runApp({
   container.appendChild(canvas);
   const windowHost = new WindowHost({ container });
   windowHost.addCanvas(canvas);
+  windows?.({
+    close: id => {
+      // The window host's own way to ask is its "close window" menu item, which goes to the
+      // focused window: `id` is the focused one for the length of the call.
+      const focused = windowHost.focused;
+      windowHost.focused = id;
+      windowHost.systemItem(CLOSE_WINDOW);
+      windowHost.focused = focused;
+    },
+  });
   const gpuHost = new WebGPUHost();
   let memory;
   let line = '';
