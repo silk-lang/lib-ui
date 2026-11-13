@@ -27,8 +27,38 @@ import companion { Companion, Dock, NoCompanion, dockTarget, pointed }
 static if Intrinsic.targetArchitecture() == "wasm32" {
   // No threads in the browser: frames are drawn on this thread (render_inline.silk).
   import render_inline { InlineRenderer as RenderThread }
+
+  /// What the renderer needs once the window exists; in the browser nothing starts before.
+  struct EarlyRenderer {
+    settings: RenderSettings,
+  }
+
+  effect fn prepareRenderer(settings: RenderSettings, cache: String) -> EarlyRenderer
+    ! GpuError | OutOfMemoryError {
+    drop cache
+    return EarlyRenderer { settings: settings }
+  }
+
+  effect fn attachRenderer(early: EarlyRenderer, raw: RawSurface, window: WindowId) -> RenderThread
+    ! GpuError | OutOfMemoryError {
+    return run RenderThread.start(raw, window, early.settings)
+  }
 } else {
   import render_thread { RenderThread }
+
+  /// Starts the render thread, which makes the GPU device and pipelines while the window opens
+  /// and the client builds its first frame.
+  effect fn prepareRenderer(settings: RenderSettings, cache: String) -> RenderThread
+    ! GpuError | OutOfMemoryError {
+    return run RenderThread.prepare(settings, move cache)
+  }
+
+  effect fn attachRenderer(early: RenderThread, raw: RawSurface, window: WindowId) -> RenderThread
+    ! GpuError | OutOfMemoryError {
+    let mut thread = move early
+    run thread.attach(raw, window)
+    return move thread
+  }
 }
 
 import platform_thread { HostPlatform, Launched }
@@ -44,7 +74,7 @@ import window.event { Event }
 import window.native { NativePlatform }
 // Interface methods resolve through this import; silk#2819 reports it as unused.
 import window.platform { Platform as _Platform }
-import window.types { Wait, WindowError, WindowId, WindowOptions }
+import window.types { RawSurface, Wait, WindowError, WindowId, WindowOptions }
 import webgpu.runtime { GpuError }
 import silk.collections.list { List }
 import silk.core.effect { Effect }
@@ -821,6 +851,14 @@ pub effect fn runWindowWith<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
   if tracing {
     StderrWriter.print("silk-ui: host started\n", &())
   }
+  // The GPU starts first: on its own thread it takes longer than everything up to the first
+  // frame on this one.
+  let cache = if check {
+    String.make()
+  } else {
+    run gpuCacheDirectory()
+  }
+  let early = run prepareRenderer(RenderSettings { check: check }, move cache)
   let mut tree = run UiTree.make(collection)
 
   // A window per root. In the browser a window is a canvas, and the renderer knows the
@@ -868,7 +906,7 @@ pub effect fn runWindowWith<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
   let raw = platform.rawSurface(window)
 
   // The GPU lives on the render thread; frames go there as copies (see render_thread.silk).
-  let mut renderer = run RenderThread.start(raw, owner, RenderSettings { check: check })
+  let mut renderer = run attachRenderer(move early, raw, owner)
   if tracing {
     StderrWriter.print("silk-ui: gpu ready\n", &())
   }
@@ -1466,6 +1504,49 @@ pub effect fn startInspector(options: InspectorOptions) -> Inspector
 /// The value of this process's environment variable `name`, for code that has no `HostInput`
 /// (see `startInspector`). None when it is not set, is not UTF-8 or the environment cannot be
 /// read.
+/// Where the GPU keeps translated shaders and pipelines between runs (see the render thread):
+/// `SILK_UI_GPU_CACHE` when set (empty turns the cache off), otherwise `silk-ui/gpu` in the
+/// user's cache directory. Empty when there is none.
+effect fn gpuCacheDirectory() -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match move run environmentVariable("SILK_UI_GPU_CACHE") {
+    Option<String>.Some { value } => {
+      return move value
+    }
+    Option<String>.None => ()
+  }
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    return run underDirectory(run environmentVariable("LOCALAPPDATA"), "\\silk-ui\\gpu")
+  } else {
+    static if Intrinsic.targetOperatingSystem() == "darwin" {
+      return run underDirectory(run environmentVariable("HOME"), "/Library/Caches/silk-ui/gpu")
+    } else {
+      let xdg = run environmentVariable("XDG_CACHE_HOME")
+      if Option<String>.isSome(&xdg) {
+        return run underDirectory(move xdg, "/silk-ui/gpu")
+      }
+      return run underDirectory(run environmentVariable("HOME"), "/.cache/silk-ui/gpu")
+    }
+  }
+}
+
+/// `base` followed by `path`; empty when there is no `base` or it is empty.
+effect fn underDirectory(base: Option<String>, path: string) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match move base {
+    Option<String>.Some { value } => {
+      let mut joined = move value
+      if joined.ownedByteLength() != 0 {
+        run joined.append(path)
+      }
+      move joined
+    }
+    Option<String>.None => String.make()
+  }
+}
+
 pub effect fn environmentVariable(name: string) -> Option<String>
   ! OutOfMemoryError
   ? &mut Allocator {
