@@ -945,8 +945,9 @@ class Page {
           this.meta.delete(id);
         }
       }
-      // Depth first, without recursion: down, then along, then up and along.
-      if (node.firstChild) {
+      // Depth first, without recursion: down, then along, then up and along. The nodes inside
+      // a copy that waits (see `clone`) were never named, so they hold nothing to forget.
+      if (node.silkLazy === undefined && node.firstChild) {
         node = node.firstChild;
         continue;
       }
