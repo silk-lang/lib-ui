@@ -1,0 +1,475 @@
+//! The tree as an AccessKit accessibility tree: [`AccessTree`] turns the live nodes into
+//! [`TreeUpdate`]s, sending only the nodes that changed since the last update, and
+//! [`doAction`] answers the [`ActionRequest`]s a platform adapter hands back.
+//!
+//! It is host-agnostic: a window host passes the updates to an AccessKit platform adapter,
+//! a web host could turn them into DOM attributes, and tests read them directly.
+import accesskit.lib {
+  Node as AccessNode,
+  NodeId as AccessId,
+  Role as AccessRole,
+  Action,
+  ActionData,
+  ActionRequest,
+  Toggled,
+  TreeInfo,
+  TreeUpdate,
+  Rect as AccessRect
+}
+import engine { UiTree }
+import node { NONE, Event, EventKind }
+import mutation { NodeKind, Role, LISTEN_CLICK, NOT_FOCUSABLE }
+import input { Input }
+import inspect { NodeInfo }
+import inspect as inspect
+import edit as edit
+import silk.collections.hash { Hash }
+import silk.collections.hash_map { HashMap }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.text.string { String }
+
+/// The id of the window node at the root of every accessibility tree. Tree node ids are
+/// `u32`, so this never collides with one.
+pub fn windowId() -> AccessId {
+  return AccessId.of(u64.shiftLeft(1, 32))
+}
+
+/// The accessibility id of the tree node `id`.
+pub fn accessId(id: u32) -> AccessId {
+  return AccessId.of(u32.toU64(id))
+}
+
+/// The tree node a target names, or NONE for the window node or an id the tree never had.
+fn nodeIdOf(target: AccessId) -> u32 {
+  if target.value >= u64.shiftLeft(1, 32) {
+    return NONE
+  }
+  return u64.toU32(target.value)
+}
+
+/// The AccessKit role for a tree role. `None` maps to a generic container that platform
+/// adapters look through.
+pub fn accessRoleOf(value: Role) -> AccessRole {
+  return match value {
+    Role.None => AccessRole.GenericContainer
+    Role.Generic => AccessRole.GenericContainer
+    Role.Button => AccessRole.Button
+    Role.Link => AccessRole.Link
+    Role.Checkbox => AccessRole.CheckBox
+    Role.Radio => AccessRole.RadioButton
+    Role.TextBox => AccessRole.TextInput
+    Role.Heading => AccessRole.Heading
+    Role.Paragraph => AccessRole.Paragraph
+    Role.List => AccessRole.List
+    Role.ListItem => AccessRole.ListItem
+    Role.Image => AccessRole.Image
+    Role.Dialog => AccessRole.Dialog
+    Role.Menu => AccessRole.Menu
+    Role.MenuItem => AccessRole.MenuItem
+    Role.Tab => AccessRole.Tab
+    Role.TabList => AccessRole.TabList
+    Role.TabPanel => AccessRole.TabPanel
+    Role.Toolbar => AccessRole.Toolbar
+    Role.Navigation => AccessRole.Navigation
+    Role.Main => AccessRole.Main
+    Role.Form => AccessRole.Form
+    Role.Group => AccessRole.Group
+    Role.Slider => AccessRole.Slider
+    Role.Switch => AccessRole.Switch
+    Role.ListBox => AccessRole.ListBox
+    Role.Option => AccessRole.ListBoxOption
+    Role.Tooltip => AccessRole.Tooltip
+  }
+}
+
+fn toggles(value: Role) -> bool {
+  return value == Role.Checkbox || value == Role.Radio || value == Role.Switch
+}
+
+fn selects(value: Role) -> bool {
+  return value == Role.Option || value == Role.Tab || value == Role.ListItem
+    || value == Role.MenuItem
+}
+
+/// The root of what assistive technology may reach: the innermost focus trap around the
+/// focused node (a modal dialog), or the tree's root.
+fn scope(tree: &UiTree<'_>) -> u32 {
+  let mut at = tree.focused
+  while at != NONE {
+    if tree.node(at).focusTrap {
+      return at
+    }
+    at = tree.node(at).parent
+  }
+  return tree.root
+}
+
+fn within(tree: &UiTree<'_>, slot: u32, root: u32) -> bool {
+  let mut at = slot
+  while at != NONE {
+    if at == root {
+      return true
+    }
+    at = tree.node(at).parent
+  }
+  return false
+}
+
+fn disabled(tree: &UiTree<'_>, slot: u32) -> bool {
+  let mut at = slot
+  while at != NONE {
+    if tree.node(at).disabled {
+      return true
+    }
+    at = tree.node(at).parent
+  }
+  return false
+}
+
+fn exposed(tree: &UiTree<'_>, slot: u32) -> bool {
+  let node = tree.node(slot)
+  return node.live && node.computed.text.visible
+}
+
+/// The AccessKit node for `slot`, with `children` as its children.
+effect fn describe(tree: &UiTree<'_>, slot: u32, children: &[AccessId]) -> AccessNode
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let node = tree.node(slot)
+  let mut kind = accessRoleOf(node.accessRole)
+  if node.accessRole == Role.None && node.kind == NodeKind.Text {
+    kind = AccessRole.Label
+  }
+  if node.accessRole == Role.None || node.accessRole == Role.TextBox {
+    if node.kind == NodeKind.Input {
+      kind = if node.edit.multiline {
+        AccessRole.MultilineTextInput
+      } else {
+        AccessRole.TextInput
+      }
+    }
+  }
+  let mut out = AccessNode.make(kind)
+  if children.length > 0 {
+    run out.setChildren(children)
+  }
+  match run inspect.info(tree, node.id) {
+    Option.Some { value } => {
+      let info: NodeInfo = value
+      if info.laidOut {
+        let b = info.bounds
+        run out.setBounds(
+          AccessRect.make(
+            f32.toF64(b.xMin),
+            f32.toF64(b.yMin),
+            f32.toF64(b.xMax),
+            f32.toF64(b.yMax),
+          ),
+        )
+      }
+    }
+    Option.None => {}
+  }
+  if String.byteLength(String.view(&node.label)) > 0 {
+    run out.setLabel(String.view(&node.label))
+  }
+  if node.kind == NodeKind.Text || node.kind == NodeKind.Input {
+    run out.setValue(String.view(&node.text))
+  }
+  if node.kind == NodeKind.Input {
+    if String.byteLength(String.view(&node.edit.placeholder)) > 0 {
+      run out.setPlaceholder(String.view(&node.edit.placeholder))
+    }
+    if node.edit.readOnly {
+      out.setReadOnly()
+    } else {
+      out.addAction(Action.SetValue)
+      out.addAction(Action.ReplaceSelectedText)
+    }
+  }
+  if disabled(tree, slot) {
+    out.setDisabled()
+  }
+  if toggles(node.accessRole) {
+    run out.setToggled(
+      if node.checked {
+        Toggled.True
+      } else {
+        Toggled.False
+      },
+    )
+  }
+  if selects(node.accessRole) || node.selected {
+    run out.setSelected(node.selected)
+  }
+  if node.expanded {
+    run out.setExpanded(true)
+  }
+  if node.focusTrap && node.accessRole == Role.Dialog {
+    out.setModal()
+  }
+  if node.hasValueRange {
+    run out.setMinNumericValue(f32.toF64(node.valueMin))
+    run out.setMaxNumericValue(f32.toF64(node.valueMax))
+    run out.setNumericValue(f32.toF64(node.valueNow))
+    out.addAction(Action.Increment)
+    out.addAction(Action.Decrement)
+  }
+  if node.tabIndex != NOT_FOCUSABLE {
+    out.addAction(Action.Focus)
+  }
+  if (node.listeners & LISTEN_CLICK) != 0 || node.accessRole == Role.Button
+    || node.accessRole == Role.Link
+    || toggles(node.accessRole)
+    || node.accessRole == Role.MenuItem
+    || node.accessRole == Role.Tab
+    || node.accessRole == Role.Option {
+    out.addAction(Action.Click)
+  }
+  return move out
+}
+
+/// Appends the AccessKit nodes of the exposed subtree at `slot` to `out`, children before
+/// their parent, and returns false when `slot` itself is not exposed.
+effect fn collect(tree: &UiTree<'_>, slot: u32, out: &mut List<Entry>) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !exposed(tree, slot) {
+    return false
+  }
+  let mut slots = List<u32>.make()
+  run tree.childSlots(slot, &mut slots)
+  let mut children = List<AccessId>.make()
+  let mut i: usize = 0
+  while i < slots.length() {
+    let child = slots.get(i)
+    if run collect(tree, child, &mut out) {
+      run children.append(accessId(tree.node(child).id))
+    }
+    i = i + 1
+  }
+  let id = tree.node(slot).id
+  let node = run describe(tree, slot, children.asSlice())
+  run out.append(Entry { id: id, node: move node })
+  return true
+}
+
+struct Entry {
+  id: u32,
+  node: AccessNode,
+}
+
+/// Keeps what an AccessKit adapter has been sent, so later updates carry only what changed.
+pub struct AccessTree {
+  /// The nodes last sent, and where each tree node id sits among them.
+  sent: List<AccessNode>,
+  index: HashMap<u32, u32>,
+  root: u32,
+  focus: AccessId,
+  started: bool,
+}
+
+impl AccessTree {
+  pub fn make() -> AccessTree {
+    return AccessTree {
+      sent: List<AccessNode>.make(),
+      index: HashMap<u32, u32>.make(Hash.seed(4243)),
+      root: NONE,
+      focus: windowId(),
+      started: false,
+    }
+  }
+
+  /// Whether an update has been made since [`AccessTree.make`] or [`AccessTree.reset`].
+  pub fn hasStarted(self: &Self) -> bool {
+    return self.started
+  }
+
+  /// Forgets what was sent, so the next update is a full tree again (for a new adapter).
+  pub fn reset(self: &mut Self) -> () {
+    self.sent.clear()
+    self.index.clear()
+    self.root = NONE
+    self.focus = windowId()
+    self.started = false
+  }
+
+  /// The whole tree as one update, as an adapter's activation handler wants it. It also
+  /// becomes the base later [`AccessTree.update`]s diff against.
+  pub effect fn fullUpdate(self: &mut Self, tree: &UiTree<'_>) -> TreeUpdate
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.reset()
+    return match run self.update(tree) {
+      Option.Some { value } => move value
+      Option.None => Intrinsic.trap("ui_tree.access: a first update always has nodes")
+    }
+  }
+
+  /// The nodes that changed since the last update, or none when nothing did. The window
+  /// node and the root come in the first update; later ones carry new and changed nodes, and
+  /// nodes whose children changed (which is how removals reach the adapter).
+  pub effect fn update(self: &mut Self, tree: &UiTree<'_>) -> Option<TreeUpdate>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut entries = List<Entry>.make()
+    let root = scope(tree)
+    let hasRoot = root != NONE && run collect(tree, root, &mut entries)
+    let mut window = AccessNode.make(AccessRole.Window)
+    if hasRoot {
+      run window.setChildren(&[accessId(tree.node(root).id)])
+    }
+    let focusSlot = tree.focused
+    let focus = if focusSlot != NONE && hasRoot && within(tree, focusSlot, root)
+      && exposed(tree, focusSlot) {
+      accessId(tree.node(focusSlot).id)
+    } else {
+      windowId()
+    }
+    let mut update = TreeUpdate.make(focus)
+    let rootId = if hasRoot {
+      tree.node(root).id
+    } else {
+      NONE
+    }
+    if !self.started || rootId != self.root {
+      run update.push(windowId(), move window)
+    }
+    if !self.started {
+      update.tree = Option.Some { value: TreeInfo.make(windowId()) }
+    }
+    let mut nextSent = List<AccessNode>.make()
+    let mut nextIndex = HashMap<u32, u32>.make(Hash.seed(4253))
+    let mut changed = false
+    while let Option.Some { value: entry } = entries.pop() {
+      let entry: Entry = move entry
+      let id = entry.id
+      let same = match self.index.get(id) {
+        Option.Some { value } => self.sent.asSlice()[u32.toUsize(value)].equals(&entry.node)
+        Option.None => false
+      }
+      if !same {
+        let copy = run entry.node.copy()
+        run update.push(accessId(id), move copy)
+        changed = true
+      }
+      drop run nextIndex.insert(id, usize.toU32(nextSent.length()))
+      run nextSent.append(move entry.node)
+    }
+
+    // Nodes that left the tree: their parents' new child lists already tell the adapter.
+    let mut removed = false
+    let mut bucket: usize = 0
+    while bucket < self.index.bucketCount() {
+      if self.index.occupiedAt(bucket) && !nextIndex.contains(self.index.keyAt(bucket)) {
+        removed = true
+      }
+      bucket = bucket + 1
+    }
+    self.sent = move nextSent
+    self.index = move nextIndex
+    let firstUpdate = !self.started
+    let focusMoved = !focus.equals(self.focus)
+    let rootMoved = rootId != self.root
+    self.started = true
+    self.root = rootId
+    self.focus = focus
+    if firstUpdate || changed || focusMoved || rootMoved || removed {
+      return Option.Some { value: move update }
+    }
+    return Option.None
+  }
+}
+
+/// What [`doAction`] did with a request.
+pub enum ActionOutcome {
+  /// The tree acted on it.
+  Done,
+  /// The target is gone, hidden, disabled or outside the focus trap.
+  Unavailable,
+  /// The tree does not support this action on this node.
+  Unsupported,
+}
+
+/// Answers `request` from a platform adapter: Click queues a click event, Focus moves focus,
+/// SetValue and ReplaceSelectedText edit an input as typing would, Increment and Decrement
+/// press the arrow keys, and Expand and Collapse click the node.
+pub effect fn doAction(tree: &mut UiTree<'_>, request: &ActionRequest) -> ActionOutcome
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let target = nodeIdOf(request.targetNode)
+  if target == NONE {
+    return ActionOutcome.Unsupported
+  }
+  let slot = tree.slotOf(target)
+  if slot == NONE || !within(&tree.*, slot, scope(&tree.*)) || disabled(&tree.*, slot)
+    || !exposed(&tree.*, slot) {
+    return ActionOutcome.Unavailable
+  }
+  let action = request.action
+  if action == Action.Click || action == Action.Expand || action == Action.Collapse {
+    let mut path = List<u32>.make()
+    run tree.pathTo(slot, &mut path)
+    run tree.queueEvent(Event.make(EventKind.Click, target, move path))
+    return ActionOutcome.Done
+  }
+  if action == Action.Focus {
+    if tree.node(slot).tabIndex == NOT_FOCUSABLE {
+      return ActionOutcome.Unsupported
+    }
+    run tree.focusSlot(slot)
+    return ActionOutcome.Done
+  }
+  if action == Action.Blur {
+    if tree.focused == slot {
+      run tree.focusSlot(NONE)
+    }
+    return ActionOutcome.Done
+  }
+  if action == Action.SetValue || action == Action.ReplaceSelectedText {
+    if tree.node(slot).kind != NodeKind.Input || tree.node(slot).edit.readOnly {
+      return ActionOutcome.Unsupported
+    }
+    let text = match &request.data {
+      Option.Some { value } => match &value {
+        ActionData.Value { value: given } => run String.copy(String.view(&given))
+        _ => String.make()
+      }
+      Option.None => String.make()
+    }
+    run tree.focusSlot(slot)
+    if action == Action.SetValue {
+      run edit.selectAll(&mut tree, slot)
+    }
+    run tree.dispatch(Input.TextInput { text: move text })
+    return ActionOutcome.Done
+  }
+  if action == Action.Increment || action == Action.Decrement {
+    if !tree.node(slot).hasValueRange {
+      return ActionOutcome.Unsupported
+    }
+    run tree.focusSlot(slot)
+    run tree.dispatch(
+      Input.KeyDown {
+        key: run String.copy(
+          if action == Action.Increment {
+            "ArrowUp"
+          } else {
+            "ArrowDown"
+          },
+        ),
+        code: String.make(),
+        modifiers: 0,
+        repeat: false,
+      },
+    )
+    return ActionOutcome.Done
+  }
+  return ActionOutcome.Unsupported
+}
