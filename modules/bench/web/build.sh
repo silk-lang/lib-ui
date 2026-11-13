@@ -14,6 +14,6 @@ profile=release
 [ "$optimization" = "size" ] && profile=release-size
 mkdir -p "$target/dist"
 cp "$here/page/index.html" "$here/page/package.json" "$here/page/package-lock.json" "$target/"
-cp "$here/build/llvm/wasm32-unknown-unknown/$profile/ui-bench-web" "$target/dist/bench.wasm"
+cp "$root/build/llvm/wasm32-unknown-unknown/$profile/ui-bench-web" "$target/dist/bench.wasm"
 cp "$root/modules/app/dom/js/silk-ui-dom.js" "$target/dist/silk-ui-dom.js"
 echo "Built $target"

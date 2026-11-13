@@ -11,7 +11,7 @@
 //! called at all.
 import heap { Heap }
 import program { Submodel }
-import ui { Ui, Span, PassSizes }
+import ui { Ui, Span, PassSizes, LazyHints }
 // What a view names next to the builder.
 pub import ui { Reply, DefaultAction }
 pub import ui_protocol.grid { Grid }
@@ -26,7 +26,6 @@ import silk.collections.list { List }
 import silk.collections.slice { Slice }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
-import silk.core.result { Result }
 import silk.geometry.rect { Rect }
 import silk.mem.pointer { Pointer }
 import silk.num.f64
@@ -65,6 +64,9 @@ enum Shape {
   Overlay,
   /// Its children become children of the node that holds it.
   Fragment,
+  /// A keyed lazy region (see `Document.lazy`): its one kid, or none when the last render's
+  /// region is reused.
+  Lazy,
 }
 
 struct Record {
@@ -77,6 +79,8 @@ struct Record {
   text: Span,
   keyed: bool,
   key: u64,
+  /// The hash of a lazy region.
+  hash: u64,
 }
 
 impl Copy for Record {}
@@ -197,10 +201,8 @@ impl Tree {
 
   fn text(self: &Self, span: Span) -> string {
     let bytes = Slice.view(self.bytes.asSlice(), u32.toUsize(span.start), u32.toUsize(span.length))
-    return match String.fromUtf8(bytes) {
-      Result.Success { value } => value
-      Result.Failure { error: _ } => ""
-    }
+    // Every span holds a whole string the view stored (or digits): valid UTF-8 already.
+    return unsafe String.fromUtf8Unchecked(bytes)
   }
 
   fn group(self: &mut Self, attributes: &[Attr]) -> Span {
@@ -255,6 +257,34 @@ impl Tree {
           text: text,
           keyed: false,
           key: 0,
+          hash: 0,
+        },
+      ),
+    )
+    return Node { index: index }
+  }
+}
+
+impl Tree {
+  /// A lazy record with the kid `kid`, or with none (reuse the last render's region).
+  fn lazy(self: &mut Self, key: u64, hash: u64, kid: Option<u32>) -> Node {
+    let kidStart = usize.toU32(self.kids.length())
+    if let Option<u32>.Some { value } = kid {
+      self.heap.alloc(self.kids.append(value))
+    }
+    let index = usize.toU32(self.records.length())
+    self.heap.alloc(
+      self.records.append(
+        Record {
+          shape: Shape.Lazy,
+          kidStart: kidStart,
+          kidCount: usize.toU32(self.kids.length()) - kidStart,
+          attrStart: 0,
+          attrCount: 0,
+          text: Span.empty(),
+          keyed: true,
+          key: key,
+          hash: hash,
         },
       ),
     )
@@ -305,6 +335,9 @@ pub struct Document<M> {
   tree: *mut Tree,
   slots: *mut Slots<M>,
   event: *const Event,
+  hints: *const LazyHints,
+  /// Whether `lazy` may skip a body the hints name.
+  reuse: bool,
 }
 
 fn mapReply<A, B>(reply: Reply<A>, wrap: fn(A) -> B) -> Reply<B> {
@@ -575,6 +608,29 @@ impl<M> Document<M> {
     return node
   }
 
+  /// `body()`, keyed `key`, skipped when the last render made it with the same `hash`: then
+  /// its nodes are copied from that render and the diff skips them, as Elm's `Html.lazy`.
+  /// `hash` must change whenever anything `body` reads changes (`textKey` hashes text). Made
+  /// for the rows of a long list; `body` must return one node.
+  pub fn lazy(self: &Self, key: u64, hash: u64, body: fn() -> Node) -> Node {
+    let mut anchor: u8 = 0
+    if self.reuse {
+      let hints = unsafe Pointer.borrow(&anchor, self.hints)
+      if hints.has(key, hash) {
+        let tree = unsafe Pointer.borrowMut(&mut anchor, self.tree)
+        return tree.lazy(key, hash, Option<u32>.None)
+      }
+    }
+    let node = body()
+    let tree = unsafe Pointer.borrowMut(&mut anchor, self.tree)
+    let shape = tree.records.get(u32.toUsize(node.index)).shape
+    if tree.dispatching || shape == Shape.Fragment || shape == Shape.Overlay {
+      return self.keyed(key, node)
+    }
+    drop self.keyed(key, node)
+    return tree.lazy(key, hash, Option<u32>.Some { value: node.index })
+  }
+
   /// One node per item, as children of the node that holds the result.
   pub fn each<T>(self: &Self, items: &[T], view: fn(&T) -> Node) -> Node {
     let mut heap = Heap.make()
@@ -597,6 +653,8 @@ impl<M> Document<M> {
       tree: self.tree,
       slots: Pointer.fromMutRef(&mut inner),
       event: self.event,
+      hints: self.hints,
+      reuse: self.reuse,
     }
     let node = view(&builder)
     let mut anchor: u8 = 0
@@ -1149,6 +1207,17 @@ fn place<M>(ui: &mut Ui<M>, tree: &Tree, slots: *mut Slots<M>, index: u32) -> ()
     ui.overlay(record.key, |ui| fill<M>(&mut ui, tree, slots, record))
     return ()
   }
+  if record.shape == Shape.Lazy {
+    if record.kidCount == 0 {
+      if !ui.reuseKeyed(record.key, record.hash) {
+        ui.lazyMissed = true
+      }
+    } else {
+      let kid = tree.kids.get(u32.toUsize(record.kidStart))
+      ui.lazyKeyed(record.key, record.hash, |ui| place<M>(&mut ui, tree, slots, kid))
+    }
+    return ()
+  }
   if record.keyed {
     ui.key(record.key)
   }
@@ -1179,21 +1248,32 @@ fn place<M>(ui: &mut Ui<M>, tree: &Tree, slots: *mut Slots<M>, index: u32) -> ()
 /// A box at the top of the view is the root itself: its attributes go on the root and its
 /// children are the root's children. Any other node is the root's only child.
 pub fn render<M>(ui: &mut Ui<M>, view: fn(&Document<M>) -> Node) -> () {
-  let mut tree = Tree.make(ui.isDispatching(), ui.dispatched().kind, ui.passSizes)
-  let mut slots = Slots<M>.make()
-  let builder = Document<M> {
-    tree: Pointer.fromMutRef(&mut tree),
-    slots: Pointer.fromMutRef(&mut slots),
-    event: Pointer.fromRef(ui.dispatched()),
-  }
-  let root = view(&builder)
-  ui.passSizes = tree.sizes()
-  ui.reserveNodes(tree.records.length())
-  let record = tree.records.get(u32.toUsize(root.index))
-  let replies = Pointer.fromMutRef(&mut slots)
-  if record.shape == Shape.Box && !record.keyed {
-    fill<M>(&mut ui, &tree, replies, record)
-  } else {
-    place<M>(&mut ui, &tree, replies, root.index)
+  let mut reuse = ui.mayReuse()
+  while true {
+    let mut tree = Tree.make(ui.isDispatching(), ui.dispatched().kind, ui.passSizes)
+    let mut slots = Slots<M>.make()
+    let builder = Document<M> {
+      tree: Pointer.fromMutRef(&mut tree),
+      slots: Pointer.fromMutRef(&mut slots),
+      event: Pointer.fromRef(ui.dispatched()),
+      hints: Pointer.fromRef(ui.lazyHints()),
+      reuse: reuse,
+    }
+    let root = view(&builder)
+    ui.passSizes = tree.sizes()
+    ui.reserveNodes(tree.records.length())
+    let record = tree.records.get(u32.toUsize(root.index))
+    let replies = Pointer.fromMutRef(&mut slots)
+    if record.shape == Shape.Box && !record.keyed {
+      fill<M>(&mut ui, &tree, replies, record)
+    } else {
+      place<M>(&mut ui, &tree, replies, root.index)
+    }
+    if !ui.lazyMissed {
+      return ()
+    }
+    // A region the view skipped could not be copied: describe everything this time.
+    ui.restartRender()
+    reuse = false
   }
 }

@@ -4,11 +4,16 @@
 //! stylesheet and the benchmark driver's selectors apply as they do to the others.
 import ui_app.css
 import ui_app.css { Keyword }
-import ui_app.lib { Document, Node, NoCommand, NoOutput, Program, Update }
+import ui_app.lib { Document, Node, NoCommand, NoOutput, Program, Update, textKey }
 import ui_app_dom.page
+import ui_app_dom.dom { Dom }
+import ui_app.backend { TreeError }
+import ui_app.program { make }
+import ui_app.runtime { settle, drain }
 import silk.collections.list { List }
 import silk.core.effect { Effect }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
 import silk.num.u64
 import silk.num.usize
 import silk.text.string { String }
@@ -196,7 +201,7 @@ impl Program<Message, NoCommand> for Bench {
           &[
             h.box(
               &[h.element("tbody"), h.id("tbody")],
-              &[h.each(model.rows.asSlice(), |row| h.keyed(row.id, line(h, row, model.selected)))],
+              &[h.each(model.rows.asSlice(), |row| h.lazy(row.id, rowHash(row, model.selected), || line(h, row, model.selected)))],
             ),
           ],
         ),
@@ -224,6 +229,16 @@ fn button(h: &Document<Message>, id: string, label: string, message: Message) ->
       ),
     ],
   )
+}
+
+/// A hash of everything `line` reads but the id, which is the row's key.
+fn rowHash(row: &Row, selected: u64) -> u64 {
+  let hash = textKey(String.view(&row.label))
+  return if row.id == selected {
+    u64.bitXor(hash, 1)
+  } else {
+    hash
+  }
 }
 
 fn line(h: &Document<Message>, row: &Row, selected: u64) -> Node {
@@ -277,6 +292,40 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
   }
 }
 
-pub fn main() -> i32 {
-  return 0
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  effect fn profile(selects: u32) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut host = run make<Bench, Message, NoCommand>()
+    let mut dom = Dom.make()
+    dom.setViewport(1280.0, 800.0)
+    run host.sized(1280.0, 800.0)
+    drop run settle(&mut host)
+    drop host.takeWent()
+    run host.start(&mut dom, 0.0)
+    run drain(&mut host, &mut dom)
+    host.send(Message.Run)
+    run drain(&mut host, &mut dom)
+    let mut i: u32 = 0
+    while i < selects {
+      host.send(Message.Select { id: u32.toU64(i % 50 + 2) })
+      run drain(&mut host, &mut dom)
+      i = i + 1
+    }
+  }
+
+  effect fn gaveUp<E>(error: E) -> () {
+    drop error
+  }
+
+  pub fn main() -> i32 {
+    let mut allocator = Allocator.systemAllocatorProvider()
+    run Effect.catchAll(profile(200), gaveUp)
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    return 0
+  }
+} else {
+  pub fn main() -> i32 {
+    return 0
+  }
 }

@@ -27,3 +27,8 @@ a Chromium of your own.
 
 `OPTIMIZATION=size modules/bench/web/build.sh jfb` builds the smaller WebAssembly instead of the
 faster one.
+
+Off the browser the program is a profiling driver: it renders 1,000 rows and selects one 200
+times through the same runtime and diff, with the page's batches encoded and dropped. Build it
+with `silk build --manifest-path modules/bench/web/silk.toml --profile-input
+'{"optimization":"speed","debug":true}'` and run it under `valgrind --tool=callgrind`.

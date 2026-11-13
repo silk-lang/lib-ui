@@ -195,6 +195,11 @@ pub struct Entry {
   pub id: u32,
   /// Copied by `lazy` from the last render, with everything below it: nothing to diff.
   pub copied: bool,
+  /// A copied entry whose kept replies came with it (see `Ui.keep`), so a dispatch through it
+  /// can be answered without running the view.
+  pub carried: bool,
+  /// The keyed lazy record whose region starts at this entry, or `NO_ENTRY`.
+  pub lazy: u32,
 }
 
 impl Copy for Entry {}
@@ -265,6 +270,8 @@ impl Entry {
       old: NO_ENTRY,
       id: 0,
       copied: false,
+      carried: false,
+      lazy: NO_ENTRY,
     }
   }
 }
@@ -290,9 +297,116 @@ pub struct LazyRecord {
   pub byteEnd: u32,
   pub canvasStart: u32,
   pub canvasEnd: u32,
+  /// Made by `lazyKeyed`: found by the key of the node it starts with, not by its ordinal.
+  pub keyed: bool,
 }
 
 impl Copy for LazyRecord {}
+
+/// The keyed lazy regions of the last render, by key and hash: what a view builder that
+/// describes nodes before playing them can skip (see `Ui.lazyKeyed`). A direct-mapped table of
+/// `hintKey`s: a hint that loses its slot to another only costs that region's body a run.
+pub struct LazyHints {
+  slots: List<u64>,
+  count: usize,
+}
+
+impl LazyHints {
+  fn make() -> LazyHints {
+    return LazyHints { slots: List<u64>.make(), count: 0 }
+  }
+
+  /// Whether the last render had a keyed lazy region with `key` and `hash`. A hint: the region
+  /// can still not be reusable, which `Ui.reuseKeyed` says.
+  pub fn has(self: &Self, key: u64, hash: u64) -> bool {
+    let size = self.slots.length()
+    if size == 0 {
+      return false
+    }
+    let value = hintKey(key, hash)
+    let slots = self.slots.asSlice()
+    let mask = size - 1
+    let at = u64.toUsize(u64.bitAnd(value, usize.toU64(mask)))
+    let mut j: usize = 0
+    while j < HINT_PROBES {
+      let found = slots[(at + j) & mask]
+      if found == value {
+        return true
+      }
+      if found == 0 {
+        return false
+      }
+      j = j + 1
+    }
+    return false
+  }
+
+  /// Empties the table, sized for about as many hints as it held.
+  fn reset(self: &mut Self, heap: &mut Heap) -> () {
+    let mut size: usize = 64
+    while size < self.count * 4 {
+      size = size * 2
+    }
+    if self.slots.length() != size {
+      self.slots.clear()
+      heap.alloc(self.slots.appendRepeated(0, size))
+    } else {
+      let slots = self.slots.asMutSlice()
+      let mut i: usize = 0
+      while i < slots.length {
+        slots[i] = 0
+        i = i + 1
+      }
+    }
+    self.count = 0
+  }
+
+  fn insert(self: &mut Self, heap: &mut Heap, key: u64, hash: u64) -> () {
+    if self.slots.length() < (self.count + 1) * 2 {
+      // Grow and move the hints over: each is placed by its own bits.
+      let mut size: usize = 64
+      while size < (self.count + 1) * 4 {
+        size = size * 2
+      }
+      let old = Intrinsic.replace(self.slots, List<u64>.make())
+      heap.alloc(self.slots.appendRepeated(0, size))
+      let mut i: usize = 0
+      while i < old.length() {
+        let value = old.asSlice()[i]
+        if value != 0 {
+          self.place(value)
+        }
+        i = i + 1
+      }
+    }
+    self.place(hintKey(key, hash))
+    self.count = self.count + 1
+  }
+
+  /// Puts `value` in the first free slot of its probes, or over the last of them.
+  fn place(self: &mut Self, value: u64) -> () {
+    let slots = self.slots.asMutSlice()
+    let mask = slots.length - 1
+    let at = u64.toUsize(u64.bitAnd(value, usize.toU64(mask)))
+    let mut j: usize = 0
+    while j < HINT_PROBES - 1 && slots[(at + j) & mask] != 0 && slots[(at + j) & mask] != value {
+      j = j + 1
+    }
+    slots[(at + j) & mask] = value
+  }
+}
+
+/// How many slots a hint may sit in after its own.
+const HINT_PROBES: usize = 4
+
+fn hintKey(key: u64, hash: u64) -> u64 {
+  let value = u64.bitXor(mix(key), hash)
+  return if value == 0 {
+    1
+  } else {
+    value
+  }
+}
 
 /// The flat record of one render. Entry 0 is the runtime's root box.
 pub struct Arena {
@@ -439,6 +553,8 @@ pub struct Kept<M> {
   pub entry: u32,
   pub kind: EventKind,
   pub reply: Reply<M>,
+  /// The reply was taken, by a dispatch or by a copy of its region.
+  pub taken: bool,
 }
 
 /// A reply and the depth of the node whose handler gave it.
@@ -486,8 +602,20 @@ pub struct Ui<M> {
   pub passSizes: PassSizes,
   /// The replies this render kept, in entry order (see `keep`).
   kept: List<Kept<M>>,
+  /// The replies the last render kept: a region `lazy` copies takes its replies from here.
+  previousKept: List<Kept<M>>,
   /// A dispatch took replies from `kept` since the render: the next one runs the view.
   keptSpent: bool,
+  /// The keyed lazy regions of the last render, and of this one so far.
+  hints: LazyHints,
+  nextHints: LazyHints,
+  /// Where the last `carryKept` stopped in `previousKept`: the guess for the next.
+  keptCursor: usize,
+  /// This render runs every lazy body: a first try found a region it skipped not reusable.
+  noReuse: bool,
+  /// `reuseKeyed` could not copy a region whose body the view builder skipped: the render has
+  /// to be done again with `restartRender`.
+  pub lazyMissed: bool,
   /// Whether a node of this render, or of the last, asked for focus, a reveal, a pointer
   /// capture, a scroll, an anchor or a placement. Without it, the passes over every entry that
   /// look for those are skipped.
@@ -601,7 +729,13 @@ impl<M> Ui<M> {
     return Ui<M> {
       passSizes: PassSizes { records: 0, kids: 0, ops: 0, attrs: 0, bytes: 0, styles: 0 },
       kept: List<Kept<M>>.make(),
+      previousKept: List<Kept<M>>.make(),
       keptSpent: false,
+      hints: LazyHints.make(),
+      nextHints: LazyHints.make(),
+      keptCursor: 0,
+      noReuse: false,
+      lazyMissed: false,
       marked: false,
       previousMarked: false,
       heap: Heap.make(),
@@ -655,34 +789,55 @@ impl<M> Ui<M> {
   pub effect fn beginRender(self: &mut Self) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
+    // The last render becomes `previous`; the one before it gives its lists to this one.
+    let last = Intrinsic.replace(self.arena, Arena.make())
+    let older = Intrinsic.replace(self.previous, move last)
+    self.arena = move older
+    let lastKept = Intrinsic.replace(self.kept, List<Kept<M>>.make())
+    let olderKept = Intrinsic.replace(self.previousKept, move lastKept)
+    self.kept = move olderKept
+    let lastHints = Intrinsic.replace(self.nextHints, LazyHints.make())
+    let olderHints = Intrinsic.replace(self.hints, move lastHints)
+    self.nextHints = move olderHints
+    self.lookup.clear()
+    self.previousMarked = self.marked
+    self.lazyIndex.clear()
+    self.indexed = false
+    self.noReuse = false
+    self.resetRender()
+  }
+
+  /// Starts the render again, running every lazy body: a view builder skipped a body that
+  /// `reuseKeyed` then could not copy (`lazyMissed`).
+  pub fn restartRender(self: &mut Self) -> () {
+    self.noReuse = true
+    self.resetRender()
+  }
+
+  fn resetRender(self: &mut Self) -> () {
     let lists = self.virtualLists.asMutSlice()
     let mut v: usize = 0
     while v < lists.length {
       lists[v].seen = false
       v = v + 1
     }
-    // The last render becomes `previous`; the one before it gives its lists to this one.
-    let last = Intrinsic.replace(self.arena, Arena.make())
-    let older = Intrinsic.replace(self.previous, move last)
-    self.arena = move older
     self.arena.clear()
-    self.lookup.clear()
     self.kept.clear()
+    self.nextHints.reset(&mut self.heap)
+    self.keptCursor = 0
     self.keptSpent = false
-    self.previousMarked = self.marked
+    self.lazyMissed = false
     self.marked = false
-    self.lazyIndex.clear()
-    self.indexed = false
     self.lazyCursor = 0
     self.claimed.clear()
     let count = self.previous.length()
-    run self.claimed.appendRepeated(false, u32.toUsize(count))
+    self.heap.alloc(self.claimed.appendRepeated(false, u32.toUsize(count)))
     let mut root = Entry.make(NodeKind.Box, NO_ENTRY, Identity { keyed: false, value: 0 })
     root.id = self.rootId
     if count > 0 {
       root.old = 0
     }
-    run self.arena.entries.append(root)
+    self.heap.alloc(self.arena.entries.append(root))
     self.current = 0
     self.hasPendingKey = false
     self.dispatching = false
@@ -690,6 +845,16 @@ impl<M> Ui<M> {
     self.overlayHost = NO_ENTRY
     self.overlays = 0
     self.searching = false
+  }
+
+  /// The keyed lazy regions of the last render (see `lazyKeyed`).
+  pub fn lazyHints(self: &Self) -> &LazyHints {
+    return &self.hints
+  }
+
+  /// Whether a view builder may skip a lazy body whose region the hints name.
+  pub fn mayReuse(self: &Self) -> bool {
+    return !self.dispatching && !self.searching && !self.noReuse
   }
 
   /// Ends a render: the overlay layer, if any, moves after the root's other children so it is
@@ -876,13 +1041,28 @@ impl<M> Ui<M> {
     let mut l: usize = 0
     while l < self.previous.lazies.length() {
       let record = self.previous.lazies.get(l)
-      drop self.heap.alloc(self.lazyIndex.insert(lazyKey(record.parent, record.ordinal), usize.toU32(l)))
+      if !record.keyed {
+        drop self.heap.alloc(self.lazyIndex.insert(lazyKey(record.parent, record.ordinal), usize.toU32(l)))
+      }
       l = l + 1
     }
   }
 
   /// The entry of the last render that matches child `identity` of `parent`, unclaimed.
   fn matchOld(self: &mut Self, parent: u32, identity: Identity, kind: NodeKind) -> u32 {
+    let found = self.findOld(parent, identity)
+    if found == NO_ENTRY || self.claimed.get(u32.toUsize(found)) {
+      return NO_ENTRY
+    }
+    if self.previous.entryRef(found).kind != kind {
+      return NO_ENTRY
+    }
+    self.claimed.set(u32.toUsize(found), true)
+    return found
+  }
+
+  /// The entry of the last render at child `identity` of `parent`, claimed or not.
+  fn findOld(self: &mut Self, parent: u32, identity: Identity) -> u32 {
     let oldParent = self.arena.entryRef(parent).old
     if oldParent == NO_ENTRY {
       return NO_ENTRY
@@ -926,13 +1106,6 @@ impl<M> Ui<M> {
         at = entry.next
       }
     }
-    if found == NO_ENTRY || self.claimed.get(u32.toUsize(found)) {
-      return NO_ENTRY
-    }
-    if self.previous.entryRef(found).kind != kind {
-      return NO_ENTRY
-    }
-    self.claimed.set(u32.toUsize(found), true)
     return found
   }
 
@@ -1480,8 +1653,97 @@ impl<M> Ui<M> {
       byteEnd: usize.toU32(self.arena.bytes.length()),
       canvasStart: canvasStart,
       canvasEnd: usize.toU32(self.arena.canvas.length()),
+      keyed: false,
     }
     self.heap.alloc(self.arena.lazies.append(record))
+  }
+
+  /// A lazy region that is one keyed node: `body` opens it after `ui.key(key)`. Found again
+  /// by that key, so it is reused when its siblings come and go or move, as a keyed row of a
+  /// list. Its key and hash go in the hints of the next render (see `lazyHints`).
+  pub fn lazyKeyed(self: &mut Self, key: u64, hash: u64, body: fn(&mut Ui<M>) -> ()) -> () {
+    if self.dispatching || self.searching {
+      body(&mut self)
+      return ()
+    }
+    if !self.noReuse && self.reuseKeyed(key, hash) {
+      return ()
+    }
+    let parent = self.current
+    let entryStart = self.arena.length()
+    let styleStart = usize.toU32(self.arena.styles.length())
+    let byteStart = usize.toU32(self.arena.bytes.length())
+    let canvasStart = usize.toU32(self.arena.canvas.length())
+    let overlaysBefore = self.overlays
+    body(&mut self)
+    if self.overlays != overlaysBefore || self.arena.length() == entryStart {
+      return ()
+    }
+    let root = self.arena.entryRef(entryStart)
+    if root.parent != parent || !root.identity.keyed || root.identity.value != key {
+      return ()
+    }
+    let record = LazyRecord {
+      parent: parent,
+      ordinal: u32.MAX,
+      hash: hash,
+      entryStart: entryStart,
+      entryEnd: self.arena.length(),
+      styleStart: styleStart,
+      styleEnd: usize.toU32(self.arena.styles.length()),
+      byteStart: byteStart,
+      byteEnd: usize.toU32(self.arena.bytes.length()),
+      canvasStart: canvasStart,
+      canvasEnd: usize.toU32(self.arena.canvas.length()),
+      keyed: true,
+    }
+    self.markKeyed(record)
+  }
+
+  /// Appends keyed lazy record `record` of this render and names it in the next hints.
+  fn markKeyed(self: &mut Self, record: LazyRecord) -> () {
+    let index = usize.toU32(self.arena.lazies.length())
+    self.heap.alloc(self.arena.lazies.append(record))
+    let root = self.arena.entryMut(record.entryStart)
+    root.lazy = index
+    let key = root.identity.value
+    self.nextHints.insert(&mut self.heap, key, record.hash)
+  }
+
+  /// Copies the keyed lazy region of the last render with `key` under the open node when its
+  /// hash is `hash`; false when there is none to copy, and nothing changed.
+  pub fn reuseKeyed(self: &mut Self, key: u64, hash: u64) -> bool {
+    if self.dispatching || self.searching || self.noReuse {
+      return false
+    }
+    let parent = self.current
+    let oldParent = self.arena.entryRef(parent).old
+    if oldParent == NO_ENTRY {
+      return false
+    }
+    let found = self.findOld(parent, Identity { keyed: true, value: key })
+    if found == NO_ENTRY {
+      return false
+    }
+    let at = self.previous.entryRef(found).lazy
+    if at == NO_ENTRY {
+      return false
+    }
+    let record = self.previous.lazies.get(u32.toUsize(at))
+    if !record.keyed || record.hash != hash || record.entryStart != found
+      || !self.unclaimedRange(record.entryStart, record.entryEnd) {
+      return false
+    }
+    let mut v: usize = 0
+    while v < self.virtualLists.length() {
+      let list = &self.virtualLists.asSlice()[v]
+      if !list.seen && list.port >= record.entryStart && list.port < record.entryEnd {
+        return false
+      }
+      v = v + 1
+    }
+    self.copyLazy(record, u32.toUsize(at), parent)
+    return true
   }
 
   fn unclaimedRange(self: &Self, start: u32, end: u32) -> bool {
@@ -1508,15 +1770,30 @@ impl<M> Ui<M> {
     self.reused = self.reused + (record.entryEnd - record.entryStart)
     let inside = |index: u32| index != NO_ENTRY && index >= record.entryStart
       && index < record.entryEnd
-    let mut i = record.entryStart
-    while i < record.entryEnd {
-      self.claimed.set(u32.toUsize(i), true)
-      let mut entry = self.previous.entry(i)
-      entry.old = i
+    let count = u32.toUsize(record.entryEnd - record.entryStart)
+    let mut c: usize = 0
+    while c < count {
+      self.claimed.set(u32.toUsize(record.entryStart) + c, true)
+      c = c + 1
+    }
+    if self.previousMarked {
+      self.marked = true
+    }
+    // One copy of the whole region, then each entry is moved to its new place in it.
+    self.heap.alloc(
+      self.arena.entries.appendSlice(
+        Slice.view(self.previous.entries.asSlice(), u32.toUsize(record.entryStart), count),
+      ),
+    )
+    let mut grids = false
+    let entries = self.arena.entries.asMutSlice()
+    let mut k: usize = 0
+    while k < count {
+      let entry = &mut entries[u32.toUsize(entryStart) + k]
+      entry.old = record.entryStart + usize.toU32(k)
+      entry.carried = !entry.copied || entry.carried
       entry.copied = true
-      if self.previousMarked {
-        self.marked = true
-      }
+      entry.lazy = NO_ENTRY
       if entry.firstChild != NO_ENTRY {
         entry.firstChild = u32.wrappingAdd(entry.firstChild, entryShift)
         entry.lastChild = u32.wrappingAdd(entry.lastChild, entryShift)
@@ -1525,51 +1802,67 @@ impl<M> Ui<M> {
         entry.firstStyle = u32.wrappingAdd(entry.firstStyle, styleShift)
         entry.lastStyle = u32.wrappingAdd(entry.lastStyle, styleShift)
       }
-      entry.text = shifted(entry.text, byteShift)
-      entry.label = shifted(entry.label, byteShift)
-      entry.testId = shifted(entry.testId, byteShift)
-      entry.placeholder = shifted(entry.placeholder, byteShift)
-      entry.href = shifted(entry.href, byteShift)
-      entry.transition = shifted(entry.transition, byteShift)
-      entry.element = shifted(entry.element, byteShift)
-      entry.className = shifted(entry.className, byteShift)
-      entry.elementId = shifted(entry.elementId, byteShift)
+      if byteShift != 0 {
+        entry.text = shifted(entry.text, byteShift)
+        entry.label = shifted(entry.label, byteShift)
+        entry.testId = shifted(entry.testId, byteShift)
+        entry.placeholder = shifted(entry.placeholder, byteShift)
+        entry.href = shifted(entry.href, byteShift)
+        entry.transition = shifted(entry.transition, byteShift)
+        entry.element = shifted(entry.element, byteShift)
+        entry.className = shifted(entry.className, byteShift)
+        entry.elementId = shifted(entry.elementId, byteShift)
+      }
       entry.canvas = shifted(entry.canvas, canvasShift)
       if entry.grid != NO_ENTRY {
-        let grid = self.heap.alloc(self.previous.grids.asSlice()[u32.toUsize(entry.grid)].copy())
-        entry.grid = usize.toU32(self.arena.grids.length())
-        self.heap.alloc(self.arena.grids.append(move grid))
+        grids = true
       }
-      if inside(entry.parent) {
+      if entry.parent != NO_ENTRY && entry.parent >= record.entryStart
+        && entry.parent < record.entryEnd {
         entry.parent = u32.wrappingAdd(entry.parent, entryShift)
         if entry.next != NO_ENTRY {
           entry.next = u32.wrappingAdd(entry.next, entryShift)
         }
-        self.heap.alloc(self.arena.entries.append(entry))
       } else {
-        // A top-level node of the region: link it under the new parent.
+        // A top-level node of the region: linked under the new parent below.
         entry.parent = parent
         entry.next = NO_ENTRY
-        let index = self.arena.length()
-        let mut up = self.arena.entry(parent)
-        entry.position = up.childCount
-        up.childCount = up.childCount + 1
-        if !entry.identity.keyed {
-          entry.identity = Identity { keyed: false, value: u32.toU64(up.unkeyed) }
+      }
+      k = k + 1
+    }
+    k = 0
+    while k < count {
+      let index = entryStart + usize.toU32(k)
+      if grids && self.arena.entryRef(index).grid != NO_ENTRY {
+        let from = self.arena.entryRef(index).grid
+        let grid = self.heap.alloc(self.previous.grids.asSlice()[u32.toUsize(from)].copy())
+        let gridIndex = usize.toU32(self.arena.grids.length())
+        self.heap.alloc(self.arena.grids.append(move grid))
+        let entry = self.arena.entryMut(index)
+        entry.grid = gridIndex
+      }
+      if self.arena.entryRef(index).parent == parent {
+        let mut identity = self.arena.entryRef(index).identity
+        let up = self.arena.entryMut(parent)
+        let position = up.childCount
+        up.childCount = position + 1
+        if !identity.keyed {
+          identity = Identity { keyed: false, value: u32.toU64(up.unkeyed) }
           up.unkeyed = up.unkeyed + 1
         }
-        if up.lastChild == NO_ENTRY {
+        let lastChild = up.lastChild
+        up.lastChild = index
+        if lastChild == NO_ENTRY {
           up.firstChild = index
         } else {
-          let mut last = self.arena.entry(up.lastChild)
+          let last = self.arena.entryMut(lastChild)
           last.next = index
-          self.arena.setEntry(up.lastChild, last)
         }
-        up.lastChild = index
-        self.arena.setEntry(parent, up)
-        self.heap.alloc(self.arena.entries.append(entry))
+        let entry = self.arena.entryMut(index)
+        entry.position = position
+        entry.identity = identity
       }
-      i = i + 1
+      k = k + 1
     }
     let mut s = record.styleStart
     while s < record.styleEnd {
@@ -1636,8 +1929,13 @@ impl<M> Ui<M> {
           byteEnd: u32.wrappingAdd(inner.byteEnd, byteShift),
           canvasStart: u32.wrappingAdd(inner.canvasStart, canvasShift),
           canvasEnd: u32.wrappingAdd(inner.canvasEnd, canvasShift),
+          keyed: inner.keyed,
         }
-        self.heap.alloc(self.arena.lazies.append(moved))
+        if moved.keyed {
+          self.markKeyed(moved)
+        } else {
+          self.heap.alloc(self.arena.lazies.append(moved))
+        }
       }
       n = n + 1
     }
@@ -1653,8 +1951,53 @@ impl<M> Ui<M> {
       byteEnd: usize.toU32(self.arena.bytes.length()),
       canvasStart: canvasStart,
       canvasEnd: usize.toU32(self.arena.canvas.length()),
+      keyed: record.keyed,
     }
-    self.heap.alloc(self.arena.lazies.append(copied))
+    if copied.keyed {
+      self.markKeyed(copied)
+    } else {
+      self.heap.alloc(self.arena.lazies.append(copied))
+    }
+    self.carryKept(record.entryStart, record.entryEnd, entryShift)
+  }
+
+  /// Moves the replies the last render kept for its entries `start..end` to this render's,
+  /// at the entries `shift` after them, where `copyLazy` put them. A reply a dispatch took is
+  /// gone: its entry is no longer `carried`, and a dispatch through it runs the view.
+  fn carryKept(self: &mut Self, start: u32, end: u32, shift: u32) -> () {
+    let mut low: usize = 0
+    let mut high = self.previousKept.length()
+    // Regions are mostly copied in order: try where the last one stopped.
+    let guess = self.keptCursor
+    if guess <= high && (guess == high || self.previousKept.asSlice()[guess].entry >= start)
+      && (guess == 0 || self.previousKept.asSlice()[guess - 1].entry < start) {
+      low = guess
+      high = guess
+    }
+    while low < high {
+      let middle = (low + high) / 2
+      if self.previousKept.asSlice()[middle].entry < start {
+        low = middle + 1
+      } else {
+        high = middle
+      }
+    }
+    while low < self.previousKept.length() && self.previousKept.asSlice()[low].entry < end {
+      let item = &mut self.previousKept.asMutSlice()[low]
+      let target = u32.wrappingAdd(item.entry, shift)
+      if item.taken {
+        let entry = self.arena.entryMut(target)
+        entry.carried = false
+      } else {
+        item.taken = true
+        let kind = item.kind
+        let reply = Intrinsic.replace(item.reply, Reply<M>.Pass)
+        let kept = Kept<M> { entry: target, kind: kind, reply: move reply, taken: false }
+        self.heap.alloc(self.kept.append(move kept))
+      }
+      low = low + 1
+    }
+    self.keptCursor = low
   }
 
   fn store(self: &mut Self, bytes: &[u8]) -> Span {
@@ -2207,14 +2550,14 @@ impl<M> Ui<M> {
     let entry = self.arena.entryMut(self.current)
     entry.listeners = u32.bitOr(entry.listeners, listenerFlag(kind))
 
-    let kept = Kept<M> { entry: self.current, kind: kind, reply: move reply }
+    let kept = Kept<M> { entry: self.current, kind: kind, reply: move reply, taken: false }
     self.heap.alloc(self.kept.append(move kept))
   }
 
   /// Answers the record `beginDispatch` started from the replies the last render kept, for
   /// the path whose entries (root first) are `entries`. False when it cannot: a node on the
-  /// path answers the record's kind by running code, or was copied by `lazy` without running
-  /// its handlers, or a dispatch already took the kept replies. The runtime then runs the view.
+  /// path answers the record's kind by running code, or was copied by `lazy` without its kept
+  /// replies, or a dispatch already took the kept replies. The runtime then runs the view.
   pub fn answerKept(self: &mut Self, entries: &[u32]) -> bool {
     if self.keptSpent || self.searching || entries.length == 0 {
       return false
@@ -2224,7 +2567,7 @@ impl<M> Ui<M> {
     let mut i: usize = 0
     while i < entries.length {
       let entry = self.arena.entryRef(entries[i])
-      if entry.copied || u32.bitAnd(entry.liveKinds, flag) != 0 {
+      if (entry.copied && !entry.carried) || u32.bitAnd(entry.liveKinds, flag) != 0 {
         return false
       }
       i = i + 1
@@ -2248,7 +2591,9 @@ impl<M> Ui<M> {
         }
         while low < self.kept.length() && self.kept.asSlice()[low].entry == target {
           if self.kept.asSlice()[low].kind == kind {
-            let reply = Intrinsic.replace(self.kept.asMutSlice()[low].reply, Reply<M>.Pass)
+            let item = &mut self.kept.asMutSlice()[low]
+            item.taken = true
+            let reply = Intrinsic.replace(item.reply, Reply<M>.Pass)
             let answer = Answer<M> { depth: usize.toU32(depth), reply: move reply }
             self.heap.alloc(self.answers.append(move answer))
           }
