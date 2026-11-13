@@ -30,8 +30,9 @@ is checked against the release's SHA-256. The output goes to `vt/native/build/`,
 ignores.
 
 The WebAssembly build is patched so that Ghostty allocates through the module's `malloc` and
-`free`: Silk's heap owns the end of the one linear memory, and a second allocator growing that
-memory by itself would hand out the same bytes.
+`free`, terminal pages included: Silk's heap owns the end of the one linear memory, and Zig's
+`WasmAllocator` or Ghostty's page pool growing that memory by themselves would hand out the same
+bytes.
 
 ## Using the component
 
