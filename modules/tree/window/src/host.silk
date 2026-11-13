@@ -270,6 +270,13 @@ pub interface WindowClient<S, E, ? R> {
     return false
   }
 
+  /// Whether this window can serve the inspector. A client whose answer is a constant
+  /// false (a production build) leaves the inspector's code out of the program: the host
+  /// checks this before every use of it, and passes an inspector that is off.
+  fn servesInspector(self: &Self) -> bool {
+    return true
+  }
+
   /// Runs the input sequence used by the host's rendering check.
   effect fn checkInput(
     self: &mut Self,
@@ -836,7 +843,8 @@ pub effect fn runWindowWith<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
   ! E | WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError
   ? R | &mut Allocator {
   let check = options.check
-  let mut inspector = if check {
+  let serves = content.servesInspector()
+  let mut inspector = if check || !serves {
     drop inspector
     Inspector.off()
   } else {
@@ -870,7 +878,7 @@ pub effect fn runWindowWith<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
   }
   run content.setup(&mut state, &mut tree)
   run tree.apply(move resources)
-  if inspector.enabled() {
+  if serves && inspector.enabled() {
     run content.report(&mut state, &mut inspector)
   }
   run content.start(&mut state, &mut tree)
@@ -901,7 +909,7 @@ pub effect fn runWindowWith<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
   }
 
   // A request line for the inspector ends the wait for the next event, as a post does.
-  run inspector.wakeWith(platform.nudge())
+  if serves { run inspector.wakeWith(platform.nudge()) }
   let mut host = HostState.of(&platform)
   let raw = platform.rawSurface(window)
 
@@ -984,7 +992,7 @@ pub effect fn runWindowWith<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
           deadline = due
         }
       }
-      match inspector.pollInterval() {
+      match if serves { inspector.pollInterval() } else { Option<f64>.None } {
         Option<f64>.Some { value } => Wait.Seconds {
           seconds: if deadline >= 0.0 && deadline < value {
             deadline
@@ -1040,10 +1048,10 @@ pub effect fn runWindowWith<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
       run content.tick(&mut state, &mut tree, time, false)
       redraw = content.needsFrame(&state.*, &tree)
     }
-    if inspector.enabled() {
+    if serves && inspector.enabled() {
       run content.report(&mut state, &mut inspector)
     }
-    if run inspector.poll(&mut tree) {
+    if serves && run inspector.poll(&mut tree) {
       while true {
         // Input from the inspector is answered like window input: the client decides
         // between the records and the default action.
@@ -1137,10 +1145,12 @@ pub effect fn runWindowWith<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
               let layoutEnd = run seconds(&mut clock)
               run content.frame(&mut state, &mut tree, viewport, &inspector)
               let canvasEnd = run seconds(&mut clock)
-              inspector.timed(
-                f64.toF32((layoutEnd - frameStart) * 1000.0),
-                f64.toF32((canvasEnd - layoutEnd) * 1000.0),
-              )
+              if serves {
+                inspector.timed(
+                  f64.toF32((layoutEnd - frameStart) * 1000.0),
+                  f64.toF32((canvasEnd - layoutEnd) * 1000.0),
+                )
+              }
               if let Option<Dock>.Some { value: docked } = dock {
                 // The dock is laid out at the whole window's size, over the client's root.
                 let whole = FrameInput {
@@ -1153,11 +1163,11 @@ pub effect fn runWindowWith<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
                 drop run tree.useRoot(FIRST_ROOT)
               }
               run serve(&mut platform, owner, &mut tree, &mut host)
-              run inspector.afterFrameScene(&tree, content.scene(&state.*, &tree))
+              if serves { run inspector.afterFrameScene(&tree, content.scene(&state.*, &tree)) }
               if let Option<Dock>.Some { value: docked } = dock {
                 composed.clear()
                 run composed.replay(
-                  inspector.sceneWith(content.scene(&state.*, &tree)),
+                  if serves { inspector.sceneWith(content.scene(&state.*, &tree)) } else { content.scene(&state.*, &tree) },
                   0,
                   usize.MAX,
                 )
@@ -1198,8 +1208,10 @@ pub effect fn runWindowWith<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
               run renderer.submit(
                 if dock.isSome() {
                   &composed
-                } else {
+                } else if serves {
                   inspector.sceneWith(content.scene(&state.*, &tree))
+                } else {
+                  content.scene(&state.*, &tree)
                 },
                 &tree.atlas,
                 tree.pendingUploads(),
@@ -1290,7 +1302,7 @@ pub effect fn runWindowWith<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
                 // The companion's shortcut: nobody else sees it.
                 drop run tree.useRoot(FIRST_ROOT)
                 redraw = true
-              } else if target == FIRST_ROOT && inspector.picking()
+              } else if serves && target == FIRST_ROOT && inspector.picking()
                 && run inspector.pickInput(&tree, &input) {
                 // The inspector's picker takes the pointer before the app sees it.
                 redraw = true
@@ -1341,13 +1353,13 @@ pub effect fn runWindowWith<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
                   drop run companion.pump(&mut tree, &mut inspector, time)
                   drop run tree.useRoot(into)
                   platform.setCursor(owner, windowCursor(tree.cursor()))
-                  redraw = tree.needsFrameOf(into) || inspector.wantsFrame()
+                  redraw = tree.needsFrameOf(into) || (serves && inspector.wantsFrame())
                   drop run tree.useRoot(FIRST_ROOT)
                 } else {
                   let prevented = run content.decide(&mut state, &mut tree)
                   run tree.finish(move input, prevented)
                   run serve(&mut platform, owner, &mut tree, &mut host)
-                  run inspector.observe(&tree)
+                  if serves { run inspector.observe(&tree) }
                   run content.pump(&mut state, &mut tree)
                   platform.setCursor(owner, windowCursor(tree.cursor()))
                   redraw = content.needsFrame(&state.*, &tree)
@@ -1372,7 +1384,7 @@ pub effect fn runWindowWith<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
     if !check && run content.update(&mut state, &mut tree, &mut platform, owner) {
       redraw = true
     }
-    if inspector.enabled() && (content.needsFrame(&state.*, &tree) || inspector.wantsFrame()) {
+    if serves && inspector.enabled() && (content.needsFrame(&state.*, &tree) || inspector.wantsFrame()) {
       let area = clientSize(width, height, &dock)
       run content.prepare(&mut state, &mut tree)
       run content.layout(
@@ -1416,7 +1428,7 @@ pub effect fn runWindowWith<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
       if dock.isSome() && tree.needsFrameOf(dockRoot(&dock)) {
         redraw = true
       }
-      redraw = redraw || inspector.wantsFrame()
+      redraw = redraw || (serves && inspector.wantsFrame())
     }
 
     // Windows open, change and close with their roots; each is framed when its root needs it.
@@ -1437,7 +1449,7 @@ pub effect fn runWindowWith<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
       platform.requestFrame(owner)
     }
   }
-  run inspector.close()
+  if serves { run inspector.close() }
   platform.clearCompositor()
   renderer.stop()
   while others.length() != 0 {

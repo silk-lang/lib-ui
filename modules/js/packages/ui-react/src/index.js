@@ -76,6 +76,11 @@ function restoreControlled(node) {
 
 function diffStyle(look, previous, next) {
   if (previous === next) return;
+  // A new node takes its style as it is.
+  if (!previous) {
+    if (next) look.set(next);
+    return;
+  }
   const changes = {};
   let any = false;
   if (previous) {
