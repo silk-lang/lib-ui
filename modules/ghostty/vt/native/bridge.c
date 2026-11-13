@@ -1,7 +1,7 @@
 // The C side of ghostty-vt. Ghostty's tagged unions, sized structs and grid references stay
 // here; Silk sees opaque handles, scalars and byte buffers. Nothing in this file needs a C
 // library: memory comes from Ghostty's allocator, so the same file builds for wasm32.
-#include <ghostty/vt.h>
+#include "build/include/ghostty/vt.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>

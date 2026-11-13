@@ -1,7 +1,7 @@
 // Input for a terminal: key, paste and mouse encoding, pointer selection gestures, and a
 // bounded queue of the replies the terminal generates for the program. All of this state is
 // owned by one `SilkInput` per terminal; no Silk callback crosses into Ghostty.
-#include <ghostty/vt.h>
+#include "build/include/ghostty/vt.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
