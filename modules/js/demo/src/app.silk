@@ -1,0 +1,96 @@
+//! What the development and the production host share: the realm, the window, and the
+//! command line's entry path and `--check`.
+import ui_js.lib { JsError }
+import ui_js_window.lib { JsApp, JsClient, JsTools }
+import ui_tree.legacy { TreeError, Mutation }
+import ui_tree_window.host { RunOptions, runWindow }
+import ui_tree_window.platform_thread { Launched }
+import ui_tree_window.console { StderrWriter }
+import ui_fixtures.fixtures as fixtures
+import ui_inspect_server.lib { Inspector }
+import silkjs.js_atomics_native { WaiterDomain, SynchronizationError }
+import silkjs.runtime_memory { RuntimeAllocator }
+import silkjs.js_libc_platform as platform
+import window.types { WindowError }
+import webgpu.runtime { GpuError }
+import atlas.atlas { AtlasError }
+import vector.geometry_error { GeometryError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.host_input { HostInput }
+
+/// Runs the entry at `entry` (the demo counter when empty) in a window with `tools`.
+pub effect fn program<T: JsTools>(check: bool, entry: &[u8], tools: T, inspector: Inspector, launched: Option<Launched>) -> i32
+  ! TreeError | WindowError | GpuError | AtlasError | GeometryError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let library = run platform.readFile(b"modules/js/packages/ui/src/index.js")
+  let source = if entry.length == 0 {
+    run platform.readFile(b"modules/js/demo/app.js")
+  } else {
+    run platform.readFile(entry)
+  }
+  let domain = run WaiterDomain.make()
+  let allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let memory = run allocator.observe()
+  let mut app = run JsApp.open(&memory, move allocator, domain.handle())
+  run app.define(b"@silk/ui", library.asSlice())
+  run app.entry(b"app.js", source.asSlice())
+  let mut client = JsClient.make(move tools)
+  let options = RunOptions {
+    title: "JavaScript on the tree",
+    width: 400.0,
+    height: 250.0,
+    check: check,
+    checkClick: "counter",
+    checkExpect: "Clicked",
+    lowestLatency: false,
+    platform: move launched,
+  }
+  let status = run Effect.result(runWindow(&mut app, &fonts, List<Mutation>.make(), move options, move inspector, &mut client))
+  run app.close()
+  return match move status {
+    Result<i32, WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError>.Success { value } => value
+    Result<i32, WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError>.Failure { error } => { fail move error }
+  }
+}
+
+pub effect fn failed<E>(error: E) -> i32 {
+  drop error
+  StderrWriter.print("The JavaScript window host failed\n", &())
+  return 2
+}
+
+effect fn noArgument<E>(error: E) -> Option<Bytes> {
+  drop error
+  return Option<Bytes>.None
+}
+
+pub fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut i: usize = 0
+  while i < left.length {
+    if left[i] != right[i] { return false }
+    i = i + 1
+  }
+  return true
+}
+
+/// Command line argument `i`, or none.
+pub effect fn argument(i: usize) -> Option<Bytes> ? &mut HostInput | &mut Allocator {
+  return run Effect.catchAll(HostInput.argument(i), noArgument)
+}
+
+effect fn noArguments<E>(error: E) -> usize {
+  drop error
+  return 0
+}
+
+/// How many command line arguments there are, the program's name included.
+pub effect fn argumentCount() -> usize ? &mut HostInput {
+  return run Effect.catchAll(HostInput.argumentCount(), noArguments)
+}

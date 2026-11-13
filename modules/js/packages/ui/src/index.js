@@ -32,10 +32,19 @@ const UNITLESS = new Set([
 ]);
 
 const nodes = new Map();
+const NO_CHILDREN = Object.freeze([]);
 let nextId = 0;
 
+// Property names repeat across nodes: each is converted once.
+const CSS_NAMES = new Map();
+
 function cssName(name) {
-  return name.replace(/[A-Z]/g, (letter) => "-" + letter.toLowerCase());
+  let css = CSS_NAMES.get(name);
+  if (css === undefined) {
+    css = name.replace(/[A-Z]/g, (letter) => "-" + letter.toLowerCase());
+    CSS_NAMES.set(name, css);
+  }
+  return css;
 }
 
 function cssValue(name, value) {
@@ -46,7 +55,8 @@ function cssValue(name, value) {
 class Look {
   #node;
   #state;
-  #values = new Map();
+  // Plain objects share their shape across nodes: a Map here costs four times the memory.
+  #values = Object.create(null);
 
   constructor(node, state) {
     this.#node = node;
@@ -64,12 +74,15 @@ class Look {
     for (const name of Object.keys(properties)) {
       const value = properties[name];
       if (value === null || value === undefined || value === "") {
-        if (this.#values.delete(name)) removed = true;
+        if (name in this.#values) {
+          delete this.#values[name];
+          removed = true;
+        }
         continue;
       }
       const text = cssValue(name, value);
-      if (this.#values.get(name) === text) continue;
-      this.#values.set(name, text);
+      if (this.#values[name] === text) continue;
+      this.#values[name] = text;
       css += cssName(name) + ":" + text + ";";
     }
     if (removed) {
@@ -84,17 +97,17 @@ class Look {
   /** Replaces the whole look. */
   replace(properties) {
     native.clearStyle(this.#node.id, this.#state);
-    this.#values.clear();
+    this.#values = Object.create(null);
     this.set(properties);
   }
 
   get(name) {
-    return this.#values.get(name);
+    return this.#values[name];
   }
 
   get cssText() {
     let css = "";
-    for (const [name, text] of this.#values) css += cssName(name) + ":" + text + ";";
+    for (const name in this.#values) css += cssName(name) + ":" + this.#values[name] + ";";
     return css;
   }
 }
@@ -102,6 +115,8 @@ class Look {
 /** A node of the tree. Make one with `createBox`, `createText`, `createInput` or `createNode`. */
 export class Node {
   #listeners = null;
+  // The base look, and the state looks by name: most nodes have the base alone.
+  #base = null;
   #looks = null;
   #flags = 0;
 
@@ -109,7 +124,8 @@ export class Node {
     this.id = ++nextId;
     this.kind = kind;
     this.parentNode = null;
-    this.childNodes = [];
+    // A text leaf has no children: they all share one empty list.
+    this.childNodes = kind === "text" ? NO_CHILDREN : [];
     nodes.set(this.id, this);
     native.create(this.id, KINDS[kind]);
   }
@@ -203,11 +219,10 @@ export class Node {
 
   /** The look the tree lays over the base in `state`: hover, active, focus or focusVisible. */
   look(state) {
+    if (state === "base") return (this.#base ??= new Look(this, 0));
     if (!(state in STATES)) throw new TypeError("the tree has no look '" + state + "'");
-    this.#looks ??= new Map();
-    let look = this.#looks.get(state);
-    if (!look) this.#looks.set(state, (look = new Look(this, STATES[state])));
-    return look;
+    this.#looks ??= Object.create(null);
+    return (this.#looks[state] ??= new Look(this, STATES[state]));
   }
 
   /** Sets a tree attribute: tabIndex, disabled, label, testId, placeholder and so on. */

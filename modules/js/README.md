@@ -157,7 +157,7 @@ With `host` set the plugin starts that binary with `--dev <port>`; without it, i
 the port for a host you start yourself. Closing the window ends the session.
 
 How it works: the plugin adds a Vite environment named `silk` and listens on a local TCP
-port. The host connects when its window opens (`JsApp.dev(port)`), and the server sends one
+port. The host connects when its window opens (`DevTools.server(port)`), and the server sends one
 script first: Vite's module runner, bundled, with the host's line transport under it
 (`__ui.devSend` out, `__ui.devMessage` in). The runner asks the server for each module,
 already transformed, and evaluates it in the realm. Dependencies are pre-bundled by Vite,
@@ -239,6 +239,12 @@ tree's `begin` and `finish`, runs timers and animation frames on the host's cloc
 prints console lines on standard error. An uncaught exception is printed as a browser
 console prints it, and the window keeps running.
 
+The window client takes the host's tools as a type: `JsClient.make(NoTools {})` runs the
+application as it was built, and `JsClient.make(DevTools.make())` adds the development ones
+from [window/dev](window/dev) (`ui-js-window-dev`): `DevTools.watch` for `--watch`,
+`DevTools.server` for the dev server. Only a client with `DevTools` serves the inspector
+(`WindowClient.servesInspector`).
+
 [demo](demo) is a counter in JavaScript:
 
 ```sh
@@ -246,6 +252,27 @@ silk run --manifest-path modules/js/demo/silk.toml
 ```
 
 Run it from the repository root. `silk task native check` runs it with `--check`.
+
+### Production builds
+
+A production build leaves out everything that is there for development: the dev server
+client, `--watch` reloading, and the inspector server. The demo's `production` profile
+builds [demo/src/production.silk](demo/src/production.silk), which runs `NoTools` and
+passes an inspector that is off; since its client answers `servesInspector` with a
+constant false, the window host's inspector code is not in the program either.
+
+```sh
+silk build --manifest-path modules/js/demo/silk.toml --profile production
+```
+
+Engine features are chosen per build too. The bridge answers
+`EngineServices.includesIntl` and `includesTemporal` with false (a realm here installs
+neither), so the engine's ECMA-402 and Temporal code and their CLDR and time zone tables
+are left out: `localeCompare`, `toLocaleString` and the like give their
+locale-independent results, and a local `Date` string ends at its offset. The production
+demo is 38.0 MB against 44.2 MB for the release build before these changes (5.2 MB from
+the engine features, 1.0 MB from the tools and the inspector). WebAssembly is not part of
+the engine here (it lives in the SilkJS runtime, which ui-js does not link).
 
 ## Status
 
@@ -255,7 +282,8 @@ Run it from the repository root. `silk task native check` runs it with `--check`
   `silk test --manifest-path modules/js/examples/tests/silk.toml --root src/tests.silk` for
   the bundled examples on the engine (build them first).
 - Not here yet: unhandled rejection reports, images and canvas commands from JavaScript,
-  source maps for errors under the dev server, and choosing engine features for each build.
+  source maps for errors under the dev server, and choosing engine features beyond Intl and
+  Temporal for each build.
 - Memory, release builds on Linux x86-64 under Xvfb with a software GPU, resident after six
   seconds: the Silk window demo 155 MB, the JavaScript counter 169 MB, the React counter
   174 MB. The GPU stack is most of each; the engine with `@silk/ui` adds about 14 MB and
