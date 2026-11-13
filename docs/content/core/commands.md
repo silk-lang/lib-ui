@@ -46,9 +46,9 @@ A command always ends in a message, so a command that can fail says so in its me
 
 ## Services
 
-::source examples/src/core/dice.silk "pub service Random"
+::source examples/src/core/dice.silk "effect fn roll"
 
-`execute` does not call a random number generator directly. It asks for a **service**: `Random`. The signature of `execute` lists what it needs after the `?`:
+`execute` does not call a random number generator directly. It asks for a **service**: `Random`, from the standard library's `silk.system.random`. The signature of `execute` lists what it needs after the `?`:
 
 ```silk
 effect fn execute(self: Self) -> Message
@@ -60,9 +60,9 @@ The program says what it needs and not where it comes from. Whoever starts the p
 
 | Where the program runs | Who provides `Random` |
 | --- | --- |
-| In this page | A struct that calls the browser's `Math.random` |
-| In a native app | A struct with a generator of its own |
-| In a test | A struct that always answers 4 |
+| In this page | `OsRandom`, which asks the browser's `crypto.getRandomValues` |
+| In a native app | `OsRandom` too, which asks the operating system |
+| In a test | A struct that always gives the same bytes, so the die lands on 4 |
 
 That last line is the point. Here is the test for this program. It decides what the die says, then checks what the program made of one roll and of fifty.
 

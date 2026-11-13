@@ -151,7 +151,7 @@ class Writer {
  * `font-family` values: `{ 1: "Inter, sans-serif" }`. `images` and `icons` give the address of
  * each image and icon resource number the same way. `base` is what comes before a link's path
  * in its address when the site is not at the root of its origin (`"/docs"`). `imports` adds
- * host modules the program imports besides `dom` and `math`.
+ * host modules the program imports besides `dom`, `math` and the standard library's `silk`.
  *
  * When `root` already holds the markup of a server render (`Html` in `src/html.silk`), the
  * program adopts its nodes instead of making new ones.
@@ -168,6 +168,8 @@ export async function mount({ wasm, root, fonts = {}, images = {}, icons = {}, b
       group[entry.name] = imports[entry.module][entry.name];
     } else if (entry.module === "math" && typeof Math[entry.name] === "function") {
       group[entry.name] = Math[entry.name];
+    } else if (entry.module === "silk" && standardImports[entry.name]) {
+      group[entry.name] = standardImports[entry.name](page);
     } else if (entry.kind === "function") {
       group[entry.name] = () => {
         throw new Error(`silk-ui: no host function ${entry.module}#${entry.name}`);
@@ -178,6 +180,19 @@ export async function mount({ wasm, root, fonts = {}, images = {}, icons = {}, b
   page.start(instance.exports);
   return page;
 }
+
+// The host imports of the standard library's providers: `OsRandom` asks for `silk.random`,
+// `OsSystemClock` and `OsMonotonicClock` for `silk.clock`. A program that uses them needs
+// nothing from the page.
+const standardImports = {
+  random: (page) => (pointer, length) => {
+    // `crypto.getRandomValues` fills at most 65536 bytes at a time.
+    for (let at = 0; at < length; at += 65536) {
+      crypto.getRandomValues(new Uint8Array(page.exports.memory.buffer, pointer + at, Math.min(65536, length - at)));
+    }
+  },
+  clock: () => (monotonic) => (monotonic ? performance.now() : performance.timeOrigin + performance.now()),
+};
 
 async function compile(wasm) {
   if (wasm instanceof WebAssembly.Module) return wasm;
