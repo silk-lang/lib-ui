@@ -33,7 +33,9 @@ import silk.collections.hash { Hash, Word }
 import silk.collections.hash_map { HashMap }
 import silk.collections.list { List }
 import silk.core.option { Option }
-import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.allocator { Allocator, OutOfMemoryError, SystemAllocator }
+import silk.mem.arena { Arena as BumpArena, ArenaReset }
+import silk.core.effect { Effect }
 import silk.num.u32
 import silk.num.usize
 import silk.text.string { String }
@@ -60,6 +62,12 @@ pub struct DiffState {
   stable: List<bool>,
   tails: List<usize>,
   previous: List<usize>,
+  /// Whether the backend copies what it needs out of a batch and keeps none of it
+  /// (`Backend.copiesBatches`): the text of the mutations then comes from `scratch`.
+  pub transient: bool,
+  /// A bump allocator for the text of one render's mutations, reset at the next render. A
+  /// string there costs a pointer bump instead of a heap allocation, and dropping it a count.
+  scratch: BumpArena<SystemAllocator>,
 }
 
 impl DiffState {
@@ -79,6 +87,8 @@ impl DiffState {
       stable: List<bool>.make(),
       tails: List<usize>.make(),
       previous: List<usize>.make(),
+      transient: false,
+      scratch: BumpArena<SystemAllocator>.make(Allocator.systemAllocatorProvider()),
     }
   }
 
@@ -147,6 +157,8 @@ pub effect fn diffFrom(
   ? &mut Allocator {
   state.indexed = false
   state.scans = 0
+  // The last batch is gone (a backend that copies drops it in `mutate`): its chunk is free.
+  state.scratch.reset(ArenaReset.RetainCapacity)
   state.used.clear()
   run state.used.appendRepeated(false, u32.toUsize(old.length()))
   let count = next.length()
@@ -445,7 +457,7 @@ effect fn props(
   let element = next.text(entry.element)
   if !sameBytes(element, old.text(prior.element)) {
     run out.append(
-      Mutation.SetAttribute { id: id, attribute: Attribute.Element { name: run copyText(element) } },
+      Mutation.SetAttribute { id: id, attribute: Attribute.Element { name: run copyText(&mut state, element) } },
     )
   }
   let className = next.text(entry.className)
@@ -453,7 +465,7 @@ effect fn props(
     run out.append(
       Mutation.SetAttribute {
         id: id,
-        attribute: Attribute.ClassName { value: run copyText(className) },
+        attribute: Attribute.ClassName { value: run copyText(&mut state, className) },
       },
     )
   }
@@ -465,7 +477,7 @@ effect fn props(
       run out.append(
         Mutation.SetAttribute {
           id: id,
-          attribute: Attribute.ElementId { value: run copyText(elementId) },
+          attribute: Attribute.ElementId { value: run copyText(&mut state, elementId) },
         },
       )
     }
@@ -483,7 +495,7 @@ effect fn props(
     let text = next.text(entry.text)
     if !sameBytes(text, old.text(prior.text))
       || (fresh && entry.kind == NodeKind.Input && text.length != 0) {
-      run out.append(Mutation.SetText { id: id, value: run copyText(text) })
+      run out.append(Mutation.SetText { id: id, value: run copyText(&mut state, text) })
     }
   }
   if entry.extra != 0 || prior.extra != 0 {
@@ -507,13 +519,13 @@ effect fn props(
     let label = next.text(ex.label)
     if !sameBytes(label, old.text(px.label)) {
       run out.append(
-        Mutation.SetAttribute { id: id, attribute: Attribute.Label { value: run copyText(label) } },
+        Mutation.SetAttribute { id: id, attribute: Attribute.Label { value: run copyText(&mut state, label) } },
       )
     }
     let testId = next.text(ex.testId)
     if !sameBytes(testId, old.text(px.testId)) {
       run out.append(
-        Mutation.SetAttribute { id: id, attribute: Attribute.TestId { value: run copyText(testId) } },
+        Mutation.SetAttribute { id: id, attribute: Attribute.TestId { value: run copyText(&mut state, testId) } },
       )
     }
     if ex.hasTabIndex != px.hasTabIndex || ex.tabIndex != px.tabIndex {
@@ -562,7 +574,7 @@ effect fn props(
     let href = next.text(ex.href)
     if !sameBytes(href, old.text(px.href)) {
       run out.append(
-        Mutation.SetAttribute { id: id, attribute: Attribute.Href { value: run copyText(href) } },
+        Mutation.SetAttribute { id: id, attribute: Attribute.Href { value: run copyText(&mut state, href) } },
       )
     }
     let transition = next.text(ex.transition)
@@ -570,7 +582,7 @@ effect fn props(
       run out.append(
         Mutation.SetAttribute {
           id: id,
-          attribute: Attribute.Transition { value: run copyText(transition) },
+          attribute: Attribute.Transition { value: run copyText(&mut state, transition) },
         },
       )
     }
@@ -590,7 +602,7 @@ effect fn props(
         run out.append(
           Mutation.SetAttribute {
             id: id,
-            attribute: Attribute.Placeholder { value: run copyText(placeholder) },
+            attribute: Attribute.Placeholder { value: run copyText(&mut state, placeholder) },
           },
         )
       }
@@ -738,9 +750,13 @@ fn sameCommands(a: &[CanvasCommand], b: &[CanvasCommand]) -> bool {
   return true
 }
 
-effect fn copyText(bytes: &[u8]) -> String
+effect fn copyText(state: &mut DiffState, bytes: &[u8]) -> String
   ! OutOfMemoryError
   ? &mut Allocator {
   // The arena's text pool holds only whole strings a view gave (and digits): valid UTF-8.
-  return run String.copy(unsafe String.fromUtf8Unchecked(bytes))
+  let text = unsafe String.fromUtf8Unchecked(bytes)
+  if state.transient {
+    return run String.copy(text) |> Effect.provideMut<Allocator>(&mut state.scratch)
+  }
+  return run String.copy(text)
 }
