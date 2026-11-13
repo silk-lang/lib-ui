@@ -67,6 +67,7 @@ const counterTargets = [
     title: "JavaScript on the tree",
     ships: [["binary", silkBuild("production", "ui-js-demo")], ["bundle", silkBundle], ["@silk/ui", join(repo, "modules/js/packages/ui/src/index.js")]],
     debugBinary: silkBuild("debug", "ui-js-demo"),
+    bundle: silkBundle,
     interactive: true,
   },
   {
@@ -79,6 +80,7 @@ const counterTargets = [
     env: { NODE_OPTIONS: "" },
     title: "bench-counter",
     ships: [["electron", electronDir], ["app", join(here, "electron/main.cjs")], ["web", webDist]],
+    bundle: join(webDist, "assets"),
     interactive: true,
   },
   {
@@ -152,6 +154,7 @@ const starterTargets = [
     title: "Silk UI",
     firstFrame: starterFirstFrame,
     ships: [["binary", silkBuild("production", "ui-js-demo")], ["bundle", join(starter, "dist/app.js")], ["@silk/ui", join(repo, "modules/js/packages/ui/src/index.js")]],
+    bundle: join(starter, "dist/app.js"),
     interactive: false,
   },
   {
@@ -164,6 +167,7 @@ const starterTargets = [
     title: "Silk UI",
     firstFrame: starterFirstFrame,
     ships: [["electron", starterElectron], ["app", join(starter, "electron/main.cjs")], ["web", join(starter, "dist-web")]],
+    bundle: join(starter, "dist-web/assets"),
     interactive: false,
   },
   {
@@ -530,10 +534,9 @@ function sizes(target) {
   }
   if (target.debugBinary && existsSync(target.debugBinary)) out.debug = statSync(target.debugBinary).size;
   if (target.system) out.system = systemLibrarySize(target.system);
-  if (target.name === "ui-js" || target.name === "electron") {
-    const bundle = target.name === "ui-js" ? silkBundle : join(webDist, "assets");
-    out.bundle = sizeOf(bundle);
-    out.bundleGzip = gzipSizeOf([bundle]);
+  if (target.bundle) {
+    out.bundle = sizeOf(target.bundle);
+    out.bundleGzip = gzipSizeOf([target.bundle]);
   }
   return out;
 }
