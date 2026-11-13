@@ -1,0 +1,709 @@
+//! How AT-SPI sees an AccessKit node: its role, states, interfaces, name, attributes,
+//! actions and extents.
+//!
+//! Ported from AccessKit (`accesskit_atspi_common/src/node.rs`), Copyright 2022 The AccessKit
+//! Authors, under the MIT or Apache-2.0 license.
+import accesskit.lib { Role, Toggled, Orientation, Live, Rect, Point }
+import accesskit_consumer.lib { NodeRef, FilterResult, CommonFilter, commonFilter }
+import atspi { AtspiRole, AtspiState }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f64
+import silk.num.u32
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+import silk.text.string { String }
+
+/// A set of AT-SPI states, one bit per state.
+pub struct StateSet {
+  pub bits: u64,
+}
+
+impl Copy for StateSet {}
+
+impl StateSet {
+  pub fn empty() -> StateSet {
+    return StateSet { bits: 0 }
+  }
+
+  pub fn insert(self: &mut Self, state: AtspiState) -> () {
+    self.bits = self.bits | u64.shiftLeft(1, u32.toU64(u8ToU32(AtspiState.value(state))))
+  }
+
+  pub fn contains(self: &Self, state: AtspiState) -> bool {
+    return (self.bits & u64.shiftLeft(1, u32.toU64(u8ToU32(AtspiState.value(state))))) != 0
+  }
+
+  /// The low and high words, as AT-SPI sends a state set (`au`).
+  pub fn low(self: &Self) -> u32 {
+    return u64.wrappingToU32(self.bits)
+  }
+
+  pub fn high(self: &Self) -> u32 {
+    return u64.wrappingToU32(u64.shiftRight(self.bits, 32))
+  }
+}
+
+fn u8ToU32(value: u8) -> u32 {
+  return u8.toU32(value)
+}
+
+/// The window's frame (`outer`) and content (`inner`) on the screen. AccessKit coordinates
+/// start at the content's origin.
+pub struct WindowBounds {
+  pub outer: Rect,
+  pub inner: Rect,
+}
+
+impl Copy for WindowBounds {}
+
+impl WindowBounds {
+  pub fn zero() -> WindowBounds {
+    return WindowBounds { outer: Rect.zero(), inner: Rect.zero() }
+  }
+
+  fn origin(self: &Self, parent: Option<NodeRef<'_>>, coordType: CoordType) -> Point {
+    return match coordType {
+      CoordType.Screen => Point.make(self.inner.x0, self.inner.y0)
+      CoordType.Window => Point.make(0.0, 0.0)
+      CoordType.Parent => match parent {
+        Option.Some { value } => match value.boundingBox() {
+          Option.Some { value: b } => Point.make(0.0 - b.x0, 0.0 - b.y0)
+          Option.None => Point.make(0.0, 0.0)
+        }
+        Option.None => Point.make(self.inner.x0, self.inner.y0)
+      }
+    }
+  }
+
+  /// `point` in AccessKit coordinates, in the AT-SPI coordinates of `coordType`.
+  pub fn toAtspi(
+    self: &Self,
+    point: Point,
+    parent: Option<NodeRef<'_>>,
+    coordType: CoordType,
+  ) -> Point {
+    let origin = self.origin(parent, coordType)
+    return Point.make(origin.x + point.x, origin.y + point.y)
+  }
+
+  /// `point` in the AT-SPI coordinates of `coordType`, in AccessKit coordinates.
+  pub fn toAccessKit(
+    self: &Self,
+    point: Point,
+    parent: Option<NodeRef<'_>>,
+    coordType: CoordType,
+  ) -> Point {
+    let origin = self.origin(parent, coordType)
+    return Point.make(point.x - origin.x, point.y - origin.y)
+  }
+}
+
+/// What AT-SPI coordinates are relative to.
+pub enum CoordType {
+  Screen,
+  Window,
+  Parent,
+}
+
+impl CoordType {
+  pub fn of(value: u32) -> CoordType {
+    if value == 1 {
+      return CoordType.Window
+    }
+    if value == 2 {
+      return CoordType.Parent
+    }
+    return CoordType.Screen
+  }
+}
+
+/// AT-SPI interfaces, as bits.
+pub fn ACCESSIBLE() -> u32 {
+  return 1
+}
+
+pub fn ACTION() -> u32 {
+  return 2
+}
+
+pub fn COMPONENT() -> u32 {
+  return 4
+}
+
+pub fn DOCUMENT() -> u32 {
+  return 8
+}
+
+pub fn EDITABLE_TEXT() -> u32 {
+  return 16
+}
+
+pub fn HYPERLINK() -> u32 {
+  return 32
+}
+
+pub fn IMAGE() -> u32 {
+  return 64
+}
+
+pub fn SELECTION() -> u32 {
+  return 128
+}
+
+pub fn TEXT() -> u32 {
+  return 256
+}
+
+pub fn VALUE() -> u32 {
+  return 512
+}
+
+pub fn APPLICATION() -> u32 {
+  return 1024
+}
+
+/// The D-Bus names of the interfaces in `set`, in a fixed order.
+pub fn interfaceNameAt(index: u32) -> string<'static> {
+  return match index {
+    0 => "org.a11y.atspi.Accessible"
+    1 => "org.a11y.atspi.Action"
+    2 => "org.a11y.atspi.Component"
+    3 => "org.a11y.atspi.Document"
+    4 => "org.a11y.atspi.EditableText"
+    5 => "org.a11y.atspi.Hyperlink"
+    6 => "org.a11y.atspi.Image"
+    7 => "org.a11y.atspi.Selection"
+    8 => "org.a11y.atspi.Text"
+    9 => "org.a11y.atspi.Value"
+    _ => "org.a11y.atspi.Application"
+  }
+}
+
+/// The interface bit for a D-Bus interface name, or 0.
+pub fn interfaceBit(name: string) -> u32 {
+  let mut i: u32 = 0
+  while i <= 10 {
+    if interfaceNameAt(i) == name {
+      return u32.shiftLeft(1, i)
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+/// The AT-SPI role of `node`.
+pub fn atspiRole(node: &NodeRef<'_>) -> AtspiRole {
+  if node.hasRoleDescription() {
+    return AtspiRole.Extended
+  }
+  return match node.accessRole() {
+    Role.Alert => AtspiRole.Notification
+    Role.AlertDialog => AtspiRole.Alert
+    Role.Comment => AtspiRole.Section
+    Role.Suggestion => AtspiRole.Section
+    Role.Application => AtspiRole.Embedded
+    Role.Article => AtspiRole.Article
+    Role.Audio => AtspiRole.Audio
+    Role.Banner => AtspiRole.Landmark
+    Role.Header => AtspiRole.Landmark
+    Role.Blockquote => AtspiRole.BlockQuote
+    Role.Caret => AtspiRole.Unknown
+    Role.Button => if node.toggled().isSome() {
+      AtspiRole.ToggleButton
+    } else {
+      AtspiRole.Button
+    }
+    Role.DefaultButton => AtspiRole.Button
+    Role.Canvas => AtspiRole.Canvas
+    Role.Caption => AtspiRole.Caption
+    Role.Cell => AtspiRole.TableCell
+    Role.GridCell => AtspiRole.TableCell
+    Role.CheckBox => AtspiRole.CheckBox
+    Role.Switch => AtspiRole.ToggleButton
+    Role.ColorWell => AtspiRole.Button
+    Role.ColumnHeader => AtspiRole.ColumnHeader
+    Role.ComboBox => AtspiRole.ComboBox
+    Role.EditableComboBox => AtspiRole.ComboBox
+    Role.Complementary => AtspiRole.Landmark
+    Role.ContentDeletion => AtspiRole.ContentDeletion
+    Role.ContentInsertion => AtspiRole.ContentInsertion
+    Role.ContentInfo => AtspiRole.Landmark
+    Role.Footer => AtspiRole.Landmark
+    Role.Definition => AtspiRole.DescriptionValue
+    Role.DescriptionList => AtspiRole.DescriptionList
+    Role.Details => AtspiRole.Panel
+    Role.Dialog => AtspiRole.Dialog
+    Role.DisclosureTriangle => AtspiRole.ToggleButton
+    Role.DocCover => AtspiRole.Image
+    Role.DocBackLink => AtspiRole.Link
+    Role.DocBiblioRef => AtspiRole.Link
+    Role.DocGlossRef => AtspiRole.Link
+    Role.DocNoteRef => AtspiRole.Link
+    Role.DocBiblioEntry => AtspiRole.ListItem
+    Role.DocEndnote => AtspiRole.ListItem
+    Role.DocNotice => AtspiRole.Comment
+    Role.DocTip => AtspiRole.Comment
+    Role.DocFootnote => AtspiRole.Footnote
+    Role.DocPageBreak => AtspiRole.Separator
+    Role.DocPageFooter => AtspiRole.Footer
+    Role.DocPageHeader => AtspiRole.Header
+    Role.DocAcknowledgements => AtspiRole.Landmark
+    Role.DocAfterword => AtspiRole.Landmark
+    Role.DocAppendix => AtspiRole.Landmark
+    Role.DocBibliography => AtspiRole.Landmark
+    Role.DocChapter => AtspiRole.Landmark
+    Role.DocConclusion => AtspiRole.Landmark
+    Role.DocCredits => AtspiRole.Landmark
+    Role.DocEndnotes => AtspiRole.Landmark
+    Role.DocEpilogue => AtspiRole.Landmark
+    Role.DocErrata => AtspiRole.Landmark
+    Role.DocForeword => AtspiRole.Landmark
+    Role.DocGlossary => AtspiRole.Landmark
+    Role.DocIndex => AtspiRole.Landmark
+    Role.DocIntroduction => AtspiRole.Landmark
+    Role.DocPageList => AtspiRole.Landmark
+    Role.DocPart => AtspiRole.Landmark
+    Role.DocPreface => AtspiRole.Landmark
+    Role.DocPrologue => AtspiRole.Landmark
+    Role.DocToc => AtspiRole.Landmark
+    Role.DocAbstract => AtspiRole.Section
+    Role.DocColophon => AtspiRole.Section
+    Role.DocCredit => AtspiRole.Section
+    Role.DocDedication => AtspiRole.Section
+    Role.DocEpigraph => AtspiRole.Section
+    Role.DocExample => AtspiRole.Section
+    Role.DocPullquote => AtspiRole.Section
+    Role.DocQna => AtspiRole.Section
+    Role.DocSubtitle => AtspiRole.Heading
+    Role.Document => AtspiRole.DocumentFrame
+    Role.EmbeddedObject => AtspiRole.Embedded
+    Role.Form => AtspiRole.Form
+    Role.Figure => AtspiRole.Panel
+    Role.Feed => AtspiRole.Panel
+    Role.GenericContainer => AtspiRole.Section
+    Role.Ruby => AtspiRole.Section
+    Role.GraphicsDocument => AtspiRole.DocumentFrame
+    Role.GraphicsObject => AtspiRole.Panel
+    Role.GraphicsSymbol => AtspiRole.Image
+    Role.Grid => AtspiRole.Table
+    Role.Group => AtspiRole.Panel
+    Role.Heading => AtspiRole.Heading
+    Role.Iframe => AtspiRole.InternalFrame
+    Role.IframePresentational => AtspiRole.InternalFrame
+    Role.Image => AtspiRole.Image
+    Role.TextRun => AtspiRole.Static
+    Role.Legend => AtspiRole.Label
+    Role.LayoutTable => AtspiRole.Section
+    Role.LayoutTableCell => AtspiRole.Section
+    Role.LayoutTableRow => AtspiRole.Section
+    Role.LineBreak => AtspiRole.Static
+    Role.Link => AtspiRole.Link
+    Role.List => AtspiRole.List
+    Role.ListBox => AtspiRole.ListBox
+    Role.ListBoxOption => AtspiRole.ListItem
+    Role.ListGrid => AtspiRole.Table
+    Role.ListItem => AtspiRole.ListItem
+    Role.ListMarker => AtspiRole.Static
+    Role.Log => AtspiRole.Log
+    Role.Main => AtspiRole.Landmark
+    Role.Mark => AtspiRole.Static
+    Role.Math => AtspiRole.Math
+    Role.Marquee => AtspiRole.Marquee
+    Role.Menu => AtspiRole.Menu
+    Role.MenuListPopup => AtspiRole.Menu
+    Role.MenuBar => AtspiRole.MenuBar
+    Role.MenuItem => AtspiRole.MenuItem
+    Role.MenuListOption => AtspiRole.MenuItem
+    Role.MenuItemCheckBox => AtspiRole.CheckMenuItem
+    Role.MenuItemRadio => AtspiRole.RadioMenuItem
+    Role.Meter => AtspiRole.LevelBar
+    Role.Navigation => AtspiRole.Landmark
+    Role.Note => AtspiRole.Comment
+    Role.Pane => AtspiRole.Panel
+    Role.ScrollView => AtspiRole.Panel
+    Role.Paragraph => AtspiRole.Paragraph
+    Role.PdfActionableHighlight => AtspiRole.Button
+    Role.PdfRoot => AtspiRole.DocumentFrame
+    Role.PluginObject => AtspiRole.Embedded
+    Role.ProgressIndicator => AtspiRole.ProgressBar
+    Role.RadioButton => AtspiRole.RadioButton
+    Role.RadioGroup => AtspiRole.Panel
+    Role.Region => AtspiRole.Landmark
+    Role.RootWebArea => AtspiRole.DocumentWeb
+    Role.Row => AtspiRole.TableRow
+    Role.RowGroup => AtspiRole.Panel
+    Role.RowHeader => AtspiRole.RowHeader
+    Role.RubyAnnotation => AtspiRole.Static
+    Role.Section => AtspiRole.Section
+    Role.SectionFooter => AtspiRole.Footer
+    Role.SectionHeader => AtspiRole.Header
+    Role.ScrollBar => AtspiRole.ScrollBar
+    Role.Search => AtspiRole.Landmark
+    Role.Slider => AtspiRole.Slider
+    Role.SpinButton => AtspiRole.SpinButton
+    Role.Splitter => AtspiRole.Separator
+    Role.Label => AtspiRole.Label
+    Role.Status => AtspiRole.StatusBar
+    Role.SvgRoot => AtspiRole.DocumentFrame
+    Role.Tab => AtspiRole.PageTab
+    Role.Table => AtspiRole.Table
+    Role.TabList => AtspiRole.PageTabList
+    Role.TabPanel => AtspiRole.ScrollPane
+    Role.Term => AtspiRole.DescriptionTerm
+    Role.TitleBar => AtspiRole.TitleBar
+    Role.TextInput => AtspiRole.Entry
+    Role.MultilineTextInput => AtspiRole.Entry
+    Role.SearchInput => AtspiRole.Entry
+    Role.EmailInput => AtspiRole.Entry
+    Role.NumberInput => AtspiRole.Entry
+    Role.PhoneNumberInput => AtspiRole.Entry
+    Role.UrlInput => AtspiRole.Entry
+    Role.DateInput => AtspiRole.DateEditor
+    Role.DateTimeInput => AtspiRole.DateEditor
+    Role.WeekInput => AtspiRole.DateEditor
+    Role.MonthInput => AtspiRole.DateEditor
+    Role.TimeInput => AtspiRole.DateEditor
+    Role.PasswordInput => AtspiRole.PasswordText
+    Role.Abbr => AtspiRole.Static
+    Role.Code => AtspiRole.Static
+    Role.Emphasis => AtspiRole.Static
+    Role.Strong => AtspiRole.Static
+    Role.Time => AtspiRole.Static
+    Role.Timer => AtspiRole.Timer
+    Role.Toolbar => AtspiRole.ToolBar
+    Role.Tooltip => AtspiRole.ToolTip
+    Role.Tree => AtspiRole.Tree
+    Role.TreeItem => AtspiRole.TreeItem
+    Role.TreeGrid => AtspiRole.TreeTable
+    Role.Video => AtspiRole.Video
+    Role.Window => AtspiRole.Frame
+    Role.WebView => AtspiRole.Panel
+    Role.FigureCaption => AtspiRole.Caption
+    Role.Unknown => AtspiRole.Unknown
+    Role.ImeCandidate => AtspiRole.RedundantObject
+    Role.Keyboard => AtspiRole.RedundantObject
+    Role.Terminal => AtspiRole.Terminal
+  }
+}
+
+/// The accessible name: the value for nodes named by their value, the label otherwise.
+pub effect fn name(node: &NodeRef<'_>) -> Option<String>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if node.labelComesFromValue() {
+    return run node.value()
+  }
+  return run node.label()
+}
+
+/// The AT-SPI states of `node`, given whether its window has focus.
+pub fn states(node: &NodeRef<'_>, windowFocused: bool) -> StateSet {
+  let filter = CommonFilter {}
+  let kind = atspiRole(node)
+  let mut set = StateSet.empty()
+  let isRootWindow = node.parentId().isNone() && node.accessRole() == Role.Window
+  let isActiveDialog = node.isDialog()
+    && match node.treeState.activeDialog() {
+      Option.Some { value } => value.id.equals(node.id)
+      Option.None => false
+    }
+  if windowFocused && (isRootWindow || isActiveDialog) {
+    set.insert(AtspiState.Active)
+  }
+  if node.isTextInput() && !node.isReadOnly() {
+    set.insert(AtspiState.Editable)
+  }
+  if node.isFocusable(&filter) {
+    set.insert(AtspiState.Focusable)
+  }
+  if commonFilter(node) == FilterResult.Include {
+    set.insert(AtspiState.Visible)
+    set.insert(AtspiState.Showing)
+  }
+  if node.isRequired() {
+    set.insert(AtspiState.Required)
+  }
+  if node.isMultiselectable() {
+    set.insert(AtspiState.Multiselectable)
+  }
+  match node.orientation() {
+    Option.Some { value } => {
+      set.insert(
+        if value == Orientation.Horizontal {
+          AtspiState.Horizontal
+        } else {
+          AtspiState.Vertical
+        },
+      )
+    }
+    Option.None => {}
+  }
+  let toggled = node.toggled()
+  if kind != AtspiRole.ToggleButton && toggled.isSome() {
+    set.insert(AtspiState.Checkable)
+  }
+  if node.isBusy() {
+    set.insert(AtspiState.Busy)
+  }
+  if node.isModal() {
+    set.insert(AtspiState.Modal)
+  }
+  match node.isSelected() {
+    Option.Some { value } => {
+      if !node.isDisabled() {
+        set.insert(AtspiState.Selectable)
+      }
+      if value {
+        set.insert(AtspiState.Selected)
+      }
+    }
+    Option.None => {}
+  }
+  if node.isTextInput() {
+    set.insert(AtspiState.SelectableText)
+    set.insert(
+      if node.isMultiline() {
+        AtspiState.MultiLine
+      } else {
+        AtspiState.SingleLine
+      },
+    )
+  }
+  if node.accessRole() == Role.ProgressIndicator && node.numericValue().isNone() {
+    set.insert(AtspiState.Indeterminate)
+  }
+  match toggled {
+    Option.Some { value } => {
+      if value == Toggled.Mixed {
+        set.insert(AtspiState.Indeterminate)
+      } else if value == Toggled.True {
+        set.insert(
+          if kind == AtspiRole.ToggleButton {
+            AtspiState.Pressed
+          } else {
+            AtspiState.Checked
+          },
+        )
+      }
+    }
+    Option.None => {}
+  }
+  match node.data().isExpanded() {
+    Option.Some { value } => {
+      set.insert(AtspiState.Expandable)
+      set.insert(
+        if value {
+          AtspiState.Expanded
+        } else {
+          AtspiState.Collapsed
+        },
+      )
+    }
+    Option.None => {}
+  }
+  if !node.isDisabled() {
+    if node.isReadOnlySupported() && node.isReadOnly() {
+      set.insert(AtspiState.ReadOnly)
+    } else {
+      set.insert(AtspiState.Enabled)
+      set.insert(AtspiState.Sensitive)
+    }
+  }
+  if node.isFocused() {
+    set.insert(AtspiState.Focused)
+  }
+  return set
+}
+
+pub fn supportsAction(node: &NodeRef<'_>) -> bool {
+  return node.isClickable(&CommonFilter {})
+}
+
+pub fn supportsComponent(node: &NodeRef<'_>) -> bool {
+  return node.rawBounds().isSome() || node.isRoot()
+}
+
+pub fn supportsDocument(node: &NodeRef<'_>) -> bool {
+  let kind = node.accessRole()
+  return kind == Role.RootWebArea || kind == Role.PdfRoot
+}
+
+pub fn supportsEditableText(node: &NodeRef<'_>) -> bool {
+  return node.isTextInput() && node.supportsTextRanges()
+}
+
+pub fn supportsImage(node: &NodeRef<'_>) -> bool {
+  let kind = node.accessRole()
+  return kind == Role.Canvas || kind == Role.DocCover || kind == Role.GraphicsSymbol
+    || kind == Role.Image
+    || kind == Role.SvgRoot
+}
+
+pub fn supportsValue(node: &NodeRef<'_>) -> bool {
+  return node.numericValue().isSome()
+}
+
+/// The interfaces `node` implements, as bits.
+pub fn interfaces(node: &NodeRef<'_>) -> u32 {
+  let mut set = ACCESSIBLE()
+  if supportsAction(node) {
+    set = set | ACTION()
+  }
+  if supportsComponent(node) {
+    set = set | COMPONENT()
+  }
+  if supportsDocument(node) {
+    set = set | DOCUMENT()
+  }
+  if supportsEditableText(node) {
+    set = set | EDITABLE_TEXT()
+  }
+  if node.supportsUrl() {
+    set = set | HYPERLINK()
+  }
+  if supportsImage(node) {
+    set = set | IMAGE()
+  }
+  if node.isContainerWithSelectableChildren() {
+    set = set | SELECTION()
+  }
+  if node.supportsTextRanges() {
+    set = set | TEXT()
+  }
+  if supportsValue(node) {
+    set = set | VALUE()
+  }
+  return set
+}
+
+/// AT-SPI politeness: 0 none, 1 polite, 2 assertive.
+pub fn politeness(node: &NodeRef<'_>) -> i32 {
+  return match node.live() {
+    Live.Off => 0
+    Live.Polite => 1
+    Live.Assertive => 2
+  }
+}
+
+pub fn actionCount(node: &NodeRef<'_>) -> i32 {
+  return if supportsAction(node) {
+    1
+  } else {
+    0
+  }
+}
+
+pub fn actionName(node: &NodeRef<'_>, index: i32) -> string<'static> {
+  if index == 0 && supportsAction(node) {
+    return "click"
+  }
+  return ""
+}
+
+/// One `a{ss}` attribute.
+pub struct Attribute {
+  pub key: string<'static>,
+  pub value: String,
+}
+
+pub effect fn decimal(value: usize) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut digits = List<u8>.make()
+  let mut rest = value
+  if rest == 0 {
+    run digits.append(48)
+  }
+  while rest > 0 {
+    run digits.append(usize.toU8(rest % 10) + 48)
+    rest = rest / 10
+  }
+  let mut out = String.make()
+  let mut i = digits.length()
+  while i > 0 {
+    i = i - 1
+    let one: [u8; 1] = [digits.get(i)]
+    run out.append(String.fromUtf8(&one).unwrapOr(""))
+  }
+  return move out
+}
+
+/// The object attributes of `node` (`GetAttributes`).
+pub effect fn attributes(node: &NodeRef<'_>, out: &mut List<Attribute>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match node.placeholder() {
+    Option.Some { value } => {
+      run out.append(Attribute { key: "placeholder-text", value: run String.copy(value) })
+    }
+    Option.None => {}
+  }
+  match node.positionInSet() {
+    Option.Some { value } => {
+      run out.append(Attribute { key: "posinset", value: run decimal(value + 1) })
+    }
+    Option.None => {}
+  }
+  match node.sizeOfSetFromContainer(&CommonFilter {}) {
+    Option.Some { value } => {
+      run out.append(Attribute { key: "setsize", value: run decimal(value) })
+    }
+    Option.None => {}
+  }
+  match node.htmlId() {
+    Option.Some { value } => {
+      run out.append(Attribute { key: "id", value: run String.copy(value) })
+    }
+    Option.None => {}
+  }
+  match node.brailleLabel() {
+    Option.Some { value } => {
+      run out.append(Attribute { key: "braillelabel", value: run String.copy(value) })
+    }
+    Option.None => {}
+  }
+  match node.brailleRoleDescription() {
+    Option.Some { value } => {
+      run out.append(Attribute { key: "brailleroledescription", value: run String.copy(value) })
+    }
+    Option.None => {}
+  }
+}
+
+/// The extents of `node` in `coordType` coordinates, clipped to the window for the root.
+pub fn extents(node: &NodeRef<'_>, bounds: &WindowBounds, coordType: CoordType) -> Option<Rect> {
+  let mut box = node.boundingBox()
+  if node.isRoot() {
+    let window = Rect.make(0.0, 0.0, bounds.inner.width(), bounds.inner.height())
+    if !window.isEmpty() {
+      box = match box {
+        Option.Some { value } => Option.Some {
+          value: Rect.make(
+            f64.min(value.x0, window.x1),
+            f64.min(value.y0, window.y1),
+            f64.min(value.x1, window.x1),
+            f64.min(value.y1, window.y1),
+          ),
+        }
+        Option.None => Option.Some { value: window }
+      }
+    }
+  }
+  return match box {
+    Option.Some { value } => {
+      let origin = bounds.toAtspi(
+        Point.make(value.x0, value.y0),
+        node.filteredParent(&CommonFilter {}),
+        coordType,
+      )
+      Option.Some {
+        value: Rect.make(origin.x, origin.y, origin.x + value.width(), origin.y + value.height()),
+      }
+    }
+    Option.None => Option.None
+  }
+}

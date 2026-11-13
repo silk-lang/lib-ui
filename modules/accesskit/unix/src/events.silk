@@ -1,0 +1,891 @@
+//! The AT-SPI events a tree update causes, collected by a [`ChangeHandler`] and sent later.
+//!
+//! Ported from AccessKit (`accesskit_atspi_common/src/adapter.rs` and `events.rs`), Copyright
+//! 2022 The AccessKit Authors, under the MIT or Apache-2.0 license.
+import accesskit.lib { Role, Rect, TextSelection }
+import accesskit_consumer.lib {
+  NodeRef,
+  FullNodeId,
+  IdSet,
+  ChangeHandler,
+  FilterResult,
+  CommonFilter,
+  commonFilter,
+  characterCount
+}
+import atspi { AtspiState }
+import node {
+  WindowBounds,
+  CoordType,
+  atspiRole,
+  states,
+  name,
+  politeness,
+  extents,
+  supportsDocument,
+  supportsValue
+}
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.i32
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.text.string { String }
+
+/// The object an event is about, or that an event points to.
+pub union Target {
+  /// The application object at `/org/a11y/atspi/accessible/root`.
+  App,
+  /// A node of window `window`.
+  Node { pub window: u32, pub id: FullNodeId },
+}
+
+impl Copy for Target {}
+
+/// The `any_data` of an event.
+pub union EventData {
+  /// The default: a `u32` zero.
+  Nothing,
+  Text { pub value: String },
+  Object { pub target: Target },
+  Number { pub value: f64 },
+  Role { pub value: u32 },
+  /// An `(iiii)` rectangle in window coordinates.
+  Bounds { pub value: Rect },
+}
+
+/// Which signal an event goes out as.
+pub enum EventKind {
+  /// `org.a11y.atspi.Event.Object`.
+  Object,
+  /// `org.a11y.atspi.Event.Window`.
+  Window,
+  /// `org.a11y.atspi.Event.Document`.
+  Document,
+  /// `org.a11y.atspi.Cache.AddAccessible`, built when the event is sent.
+  CacheAdd,
+  /// `org.a11y.atspi.Cache.RemoveAccessible`.
+  CacheRemove,
+}
+
+/// One event to send.
+pub struct Event {
+  pub kind: EventKind,
+  pub target: Target,
+  /// The signal member, such as `StateChanged`.
+  pub member: string<'static>,
+  /// The event's `kind` string, such as `focused` or `accessible-name`.
+  pub detail: string<'static>,
+  pub detail1: i32,
+  pub detail2: i32,
+  pub data: EventData,
+}
+
+impl Event {
+  pub fn object(
+    target: Target,
+    member: string<'static>,
+    detail: string<'static>,
+    detail1: i32,
+    data: EventData,
+  ) -> Event {
+    return Event {
+      kind: EventKind.Object,
+      target: target,
+      member: member,
+      detail: detail,
+      detail1: detail1,
+      detail2: 0,
+      data: move data,
+    }
+  }
+
+  /// The interface the signal is sent on.
+  pub fn interfaceName(self: &Self) -> string<'static> {
+    return match self.kind {
+      EventKind.Object => "org.a11y.atspi.Event.Object"
+      EventKind.Window => "org.a11y.atspi.Event.Window"
+      EventKind.Document => "org.a11y.atspi.Event.Document"
+      EventKind.CacheAdd => "org.a11y.atspi.Cache"
+      EventKind.CacheRemove => "org.a11y.atspi.Cache"
+    }
+  }
+}
+
+fn included(node: &NodeRef<'_>) -> bool {
+  return commonFilter(node) == FilterResult.Include
+}
+
+/// The window roles AT-SPI treats as a top-level window.
+pub fn rootWindow<'a>(node: &NodeRef<'a>) -> Option<NodeRef<'a>> {
+  let root = node.treeState.rootNode()
+  return match root.accessRole() {
+    Role.AlertDialog => Option.Some { value: root }
+    Role.Dialog => Option.Some { value: root }
+    Role.Window => Option.Some { value: root }
+    _ => Option.None
+  }
+}
+
+/// The filtered parent of `node` as an event target: the application for a window.
+pub fn parentTarget(window: u32, node: &NodeRef<'_>) -> Target {
+  return match node.filteredParent(&CommonFilter {}) {
+    Option.Some { value } => Target.Node { window: window, id: value.id }
+    Option.None => Target.App
+  }
+}
+
+/// Collects the events one tree update of one window causes.
+pub struct EventCollector {
+  /// The window's id, used in object paths.
+  pub window: u32,
+  /// The window's position among the application's children.
+  pub windowIndex: u32,
+  pub bounds: WindowBounds,
+  pub events: List<Event>,
+  added: IdSet,
+  removed: IdSet,
+  checkedText: IdSet,
+  selectionChanged: IdSet,
+}
+
+impl EventCollector {
+  pub fn make(window: u32, windowIndex: u32, bounds: WindowBounds) -> EventCollector {
+    return EventCollector {
+      window: window,
+      windowIndex: windowIndex,
+      bounds: bounds,
+      events: List<Event>.make(),
+      added: IdSet.make(),
+      removed: IdSet.make(),
+      checkedText: IdSet.make(),
+      selectionChanged: IdSet.make(),
+    }
+  }
+
+  fn target(self: &Self, node: &NodeRef<'_>) -> Target {
+    return Target.Node { window: self.window, id: node.id }
+  }
+
+  effect fn push(self: &mut Self, event: Event) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.events.append(move event)
+  }
+
+  effect fn state(self: &mut Self, node: &NodeRef<'_>, state: AtspiState, on: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let detail1: i32 = if on {
+      1
+    } else {
+      0
+    }
+    let event = Event.object(
+      self.target(node),
+      "StateChanged",
+      state.eventName(),
+      detail1,
+      EventData.Nothing,
+    )
+    run self.push(move event)
+  }
+
+  effect fn cache(self: &mut Self, kind: EventKind, node: &NodeRef<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let event = Event {
+      kind: kind,
+      target: self.target(node),
+      member: if kind == EventKind.CacheAdd {
+        "AddAccessible"
+      } else {
+        "RemoveAccessible"
+      },
+      detail: "",
+      detail1: 0,
+      detail2: 0,
+      data: EventData.Nothing,
+    }
+    run self.push(move event)
+  }
+
+  /// The window `node` (a tree root) appeared: the application gained a child.
+  pub effect fn windowCreated(self: &mut Self, node: &NodeRef<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let event = Event.object(
+      Target.App,
+      "ChildrenChanged",
+      "add",
+      u32.wrappingToI32(self.windowIndex),
+      EventData.Object { target: self.target(node) },
+    )
+    run self.push(move event)
+  }
+
+  /// The window `node` went away.
+  pub effect fn windowDestroyed(self: &mut Self, node: &NodeRef<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let event = Event.object(
+      Target.App,
+      "ChildrenChanged",
+      "remove",
+      -1,
+      EventData.Object { target: self.target(node) },
+    )
+    run self.push(move event)
+  }
+
+  effect fn windowEvent(self: &mut Self, window: &NodeRef<'_>, member: string<'static>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let label = match run name(window) {
+      Option.Some { value } => move value
+      Option.None => String.make()
+    }
+    let event = Event {
+      kind: EventKind.Window,
+      target: self.target(window),
+      member: member,
+      detail: "",
+      detail1: 0,
+      detail2: 0,
+      data: EventData.Text { value: move label },
+    }
+    run self.push(move event)
+  }
+
+  /// The host window gained focus.
+  pub effect fn windowActivated(self: &mut Self, window: &NodeRef<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.windowEvent(window, "Activate")
+    run self.state(window, AtspiState.Active, true)
+    let event = Event.object(
+      Target.App,
+      "ActiveDescendantChanged",
+      "",
+      0,
+      EventData.Object { target: self.target(window) },
+    )
+    run self.push(move event)
+  }
+
+  /// The host window lost focus.
+  pub effect fn windowDeactivated(self: &mut Self, window: &NodeRef<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.windowEvent(window, "Deactivate")
+    run self.state(window, AtspiState.Active, false)
+  }
+
+  effect fn addNode(self: &mut Self, node: &NodeRef<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !(run self.added.insert(node.id)) {
+      return ()
+    }
+    run self.cache(EventKind.CacheAdd, node)
+    if node.isRoot() && node.accessRole() == Role.Window {
+      run self.windowCreated(node)
+    }
+    let live = politeness(node)
+    if live != 0 {
+      match run name(node) {
+        Option.Some { value } => {
+          let event = Event.object(
+            self.target(node),
+            "Announcement",
+            "",
+            live,
+            EventData.Text { value: move value },
+          )
+          run self.push(move event)
+        }
+        Option.None => {}
+      }
+    }
+    if isSelectedTrue(node) {
+      run self.enqueueSelectionChanged(node)
+    }
+  }
+
+  effect fn addSubtree(self: &mut Self, node: &NodeRef<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.addNode(node)
+    let filter = CommonFilter {}
+    let mut children = node.filteredChildren(&filter)
+    while let Option.Some { value: child } = children.next(&filter) {
+      run self.addSubtree(&child)
+    }
+  }
+
+  effect fn removeNode(self: &mut Self, node: &NodeRef<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !(run self.removed.insert(node.id)) {
+      return ()
+    }
+    if node.isRoot() && node.accessRole() == Role.Window {
+      run self.windowDestroyed(node)
+    }
+    run self.state(node, AtspiState.Defunct, true)
+    run self.cache(EventKind.CacheRemove, node)
+    if isSelectedTrue(node) {
+      run self.enqueueSelectionChanged(node)
+    }
+  }
+
+  effect fn removeSubtree(self: &mut Self, node: &NodeRef<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let filter = CommonFilter {}
+    let mut children = node.filteredChildren(&filter)
+    while let Option.Some { value: child } = children.next(&filter) {
+      run self.removeSubtree(&child)
+    }
+    run self.removeNode(node)
+  }
+
+  effect fn enqueueSelectionChanged(self: &mut Self, node: &NodeRef<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !node.isItemLike() {
+      return ()
+    }
+    match node.selectionContainer(&CommonFilter {}) {
+      Option.Some { value: container } => {
+        if container.isContainerWithSelectableChildren() {
+          drop run self.selectionChanged.insert(container.id)
+        }
+      }
+      Option.None => {}
+    }
+  }
+
+  /// Sends `SelectionChanged` for each container whose selection changed. Call after the update.
+  pub effect fn finish(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut i: usize = 0
+    while i < self.selectionChanged.length() {
+      let id = self.selectionChanged.asSlice()[i]
+      if !self.removed.contains(id) {
+        let event = Event.object(
+          Target.Node { window: self.window, id: id },
+          "SelectionChanged",
+          "",
+          0,
+          EventData.Nothing,
+        )
+        run self.push(move event)
+      }
+      i = i + 1
+    }
+  }
+
+  effect fn textChangeInParent(self: &mut Self, old: &NodeRef<'_>, new: &NodeRef<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !new.supportsTextRanges() || !old.supportsTextRanges() {
+      return ()
+    }
+    if !(run self.checkedText.insert(new.id)) {
+      return ()
+    }
+    let oldText = run old.documentRange().text()
+    let newText = run new.documentRange().text()
+    let before = String.utf8Bytes(oldText.view())
+    let after = String.utf8Bytes(newText.view())
+    let mut prefix: usize = 0
+    while prefix < before.length && prefix < after.length && before[prefix] == after[prefix] {
+      prefix = prefix + 1
+    }
+    if prefix == before.length && prefix == after.length {
+      return ()
+    }
+    while !String.isCharBoundary(oldText.view(), prefix)
+      || !String.isCharBoundary(newText.view(), prefix) {
+      prefix = prefix - 1
+    }
+    let mut suffix: usize = 0
+    while suffix < before.length - prefix && suffix < after.length - prefix
+      && before[before.length - 1 - suffix] == after[after.length - 1 - suffix] {
+      suffix = suffix + 1
+    }
+    while !String.isCharBoundary(oldText.view(), before.length - suffix)
+      || !String.isCharBoundary(newText.view(), after.length - suffix) {
+      suffix = suffix - 1
+    }
+    let start = usize.wrappingToI32(characterCount(String.slice(newText.view(), 0, prefix)))
+    let removed = String.slice(oldText.view(), prefix, before.length - suffix - prefix)
+    let removedLength = usize.wrappingToI32(characterCount(removed))
+    if removedLength > 0 {
+      let event = Event {
+        kind: EventKind.Object,
+        target: self.target(new),
+        member: "TextChanged",
+        detail: "delete",
+        detail1: start,
+        detail2: removedLength,
+        data: EventData.Text { value: run String.copy(removed) },
+      }
+      run self.push(move event)
+    }
+    let inserted = String.slice(newText.view(), prefix, after.length - suffix - prefix)
+    let insertedLength = usize.wrappingToI32(characterCount(inserted))
+    if insertedLength > 0 {
+      let event = Event {
+        kind: EventKind.Object,
+        target: self.target(new),
+        member: "TextChanged",
+        detail: "insert",
+        detail1: start,
+        detail2: insertedLength,
+        data: EventData.Text { value: run String.copy(inserted) },
+      }
+      run self.push(move event)
+    }
+  }
+
+  effect fn textChange(self: &mut Self, old: &NodeRef<'_>, new: &NodeRef<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let kind = new.accessRole()
+    if kind == Role.TextRun || kind == Role.GenericContainer {
+      let filter = CommonFilter {}
+      match old.filteredParent(&filter) {
+        Option.Some { value: oldParent } => match new.filteredParent(&filter) {
+          Option.Some { value: newParent } => run self.textChangeInParent(&oldParent, &newParent)
+          Option.None => {}
+        }
+        Option.None => {}
+      }
+    } else {
+      run self.textChangeInParent(old, new)
+    }
+  }
+
+  effect fn caretMoved(self: &mut Self, node: &NodeRef<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match node.textSelectionFocus() {
+      Option.Some { value: focus } => {
+        let event = Event.object(
+          self.target(node),
+          "TextCaretMoved",
+          "",
+          usize.wrappingToI32(focus.toGlobalUsvIndex()),
+          EventData.Nothing,
+        )
+        run self.push(move event)
+      }
+      Option.None => {}
+    }
+  }
+
+  effect fn textSelectionAppeared(self: &mut Self, new: &NodeRef<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !new.supportsTextRanges() {
+      return ()
+    }
+    match new.textSelection() {
+      Option.Some { value: range } => {
+        if !range.isDegenerate() {
+          let event = Event.object(
+            self.target(new),
+            "TextSelectionChanged",
+            "",
+            0,
+            EventData.Nothing,
+          )
+          run self.push(move event)
+        }
+      }
+      Option.None => {}
+    }
+    run self.caretMoved(new)
+  }
+
+  effect fn textSelectionChange(self: &mut Self, previous: &NodeRef<'_>, new: &NodeRef<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !new.supportsTextRanges() {
+      return ()
+    }
+    let oldSelection = previous.rawTextSelection()
+    let newSelection = new.rawTextSelection()
+    if !previous.isFocused() || sameSelection(oldSelection, newSelection) {
+      return ()
+    }
+    let wasRange = match previous.textSelection() {
+      Option.Some { value } => !value.isDegenerate()
+      Option.None => false
+    }
+    match new.textSelection() {
+      Option.Some { value: range } => {
+        if !range.isDegenerate() || wasRange {
+          let event = Event.object(
+            self.target(new),
+            "TextSelectionChanged",
+            "",
+            0,
+            EventData.Nothing,
+          )
+          run self.push(move event)
+        }
+      }
+      Option.None => {}
+    }
+    let caretMoved = match oldSelection {
+      Option.Some { value: a } => match newSelection {
+        Option.Some { value: b } => !a.focus.node.equals(b.focus.node)
+          || a.focus.characterIndex != b.focus.characterIndex
+        Option.None => true
+      }
+      Option.None => newSelection.isSome()
+    }
+    if caretMoved {
+      run self.caretMoved(new)
+    }
+  }
+
+  effect fn notifyChanges(self: &mut Self, old: &NodeRef<'_>, new: &NodeRef<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    // States, except focus, which `focusMoved` reports.
+    let before = states(old, true)
+    let after = states(new, true)
+    let changed = u64.bitXor(before.bits, after.bits)
+    let mut bit: u32 = 0
+    while bit < 64 {
+      if u64.bitAnd(u64.shiftRight(changed, u32.toU64(bit)), 1) == 1 {
+        let state = AtspiState.ofBit(bit)
+        if state != AtspiState.Focused {
+          run self.state(new, state, after.contains(state))
+        }
+      }
+      bit = bit + 1
+    }
+
+    // Properties.
+    let newName = run name(new)
+    let oldName = run name(old)
+    if !sameText(&newName, &oldName) {
+      let text = match &newName {
+        Option.Some { value } => run String.copy(value.view())
+        Option.None => String.make()
+      }
+      let announced = run String.copy(text.view())
+      let event = Event.object(
+        self.target(new),
+        "PropertyChange",
+        "accessible-name",
+        0,
+        EventData.Text { value: move text },
+      )
+      run self.push(move event)
+      let live = politeness(new)
+      if live != 0 {
+        let event = Event.object(
+          self.target(new),
+          "Announcement",
+          "",
+          live,
+          EventData.Text { value: move announced },
+        )
+        run self.push(move event)
+      }
+    }
+    let newDescription = run new.description()
+    let oldDescription = run old.description()
+    if !sameText(&newDescription, &oldDescription) {
+      let text = match move newDescription {
+        Option.Some { value } => move value
+        Option.None => String.make()
+      }
+      let event = Event.object(
+        self.target(new),
+        "PropertyChange",
+        "accessible-description",
+        0,
+        EventData.Text { value: move text },
+      )
+      run self.push(move event)
+    }
+    let parentChanged = match new.parentId() {
+      Option.Some { value: a } => match old.parentId() {
+        Option.Some { value: b } => !a.equals(b)
+        Option.None => true
+      }
+      Option.None => old.parentId().isSome()
+    }
+    if parentChanged {
+      let event = Event.object(
+        self.target(new),
+        "PropertyChange",
+        "accessible-parent",
+        0,
+        EventData.Object { target: parentTarget(self.window, new) },
+      )
+      run self.push(move event)
+    }
+    let kind = atspiRole(new)
+    if kind != atspiRole(old) {
+      let event = Event.object(
+        self.target(new),
+        "PropertyChange",
+        "accessible-role",
+        0,
+        EventData.Role { value: kind.number() },
+      )
+      run self.push(move event)
+    }
+    match currentValue(new) {
+      Option.Some { value } => {
+        let same = match currentValue(old) {
+          Option.Some { value: previous } => previous == value
+          Option.None => false
+        }
+        if !same {
+          let event = Event.object(
+            self.target(new),
+            "PropertyChange",
+            "accessible-value",
+            0,
+            EventData.Number { value: value },
+          )
+          run self.push(move event)
+        }
+      }
+      Option.None => {}
+    }
+
+    // Bounds.
+    let sameBounds = match new.rawBounds() {
+      Option.Some { value: a } => match old.rawBounds() {
+        Option.Some { value: b } => a.equals(b)
+        Option.None => false
+      }
+      Option.None => old.rawBounds().isNone()
+    }
+    if !sameBounds || !new.directTransform().equals(old.directTransform()) {
+      match extents(new, &self.bounds, CoordType.Window) {
+        Option.Some { value } => {
+          let event = Event.object(
+            self.target(new),
+            "BoundsChanged",
+            "",
+            0,
+            EventData.Bounds { value: value },
+          )
+          run self.push(move event)
+        }
+        Option.None => {}
+      }
+    }
+
+    // Children.
+    let filter = CommonFilter {}
+    let mut oldChildren = List<FullNodeId>.make()
+    let mut cursor = old.filteredChildren(&filter)
+    while let Option.Some { value: child } = cursor.next(&filter) {
+      run oldChildren.append(child.id)
+    }
+    let mut newChildren = List<FullNodeId>.make()
+    cursor = new.filteredChildren(&filter)
+    while let Option.Some { value: child } = cursor.next(&filter) {
+      run newChildren.append(child.id)
+    }
+    let mut i: usize = 0
+    while i < newChildren.length() {
+      let child = newChildren.get(i)
+      if !holds(&oldChildren, child) {
+        let event = Event.object(
+          self.target(new),
+          "ChildrenChanged",
+          "add",
+          usize.wrappingToI32(i),
+          EventData.Object { target: Target.Node { window: self.window, id: child } },
+        )
+        run self.push(move event)
+      }
+      i = i + 1
+    }
+    i = 0
+    while i < oldChildren.length() {
+      let child = oldChildren.get(i)
+      if !holds(&newChildren, child) {
+        let event = Event.object(
+          self.target(new),
+          "ChildrenChanged",
+          "remove",
+          -1,
+          EventData.Object { target: Target.Node { window: self.window, id: child } },
+        )
+        run self.push(move event)
+      }
+      i = i + 1
+    }
+
+    // Documents.
+    if supportsDocument(new) && old.isBusy() && !new.isBusy() {
+      let event = Event {
+        kind: EventKind.Document,
+        target: self.target(new),
+        member: "LoadComplete",
+        detail: "",
+        detail1: 0,
+        detail2: 0,
+        data: EventData.Nothing,
+      }
+      run self.push(move event)
+    }
+  }
+}
+
+/// The value AT-SPI's Value interface reports for `node`, if it has one.
+pub fn currentValue(node: &NodeRef<'_>) -> Option<f64> {
+  if !supportsValue(node) {
+    return Option.None
+  }
+  return node.numericValue()
+}
+
+fn isSelectedTrue(node: &NodeRef<'_>) -> bool {
+  return match node.isSelected() {
+    Option.Some { value } => value
+    Option.None => false
+  }
+}
+
+fn sameFlag(a: Option<bool>, b: Option<bool>) -> bool {
+  return match a {
+    Option.Some { value: x } => match b {
+      Option.Some { value: y } => x == y
+      Option.None => false
+    }
+    Option.None => b.isNone()
+  }
+}
+
+fn holds(list: &List<FullNodeId>, id: FullNodeId) -> bool {
+  let mut i: usize = 0
+  while i < list.length() {
+    if list.get(i).equals(id) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+fn sameText(a: &Option<String>, b: &Option<String>) -> bool {
+  return match &a.* {
+    Option.Some { value: x } => match &b.* {
+      Option.Some { value: y } => x.view() == y.view()
+      Option.None => false
+    }
+    Option.None => b.isNone()
+  }
+}
+
+fn sameSelection(a: Option<TextSelection>, b: Option<TextSelection>) -> bool {
+  return match a {
+    Option.Some { value: x } => match b {
+      Option.Some { value: y } => x.anchor.node.equals(y.anchor.node)
+        && x.anchor.characterIndex == y.anchor.characterIndex
+        && x.focus.node.equals(y.focus.node)
+        && x.focus.characterIndex == y.focus.characterIndex
+      Option.None => false
+    }
+    Option.None => b.isNone()
+  }
+}
+
+impl ChangeHandler for EventCollector {
+  effect fn nodeAdded(self: &mut Self, node: &NodeRef<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if included(node) {
+      run self.addNode(node)
+    }
+  }
+
+  effect fn nodeUpdated(self: &mut Self, old: &NodeRef<'_>, new: &NodeRef<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.textChange(old, new)
+    let before = commonFilter(old)
+    let after = commonFilter(new)
+    if before != after {
+      if after == FilterResult.Include {
+        if before == FilterResult.ExcludeSubtree {
+          run self.addSubtree(new)
+        } else {
+          run self.addNode(new)
+        }
+      } else if before == FilterResult.Include {
+        if after == FilterResult.ExcludeSubtree {
+          run self.removeSubtree(old)
+        } else {
+          run self.removeNode(old)
+        }
+      }
+    } else if after == FilterResult.Include {
+      run self.notifyChanges(old, new)
+      run self.textSelectionChange(old, new)
+      if !sameFlag(new.isSelected(), old.isSelected()) {
+        run self.enqueueSelectionChanged(new)
+      }
+    }
+  }
+
+  effect fn focusMoved(self: &mut Self, old: Option<NodeRef<'_>>, new: Option<NodeRef<'_>>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match old {
+      Option.None => match new {
+        Option.Some { value: node } => match rootWindow(&node) {
+          Option.Some { value: window } => run self.windowActivated(&window)
+          Option.None => {}
+        }
+        Option.None => {}
+      }
+      Option.Some { value: node } => {
+        if new.isNone() {
+          match rootWindow(&node) {
+            Option.Some { value: window } => run self.windowDeactivated(&window)
+            Option.None => {}
+          }
+        }
+      }
+    }
+    match new {
+      Option.Some { value: node } => {
+        run self.state(&node, AtspiState.Focused, true)
+        run self.textSelectionAppeared(&node)
+      }
+      Option.None => {}
+    }
+    match old {
+      Option.Some { value: node } => run self.state(&node, AtspiState.Focused, false)
+      Option.None => {}
+    }
+  }
+
+  effect fn nodeRemoved(self: &mut Self, node: &NodeRef<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if included(node) {
+      run self.removeNode(node)
+    }
+  }
+}
