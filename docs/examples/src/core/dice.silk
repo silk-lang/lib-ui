@@ -1,10 +1,14 @@
 //! Dice: a command asks the outside world for a random number, and a message brings it back.
-import core.look { INK, LINE, MUTED, primary, rgb }
+//! The program keeps count of what came up, so a few hundred rolls draw the die's odds.
+import core.look { ACCENT, INK, LINE, MUTED, button, primary, rgb }
 import ui_app.css
-import ui_app.css { px, Align, BorderStyle }
+import ui_app.css { px, Align, BorderStyle, BoxSizing, FlexWrap }
 import ui_app.lib { CommandSet, Document, Node, NoOutput, Program, Update }
+import silk.collections.list { List }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.i64
 import silk.num.u32
+import silk.num.usize
 
 /// Where random numbers come from. The program only says it needs one: the browser, a native
 /// app and a test each provide their own.
@@ -17,11 +21,15 @@ pub struct Dice {
   /// The face that is up; zero before the first roll.
   pub face: u32,
   pub rolls: i64,
-  pub rolling: bool,
+  /// How many rolls were asked for and have not come back yet.
+  pub waiting: u32,
+  /// How often each face came up: `counts[0]` is for the one.
+  pub counts: [i64; 6],
 }
 
 pub union Message {
   ClickedRoll,
+  ClickedRollMany,
   Rolled { pub face: u32 },
 }
 
@@ -46,11 +54,14 @@ impl CommandSet<Message ? &mut Random> for Command {
 
 type Next = Update<Dice, Command, NoOutput>
 
+/// How many rolls "Roll 50" asks for.
+const MANY: u32 = 50
+
 impl Program<Message, Command> for Dice {
   effect fn init() -> Next
     ! OutOfMemoryError
     ? &mut Allocator {
-    return Next.of(Dice { face: 0, rolls: 0, rolling: false })
+    return Next.of(Dice { face: 0, rolls: 0, waiting: 0, counts: [0, 0, 0, 0, 0, 0] })
   }
 
   effect fn update(mut model: Dice, message: Message) -> Next
@@ -58,13 +69,25 @@ impl Program<Message, Command> for Dice {
     ? &mut Allocator {
     match move message {
       Message.ClickedRoll => {
-        model.rolling = true
+        model.waiting = model.waiting + 1
         return run Next.with(move model, Command.Roll { sides: 6 })
+      }
+      Message.ClickedRollMany => {
+        let mut commands = run List<Command>.makeWithCapacity(u32.toUsize(MANY))
+        let mut i: u32 = 0
+        while i < MANY {
+          run commands.append(Command.Roll { sides: 6 })
+          i = i + 1
+        }
+        model.waiting = model.waiting + MANY
+        return Next.batch(move model, move commands)
       }
       Message.Rolled { face } => {
         model.face = face
         model.rolls = model.rolls + 1
-        model.rolling = false
+        model.waiting = model.waiting - 1
+        let at = u32.toUsize(face - 1)
+        model.counts[at] = model.counts[at] + 1
       }
     }
     return Next.of(move model)
@@ -76,45 +99,212 @@ impl Program<Message, Command> for Dice {
         h.style(
           &[
             css.alignItems(Align.Center),
-            css.columnGap(px(16.0)),
+            css.columnGap(px(24.0)),
+            css.rowGap(px(16.0)),
+            css.flexWrap(FlexWrap.Wrap),
             css.padding(px(16.0)),
             css.color(rgb(INK)),
           ],
         ),
       ],
       &[
-        h.row(
+        h.column(
+          &[h.style(&[css.alignItems(Align.Center), css.rowGap(px(12.0))])],
           &[
-            h.testId("face"),
-            h.style(
+            h.box(&[h.testId("face"), h.label(FACES[u32.toUsize(model.face)])], &[die(h, model.face, 72.0)]),
+            h.row(
+              &[h.style(&[css.columnGap(px(8.0))])],
               &[
-                css.width(px(56.0)),
-                css.height(px(56.0)),
-                css.borderWidth(px(1.0)),
-                css.borderStyle(BorderStyle.Solid),
-                css.borderColor(rgb(LINE)),
-                css.borderRadius(px(12.0)),
-                css.alignItems(Align.Center),
-                css.justifyContent(Align.Center),
-                css.fontSize(px(28.0)),
-                css.fontWeight(700.0),
+                primary(h, "Roll", Message.ClickedRoll),
+                button(h, "Roll 50", Message.ClickedRollMany),
               ],
             ),
           ],
-          &[
-            if model.face == 0 {
-              h.text("?")
-            } else {
-              h.number(u32.toI64(model.face))
-            },
-          ],
         ),
-        primary(h, "Roll", Message.ClickedRoll),
-        h.row(
-          &[h.style(&[css.columnGap(px(4.0)), css.color(rgb(MUTED))])],
-          &[h.box(&[h.testId("rolls")], &[h.number(model.rolls)]), h.text("rolls")],
+        h.column(
+          &[h.style(&[css.rowGap(px(8.0)), css.flexGrow(1.0), css.minWidth(px(220.0))])],
+          &[
+            h.row(
+              &[h.style(&[css.columnGap(px(8.0)), css.alignItems(Align.End), css.height(px(BARS + 48.0))])],
+              &[
+                bar(h, model, 1),
+                bar(h, model, 2),
+                bar(h, model, 3),
+                bar(h, model, 4),
+                bar(h, model, 5),
+                bar(h, model, 6),
+              ],
+            ),
+            h.row(
+              &[h.style(&[css.columnGap(px(4.0)), css.color(rgb(MUTED)), css.fontSize(px(13.0))])],
+              &[
+                h.box(&[h.testId("rolls")], &[h.number(model.rolls)]),
+                h.box(&[], &[h.text("rolls, average")]),
+                h.box(&[], &[average(h, model)]),
+              ],
+            ),
+          ],
         ),
       ],
     )
   }
+}
+
+const FACES: [string<'static>; 7] = ["Not rolled", "One", "Two", "Three", "Four", "Five", "Six"]
+
+/// The height of the tallest bar.
+const BARS: f32 = 72.0
+
+/// The most often any face came up. The bars are drawn against it.
+fn most(model: &Dice) -> i64 {
+  let mut most: i64 = 1
+  let mut i: usize = 0
+  while i < 6 {
+    if model.counts[i] > most {
+      most = model.counts[i]
+    }
+    i = i + 1
+  }
+  return most
+}
+
+/// One face's bar: its count, a bar as tall as its share, and a small die under it.
+fn bar(h: &Document<Message>, model: &Dice, face: u32) -> Node {
+  let count = model.counts[u32.toUsize(face - 1)]
+  let height = BARS * i64.toF32(count) / i64.toF32(most(model))
+  return h.column(
+    &[h.style(&[css.alignItems(Align.Center), css.rowGap(px(4.0)), css.flexGrow(1.0), css.flexBasis(px(0.0))])],
+    &[
+      h.box(&[h.style(&[css.fontSize(px(11.0)), css.color(rgb(MUTED))])], &[h.number(count)]),
+      h.box(
+        &[
+          h.style(
+            &[
+              css.alignSelf(Align.Stretch),
+              css.height(px(height)),
+              css.borderRadius(px(4.0)),
+              css.backgroundColor(
+                rgb(
+                  if face == model.face {
+                    ACCENT
+                  } else {
+                    0x99D5CF
+                  },
+                ),
+              ),
+            ],
+          ),
+          h.transition("height 180ms ease, background-color 180ms ease"),
+        ],
+        &[],
+      ),
+      die(h, face, 18.0),
+    ],
+  )
+}
+
+/// The average of every roll so far, to one decimal place.
+fn average(h: &Document<Message>, model: &Dice) -> Node {
+  if model.rolls == 0 {
+    return h.text("0.0")
+  }
+  let mut sum: i64 = 0
+  let mut i: usize = 0
+  while i < 6 {
+    sum = sum + model.counts[i] * (usize.toI64(i) + 1)
+    i = i + 1
+  }
+  let tenths = (sum * 10 + model.rolls / 2) / model.rolls
+  return h.row(&[], &[h.number(tenths / 10), h.text("."), h.number(tenths % 10)])
+}
+
+/// Whether a face has a pip in a cell of its three by three grid, counted row by row.
+fn pip(face: u32, cell: u32) -> bool {
+  if cell == 4 {
+    return face == 1 || face == 3 || face == 5
+  }
+  if cell == 0 || cell == 8 {
+    return face >= 2
+  }
+  if cell == 2 || cell == 6 {
+    return face >= 4
+  }
+  if cell == 3 || cell == 5 {
+    return face == 6
+  }
+  return false
+}
+
+/// A die of `size` pixels with `face` up, drawn with pips. Face zero is a die not rolled yet.
+fn die(h: &Document<Message>, face: u32, size: f32) -> Node {
+  return h.column(
+    &[
+      h.style(
+        &[
+          css.width(px(size)),
+          css.height(px(size)),
+          css.boxSizing(BoxSizing.BorderBox),
+          css.padding(px(size * 0.14)),
+          css.justifyContent(Align.SpaceBetween),
+          css.borderWidth(px(1.0)),
+          css.borderStyle(BorderStyle.Solid),
+          css.borderColor(rgb(LINE)),
+          css.borderRadius(px(size * 0.2)),
+          css.backgroundColor(rgb(0xFFFFFF)),
+        ],
+      ),
+    ],
+    &[
+      if face == 0 {
+        h.row(
+          &[
+            h.style(
+              &[
+                css.flexGrow(1.0),
+                css.alignItems(Align.Center),
+                css.justifyContent(Align.Center),
+                css.fontSize(px(size * 0.4)),
+                css.color(rgb(MUTED)),
+              ],
+            ),
+          ],
+          &[h.text("?")],
+        )
+      } else {
+        h.fragment(&[pips(h, face, 0, size), pips(h, face, 3, size), pips(h, face, 6, size)])
+      },
+    ],
+  )
+}
+
+/// One row of a die's grid, starting at cell `from`.
+fn pips(h: &Document<Message>, face: u32, from: u32, size: f32) -> Node {
+  return h.row(
+    &[h.style(&[css.justifyContent(Align.SpaceBetween)])],
+    &[dot(h, pip(face, from), size), dot(h, pip(face, from + 1), size), dot(h, pip(face, from + 2), size)],
+  )
+}
+
+fn dot(h: &Document<Message>, on: bool, size: f32) -> Node {
+  return h.box(
+    &[
+      h.style(
+        &[
+          css.width(px(size * 0.18)),
+          css.height(px(size * 0.18)),
+          css.borderRadius(px(size)),
+          css.backgroundColor(
+            rgb(
+              if on {
+                INK
+              } else {
+                0xFFFFFF
+              },
+            ),
+          ),
+        ],
+      ),
+    ],
+    &[],
+  )
 }

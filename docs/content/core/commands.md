@@ -8,13 +8,15 @@
 
 ::demo dice
 
+Press Roll a few times, then Roll 50. The bars count how often each face came up, so the die's odds draw themselves.
+
 ::source examples/src/core/dice.silk
 
 ## Asking
 
 ::source examples/src/core/dice.silk "effect fn update"
 
-When Roll is clicked, `update` does not roll anything. It returns the model with a command next to it:
+When Roll is clicked, `update` does not roll anything. It counts one more roll it is waiting for, and returns the model with a command next to it:
 
 ```silk
 return run Next.with(move model, Command.Roll { sides: 6 })
@@ -27,6 +29,8 @@ A command is plain data, like a message. `update` is still a function you can ca
 | A model and nothing else | `Next.of(model)` |
 | A model and one command | `run Next.with(model, command)` |
 | A model and several commands | `Next.batch(model, commands)` |
+
+Roll 50 is the last row: one update returns fifty commands, and fifty `Rolled` messages come back, one at a time. Nothing else in the program changes for it.
 
 `init` returns the same thing, so a program can start with commands: load the saved state, ask for the first page of data.
 
@@ -60,7 +64,7 @@ The program says what it needs and not where it comes from. Whoever starts the p
 | In a native app | A struct with a generator of its own |
 | In a test | A struct that always answers 4 |
 
-That last line is the point. Here is the test for this program. It decides what the die says, then checks what the program made of it.
+That last line is the point. Here is the test for this program. It decides what the die says, then checks what the program made of one roll and of fifty.
 
 ::source tests/src/core.silk "struct Loaded"
 
