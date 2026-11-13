@@ -177,6 +177,11 @@ time; what is left is lavapipe: about 30 ms for the adapter (the Vulkan loader a
 the difference is reading the driver (libLLVM is about 100 MB) back from disk. On a machine
 with a GPU both should be much smaller; that is not measured here.
 
+Then (lib-ui, `startGpu`): the app starts the GPU first thing, before it loads fonts and the
+script, and hands it to the host in `RunOptions.gpu`. With the production host, 5 cold and
+7 warm runs: ui-js 87 ms warm (from 101), 252 ms cold (from 289), 238 ms first launch; the
+native counter 93 ms warm (from 101).
+
 ### What could shrink
 
 - **Intl and Temporal.** The realm does not install them, but their data is linked: the

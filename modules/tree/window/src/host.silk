@@ -43,6 +43,17 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
     ! GpuError | OutOfMemoryError {
     return run RenderThread.start(raw, window, early.settings)
   }
+
+  /// A window's GPU started before [`runWindow`], with [`startGpu`]. In the browser it holds
+  /// only the settings, since there the device is made with the canvas.
+  pub struct StartedGpu {
+    early: EarlyRenderer,
+  }
+
+  effect fn prepareGpu(check: bool) -> EarlyRenderer
+    ! GpuError | OutOfMemoryError {
+    return EarlyRenderer { settings: RenderSettings { check: check } }
+  }
 } else {
   import render_thread { RenderThread }
 
@@ -59,7 +70,35 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
     run thread.attach(raw, window)
     return move thread
   }
+
+  /// A window's GPU started before [`runWindow`], with [`startGpu`]: its render thread, making
+  /// the device and pipelines.
+  pub struct StartedGpu {
+    early: RenderThread,
+  }
+
+  effect fn prepareGpu(check: bool) -> RenderThread
+    ! GpuError | OutOfMemoryError
+    ? &mut Allocator {
+    let cache = if check {
+      String.make()
+    } else {
+      run gpuCacheDirectory()
+    }
+    return run prepareRenderer(RenderSettings { check: check }, move cache)
+  }
 }
+
+/// Starts a window's GPU (the device and the renderer's pipelines, on the render thread) before
+/// [`runWindow`], for [`RunOptions.gpu`]. Most of a window's startup is the GPU, so an app that
+/// calls this first, before it loads fonts or a script, has its first frame sooner. `check`
+/// must be the `RunOptions.check` it runs with.
+pub effect fn startGpu(check: bool) -> StartedGpu
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  return StartedGpu { early: run prepareGpu(check) }
+}
+
 
 import platform_thread { HostPlatform, Launched }
 import vector.pixmap { Pixmap }
@@ -344,6 +383,8 @@ pub struct RunOptions {
   /// The platform thread of an app started with `platform_thread.launch`, or None to run the
   /// platform on this thread.
   pub platform: Option<Launched>,
+  /// The GPU from [`startGpu`], or None to start it when the host starts.
+  pub gpu: Option<StartedGpu>,
 }
 
 /// The frame `check` reads back: the scripted input goes in after frame 1.
@@ -859,14 +900,14 @@ pub effect fn runWindowWith<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
   if tracing {
     StderrWriter.print("silk-ui: host started\n", &())
   }
-  // The GPU starts first: on its own thread it takes longer than everything up to the first
-  // frame on this one.
-  let cache = if check {
-    String.make()
-  } else {
-    run gpuCacheDirectory()
+  // The GPU starts first, unless the app started it already: on its own thread it takes longer
+  // than everything up to the first frame on this one.
+  let mut options = move options
+  let given = Intrinsic.replace(options.gpu, Option<StartedGpu>.None)
+  let early = match move given {
+    Option<StartedGpu>.Some { value } => move value.early
+    Option<StartedGpu>.None => run prepareGpu(check)
   }
-  let early = run prepareRenderer(RenderSettings { check: check }, move cache)
   let mut tree = run UiTree.make(collection)
 
   // A window per root. In the browser a window is a canvas, and the renderer knows the
@@ -887,7 +928,6 @@ pub effect fn runWindowWith<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
   }
   let mut snapshot = CpuSnapshot.make()
 
-  let mut options = move options
   let launched = Intrinsic.replace(options.platform, Option<Launched>.None)
   let mut platform = match move launched {
     Option<Launched>.Some { value } => HostPlatform.proxied(move value)

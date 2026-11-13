@@ -7,6 +7,7 @@ import net from "node:net";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { build, DevEnvironment, transformWithOxc } from "vite";
+import { reconcilerPlugin } from "./reconciler.js";
 
 const require = createRequire(import.meta.url);
 const REFRESH = "virtual:silk-refresh";
@@ -168,7 +169,8 @@ export function devPlugins(options) {
             define,
             // Nothing is left to the host to load: it has no module resolution of its own.
             resolve: { noExternal: true },
-            optimizeDeps: { noDiscovery: false, rolldownOptions: { transform: { define } } },
+            // Dependencies are bundled before the plugins see them: patch React's reconciler there.
+            optimizeDeps: { noDiscovery: false, rolldownOptions: { transform: { define }, plugins: [reconcilerPlugin()] } },
             dev: {
               createEnvironment: (name, config) => new DevEnvironment(name, config, { hot: true, transport: channel }),
             },

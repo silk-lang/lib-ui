@@ -122,3 +122,42 @@ test("unload destroys every node, for a reload", () => {
   assert.ok(destroyed.includes(box.id));
   assert.equal(nodeById(box.id), null);
 });
+
+test("a font family list is defined once and named by number", () => {
+  mock.take();
+  const a = createBox({ fontFamily: "monospace" });
+  const b = createBox({ fontFamily: "monospace" });
+  const calls = mock.take();
+  const defined = calls.filter((call) => call[0] === "fontFamily");
+  assert.equal(defined.length, 1);
+  assert.equal(defined[0][2], "monospace");
+  const id = defined[0][1];
+  assert.deepEqual(calls.filter((call) => call[0] === "style"), [
+    ["style", a.id, "font-family:" + id + ";", 0],
+    ["style", b.id, "font-family:" + id + ";", 0],
+  ]);
+});
+
+test("a click inside a link opens its address unless a listener prevents it", () => {
+  const opened = [];
+  globalThis.open = (url) => opened.push(url);
+  const link = createBox();
+  const inside = createBox();
+  link.append(inside);
+  mock.take();
+  link.setAttribute("href", "https://example.com/");
+  assert.deepEqual(mock.take(), [["listen", link.id, 4], ["attribute", link.id, "href", "https://example.com/"]]);
+  mock.click(inside.id);
+  assert.deepEqual(opened, ["https://example.com/"]);
+
+  const stop = (event) => event.preventDefault();
+  link.addEventListener("click", stop);
+  mock.click(inside.id);
+  assert.equal(opened.length, 1);
+  link.removeEventListener("click", stop);
+  assert.deepEqual(mock.take(), [], "the link still wants clicks");
+
+  link.setAttribute("href", "");
+  assert.deepEqual(mock.take(), [["listen", link.id, 0], ["attribute", link.id, "href", ""]]);
+  delete globalThis.open;
+});
