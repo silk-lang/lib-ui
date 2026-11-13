@@ -1,0 +1,125 @@
+//! A pseudoterminal and the process on it: openpty and fork on Linux and macOS, a ConPTY
+//! pseudoconsole on Windows. Reads never block. Drop closes it and ends the process.
+import silk.core.ownership { Drop }
+import silk.mem.pointer { Pointer }
+import silk.text.string { String }
+
+pub struct PtyError {
+  pub code: i32
+}
+
+pub struct Pty {
+  handle: ?*mut u8
+}
+
+unsafe extern "C" fn silk_term_pty_new(
+  cols: u16,
+  rows: u16,
+  command: ?[*]const u8,
+  length: usize,
+  out: *mut ?*mut u8,
+) -> i32
+
+unsafe extern "C" fn silk_term_pty_free(pty: ?*mut u8) -> ()
+
+unsafe extern "C" fn silk_term_pty_read(
+  pty: ?*mut u8,
+  output: ?[*]mut u8,
+  capacity: usize,
+  count: *mut usize,
+) -> i32
+
+unsafe extern "C" fn silk_term_pty_write(pty: ?*mut u8, bytes: ?[*]const u8, length: usize) -> i32
+
+unsafe extern "C" fn silk_term_pty_resize(pty: ?*mut u8, cols: u16, rows: u16) -> i32
+
+unsafe extern "C" fn silk_term_pty_status(pty: ?*mut u8) -> i32
+
+unsafe extern "C" fn silk_term_pty_finished(pty: ?*mut u8) -> u8
+
+effect fn check(code: i32) -> ()
+  ! PtyError {
+  if code != 0 {
+    fail PtyError { code: code }
+  }
+}
+
+impl Drop for Pty {
+  fn drop(self: &mut Self) -> () {
+    unsafe silk_term_pty_free(self.handle)
+  }
+}
+
+impl Pty {
+  /// Starts the user's shell interactively in the current directory: `$SHELL` (or the
+  /// account's shell, then /bin/sh), or `%COMSPEC%` on Windows.
+  pub effect fn shell(cols: u16, rows: u16) -> Pty
+    ! PtyError {
+    let mut handle = Pointer.null<u8>()
+    run check(
+      unsafe silk_term_pty_new(
+        cols,
+        rows,
+        unsafe Pointer.bytes<u8>(Pointer.null<u8>()),
+        0,
+        Pointer.fromMutRef(&mut handle),
+      ),
+    )
+    return Pty { handle: handle }
+  }
+
+  /// Runs `command` through `/bin/sh -c` (`cmd.exe /c` on Windows) on a new PTY.
+  pub effect fn command(cols: u16, rows: u16, command: string) -> Pty
+    ! PtyError {
+    let bytes = String.utf8Bytes(command)
+    let mut handle = Pointer.null<u8>()
+    run check(
+      unsafe silk_term_pty_new(
+        cols,
+        rows,
+        Pointer.fromSlice(bytes),
+        bytes.length,
+        Pointer.fromMutRef(&mut handle),
+      ),
+    )
+    return Pty { handle: handle }
+  }
+
+  /// Reads immediately available output and flushes queued writes, without blocking.
+  pub effect fn read(self: &mut Self, output: &mut [u8]) -> usize
+    ! PtyError {
+    let mut count: usize = 0
+    run check(
+      unsafe silk_term_pty_read(
+        self.handle,
+        Pointer.fromMutSlice(&mut output),
+        output.length,
+        Pointer.fromMutRef(&mut count),
+      ),
+    )
+    return count
+  }
+
+  /// Queues input, preserving partial writes. The pending queue is bounded to 8 MiB.
+  pub effect fn write(self: &mut Self, bytes: &[u8]) -> ()
+    ! PtyError {
+    run check(unsafe silk_term_pty_write(self.handle, Pointer.fromSlice(bytes), bytes.length))
+  }
+
+  /// Changes the PTY size: `TIOCSWINSZ`, which signals the foreground job, or
+  /// `ResizePseudoConsole`.
+  pub effect fn resize(self: &mut Self, columns: u16, rows: u16) -> ()
+    ! PtyError {
+    run check(unsafe silk_term_pty_resize(self.handle, columns, rows))
+  }
+
+  /// Whether the process has exited and all PTY output has been drained.
+  pub fn finished(self: &Self) -> bool {
+    return unsafe silk_term_pty_finished(self.handle) != 0
+  }
+
+  /// -1 while running, otherwise the exit code (128 + signal for signal termination).
+  pub fn status(self: &mut Self) -> i32 {
+    return unsafe silk_term_pty_status(self.handle)
+  }
+}

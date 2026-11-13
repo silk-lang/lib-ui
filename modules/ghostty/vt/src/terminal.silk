@@ -1,0 +1,682 @@
+//! Terminal emulation through libghostty-vt 1.0. Feed a program's output to
+//! [`Terminal.write`], send what [`Terminal.encodeKey`] and the other encoders return to the
+//! program, and draw an owned [`Snapshot`]. This module owns no PTY, window or process.
+//! Native memory comes from Ghostty's allocator; dropping a handle releases it.
+import sys
+import silk.core.option { Option }
+import silk.core.ownership { Copy, Drop }
+import silk.mem.pointer { Pointer }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.i32
+import silk.text.string { String }
+
+/// A libghostty result code: `-1` out of memory, `-2` an invalid value, `-3` a buffer too
+/// small for the output.
+pub struct GhosttyError {
+  pub code: i32
+}
+
+effect fn checked(code: i32) -> ()
+  ! GhosttyError {
+  if code != 0 {
+    fail GhosttyError { code: code }
+  }
+}
+
+/// The scrollable area, in rows: `offset` is the first row the viewport shows, out of
+/// `total`; the viewport shows `length` rows. At the bottom, `offset + length == total`.
+pub struct Scrollbar {
+  pub total: u64,
+  pub offset: u64,
+  pub length: u64,
+}
+
+impl Copy for Scrollbar {}
+
+/// The size a terminal is drawn at: its grid and the pixel size of one cell. Mouse reports
+/// and selection gestures need it to turn pixels into cells.
+pub struct Geometry {
+  pub columns: u32,
+  pub rows: u32,
+  pub cellWidth: u32,
+  pub cellHeight: u32,
+}
+
+impl Copy for Geometry {}
+
+/// What a pointer did, for [`Terminal.encodeMouse`].
+pub enum MouseAction {
+  Press,
+  Release,
+  Motion,
+}
+
+/// A pointer event for a program that tracks the mouse. `button` is 0 for none, 1 left,
+/// 2 right, 3 middle, 4 wheel up and 5 wheel down. `x` and `y` are pixels from the top left
+/// of the grid. `pressed` says whether any button is down (for motion reports).
+pub struct MouseEvent {
+  pub action: MouseAction,
+  pub button: u32,
+  pub modifiers: u32,
+  pub pressed: bool,
+  pub x: f32,
+  pub y: f32,
+}
+
+impl Copy for MouseEvent {}
+
+/// Which way a selection dragged past the grid's edge asks the viewport to scroll.
+pub enum Autoscroll {
+  None,
+  Up,
+  Down,
+}
+
+/// An owned terminal. Mutating operations need an exclusive borrow; use it on one thread.
+pub struct Terminal {
+  handle: ?*mut u8,
+  input: ?*mut u8
+}
+
+impl Drop for Terminal {
+  fn drop(self: &mut Self) -> () {
+    unsafe sys.silk_ghostty_input_free(self.handle, self.input)
+    unsafe sys.ghostty_terminal_free(self.handle)
+  }
+}
+
+impl Terminal {
+  /// A terminal of `columns` by `rows` cells, both nonzero. Fails with `GhosttyError` on an
+  /// invalid size or when native memory runs out.
+  pub effect fn make(columns: u16, rows: u16) -> Terminal
+    ! GhosttyError {
+    if columns == 0 || rows == 0 {
+      fail GhosttyError { code: -2 }
+    }
+    let mut handle = Pointer.null<u8>()
+    run checked(
+      unsafe sys.ghostty_terminal_new(
+        Pointer.null<u8>(),
+        Pointer.fromMutRef<?*mut u8>(&mut handle),
+        columns,
+        rows,
+      ),
+    )
+    let mut terminal = Terminal { handle: handle, input: Pointer.null<u8>() }
+    run checked(
+      unsafe sys.silk_ghostty_input_new(handle, Pointer.fromMutRef<?*mut u8>(&mut terminal.input)),
+    )
+    return move terminal
+  }
+
+  // Output from the program.
+
+  /// Feeds a program's output: any chunk of bytes, including split UTF-8 and escape
+  /// sequences. Ghostty processes best-effort; [`Terminal.hasProcessingError`] reports its
+  /// sticky failure.
+  pub fn write(self: &mut Self, bytes: &[u8]) -> () {
+    unsafe sys.ghostty_terminal_vt_write(self.handle, Pointer.fromSlice<u8>(bytes), bytes.length)
+  }
+
+  /// Feeds UTF-8 text, escape sequences included, as program output.
+  pub fn writeText(self: &mut Self, text: string) -> () {
+    self.write(String.utf8Bytes(text))
+  }
+
+  /// Drains the replies the terminal generated for the program (cursor position reports,
+  /// device attributes, and so on) into `output`. Send them to the program, not to `write`.
+  /// Repeat until it returns zero. Replies queue up to 1 MiB; overflowing that or running out
+  /// of memory is a sticky `GhosttyError`.
+  pub effect fn readReplies(self: &mut Self, output: &mut [u8]) -> usize
+    ! GhosttyError {
+    let mut written: usize = 0
+    run checked(
+      unsafe sys.silk_ghostty_replies(
+        self.input,
+        Pointer.fromMutSlice(&mut output),
+        output.length,
+        Pointer.fromMutRef(&mut written),
+      ),
+    )
+    return written
+  }
+
+  // Input for the program. Each encoder writes to a buffer the caller owns and returns the
+  // number of bytes to send; it fails with code -3 when the buffer is too small.
+
+  /// Encodes a key press with the terminal's current keyboard modes (application cursor
+  /// keys, Kitty keyboard flags). `key` is a UI Events key name (`Enter`, `ArrowUp`, `F1`) or
+  /// the key's text. Modifier bits: Shift 1, Control 2, Alt 4, Meta 8, CapsLock 16.
+  pub effect fn encodeKey(self: &mut Self, key: string, modifiers: u32, output: &mut [u8]) -> usize
+    ! GhosttyError {
+    let name = String.utf8Bytes(key)
+    let mut written: usize = 0
+    run checked(
+      unsafe sys.silk_ghostty_key(
+        self.handle,
+        self.input,
+        Pointer.fromSlice(name),
+        name.length,
+        modifiers,
+        Pointer.fromMutSlice(&mut output),
+        output.length,
+        Pointer.fromMutRef(&mut written),
+      ),
+    )
+    return written
+  }
+
+  /// Encodes pasted text: sanitized, and bracketed when the program asked for bracketed
+  /// paste. Give it at least the text's byte length plus 12 bytes.
+  pub effect fn encodePaste(self: &mut Self, text: string, output: &mut [u8]) -> usize
+    ! GhosttyError {
+    let bytes = String.utf8Bytes(text)
+    let mut written: usize = 0
+    run checked(
+      unsafe sys.silk_ghostty_paste(
+        self.handle,
+        Pointer.fromSlice(bytes),
+        bytes.length,
+        Pointer.fromMutSlice(&mut output),
+        output.length,
+        Pointer.fromMutRef(&mut written),
+      ),
+    )
+    return written
+  }
+
+  /// Encodes a pointer event in the mouse format the program chose. Returns zero when the
+  /// program tracks no mouse, or not this kind of event (see [`Terminal.tracksMouse`]).
+  pub effect fn encodeMouse(
+    self: &mut Self,
+    event: MouseEvent,
+    geometry: Geometry,
+    output: &mut [u8],
+  ) -> usize
+    ! GhosttyError {
+    let action: u32 = match event.action {
+      MouseAction.Press => 0
+      MouseAction.Release => 1
+      MouseAction.Motion => 2
+    }
+    let mut written: usize = 0
+    run checked(
+      unsafe sys.silk_ghostty_mouse(
+        self.handle,
+        self.input,
+        action,
+        event.button,
+        event.modifiers,
+        if event.pressed {
+          1
+        } else {
+          0
+        },
+        event.x,
+        event.y,
+        geometry.columns * geometry.cellWidth,
+        geometry.rows * geometry.cellHeight,
+        geometry.cellWidth,
+        geometry.cellHeight,
+        Pointer.fromMutSlice(&mut output),
+        output.length,
+        Pointer.fromMutRef(&mut written),
+      ),
+    )
+    return written
+  }
+
+  /// Encodes focus gained or lost, when the program asked for focus reports; zero bytes
+  /// otherwise.
+  pub effect fn encodeFocus(self: &mut Self, focused: bool, output: &mut [u8]) -> usize
+    ! GhosttyError {
+    let mut written: usize = 0
+    run checked(
+      unsafe sys.silk_ghostty_focus(
+        self.handle,
+        if focused {
+          1
+        } else {
+          0
+        },
+        Pointer.fromMutSlice(&mut output),
+        output.length,
+        Pointer.fromMutRef(&mut written),
+      ),
+    )
+    return written
+  }
+
+  // Size and viewport.
+
+  /// Reflows to `columns` by `rows` cells, both nonzero. Cell pixel sizes may be zero when
+  /// the host has no pixel geometry. Fails with `GhosttyError`.
+  pub effect fn resize(
+    self: &mut Self,
+    columns: u16,
+    rows: u16,
+    cellWidth: u32,
+    cellHeight: u32,
+  ) -> ()
+    ! GhosttyError {
+    if columns == 0 || rows == 0 {
+      fail GhosttyError { code: -2 }
+    }
+    run checked(
+      unsafe sys.ghostty_terminal_resize(self.handle, columns, rows, cellWidth, cellHeight),
+    )
+  }
+
+  /// Clears the screen, the scrollback and every mode, keeping the size.
+  pub fn reset(self: &mut Self) -> () {
+    unsafe sys.ghostty_terminal_reset(self.handle)
+  }
+
+  /// Moves the viewport by `rows` (negative is up, into the scrollback), clamped by Ghostty.
+  pub effect fn scroll(self: &mut Self, rows: i64) -> ()
+    ! GhosttyError {
+    run checked(unsafe sys.silk_ghostty_scroll(self.handle, rows, 0))
+  }
+
+  /// Returns the viewport to the live screen, following output.
+  pub effect fn scrollToBottom(self: &mut Self) -> ()
+    ! GhosttyError {
+    run checked(unsafe sys.silk_ghostty_scroll(self.handle, 0, 1))
+  }
+
+  /// Moves the viewport to the oldest row of the scrollback.
+  pub effect fn scrollToTop(self: &mut Self) -> ()
+    ! GhosttyError {
+    run checked(unsafe sys.silk_ghostty_scroll(self.handle, 0, 2))
+  }
+
+  /// Where the viewport is in the scrollback.
+  pub fn scrollbar(self: &Self) -> Scrollbar {
+    return Scrollbar {
+      total: unsafe sys.silk_ghostty_scrollbar(self.handle, 0),
+      offset: unsafe sys.silk_ghostty_scrollbar(self.handle, 1),
+      length: unsafe sys.silk_ghostty_scrollbar(self.handle, 2),
+    }
+  }
+
+  // Modes the program set.
+
+  /// Whether the program turned a mouse tracking mode on: pointer input then belongs to it
+  /// (send [`Terminal.encodeMouse`]) unless the user holds Shift to select.
+  pub fn tracksMouse(self: &Self) -> bool {
+    return unsafe sys.silk_ghostty_flag(self.handle, 1) != 0
+  }
+
+  /// Whether the alternate screen (full-screen programs such as editors) is showing. It has
+  /// no scrollback.
+  pub fn alternateScreen(self: &Self) -> bool {
+    return unsafe sys.silk_ghostty_flag(self.handle, 2) != 0
+  }
+
+  /// Whether the viewport shows the live screen, rather than the scrollback.
+  pub fn followsOutput(self: &Self) -> bool {
+    return unsafe sys.silk_ghostty_flag(self.handle, 5) != 0
+  }
+
+  /// The title the program set (OSC 0 or 2), empty when it set none. Borrowed until the next
+  /// write.
+  pub fn title<'a>(self: &'a Self) -> string<'a> {
+    let mut length: usize = 0
+    let bytes = unsafe sys.silk_ghostty_title(self.handle, Pointer.fromMutRef<usize>(&mut length))
+    return unsafe String.fromUtf8Unchecked(unsafe borrowedBytes(self, bytes, length))
+  }
+
+  /// Whether Ghostty hit a sticky best-effort processing error. `reset` does not clear it;
+  /// make a new terminal after an allocation failure.
+  pub fn hasProcessingError(self: &Self) -> bool {
+    return unsafe sys.silk_ghostty_flag(self.handle, 0) != 0
+  }
+
+  // Selection. The terminal keeps one selection, which follows its content as it scrolls.
+  // Snapshots report it per row; `selectedText` copies it out. Cells are viewport cells; `x`
+  // and `y` are pixels from the top left of the grid.
+
+  /// Starts a pointer selection gesture: a press on the cell. `time` is a monotonic time in
+  /// nanoseconds, which counts double and triple clicks (word and line selection). A single
+  /// press clears the selection, as a press on a web page does.
+  pub effect fn selectionPress(
+    self: &mut Self,
+    column: u32,
+    row: u32,
+    x: f64,
+    y: f64,
+    time: u64,
+  ) -> ()
+    ! GhosttyError {
+    run checked(unsafe sys.silk_ghostty_select_press(self.handle, self.input, column, row, x, y, time))
+  }
+
+  /// Extends the gesture to the cell under a moving pointer. `rectangle` selects a block
+  /// (Alt-drag in most terminals). The cell may be clamped to the grid; [`selectionAutoscroll`]
+  /// says whether the pointer is past an edge.
+  pub effect fn selectionDrag(
+    self: &mut Self,
+    column: u32,
+    row: u32,
+    x: f64,
+    y: f64,
+    geometry: Geometry,
+    rectangle: bool,
+  ) -> ()
+    ! GhosttyError {
+    run checked(
+      unsafe sys.silk_ghostty_select_drag(
+        self.handle,
+        self.input,
+        column,
+        row,
+        x,
+        y,
+        geometry.columns,
+        geometry.cellWidth,
+        geometry.rows * geometry.cellHeight,
+        if rectangle {
+          1
+        } else {
+          0
+        },
+      ),
+    )
+  }
+
+  /// Ends the gesture. The selection stays.
+  pub effect fn selectionRelease(self: &mut Self) -> ()
+    ! GhosttyError {
+    run checked(unsafe sys.silk_ghostty_select_release(self.handle, self.input))
+  }
+
+  /// Which way the dragged selection asks the viewport to scroll, after the last drag.
+  pub fn selectionAutoscroll(self: &mut Self) -> Autoscroll {
+    let value = unsafe sys.silk_ghostty_select_autoscroll(self.handle, self.input)
+    return if value == 1 {
+      Autoscroll.Up
+    } else if value == 2 {
+      Autoscroll.Down
+    } else {
+      Autoscroll.None
+    }
+  }
+
+  /// One step of autoscroll while a selection is dragged past an edge: scrolls a row and
+  /// extends the selection. Call it on a timer while `selectionAutoscroll` is not `None`.
+  pub effect fn selectionTick(
+    self: &mut Self,
+    column: u32,
+    row: u32,
+    x: f64,
+    y: f64,
+    geometry: Geometry,
+    rectangle: bool,
+  ) -> ()
+    ! GhosttyError {
+    run checked(
+      unsafe sys.silk_ghostty_select_tick(
+        self.handle,
+        self.input,
+        column,
+        row,
+        x,
+        y,
+        geometry.columns,
+        geometry.cellWidth,
+        geometry.rows * geometry.cellHeight,
+        if rectangle {
+          1
+        } else {
+          0
+        },
+      ),
+    )
+  }
+
+  /// Selects everything, scrollback included.
+  pub effect fn selectAll(self: &mut Self) -> ()
+    ! GhosttyError {
+    run checked(unsafe sys.silk_ghostty_select(self.handle, self.input, 1, 0, 0))
+  }
+
+  /// Selects the word at a viewport cell, with Ghostty's word boundaries.
+  pub effect fn selectWord(self: &mut Self, column: u32, row: u32) -> ()
+    ! GhosttyError {
+    run checked(unsafe sys.silk_ghostty_select(self.handle, self.input, 2, column, row))
+  }
+
+  /// Selects the line at a viewport cell, stopping at a shell prompt's boundary.
+  pub effect fn selectLine(self: &mut Self, column: u32, row: u32) -> ()
+    ! GhosttyError {
+    run checked(unsafe sys.silk_ghostty_select(self.handle, self.input, 3, column, row))
+  }
+
+  /// Clears the selection.
+  pub effect fn clearSelection(self: &mut Self) -> ()
+    ! GhosttyError {
+    run checked(unsafe sys.silk_ghostty_select(self.handle, self.input, 0, 0, 0))
+  }
+
+  pub fn hasSelection(self: &Self) -> bool {
+    return unsafe sys.silk_ghostty_has_selection(self.handle) != 0
+  }
+
+  // Reading.
+
+  /// Copies the viewport: cells, cursor, colors and the selection on each row. The result
+  /// survives later writes and the terminal itself.
+  pub effect fn snapshot(self: &mut Self) -> Snapshot
+    ! GhosttyError {
+    let mut handle = Pointer.null<u8>()
+    run checked(
+      unsafe sys.silk_ghostty_snapshot_new(self.handle, Pointer.fromMutRef<?*mut u8>(&mut handle)),
+    )
+    return Snapshot { handle: handle }
+  }
+
+  /// The active screen and its scrollback as plain UTF-8, trailing whitespace trimmed.
+  pub effect fn plainText(self: &Self) -> String
+    ! GhosttyError | OutOfMemoryError
+    ? &mut Allocator {
+    return run self.format(0)
+  }
+
+  /// The selected text as plain UTF-8, as a copy puts it on the clipboard; empty without a
+  /// selection.
+  pub effect fn selectedText(self: &Self) -> String
+    ! GhosttyError | OutOfMemoryError
+    ? &mut Allocator {
+    return run self.format(1)
+  }
+
+  effect fn format(self: &Self, selected: u8) -> String
+    ! GhosttyError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut buffer = TextBuffer { bytes: Pointer.fromSlice<u8>(b""), length: 0 }
+    run checked(
+      unsafe sys.silk_ghostty_format(
+        self.handle,
+        selected,
+        Pointer.fromMutRef<?[*]const u8>(&mut buffer.bytes),
+        Pointer.fromMutRef<usize>(&mut buffer.length),
+      ),
+    )
+    let bytes = unsafe borrowedBytes(&buffer, buffer.bytes, buffer.length)
+    return run String.copy(unsafe String.fromUtf8Unchecked(bytes))
+  }
+}
+
+struct TextBuffer {
+  bytes: ?[*]const u8,
+  length: usize
+}
+
+impl Drop for TextBuffer {
+  fn drop(self: &mut Self) -> () {
+    if self.length != 0 {
+      unsafe sys.ghostty_free(Pointer.null<u8>(), self.bytes, self.length)
+    }
+  }
+}
+
+unsafe fn borrowedBytes<'a, A>(anchor: &'a A, bytes: ?[*]const u8, length: usize) -> &'a [u8] {
+  return match Pointer.nonNullMany<u8>(bytes) {
+    Option<[*]const u8>.Some { value } => unsafe Pointer.borrowMany<'a, A, u8>(
+      anchor,
+      value,
+      length,
+    )
+    Option<[*]const u8>.None => b""
+  }
+}
+
+/// How the program asked the cursor to look.
+pub enum CursorStyle {
+  Bar,
+  Block,
+  Underline,
+  BlockHollow,
+}
+
+/// The cursor at capture time. Coordinates are zero-based viewport cells; `visible` is
+/// false when the cursor is hidden or scrolled out of the viewport.
+pub struct Cursor {
+  pub column: u32,
+  pub row: u32,
+  pub visible: bool,
+  pub blinking: bool,
+  pub style: CursorStyle,
+  /// `0xRRGGBB`: the color the program set, or the default foreground.
+  pub color: u32,
+}
+
+impl Copy for Cursor {}
+
+/// The first and last selected column of a row, both included.
+pub struct Span {
+  pub first: u32,
+  pub last: u32,
+}
+
+impl Copy for Span {}
+
+/// One cell: its grapheme and how to draw it. Colors are `0xRRGGBB`, resolved through the
+/// palette, before inverse, faint and invisible apply (that is the renderer's job). `width`
+/// is 0 for the spacer after a wide glyph, 1 for an ordinary cell (empty ones too), 2 for a
+/// wide glyph.
+pub struct Cell<'a> {
+  pub text: string<'a>,
+  pub foreground: u32,
+  pub background: u32,
+  pub flags: u32,
+  pub width: u32,
+}
+
+impl<'a> Copy for Cell<'a> {}
+
+/// SGR style bits of [`Cell.flags`]. The underline style is bits 8 to 10 (`UNDERLINE_MASK`).
+pub const BOLD: u32 = 1
+
+pub const ITALIC: u32 = 2
+
+pub const FAINT: u32 = 4
+
+pub const BLINK: u32 = 8
+
+pub const INVERSE: u32 = 16
+
+pub const INVISIBLE: u32 = 32
+
+pub const STRIKETHROUGH: u32 = 64
+
+pub const OVERLINE: u32 = 128
+
+pub const UNDERLINE_MASK: u32 = 1792
+
+/// An immutable copy of the viewport. Cell text borrows the snapshot, never the terminal.
+pub struct Snapshot {
+  handle: ?*mut u8
+}
+
+impl Drop for Snapshot {
+  fn drop(self: &mut Self) -> () {
+    unsafe sys.silk_ghostty_snapshot_free(self.handle)
+  }
+}
+
+impl Snapshot {
+  pub fn columns(self: &Self) -> u32 {
+    return unsafe sys.silk_ghostty_snapshot_get(self.handle, 0)
+  }
+
+  pub fn rows(self: &Self) -> u32 {
+    return unsafe sys.silk_ghostty_snapshot_get(self.handle, 1)
+  }
+
+  pub fn cursor(self: &Self) -> Cursor {
+    let style = unsafe sys.silk_ghostty_snapshot_get(self.handle, 8)
+    return Cursor {
+      column: unsafe sys.silk_ghostty_snapshot_get(self.handle, 2),
+      row: unsafe sys.silk_ghostty_snapshot_get(self.handle, 3),
+      visible: unsafe sys.silk_ghostty_snapshot_get(self.handle, 4) != 0,
+      blinking: unsafe sys.silk_ghostty_snapshot_get(self.handle, 9) != 0,
+      style: if style == 0 {
+        CursorStyle.Bar
+      } else if style == 2 {
+        CursorStyle.Underline
+      } else if style == 3 {
+        CursorStyle.BlockHollow
+      } else {
+        CursorStyle.Block
+      },
+      color: unsafe sys.silk_ghostty_snapshot_get(self.handle, 7),
+    }
+  }
+
+  /// The default foreground, `0xRRGGBB`.
+  pub fn foreground(self: &Self) -> u32 {
+    return unsafe sys.silk_ghostty_snapshot_get(self.handle, 5)
+  }
+
+  /// The default background, `0xRRGGBB`.
+  pub fn background(self: &Self) -> u32 {
+    return unsafe sys.silk_ghostty_snapshot_get(self.handle, 6)
+  }
+
+  /// The selected columns of a viewport row, if the selection reaches it.
+  pub fn selection(self: &Self, row: u32) -> Option<Span> {
+    let first = unsafe sys.silk_ghostty_row_selection(self.handle, row, 0)
+    let last = unsafe sys.silk_ghostty_row_selection(self.handle, row, 1)
+    if first < 0 || last < first {
+      return Option<Span>.None
+    }
+    return Option<Span>.Some { value: Span { first: i32.toU32(first), last: i32.toU32(last) } }
+  }
+
+  /// The cell at a zero-based viewport position; `None` outside the grid.
+  pub fn cell<'a>(self: &'a Self, column: u32, row: u32) -> Option<Cell<'a>> {
+    let columns = self.columns()
+    if column >= columns || row >= self.rows() {
+      return Option<Cell<'a>>.None
+    }
+    let index = u32.toUsize(row) * u32.toUsize(columns) + u32.toUsize(column)
+    let mut length: usize = 0
+    let pointer = unsafe sys.silk_ghostty_cell_text(
+      self.handle,
+      index,
+      Pointer.fromMutRef<usize>(&mut length),
+    )
+    let bytes = unsafe borrowedBytes(self, pointer, length)
+    return Option<Cell<'a>>.Some {
+      value: Cell<'a> {
+        text: unsafe String.fromUtf8Unchecked(bytes),
+        foreground: unsafe sys.silk_ghostty_cell_get(self.handle, index, 0),
+        background: unsafe sys.silk_ghostty_cell_get(self.handle, index, 1),
+        flags: unsafe sys.silk_ghostty_cell_get(self.handle, index, 2),
+        width: unsafe sys.silk_ghostty_cell_get(self.handle, index, 3),
+      }
+    }
+  }
+}
