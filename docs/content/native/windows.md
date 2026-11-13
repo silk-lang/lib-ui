@@ -4,7 +4,7 @@ A program can show more than one window. It does not open and close them. It **d
 
 ## Swatches
 
-::shot native-swatches "The first window. Where the browser has WebGPU it runs here. A page can show one window only, so the second one is the picture below."
+::shot native-swatches "The first window. Where the browser has WebGPU it runs here: press Open preview, and the second window opens under it, with a title bar the page draws for it."
 
 ::shot native-swatches-preview "The second window, with the blue swatch chosen. It shows the same model."
 

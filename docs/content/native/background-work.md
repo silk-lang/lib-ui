@@ -6,7 +6,7 @@ The pattern has two halves, and you have seen both: a [command](/core/commands/)
 
 ## Search
 
-::shot native-search "The worker is at 40 percent. The window stays responsive, and Cancel works."
+::shot native-search "The worker is at 40 percent. The window stays responsive, and Cancel works. A Silk program has no threads in a page yet, so this example is shown in pictures."
 
 ::shot native-search-done "The worker posted its answer."
 

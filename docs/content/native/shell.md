@@ -6,7 +6,7 @@ This page reads one app that uses every part of it.
 
 ## Pad
 
-::shot native-pad "Pad. Where the browser has WebGPU it runs here, and you can type in it. A page has no menu bar and no files, so those parts need the desktop."
+::shot native-pad "Pad. Where the browser has WebGPU it runs here, and you can type in it. The page draws the title bar a desktop would. A page has no menu bar and no files, so those parts need the desktop."
 
 Pad edits one note. It has a menu bar, opens and saves files through the system's dialogs, copies to the clipboard, follows the system's dark appearance, and asks before it closes with unsaved work.
 
@@ -83,7 +83,7 @@ subs.files(2, |request, paths| Message.ClosedDialog { request: request, paths: m
 
 ## Closing
 
-::shot native-pad-closing "The close button was pressed while the note had unsaved work."
+::shot native-pad-closing "The close button was pressed while the note had unsaved work. Where the browser has WebGPU this is Pad again, with a title bar the page draws: type something, then press its close button."
 
 Without `subs.closeRequested`, the close button closes the window. With it, the program decides:
 
