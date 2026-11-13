@@ -19,7 +19,8 @@ import silkjs.js_engine { Engine }
 import silkjs.js_engine_host { EngineServices }
 import silkjs.js_value { ValueBits }
 import silkjs.js_realm { Realm, Arguments }
-import silkjs.js_owned_value { ValueRef }
+import silkjs.js_owned_value { Value, ValueRef }
+import silkjs.js_proxy_core as core
 import silkjs.js_exceptions { JsException }
 import silkjs.js_strings { Strings }
 import silkjs.js_core_types { NativeFunctionId, NativeErrorKind, ModuleDef }
@@ -77,6 +78,10 @@ pub const DEV_RELOAD: u32 = 21
 /// The number of native functions, for the installer.
 pub const LAST: u32 = 21
 
+/// The runtime's promise rejection tracker callback: [`Bridge`] keeps the promises that
+/// were rejected with no handler until one is added.
+pub const REJECTION: u32 = 101
+
 /// The runtime's module loader callback: [`Bridge`] answers it from the defined modules.
 pub const MODULE_LOAD: u32 = 100
 
@@ -112,10 +117,19 @@ pub struct Bridge {
   /// Whether JavaScript asked for an animation frame callback.
   pub frame: bool,
   pub logs: List<LogEntry>,
+  /// Promises rejected with no handler so far, with what they were rejected with. The
+  /// host reports the ones still here after the promise jobs ran, as a browser does.
+  pub rejections: List<Rejected>,
   /// Lines JavaScript sent to the development server, oldest first.
   pub outbox: List<String>,
   /// Whether JavaScript asked for a new realm.
   pub reload: bool,
+}
+
+/// A rejected promise nothing handles yet. Both values are owned.
+pub struct Rejected {
+  pub promise: Value,
+  pub reason: Value,
 }
 
 impl Bridge {
@@ -127,6 +141,7 @@ impl Bridge {
       timers: List<Timer>.make(),
       frame: false,
       logs: List<LogEntry>.make(),
+      rejections: List<Rejected>.make(),
       outbox: List<String>.make(),
       reload: false,
     }
@@ -354,6 +369,28 @@ impl EngineServices for Bridge {
       run engine.services.batch.select(first, f64.toUsize(number(argv.get(1).view())), f64.toUsize(number(argv.get(2).view())))
     }
     return ValueBits.Undefined
+  }
+
+  /// Keeps a promise rejected with no handler, and lets go of it when a handler is added.
+  unsafe effect fn promiseRejection<'r, 'v, 'w, 'm>(engine: &mut Engine<'m, Self>, realm: Realm<'r>,
+    callback: NativeFunctionId, promise: ValueRef<'v>, reason: ValueRef<'w>, handled: bool, opaque: ?*mut u8) -> () ? &mut Allocator {
+    let items = engine.services.rejections.asSlice()
+    let mut i: usize = 0
+    while i < items.length {
+      if unsafe core.sameValue(items[i].promise.view(), promise.view()) {
+        if handled {
+          let Rejected { promise: kept, reason: why } = engine.services.rejections.remove(i)
+          realm.release(&mut engine, move kept)
+          realm.release(&mut engine, move why)
+        }
+        return
+      }
+      i = i + 1
+    }
+    if handled { return }
+    // Without memory for the entry the rejection goes unreported.
+    let entry = Rejected { promise: promise.dup(), reason: reason.dup() }
+    drop run Effect.result(engine.services.rejections.append(move entry))
   }
 
   /// A module the application defined, compiled when something first imports it.
