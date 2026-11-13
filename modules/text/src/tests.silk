@@ -3,7 +3,8 @@
 //! hyphenation. `silk task browser chrome-text` checks positions in Chrome.
 import system { TextSystem }
 import fonts { TextStyle }
-import font_collection.lib { FontCollection, Family }
+import set { FaceRule, FaceState, UnicodeRange }
+import font_collection.lib { FontCollection, Family, Range }
 import layout.lib as Engine
 import layout.lib {
   Style,
@@ -43,6 +44,10 @@ const SANS: string = "modules/text/tests/fonts/NotoSans-Regular.subset.ttf"
 const ARABIC: string = "modules/text/tests/fonts/Amiri-Regular.subset.ttf"
 
 const JAPANESE: string = "modules/text/tests/fonts/MPLUS1p-Regular.subset.ttf"
+
+const SERIF: string = "modules/text/tests/fonts/NotoSerif-Regular.subset.ttf"
+
+const BOLD: string = "modules/text/tests/fonts/NotoSans-Bold.subset.ttf"
 
 effect fn workingDirectory() -> Bytes
   ! HostInputError | OutOfMemoryError
@@ -482,4 +487,179 @@ test effect fn opticalSizingUsesTheRequestedTextSize() -> ()
     | FragmentationError {
   let mut allocator = Allocator.systemAllocatorProvider()
   run opticalSizingBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Faces added at run time.
+
+effect fn families(names: &[string], size: f32) -> TextStyle
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut list = List<Family>.make()
+  let mut i: usize = 0
+  while i < names.length {
+    run list.append(run Family.named(String.utf8Bytes(names[i])))
+    i = i + 1
+  }
+  return TextStyle.make(move list, size)
+}
+
+/// The faces of the glyph runs `output` draws with, in order.
+effect fn runFaces(system: &TextSystem<'_>, output: &LayoutTree, out: &mut List<usize>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut found = List<TextFragment>.make()
+  let mut ys = List<f32>.make()
+  run texts(&output, &mut found, &mut ys)
+  let mut i: usize = 0
+  while i < found.length() {
+    run out.append(system.glyphRun(found.get(i).shapeKey).face)
+    i = i + 1
+  }
+}
+
+effect fn addedFontsJoinAfterStartBody() -> ()
+  ! AssertionError<'static>
+    | FileError
+    | HostInputError
+    | OutOfMemoryError
+    | InvalidNode
+    | TextError
+    | FragmentationError
+  ? &mut Allocator {
+  let collection = run fonts()
+  let mut system = TextSystem.make(&collection)
+  let before = run system.addStyle(run families(&["Noto Serif", "Noto Sans"], 16.0))
+  run Testing.expect(system.keyInfo(before).face == 0, "without Noto Serif, Noto Sans draws")
+  let generation = system.fonts.set.generation
+  let added = run system.fonts.set.addFont(run readFile(SERIF))
+  run Testing.expect(added == 1, "the file has one face")
+  run Testing.expect(system.fonts.set.generation != generation, "adding a face is a change")
+  run Testing.expect(system.fonts.set.faceCount() == 4, "the added face follows the installed ones")
+  let after = run system.addStyle(run families(&["Noto Serif", "Noto Sans"], 16.0))
+  run Testing.expect(system.keyInfo(after).face == 3, "a style made after the add uses it")
+  let output = run layout(&mut system, after, 1000.0, "Hello")
+  let mut faces = List<usize>.make()
+  run runFaces(&system, &output, &mut faces)
+  run Testing.expect(faces.length() > 0 && faces.get(0) == 3, "its glyphs come from the added face")
+}
+
+test effect fn addedFontsJoinAfterStart() -> ()
+  ! AssertionError<'static>
+    | FileError
+    | HostInputError
+    | OutOfMemoryError
+    | InvalidNode
+    | TextError
+    | FragmentationError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run addedFontsJoinAfterStartBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn declaredFacesLoadWhenTextNeedsThemBody() -> ()
+  ! AssertionError<'static>
+    | FileError
+    | HostInputError
+    | OutOfMemoryError
+    | InvalidNode
+    | TextError
+    | FragmentationError
+  ? &mut Allocator {
+  let collection = run fonts()
+  let mut system = TextSystem.make(&collection)
+  let mut latin = run FaceRule.make(String.utf8Bytes("Brand"), Range.point(400.0))
+  run latin.ranges.append(UnicodeRange { first: 0x20, last: 0x7E })
+  let declared = run system.fonts.set.declare(move latin)
+  let mut arabic = run FaceRule.make(String.utf8Bytes("Brand"), Range.point(400.0))
+  run arabic.ranges.append(UnicodeRange { first: 0x600, last: 0x6FF })
+  let unused = run system.fonts.set.declare(move arabic)
+  let style = run system.addStyle(run families(&["Brand", "Noto Sans"], 16.0))
+  run Testing.expect(system.keyInfo(style).face == 0, "while Brand loads, Noto Sans stands in")
+  let mut wanted = List<usize>.make()
+  run system.fonts.set.takeWanted(&mut wanted)
+  run Testing.expect(wanted.length() == 0, "making a style loads nothing")
+
+  let output = run layout(&mut system, style, 1000.0, "Hello")
+  let mut faces = List<usize>.make()
+  run runFaces(&system, &output, &mut faces)
+  run Testing.expect(faces.length() > 0 && faces.get(0) == 0, "the fallback draws meanwhile")
+  run system.fonts.set.takeWanted(&mut wanted)
+  run Testing.expect(wanted.length() == 1 && wanted.get(0) == declared, "Latin text asks for the Latin face only")
+  run Testing.expect(system.fonts.set.state(declared) == FaceState.Loading, "the face is loading")
+  run Testing.expect(system.fonts.set.state(unused) == FaceState.Unloaded, "the Arabic face is not asked for")
+  wanted.clear()
+  drop run layout(&mut system, style, 1000.0, "Hello again")
+  run system.fonts.set.takeWanted(&mut wanted)
+  run Testing.expect(wanted.length() == 0, "a face is asked for once")
+
+  run Testing.expect(run system.fonts.set.load(declared, run readFile(SERIF), 0), "the file reads")
+  run Testing.expect(system.fonts.set.state(declared) == FaceState.Ready, "the face is ready")
+  let swapped = run system.addStyle(run families(&["Brand", "Noto Sans"], 16.0))
+  run Testing.expect(system.keyInfo(swapped).face == 3, "laid out again, text uses the loaded face")
+  let again = run layout(&mut system, swapped, 1000.0, "Hello")
+  faces.clear()
+  run runFaces(&system, &again, &mut faces)
+  run Testing.expect(faces.length() > 0 && faces.get(0) == 3, "its glyphs come from the loaded face")
+}
+
+test effect fn declaredFacesLoadWhenTextNeedsThem() -> ()
+  ! AssertionError<'static>
+    | FileError
+    | HostInputError
+    | OutOfMemoryError
+    | InvalidNode
+    | TextError
+    | FragmentationError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run declaredFacesLoadWhenTextNeedsThemBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn unicodeRangeSplitsAFamilyBody() -> ()
+  ! AssertionError<'static>
+    | FileError
+    | HostInputError
+    | OutOfMemoryError
+    | InvalidNode
+    | TextError
+    | FragmentationError
+  ? &mut Allocator {
+  let collection = run fonts()
+  let mut system = TextSystem.make(&collection)
+  // Both subsets of one family: capitals from Noto Serif, the rest from Noto Sans Bold.
+  let mut capitals = run FaceRule.make(String.utf8Bytes("Split"), Range.point(400.0))
+  run capitals.ranges.append(UnicodeRange { first: 0x41, last: 0x5A })
+  let upper = run system.fonts.set.declare(move capitals)
+  let mut rest = run FaceRule.make(String.utf8Bytes("Split"), Range.point(400.0))
+  run rest.ranges.append(UnicodeRange { first: 0x20, last: 0x40 })
+  run rest.ranges.append(UnicodeRange { first: 0x5B, last: 0x7E })
+  let lower = run system.fonts.set.declare(move rest)
+  run Testing.expect(run system.fonts.set.load(upper, run readFile(SERIF), 0), "capitals load")
+  run Testing.expect(run system.fonts.set.load(lower, run readFile(BOLD), 0), "the rest loads")
+  let style = run system.addStyle(run families(&["Split", "Noto Sans"], 16.0))
+  run Testing.expect(system.keyInfo(style).face == 4, "the face that covers a space is the first available font")
+  let output = run layout(&mut system, style, 1000.0, "Ab")
+  let mut faces = List<usize>.make()
+  run runFaces(&system, &output, &mut faces)
+  let mut serif = false
+  let mut bold = false
+  let mut i: usize = 0
+  while i < faces.length() {
+    serif = serif || faces.get(i) == 3
+    bold = bold || faces.get(i) == 4
+    i = i + 1
+  }
+  run Testing.expect(serif && bold, "each character uses the subset whose range covers it")
+  run Testing.expect(system.fonts.set.faceCount() == 5, "both subsets are in the set")
+  run Testing.expect(!system.fonts.set.hasWanted(), "nothing else is asked for")
+}
+
+test effect fn unicodeRangeSplitsAFamily() -> ()
+  ! AssertionError<'static>
+    | FileError
+    | HostInputError
+    | OutOfMemoryError
+    | InvalidNode
+    | TextError
+    | FragmentationError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run unicodeRangeSplitsAFamilyBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }
