@@ -48,6 +48,16 @@ mount(createBox({ width: 400, height: 300 }, button));
   is, as on the web. Events carry the DOM members of their kind (`clientX`, `button`,
   `detail`, `shiftKey`, `key`, `code`, `deltaY`, `inputType`). An `input` event has the new
   `value`.
+- **Rich inputs.** `createRichInput(style)` (or `createNode("richinput")`) edits a document
+  of styled text and inline atoms: `{ text, marks: [{ start, end, marks: ["bold"] }], atoms:
+  [{ kind, label, data }] }`. An atom (a mention, a chip) sits in `text` as one `OBJECT`
+  character, so the caret steps over it and Backspace deletes it whole. `defineMark(name,
+  style)` and `defineAtom(kind, style)` say what they look like; `document` reads and replaces
+  the document; `format(name, on)` and `toggleMark(name)` mark the selection, or the text typed
+  next at a caret; `insertAtom(start, end, atom)` replaces a range with an atom (a `@` trigger
+  turning into a mention). Offsets are string indices. An `input` event also has `document`,
+  and `activeMarks` holds the marks typed text gets. Typing takes the marks before the caret;
+  undo, IME and copy (which writes atom labels) work as in a plain input.
 - **Attributes.** `setAttribute(name, value)` for the tree's attributes (`tabIndex`,
   `disabled`, `label`, `testId`, `placeholder`, `multiline`, `readOnly`, `checked`,
   `selected`, `expanded`, `focusTrap`, `href`, `cursor`, `transition`). A name the tree does
@@ -106,7 +116,9 @@ createRoot().render(<Counter />);
   receive the `@silk/ui` event. Every other prop is a tree attribute (`tabIndex`, `testId`,
   `label`, `disabled`, `placeholder`), and `role` and `aria-*` work as in React DOM.
 - **Inputs.** `value` on `<input>` is controlled as in React DOM: the field shows what the
-  component keeps, whatever was typed.
+  component keeps, whatever was typed. `<richinput>` takes `marks` and `atoms` (name to
+  style), and `document` controlled the same way (`defaultDocument` for an uncontrolled one):
+  keep `event.document` from `onInput`.
 - **Timing.** `root.render` commits before it returns, so the first frame of a window has
   the content. A state change in a click, key or input listener commits before the host
   applies the mutations, so the next frame shows it. Other updates go through React's

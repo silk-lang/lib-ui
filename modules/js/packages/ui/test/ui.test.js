@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { installMock } from "./mock.js";
 
 const mock = installMock();
-const { createBox, createText, createInput, createIcon, mount, nodeById, setErrorHandler, parseMarkdown, defineKeyframes } = await import("../src/index.js");
+const { createBox, createText, createInput, createIcon, createRichInput, createNode, OBJECT, mount, nodeById, setErrorHandler, parseMarkdown, defineKeyframes } = await import("../src/index.js");
 
 test("nodes queue their mutations", () => {
   mock.take();
@@ -271,4 +271,43 @@ test("parseMarkdown turns GFM on unless told otherwise", () => {
   parseMarkdown("x", { gfm: false, footnotes: true });
   parseMarkdown("x", { tables: false, alerts: true });
   assert.deepEqual(mock.take().map((call) => call[2]), [15, 16, 78]);
+});
+
+test("a rich input sends its document with UTF-8 offsets and names its marks", () => {
+  const input = createRichInput();
+  assert.equal(createNode("richinput").kind, "input");
+  mock.take();
+  input.defineMark("bold", { fontWeight: 700 });
+  input.defineMark("code", { fontFamily: "monospace", backgroundColor: "#eee" });
+  input.defineAtom("mention", { paddingLeft: 4, borderRadius: 4 });
+  const text = "héllo " + OBJECT + " x";
+  input.document = { text, marks: [{ start: 0, end: 5, marks: ["bold", "code"] }], atoms: [{ kind: "mention", label: "@ada", data: "u1" }] };
+  const calls = mock.take();
+  assert.deepEqual(calls[0], ["mark", input.id, 0, "font-weight:700;"]);
+  assert.equal(calls[1][2], 1);
+  assert.deepEqual(calls[2], ["atomStyle", input.id, 0, "padding-left:4px;border-radius:4px;"]);
+  assert.deepEqual(calls[3], ["richText", input.id, text, "0,6,3;", "0\0@ada\0u1\0"]);
+  assert.equal(input.value, text);
+
+  // An input record from the tree comes back in string indices and mark names.
+  const marks = "0,6,1;";
+  const atoms = "0\0@ada\0u1\0";
+  const after = text + "!";
+  let seen = null;
+  input.addEventListener("input", (event) => (seen = event));
+  globalThis.__ui.dispatch(11, input.id, 13, 13, 0, 1, 0, after, "insertText", marks, atoms);
+  assert.equal(seen.inputType, "insertText");
+  assert.deepEqual(input.document, { text: after, marks: [{ start: 0, end: 5, marks: ["bold"] }], atoms: [{ kind: "mention", label: "@ada", data: "u1" }] });
+  assert.deepEqual(input.activeMarks, ["bold"]);
+  assert.equal(input.selectionStart, 10);
+
+  mock.take();
+  input.toggleMark("bold");
+  input.insertAtom(8, 10, { kind: "mention", label: "@bo", data: "u2" });
+  input.setSelectionRange(1, 2);
+  assert.deepEqual(mock.take(), [
+    ["format", input.id, 0, false],
+    ["insertAtom", input.id, 11, 13, "0\0@bo\0u2\0"],
+    ["select", input.id, 1, 3],
+  ]);
 });

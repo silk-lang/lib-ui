@@ -36,6 +36,9 @@ pub struct Piece {
   /// after it starts the next line.
   pub lineBreak: bool,
   pub rtl: bool,
+  /// What the offsets are shifted by from the fragment's own text: a rich input's run starts
+  /// there in the display text. Glyph clusters are in the fragment's own text.
+  pub base: usize,
 }
 
 impl Copy for Piece {}
@@ -102,6 +105,7 @@ pub fn pieceOf(output: &LayoutTree, text: &TextSystem<'_>, index: usize) -> Piec
     } else {
       data.bidiLevel % 2 == 1
     },
+    base: 0,
   }
 }
 
@@ -147,9 +151,117 @@ pub effect fn collect(
   }
 }
 
+/// One stretch of a rich input's display text (`rich.Run`): its css-layout node, its text
+/// node, and where it starts.
+pub struct RunSource {
+  pub css: usize,
+  pub text: usize,
+  pub start: usize,
+  pub end: usize,
+  pub atom: bool,
+}
+
+impl Copy for RunSource {}
+
+/// The pieces of a rich input's runs inside fragment `root`, in fragment order, with offsets
+/// in the display text. An atom is one piece over its inline block, with no glyphs.
+pub effect fn collectRuns(
+  output: &LayoutTree,
+  text: &TextSystem<'_>,
+  root: usize,
+  runs: &[RunSource],
+  out: &mut List<Piece>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  if root == NO_INDEX || root >= output.fragments.values.length() {
+    return ()
+  }
+  let values = output.fragments.values.asSlice()
+  let mut stack = List<usize>.make()
+  run stack.append(root)
+  while stack.length() != 0 {
+    let last = stack.length() - 1
+    let index = stack.get(last)
+    stack.truncate(last)
+    let f = values[index]
+    let mut descend = true
+    if f.kind == FragmentKind.Text && f.textData != NO_INDEX {
+      let mut r: usize = 0
+      while r < runs.length {
+        if !runs[r].atom && runs[r].text == f.source {
+          let mut piece = pieceOf(output, text, index)
+          piece.start = piece.start + runs[r].start
+          piece.end = piece.end + runs[r].start
+          piece.base = runs[r].start
+          run out.append(piece)
+          break
+        }
+        r = r + 1
+      }
+    } else if f.kind == FragmentKind.Box && index != root {
+      let mut r: usize = 0
+      while r < runs.length {
+        if runs[r].atom && runs[r].css == f.source {
+          let line = lineOf(output, index)
+          let lineBox = values[line]
+          run out.append(
+            Piece {
+              start: runs[r].start,
+              end: runs[r].end,
+              x0: f.worldLocation.x,
+              x1: f.worldLocation.x + f.size.width,
+              top: f.worldLocation.y,
+              bottom: f.worldLocation.y + f.size.height,
+              line: line,
+              lineTop: lineBox.worldLocation.y,
+              lineBottom: lineBox.worldLocation.y + lineBox.size.height,
+              shapeKey: 0,
+              glyphs: false,
+              lineBreak: false,
+              rtl: false,
+              base: runs[r].start,
+            },
+          )
+          descend = false
+          break
+        }
+        r = r + 1
+      }
+    }
+    if descend {
+      // Children in reverse so they pop in order.
+      let mut children = List<usize>.make()
+      let mut child = f.firstChild
+      while child != NO_INDEX {
+        run children.append(child)
+        child = values[child].nextSibling
+      }
+      let mut i = children.length()
+      while i > 0 {
+        i = i - 1
+        run stack.append(children.get(i))
+      }
+    }
+  }
+}
+
 /// The x of a caret at offset `d` of piece `p` (clamped to the piece). Inside a cluster (a
 /// ligature) the position is interpolated by bytes.
 pub fn caretX(text: &TextSystem<'_>, p: &Piece, d: usize) -> f32 {
+  if p.base != 0 && p.glyphs {
+    let mut local = p.*
+    local.start = p.start - p.base
+    local.end = p.end - p.base
+    local.base = 0
+    let at = if d > p.base {
+      d - p.base
+    } else {
+      0
+    }
+    return caretX(text, &local, at)
+  }
   let startEdge = if p.rtl {
     p.x1
   } else {

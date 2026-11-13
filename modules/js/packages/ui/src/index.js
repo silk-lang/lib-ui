@@ -497,6 +497,186 @@ export class Icon extends Node {
   }
 }
 
+// Offsets cross the bridge as UTF-8 bytes; a rich input speaks JavaScript string indices.
+const ASCII = /^[\x00-\x7f]*$/;
+
+function byteOf(text, index) {
+  if (ASCII.test(text)) return Math.min(index, text.length);
+  let bytes = 0;
+  for (let i = 0; i < index && i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (code < 0x80) bytes += 1;
+    else if (code < 0x800) bytes += 2;
+    else if (code >= 0xd800 && code < 0xdc00 && i + 1 < text.length) {
+      bytes += 4;
+      i++;
+    } else bytes += 3;
+  }
+  return bytes;
+}
+
+function indexOf(text, byte) {
+  if (ASCII.test(text)) return Math.min(byte, text.length);
+  let bytes = 0;
+  let i = 0;
+  while (i < text.length && bytes < byte) {
+    const code = text.charCodeAt(i);
+    if (code < 0x80) bytes += 1;
+    else if (code < 0x800) bytes += 2;
+    else if (code >= 0xd800 && code < 0xdc00 && i + 1 < text.length) {
+      bytes += 4;
+      i++;
+    } else bytes += 3;
+    i++;
+  }
+  return i;
+}
+
+function cssTextOf(properties) {
+  let css = "";
+  for (const name of Object.keys(properties ?? {})) {
+    const value = properties[name];
+    if (value === null || value === undefined || value === "") continue;
+    css += cssName(name) + ":" + cssValue(name, value) + ";";
+  }
+  return css;
+}
+
+/** Where an atom sits in a rich input's text: U+FFFC OBJECT REPLACEMENT CHARACTER. */
+export const OBJECT = "\ufffc";
+
+/**
+ * A rich text field: styled runs (marks) and inline atoms (mentions, chips) over the text the
+ * user edits, with the caret, selection, undo and input method composition of `Input`.
+ *
+ * Its `document` is `{ text, marks, atoms }`. Each atom sits in `text` as one `OBJECT`
+ * character, so the caret steps over it as one unit; `atoms` lists them in text order as
+ * `{ kind, label, data }`. `marks` lists `{ start, end, marks }` spans with mark names.
+ * Offsets here, in `selectionStart` and in `insertAtom`, are string indices.
+ */
+export class RichInput extends Input {
+  #markBits = new Map();
+  #markNames = [];
+  #kinds = new Map();
+  #kindNames = [];
+  #document = { text: "", marks: [], atoms: [] };
+
+  constructor() {
+    super();
+    /** The marks text typed at the caret gets, as of the last change. */
+    this.activeMarks = [];
+  }
+
+  #bit(name) {
+    let bit = this.#markBits.get(name);
+    if (bit === undefined) {
+      bit = this.#markNames.length;
+      if (bit >= 32) throw new RangeError("a rich input has at most 32 marks");
+      this.#markBits.set(name, bit);
+      this.#markNames.push(name);
+    }
+    return bit;
+  }
+
+  #kind(name) {
+    let kind = this.#kinds.get(name);
+    if (kind === undefined) {
+      kind = this.#kindNames.length;
+      this.#kinds.set(name, kind);
+      this.#kindNames.push(name);
+    }
+    return kind;
+  }
+
+  #names(bits) {
+    const names = [];
+    for (let bit = 0; bit < this.#markNames.length; bit++) if (bits & (1 << bit)) names.push(this.#markNames[bit]);
+    return names;
+  }
+
+  /** What text with mark `name` looks like: properties as `style.set` takes them. */
+  defineMark(name, style) {
+    native.mark(this.id, this.#bit(name), cssTextOf(style));
+  }
+
+  /** What atoms of `kind` look like: the inline block holding the label. */
+  defineAtom(kind, style) {
+    native.atomStyle(this.id, this.#kind(kind), cssTextOf(style));
+  }
+
+  get document() {
+    return this.#document;
+  }
+
+  /** Replaces the document. The caret goes to the end and the undo history is forgotten. */
+  set document(document) {
+    const text = String(document?.text ?? "");
+    const marks = (document?.marks ?? []).map((span) => ({ start: span.start, end: span.end, marks: [...span.marks] }));
+    const atoms = (document?.atoms ?? []).map((atom) => ({ kind: atom.kind, label: String(atom.label ?? ""), data: atom.data ?? "" }));
+    this.#document = { text, marks, atoms };
+    let packedMarks = "";
+    for (const span of marks) {
+      let bits = 0;
+      for (const name of span.marks) bits |= 1 << this.#bit(name);
+      packedMarks += byteOf(text, span.start) + "," + byteOf(text, span.end) + "," + (bits >>> 0) + ";";
+    }
+    let packedAtoms = "";
+    for (const atom of atoms) packedAtoms += this.#packAtom(atom);
+    native.richText(this.id, text, packedMarks, packedAtoms);
+    super._changed(text, text.length, text.length);
+  }
+
+  #packAtom(atom) {
+    return this.#kind(atom.kind) + "\0" + String(atom.label ?? "") + "\0" + String(atom.data ?? "") + "\0";
+  }
+
+  /** Turns mark `name` on or off over the selection, or for the text typed next. */
+  format(name, on = true) {
+    native.format(this.id, this.#bit(name), !!on);
+  }
+
+  /** Turns mark `name` off where the caret's text has it, on where it does not. */
+  toggleMark(name) {
+    this.format(name, !this.activeMarks.includes(name));
+  }
+
+  /** Replaces the text from `start` to `end` with `atom` (`{ kind, label, data }`). */
+  insertAtom(start, end, atom) {
+    const text = this.#document.text;
+    native.insertAtom(this.id, byteOf(text, start), byteOf(text, end), this.#packAtom(atom));
+  }
+
+  setSelectionRange(anchor, focus) {
+    const text = this.#document.text;
+    native.select(this.id, byteOf(text, anchor), byteOf(text, focus));
+  }
+
+  _changed(value, anchor, focus, marks, atoms, active) {
+    super._changed(value, indexOf(value, anchor), indexOf(value, focus));
+    if (marks === undefined) return;
+    const spans = [];
+    for (const part of String(marks).split(";")) {
+      if (!part) continue;
+      const [start, end, bits] = part.split(",").map(Number);
+      spans.push({ start: indexOf(value, start), end: indexOf(value, end), marks: this.#names(bits) });
+    }
+    const list = [];
+    const fields = String(atoms ?? "").split("\0");
+    for (let i = 0; i + 2 < fields.length; i += 3) {
+      list.push({ kind: this.#kindNames[Number(fields[i])] ?? Number(fields[i]), label: fields[i + 1], data: fields[i + 2] });
+    }
+    this.#document = { text: value, marks: spans, atoms: list };
+    this.activeMarks = this.#names(active ?? 0);
+  }
+}
+
+/** A rich text field with `style` as its base look. */
+export function createRichInput(style) {
+  const input = new RichInput();
+  if (style) input.style.set(style);
+  return input;
+}
+
 function forget(node) {
   nodes.delete(node.id);
   node._forget?.();
@@ -508,6 +688,7 @@ function forget(node) {
 }
 
 export function createNode(kind) {
+  if (kind === "richinput") return new RichInput();
   if (!(kind in KINDS)) throw new TypeError("the tree has no node kind '" + kind + "'");
   if (kind === "text") return new Text();
   if (kind === "input") return new Input();
@@ -652,7 +833,7 @@ export class Event {
   }
 }
 
-function fill(event, kind, a, b, modifiers, d, e, first, second) {
+function fill(event, kind, a, b, modifiers, d, e, first, second, third, fourth) {
   if (kind <= 6 || kind === 14) {
     event.clientX = event.x = a;
     event.clientY = event.y = b;
@@ -676,7 +857,8 @@ function fill(event, kind, a, b, modifiers, d, e, first, second) {
   } else if (kind === 11) {
     event.value = first;
     event.inputType = second;
-    event.target._changed?.(first, a, b);
+    event.target._changed?.(first, a, b, third, fourth, d);
+    if (event.target instanceof RichInput) event.document = event.target.document;
   } else if (kind === 12) {
     event.scrollLeft = a;
     event.scrollTop = b;
@@ -724,11 +906,11 @@ export function dispatchEvent(event) {
 }
 
 // The host calls this for every event record, before the tree runs the default action.
-native.dispatch = function (kind, id, a, b, modifiers, d, e, first, second) {
+native.dispatch = function (kind, id, a, b, modifiers, d, e, first, second, third, fourth) {
   const target = nodes.get(id);
   if (!target) return false;
   const event = new Event(TYPES[kind], target);
-  fill(event, kind, a, b, modifiers, d, e, first, second);
+  fill(event, kind, a, b, modifiers, d, e, first, second, third, fourth);
   dispatchEvent(event);
   if (kind === CLICK && !event.defaultPrevented) follow(target);
   return event.defaultPrevented;
