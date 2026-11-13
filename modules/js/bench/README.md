@@ -43,10 +43,13 @@ CI.
   **system libs** is what Tauri needs installed on top (WebKitGTK and JavaScriptCore).
 - **first frame**: from `spawn` to the app's `bench: first frame` line, which it prints two
   animation frames after its first render, so the frame holding it has been drawn. The
-  cold run comes first, after the page cache is dropped (all of it when the script runs as
-  root, so the system libraries and the GPU driver come from disk too, otherwise only the
-  app's files); warm is the median of the other runs. Mesa's shader cache stays on disk, so
-  cold is a second launch after a reboot, not the very first one. For the tree windows, **presented** is when the window host
+  cold runs come first (`--cold-runs`, 5 by default), each after the page cache is dropped
+  (all of it when the script runs as root, so the system libraries and the GPU driver come
+  from disk too, otherwise only the app's files); warm is the median of the other runs.
+  Mesa's shader cache and the window host's GPU cache stay on disk, so cold is a second
+  launch after a reboot. **first launch** is cold with the window host's GPU cache empty
+  (`SILK_UI_GPU_CACHE` set to a new directory), as the very first run of an app is; only
+  the tree windows have that row. For the tree windows, **presented** is when the window host
   says frame 1 is on screen (`SILK_UI_TRACE_FRAMES=1`), which needs no JavaScript.
 - **click to frame**: an XTest click ([xinput.py](xinput.py)) to the `bench: click N` line,
   again two animation frames after the commit; median of 10. **click to presented** is the
@@ -129,7 +132,8 @@ Memory (MB, all processes of the app) and idle CPU
   Vulkan drivers the loader opens and does not use (nouveau, radeon, intel, asahi and
   others) about 12 MB, and our binary's code 30 MB of clean, shared pages. The JavaScript
   side (engine, React, the app) costs about 20 MB.
-- **Startup.** A warm first frame takes 245 ms, against Electron's 168 ms and Tauri's
+- **Startup** (see [Startup after lib-ui#66](#startup-after-lib-ui66) for the current numbers).
+  A warm first frame took 245 ms, against Electron's 168 ms and Tauri's
   808 ms. Of the 245 ms, 200 ms is creating the GPU device (lavapipe), which happens after
   the window opens and before anything is drawn; the JavaScript adds about 15 ms (window
   open at 29 ms against 15 ms for the native counter), and ui-js without a window has its
@@ -144,6 +148,35 @@ Memory (MB, all processes of the app) and idle CPU
   each (184 MB after, from 154 MB), against 17 KB in Electron.
 - **Idle CPU** is zero for everything but Tauri (0.2 % of a core).
 
+### Startup after lib-ui#66
+
+The window host now starts the GPU (device and pipelines) on its render thread before the
+client runs and the window opens, the renderer compiles its pipelines side by side and a
+frame waits only for the ones it draws with (lib-graphics#4), and Dawn keeps translated
+shaders and pipeline caches on disk (lib-native#5). Before, 190 ms of a tree window's
+startup was the renderer's 15 pipelines compiled one after another after the window opened.
+
+Measured 2026-11-13T16:32Z on Intel(R) Xeon(R) Processor @ 2.10GHz (4 cores), lavapipe,
+`node run.mjs --only ui-js,electron,tree-window --runs 5 --cold-runs 5`, medians.
+
+|  | first launch first frame | cold first frame | warm first frame | click to frame | click to presented | 1000 rows to frame |
+|---|---|---|---|---|---|---|
+| ui-js (SilkJS + React) | 307 | 289 | 101 | 33 | 18 | 119 |
+| Electron + React DOM |  | 434 | 208 | 16 |  | 24 |
+| Native tree counter (no JS) | 272 | 220 | 101 |  |  |  |
+
+|  | window host started | window open | GPU device ready | frame 1 submitted | frame 1 presented |
+|---|---|---|---|---|---|
+| ui-js (SilkJS + React) | 15 | 49 | 71 | 71 | 101 |
+| Native tree counter (no JS) | 18 | 18 | 66 | 68 | 101 |
+
+Electron was slower on this machine than in the run above (208 against 168 warm). Warm, the
+JavaScript now runs while the GPU starts, so ui-js and the native counter take the same
+time; what is left is lavapipe: about 30 ms for the adapter (the Vulkan loader and libLLVM),
+15 ms for the device and 25 ms for the pipelines the first frame draws with. Cold, most of
+the difference is reading the driver (libLLVM is about 100 MB) back from disk. On a machine
+with a GPU both should be much smaller; that is not measured here.
+
 ### What could shrink
 
 - **Intl and Temporal.** The realm does not install them, but their data is linked: the
@@ -155,8 +188,8 @@ Memory (MB, all processes of the app) and idle CPU
 - **Devtools.** The demo host links the inspector server (`startInspector`); a production
   build should not.
 - **Optimizing for size**: 3.2 MB here, with no measured cost yet.
-- **Startup**: create the GPU device while the JavaScript runs (only the surface needs the
-  window), instead of after; skip `gsettings` (lib-native runs it through `popen` at
+- **Startup**: start the GPU from `main`, before fonts and the engine load (about 15 ms
+  before the window host starts now); skip `gsettings` (lib-native runs it through `popen` at
   window start for the dark mode setting, about 5 ms).
 - **JavaScript speed and memory per node** are the gap on the 1,000 rows: the interpreter
   and bridge for speed, 30 KB per row for memory.
