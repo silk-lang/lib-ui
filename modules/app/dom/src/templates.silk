@@ -1,0 +1,388 @@
+//! Repeated subtrees: the rows of a list are the same nodes with other text. Making each node
+//! of each row costs the page a call per node and attribute; a copy of a row it already made
+//! (`cloneNode`) costs one. [`Templates`] watches the mutations of a batch as `Dom` writes
+//! them, finds the subtrees a view creates whole, and for one whose shape it has seen before
+//! writes `OP_CLONE` in place of the subtree's mutations.
+//!
+//! A subtree is the mutations from a `Create` to the `InsertBefore` that places the node it
+//! made. Its shape is those mutations as they are on the wire, without the ids and without the
+//! text of `SetText`: the diff hands ids out in document order and writes a node's attributes
+//! before its children, so the ids of a copy follow from the first one, and the texts follow
+//! the `OP_CLONE`. A subtree with anything a copied element does not carry (a state style, an
+//! input, a canvas, a layout listener, any attribute but its element and class) is written as
+//! it is.
+//!
+//! The second subtree of a shape becomes its template (`OP_TEMPLATE`); the ones after it are
+//! copies.
+import wire { OP_CLONE, OP_TEMPLATE, word, text, byte }
+import ui_protocol.mutation { Mutation, NodeKind, StyleState, Attribute, LISTEN_LAYOUT }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+
+/// The fewest nodes of a subtree worth a copy: below it, making the nodes costs no more.
+const FEWEST: u32 = 4
+
+/// The most nodes of a template: the page keeps a copy of each.
+const MOST: u32 = 4096
+
+/// How many templates the page keeps. A new shape past it takes the place of the oldest.
+const SHAPES: usize = 32
+
+/// The size of the table of shapes seen once.
+const SEEN: usize = 64
+
+const SHAPE_OPEN: u8 = 1
+
+const SHAPE_TEXT: u8 = 7
+
+const SHAPE_CLOSE: u8 = 255
+
+/// A node whose `Create` was written and whose `InsertBefore` was not yet.
+struct Open {
+  id: u32,
+  text: bool,
+  /// Where its shape starts in `Templates.shape`, its mutations in the output, and in the
+  /// batch.
+  shapeStart: usize,
+  outStart: usize,
+  first: usize,
+  /// False once something a copy would not carry happened in the subtree.
+  whole: bool,
+}
+
+impl Copy for Open {}
+
+struct Template {
+  hash: u64,
+  shape: Bytes,
+  /// How many nodes it has, or 0 for a free slot.
+  nodes: u32,
+  /// Where its `OP_TEMPLATE` is in the output of this batch, or `usize.MAX` once the batch
+  /// that defined it is over.
+  definedAt: usize,
+}
+
+pub struct Templates {
+  open: List<Open>,
+  /// The shape of the outermost open subtree so far; an inner one's is its tail.
+  shape: Bytes,
+  /// The id of the last `Create`.
+  last: u32,
+  known: List<Template>,
+  next: usize,
+  /// How many templates this batch defined.
+  defined: usize,
+  seen: List<u64>,
+}
+
+fn hashOf(bytes: &[u8]) -> u64 {
+  let mut hash: u64 = 0xCBF29CE484222325
+  let mut i: usize = 0
+  while i < bytes.length {
+    hash = u64.wrappingMultiply(u64.bitXor(hash, u8.toU64(bytes[i])), 0x100000001B3)
+    i = i + 1
+  }
+  // 0 marks an empty slot of the seen table.
+  return if hash == 0 {
+    1
+  } else {
+    hash
+  }
+}
+
+fn same(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < a.length {
+    if a[i] != b[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+impl Templates {
+  pub fn make() -> Templates {
+    return Templates {
+      open: List<Open>.make(),
+      shape: Bytes.make(),
+      last: 0,
+      known: List<Template>.make(),
+      next: 0,
+      defined: 0,
+      seen: List<u64>.make(),
+    }
+  }
+
+  /// The batch is over: nothing is open, and what it defined the page now has.
+  pub fn endBatch(self: &mut Self) -> () {
+    self.open.clear()
+    self.shape.clear()
+    if self.defined != 0 {
+      let known = self.known.asMutSlice()
+      let mut i: usize = 0
+      while i < known.length {
+        let template = &mut known[i]
+        template.definedAt = usize.MAX
+        i = i + 1
+      }
+      self.defined = 0
+    }
+  }
+
+  /// No open subtree can be a template or a copy any more.
+  fn spoil(self: &mut Self) -> () {
+    let open = self.open.asMutSlice()
+    let mut i: usize = 0
+    while i < open.length {
+      let entry = &mut open[i]
+      entry.whole = false
+      i = i + 1
+    }
+  }
+
+  /// Whether node `id` is the innermost open one, so what is written about it is part of
+  /// its shape.
+  fn innermost(self: &Self, id: u32) -> bool {
+    let count = self.open.length()
+    return count != 0 && self.open.asSlice()[count - 1].id == id
+  }
+
+  /// Before `batch[at]` is written to `out`: when it places the innermost open node, that
+  /// node's subtree is complete, and becomes a copy, a template or a shape seen once.
+  pub effect fn placing(self: &mut Self, out: &mut Bytes, batch: &[Mutation], at: usize) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let count = self.open.length()
+    if count == 0 {
+      return ()
+    }
+    match &batch[at] {
+      Mutation.InsertBefore { parent, child, before } => {
+        let entry = self.open.asSlice()[count - 1]
+        if child != entry.id {
+          // A node from elsewhere moves into the open subtree, or the reverse.
+          self.spoil()
+          return ()
+        }
+        self.open.truncate(count - 1)
+        let appended = match before {
+          Option<u32>.None => true
+          Option<u32>.Some { .. } => false
+        }
+        if count > 1 && (self.open.asSlice()[count - 2].id != parent || !appended) {
+          // Placed somewhere other than last in the node that was open around it: the
+          // outer shapes do not describe that.
+          self.spoil()
+        }
+        if entry.whole {
+          // Whole, so every `Create` since its own took the next id.
+          let nodes = self.last - entry.id + 1
+          if nodes >= FEWEST && nodes <= MOST {
+            run self.complete(&mut out, batch, entry, at, nodes)
+          }
+        }
+        if count == 1 {
+          self.shape.clear()
+        } else {
+          run byte(&mut self.shape, SHAPE_CLOSE)
+        }
+      }
+      _ => {}
+    }
+  }
+
+  /// The subtree of `entry` is whole and ends before `batch[end]`.
+  effect fn complete(
+    self: &mut Self,
+    out: &mut Bytes,
+    batch: &[Mutation],
+    entry: Open,
+    end: usize,
+    nodes: u32,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let length = self.shape.length() - entry.shapeStart
+    let hash = hashOf(Slice.view(self.shape.asSlice(), entry.shapeStart, length))
+    let mut found = usize.MAX
+    let known = self.known.asSlice()
+    let mut k: usize = 0
+    while k < known.length {
+      if known[k].nodes == nodes && known[k].hash == hash
+        && same(known[k].shape.asSlice(), Slice.view(self.shape.asSlice(), entry.shapeStart, length)) {
+        found = k
+        break
+      }
+      k = k + 1
+    }
+    if found != usize.MAX {
+      // A copy: its mutations leave the output, and with them any template they defined.
+      if self.defined != 0 {
+        self.undefine(entry.outStart)
+      }
+      out.truncate(entry.outStart)
+      run byte(&mut out, OP_CLONE)
+      run word(&mut out, usize.toU32(found))
+      run word(&mut out, entry.id)
+      let countAt = out.length()
+      run word(&mut out, 0)
+      let mut texts: u32 = 0
+      let mut i = entry.first
+      while i < end {
+        match &batch[i] {
+          Mutation.SetText { id, value } => {
+            run word(&mut out, id - entry.id)
+            run text(&mut out, value.ownedUtf8Bytes())
+            texts = texts + 1
+          }
+          _ => {}
+        }
+        i = i + 1
+      }
+      let bytes = out.asMutSlice()
+      bytes[countAt] = u32.toU8(u32.bitAnd(texts, 255))
+      bytes[countAt + 1] = u32.toU8(u32.bitAnd(u32.shiftRight(texts, 8), 255))
+      bytes[countAt + 2] = u32.toU8(u32.bitAnd(u32.shiftRight(texts, 16), 255))
+      bytes[countAt + 3] = u32.toU8(u32.shiftRight(texts, 24))
+      return ()
+    }
+    if self.seen.length() == 0 {
+      run self.seen.appendRepeated(0, SEEN)
+    }
+    let slot = u64.toUsize(hash % usize.toU64(SEEN))
+    if self.seen.get(slot) != hash {
+      self.seen.set(slot, hash)
+      return ()
+    }
+    // The second of its shape: the page keeps a copy of it.
+    let shape = run Bytes.copy(Slice.view(self.shape.asSlice(), entry.shapeStart, length))
+    let template = Template { hash: hash, shape: move shape, nodes: nodes, definedAt: out.length() }
+    let mut index = self.known.length()
+    if index < SHAPES {
+      run self.known.append(move template)
+    } else {
+      index = self.next
+      self.next = (self.next + 1) % SHAPES
+      self.known.set(index, move template)
+    }
+    self.defined = self.defined + 1
+    run byte(&mut out, OP_TEMPLATE)
+    run word(&mut out, usize.toU32(index))
+    run word(&mut out, entry.id)
+    run word(&mut out, nodes)
+  }
+
+  /// Forgets the templates this batch defined at or after `from` of the output: what is
+  /// written there is about to be dropped.
+  fn undefine(self: &mut Self, from: usize) -> () {
+    let known = self.known.asMutSlice()
+    let mut i: usize = 0
+    while i < known.length {
+      let template = &mut known[i]
+      if template.definedAt != usize.MAX && template.definedAt >= from {
+        template.nodes = 0
+        template.hash = 0
+        template.definedAt = usize.MAX
+        self.defined = self.defined - 1
+      }
+      i = i + 1
+    }
+  }
+
+  /// After `mutation`, which is `batch[index]`, was written to `out` from byte `at` on (or was
+  /// not written at all).
+  pub effect fn wrote(self: &mut Self, out: &Bytes, at: usize, mutation: &Mutation, index: usize) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match &mutation.* {
+      Mutation.Create { id, kind } => {
+        if self.open.length() != 0 && id != self.last + 1 {
+          self.spoil()
+        }
+        self.last = id
+        let whole = out.length() != at && (kind == NodeKind.Box || kind == NodeKind.Text)
+        run self.open.append(
+          Open {
+            id: id,
+            text: kind == NodeKind.Text,
+            shapeStart: self.shape.length(),
+            outStart: at,
+            first: index,
+            whole: whole,
+          },
+        )
+        run byte(&mut self.shape, SHAPE_OPEN)
+        run byte(
+          &mut self.shape,
+          if kind == NodeKind.Text {
+            1
+          } else {
+            0
+          },
+        )
+      }
+      Mutation.InsertBefore { .. } => {
+        // `placing` saw it.
+      }
+      Mutation.SetText { id, .. } => {
+        let count = self.open.length()
+        if count == 0 {
+          return ()
+        }
+        if self.innermost(id) && self.open.asSlice()[count - 1].text {
+          run byte(&mut self.shape, SHAPE_TEXT)
+        } else {
+          self.spoil()
+        }
+      }
+      Mutation.SetListeners { id, flags } => {
+        run self.part(&out, at, id, u32.bitAnd(flags, LISTEN_LAYOUT) == 0)
+      }
+      Mutation.SetStyle { id, state, .. } => {
+        run self.part(&out, at, id, state == StyleState.Base)
+      }
+      Mutation.SetAttribute { id, attribute } => {
+        let carried = match &attribute {
+          Attribute.Element { .. } => true
+          Attribute.ClassName { .. } => true
+          _ => false
+        }
+        run self.part(&out, at, id, carried)
+      }
+      _ => {
+        if self.open.length() != 0 {
+          self.spoil()
+        }
+      }
+    }
+  }
+
+  /// A mutation about node `id` written from byte `at` of `out` on: part of the innermost
+  /// open node's shape when a copy carries it (`carried`), as its bytes without the id.
+  effect fn part(self: &mut Self, out: &Bytes, at: usize, id: u32, carried: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.open.length() == 0 {
+      return ()
+    }
+    let written = out.asSlice()
+    if !carried || !self.innermost(id) || written.length < at + 5 {
+      self.spoil()
+      return ()
+    }
+    run byte(&mut self.shape, written[at])
+    run self.shape.append(Slice.view(written, at + 5, written.length - at - 5))
+  }
+}

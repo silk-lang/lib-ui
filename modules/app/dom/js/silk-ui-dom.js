@@ -74,11 +74,17 @@ const FOCUSABLE =
 
 // A map from node ids to values, in an array: the ids a program hands out are small and dense.
 class IdTable {
-  constructor() {
+  // `miss(id)` is asked for an id with no value: it may give it one (see `Page.fill`). A
+  // `null` holds the place of a value that waits for that, so the array stays dense.
+  constructor(miss) {
     this.values = [];
+    this.miss = miss;
   }
   get(id) {
-    return this.values[id];
+    const value = this.values[id];
+    if (value != null) return value;
+    this.miss(id);
+    return this.values[id] ?? undefined;
   }
   set(id, value) {
     this.values[id] = value;
@@ -88,7 +94,7 @@ class IdTable {
   }
   *[Symbol.iterator]() {
     const values = this.values;
-    for (let id = 0; id < values.length; id++) if (values[id] !== undefined) yield [id, values[id]];
+    for (let id = 0; id < values.length; id++) if (values[id] != null) yield [id, values[id]];
   }
 }
 
@@ -251,10 +257,14 @@ class Page {
     this.made = new Map();
     this.anchored = new Set();
     // By node id: ids are small and dense, so arrays beat maps here.
-    this.nodes = new IdTable();
-    this.meta = new IdTable();
+    const miss = (id) => this.fill(id);
+    this.nodes = new IdTable(miss);
+    this.meta = new IdTable(miss);
+
     // Nodes destroyed in this batch, still to take out of the document (see `removeDestroyed`).
     this.destroyed = [];
+    // The subtrees the program made templates of (op 29), by number.
+    this.templates = [];
     this.rootId = 0;
     this.busy = false;
     this.queued = [];
@@ -456,6 +466,8 @@ class Page {
         }
         case 2: {
           const parent = this.nodes.get(r.u32());
+          // Its nodes get their ids by their place in it: before that place changes.
+          if (parent.silkLazy !== undefined) this.register(parent);
           const child = this.nodes.get(r.u32());
           const before = r.u32() || 0;
           const next = before ? this.nodes.get(before) : null;
@@ -633,6 +645,36 @@ class Page {
           else if (!next.hasAttribute("data-silk-html")) next.removeAttribute("data-silk");
           break;
         }
+        case 29: {
+          // The subtree of a node becomes a template: later ones like it are copies of it.
+          const template = r.u32();
+          const top = r.u32();
+          const metas = [];
+          for (let count = r.u32(), id = top; count > 0; count--, id++) {
+            const meta = this.meta.get(id);
+            metas.push({ kind: meta.kind, listeners: meta.listeners, tag: meta.tag });
+          }
+          const node = this.nodes.get(top).cloneNode(true);
+          // Where each text node is: the child to take at each level down from the top. And
+          // no copy shows as the node the template was made from: a state rule names a node
+          // by its `data-silk`.
+          const paths = [];
+          const walk = (at, path) => {
+            if (at.nodeType === 3) paths[paths.length] = path;
+            else {
+              paths[paths.length] = undefined;
+              if (at.hasAttribute("data-silk")) at.setAttribute("data-silk", "");
+            }
+            let index = 0;
+            for (let child = at.firstChild; child; child = child.nextSibling) walk(child, [...path, index++]);
+          };
+          walk(node, []);
+          this.templates[template] = { node, metas, paths };
+          break;
+        }
+        case 30:
+          this.clone(r);
+          break;
         case 27: {
           // The first root closes: the mounted element shows nothing.
           if (r.u32() !== 0) break;
@@ -793,6 +835,90 @@ class Page {
     if (kind === KIND_CANVAS) this.canvases.observe(node);
     this.nodes.set(id, node);
     this.meta.set(id, { kind, listeners: 0, prevent: 0, tag });
+  }
+
+  // Makes a copy of a template (op 29). Its nodes have the ids from the one given on, in
+  // document order, as the program handed them out; then come the texts that differ. Only the
+  // top node goes in the tables now: most rows of a long list are never named again, so the
+  // others wait until one of them is (`fill`, `reveal`).
+  clone(r) {
+    const template = this.templates[r.u32()];
+    const top = r.u32();
+    const root = template.node.cloneNode(true);
+    const { kind, listeners, tag } = template.metas[0];
+    root.silkId = top;
+    root.silkLazy = template;
+    const nodes = this.nodes.values;
+    const all = this.meta.values;
+    nodes[top] = root;
+    all[top] = { kind, listeners, prevent: 0, tag };
+    if (!tag) root.setAttribute("data-silk", top);
+    // The places of the others, which `fill` finds the top node from.
+    for (let id = top + 1, end = top + template.metas.length; id < end; id++) {
+      nodes[id] = null;
+      all[id] = null;
+    }
+    const paths = template.paths;
+    for (let count = r.u32(); count > 0; count--) {
+      const path = paths[r.u32()];
+      let node = root;
+      for (let level = 0; level < path.length; level++) {
+        node = node.firstChild;
+        for (let along = path[level]; along > 0; along--) node = node.nextSibling;
+      }
+      node.data = r.text();
+    }
+  }
+
+  // Puts the nodes of copy `root` (see `clone`) in the tables.
+  register(root) {
+    const { metas } = root.silkLazy;
+    root.silkLazy = undefined;
+    const top = root.silkId;
+    const nodes = this.nodes.values;
+    const all = this.meta.values;
+    let node = root;
+    for (let k = 0; ; k++) {
+      if (k > 0) {
+        const id = top + k;
+        const { kind, listeners, tag } = metas[k];
+        node.silkId = id;
+        nodes[id] = node;
+        all[id] = { kind, listeners, prevent: 0, tag };
+        if (!tag && node.nodeType === 1) node.setAttribute("data-silk", id);
+      }
+      // Document order, without recursion: down, then along, then up and along.
+      let next = node.firstChild;
+      if (!next) {
+        while (node !== root && !node.nextSibling) node = node.parentNode;
+        if (node === root) break;
+        next = node.nextSibling;
+      }
+      node = next;
+    }
+  }
+
+  // A table has nothing for `id`: it may be a node of a copy that waits (see `clone`).
+  fill(id) {
+    const nodes = this.nodes.values;
+    if (nodes[id] !== null) return;
+    // The top node of the copy is the nearest id before it that has its node.
+    let top = id - 1;
+    while (top > 0 && nodes[top] === null) top--;
+    const root = nodes[top];
+    const template = root?.silkLazy;
+    if (template && id < top + template.metas.length) this.register(root);
+  }
+
+  // `node` has no id: when it is inside a copy that waits, its nodes get theirs.
+  reveal(node) {
+    for (let at = node.parentNode; at && at !== this.root; at = at.parentNode) {
+      if (at.silkLazy !== undefined) {
+        this.register(at);
+        return;
+      }
+      if (at.silkId !== undefined) return;
+    }
   }
 
   // Frees node `id` and its whole subtree. The subtree leaves the document with the other
@@ -991,6 +1117,7 @@ class Page {
   // Swaps the element of node `id` for a `tag` one, keeping what was set on it and in it.
   swap(id, tag) {
     const node = this.nodes.get(id);
+    if (node.silkLazy !== undefined) this.register(node);
     const next = document.createElement(tag);
     for (const attribute of node.attributes) next.setAttribute(attribute.name, attribute.value);
     if ("value" in node) next.value = node.value;
@@ -1024,12 +1151,15 @@ class Page {
   // Events.
 
   idOf(node) {
-    return node?.silkId ?? 0;
+    if (!node) return 0;
+    if (node.silkId === undefined) this.reveal(node);
+    return node.silkId ?? 0;
   }
 
   // The program's elements from the root down to the one that holds `node`.
   pathTo(node) {
     const path = [];
+    if (node && node.silkId === undefined) this.reveal(node);
     for (let at = node; at && at !== this.root; at = at.parentNode) {
       if (at.nodeType === 1 && at.silkId !== undefined) path.push(at);
     }
