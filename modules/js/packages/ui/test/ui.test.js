@@ -85,6 +85,18 @@ test("preventDefault reaches the host for cancelable events only", () => {
   assert.equal(mock.native.dispatch(9, box.id, 0, 0, 0, 0, 0), false);
 });
 
+test("transition events bubble with their property and elapsed time", () => {
+  const outer = createBox();
+  const inner = createBox();
+  outer.append(inner);
+  mock.take();
+  let seen;
+  outer.addEventListener("transitionend", (event) => (seen = [event.propertyName, event.elapsedTime, event.target]));
+  assert.deepEqual(mock.take(), [["listen", outer.id, 1 << 19]]);
+  mock.native.dispatch(19, inner.id, 0.25, 0, 0, 0, 0, "opacity");
+  assert.deepEqual(seen, ["opacity", 0.25, inner]);
+});
+
 test("an input follows what the user types", () => {
   const input = createInput();
   let seen;

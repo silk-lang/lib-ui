@@ -36,6 +36,14 @@ const EVENT = {
   pointerCancel: 14,
   gotPointerCapture: 15,
   lostPointerCapture: 16,
+  transitionRun: 17,
+  transitionStart: 18,
+  transitionEnd: 19,
+  transitionCancel: 20,
+  animationStart: 21,
+  animationIteration: 22,
+  animationEnd: 23,
+  animationCancel: 24,
 };
 
 // The listener flag of event kind `k` is `1 << k`.
@@ -1230,19 +1238,20 @@ class Page {
     w.u32(editable ? target.selectionEnd : 0);
     w.text(event.key ?? "");
     w.text(event.code ?? "");
-    w.text("value" in target && typeof target.value === "string" ? target.value : "");
+    // Transition and animation records carry their property or @keyframes name here.
+    w.text(extra.text ?? ("value" in target && typeof target.value === "string" ? target.value : ""));
     w.text(event.inputType ?? "");
     return w;
   }
 
   // Sends `event` as a record of `kind` when a node on its path listens for it.
-  forward(kind, event, target = event.target) {
+  forward(kind, event, target = event.target, extra = {}) {
     const path = this.pathTo(target);
     if (!path.length || !(this.hears(path, kind) || (kind === EVENT.click && this.links(path)))) {
       return { path, prevented: false };
     }
     const element = path[path.length - 1];
-    const prevented = this.send(this.record(kind, element, path, event));
+    const prevented = this.send(this.record(kind, element, path, event, extra));
     if (prevented && event.cancelable) event.preventDefault();
     return { path, prevented };
   }
@@ -1275,6 +1284,17 @@ class Page {
     on("gotpointercapture", (event) => this.forward(EVENT.gotPointerCapture, event));
     on("lostpointercapture", (event) => this.forward(EVENT.lostPointerCapture, event));
     on("click", (event) => this.forward(EVENT.click, event));
+    // The elapsed time travels as x and the property or animation name as the value.
+    const motion = (kind, name) => (event) =>
+      this.forward(kind, event, event.target, { x: event.elapsedTime, y: 0, text: event[name] });
+    on("transitionrun", motion(EVENT.transitionRun, "propertyName"));
+    on("transitionstart", motion(EVENT.transitionStart, "propertyName"));
+    on("transitionend", motion(EVENT.transitionEnd, "propertyName"));
+    on("transitioncancel", motion(EVENT.transitionCancel, "propertyName"));
+    on("animationstart", motion(EVENT.animationStart, "animationName"));
+    on("animationiteration", motion(EVENT.animationIteration, "animationName"));
+    on("animationend", motion(EVENT.animationEnd, "animationName"));
+    on("animationcancel", motion(EVENT.animationCancel, "animationName"));
     on("input", (event) => this.forward(EVENT.input, event));
     on(
       "wheel",

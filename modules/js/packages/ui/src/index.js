@@ -17,7 +17,8 @@ const STATES = { base: 0, hover: 1, active: 2, focus: 3, focusVisible: 4 };
 const TYPES = [
   "pointerdown", "pointerup", "click", "pointermove", "pointerenter", "pointerleave", "wheel",
   "keydown", "keyup", "focus", "blur", "input", "scroll", "layout", "pointercancel",
-  "gotpointercapture", "lostpointercapture",
+  "gotpointercapture", "lostpointercapture", "transitionrun", "transitionstart", "transitionend",
+  "transitioncancel", "animationstart", "animationiteration", "animationend", "animationcancel",
 ];
 const KIND_OF = new Map(TYPES.map((type, kind) => [type, kind]));
 const CLICK = KIND_OF.get("click");
@@ -517,6 +518,14 @@ function fill(event, kind, a, b, modifiers, d, e, first, second) {
     event.scrollTop = b;
   } else if (kind === 13) {
     event.bounds = { x: a, y: b, width: d, height: e };
+  } else if (kind >= 17 && kind <= 20) {
+    event.propertyName = first;
+    event.elapsedTime = a;
+    event.pseudoElement = "";
+  } else if (kind >= 21) {
+    event.animationName = first;
+    event.elapsedTime = a;
+    event.pseudoElement = "";
   }
 }
 
