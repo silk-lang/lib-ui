@@ -11,7 +11,7 @@
 //! called at all.
 import heap { Heap }
 import program { Submodel }
-import ui { Ui, Span }
+import ui { Ui, Span, PassSizes }
 // What a view names next to the builder.
 pub import ui { Reply, DefaultAction }
 pub import ui_protocol.grid { Grid }
@@ -95,6 +95,9 @@ union Op {
   Expanded { value: bool },
   Href { text: Span },
   Transition { text: Span },
+  Element { text: Span },
+  ClassName { text: Span },
+  ElementId { text: Span },
   FocusTrap { value: bool },
   TakeFocus,
   Reveal,
@@ -113,6 +116,8 @@ union Op {
   Listen { kind: EventKind },
   /// The node answers the record of this pass with the reply in `slot`.
   Answer { kind: EventKind, slot: u32 },
+  /// A render keeps the reply in `slot` as the node's answer to a record of `kind`.
+  Keep { kind: EventKind, slot: u32 },
   /// The attributes at `start..start + count` of the tree's `attrs`.
   Group { start: u32, count: u32 },
 }
@@ -138,7 +143,30 @@ struct Tree {
 }
 
 impl Tree {
-  fn make(dispatching: bool, kind: EventKind) -> Tree {
+  fn make(dispatching: bool, kind: EventKind, sizes: PassSizes) -> Tree {
+    let mut tree = Tree.empty(dispatching, kind)
+    // The last pass's sizes: a view describes about as much each time.
+    tree.heap.alloc(tree.records.reserve(sizes.records))
+    tree.heap.alloc(tree.kids.reserve(sizes.kids))
+    tree.heap.alloc(tree.ops.reserve(sizes.ops))
+    tree.heap.alloc(tree.attrs.reserve(sizes.attrs))
+    tree.heap.alloc(tree.bytes.reserve(sizes.bytes))
+    tree.heap.alloc(tree.styles.reserve(sizes.styles))
+    return move tree
+  }
+
+  fn sizes(self: &Self) -> PassSizes {
+    return PassSizes {
+      records: self.records.length(),
+      kids: self.kids.length(),
+      ops: self.ops.length(),
+      attrs: self.attrs.length(),
+      bytes: self.bytes.length(),
+      styles: self.styles.length(),
+    }
+  }
+
+  fn empty(dispatching: bool, kind: EventKind) -> Tree {
     return Tree {
       heap: Heap.make(),
       records: List<Record>.make(),
@@ -234,33 +262,37 @@ impl Tree {
   }
 }
 
-/// A reply a handler gave in this pass, with its number.
-struct Slot<M> {
-  slot: u32,
-  reply: Reply<M>,
-}
-
+/// The replies handlers gave in this pass, by number: reply `n` is at `n - 1`.
 struct Slots<M> {
   heap: Heap,
-  list: List<Slot<M>>,
+  list: List<Option<Reply<M>>>,
 }
 
 impl<M> Slots<M> {
   fn make() -> Slots<M> {
-    return Slots<M> { heap: Heap.make(), list: List<Slot<M>>.make() }
+    return Slots<M> { heap: Heap.make(), list: List<Option<Reply<M>>>.make() }
+  }
+
+  /// Keeps `reply` as reply number `slot`.
+  fn put(self: &mut Self, slot: u32, reply: Reply<M>) -> () {
+    let at = u32.toUsize(slot) - 1
+    while self.list.length() <= at {
+      self.heap.alloc(self.list.append(Option<Reply<M>>.None))
+    }
+    let slots = self.list.asMutSlice()
+    drop Intrinsic.replace(slots[at], Option<Reply<M>>.Some { value: move reply })
   }
 
   /// Takes reply `slot` out of this pass.
   fn take(self: &mut Self, slot: u32) -> Reply<M> {
-    let mut i: usize = 0
-    while i < self.list.length() {
-      if self.list.asSlice()[i].slot == slot {
-        let found = self.list.remove(i)
-        return move found.reply
-      }
-      i = i + 1
+    let at = u32.toUsize(slot) - 1
+    if at >= self.list.length() {
+      return Reply<M>.Pass
     }
-    return Reply<M>.Pass
+    return match Intrinsic.replace(self.list.asMutSlice()[at], Option<Reply<M>>.None) {
+      Option<Reply<M>>.Some { value } => move value
+      Option<Reply<M>>.None => Reply<M>.Pass
+    }
   }
 }
 
@@ -569,17 +601,15 @@ impl<M> Document<M> {
     let node = view(&builder)
     let mut anchor: u8 = 0
     let slots = unsafe Pointer.borrowMut(&mut anchor, self.slots)
-    while true {
-      match move inner.list.pop() {
-        Option.Some { value: found } => {
-          let slot = found.slot
-          let reply = mapReply<CM, M>(move found.reply, wrap)
-          slots.heap.alloc(slots.list.append(Slot<M> { slot: slot, reply: move reply }))
+    let mut i: usize = 0
+    while i < inner.list.length() {
+      match Intrinsic.replace(inner.list.asMutSlice()[i], Option<Reply<CM>>.None) {
+        Option<Reply<CM>>.Some { value } => {
+          slots.put(usize.toU32(i) + 1, mapReply<CM, M>(move value, wrap))
         }
-        Option.None => {
-          break
-        }
+        Option<Reply<CM>>.None => {}
       }
+      i = i + 1
     }
     return node
   }
@@ -711,6 +741,23 @@ impl<M> Document<M> {
     return self.op(Op.Transition { text: self.store(value) })
   }
 
+  /// The element a document backend shows the node as, by HTML tag name (`"tr"`, `"button"`).
+  /// The tree renderer ignores it.
+  pub fn element(self: &Self, name: string) -> Attr {
+    return self.op(Op.Element { text: self.store(name) })
+  }
+
+  /// The node's classes, as the HTML `class` attribute, so a page's stylesheets apply to it in
+  /// a document backend. The tree renderer ignores it.
+  pub fn className(self: &Self, value: string) -> Attr {
+    return self.op(Op.ClassName { text: self.store(value) })
+  }
+
+  /// The node's HTML `id` in a document backend. The tree renderer ignores it.
+  pub fn id(self: &Self, value: string) -> Attr {
+    return self.op(Op.ElementId { text: self.store(value) })
+  }
+
   /// The grid template of a node with `display: grid`, or its placement in its parent's.
   pub fn gridTemplate(self: &Self, template: &Grid) -> Attr {
     let mut anchor: u8 = 0
@@ -800,19 +847,35 @@ impl<M> Document<M> {
     return self.op(Op.Listen { kind: kind })
   }
 
-  fn answer(self: &Self, kind: EventKind, reply: Reply<M>) -> Attr {
+  /// Keeps `reply` for the node: as its answer to the record this pass dispatches, or in a
+  /// render (`keep`) as its answer to the next record of `kind`.
+  fn slot(self: &Self, kind: EventKind, reply: Reply<M>, keep: bool) -> Attr {
     let mut anchor: u8 = 0
     let tree = unsafe Pointer.borrowMut(&mut anchor, self.tree)
     tree.replies = tree.replies + 1
     let slot = tree.replies
     let mut other: u8 = 0
     let slots = unsafe Pointer.borrowMut(&mut other, self.slots)
-    slots.heap.alloc(slots.list.append(Slot<M> { slot: slot, reply: move reply }))
+    slots.put(slot, move reply)
+    if keep {
+      return tree.op(Op.Keep { kind: kind, slot: slot })
+    }
     return tree.op(Op.Answer { kind: kind, slot: slot })
   }
 
+  fn answer(self: &Self, kind: EventKind, reply: Reply<M>) -> Attr {
+    return self.slot(kind, move reply, false)
+  }
+
+  /// A handler that answers with a message it already has. A render keeps the message, so a
+  /// dispatch can answer from it without running the view again (see `Ui.keep`).
   fn send(self: &Self, kind: EventKind, message: M) -> Attr {
-    if !self.hears(kind) {
+    let mut anchor: u8 = 0
+    let tree = unsafe Pointer.borrowMut(&mut anchor, self.tree)
+    if !tree.dispatching {
+      return self.slot(kind, Reply<M>.Emit { message: move message }, true)
+    }
+    if tree.kind != kind {
       return self.listen(kind)
     }
     return self.answer(kind, Reply<M>.Emit { message: move message })
@@ -1000,6 +1063,15 @@ fn apply<M>(ui: &mut Ui<M>, tree: &Tree, slots: *mut Slots<M>, start: u32, count
       Op.Transition { text } => {
         ui.transition(tree.text(text))
       }
+      Op.Element { text } => {
+        ui.element(tree.text(text))
+      }
+      Op.ClassName { text } => {
+        ui.className(tree.text(text))
+      }
+      Op.ElementId { text } => {
+        ui.elementId(tree.text(text))
+      }
       Op.FocusTrap { value } => {
         ui.focusTrap(value)
       }
@@ -1044,6 +1116,9 @@ fn apply<M>(ui: &mut Ui<M>, tree: &Tree, slots: *mut Slots<M>, start: u32, count
       }
       Op.Answer { kind, slot } => {
         ui.on(kind, |event| take<M>(slots, slot))
+      }
+      Op.Keep { kind, slot } => {
+        ui.keep(kind, take<M>(slots, slot))
       }
       Op.Group { start: first, count: length } => {
         apply<M>(&mut ui, tree, slots, first, length)
@@ -1104,7 +1179,7 @@ fn place<M>(ui: &mut Ui<M>, tree: &Tree, slots: *mut Slots<M>, index: u32) -> ()
 /// A box at the top of the view is the root itself: its attributes go on the root and its
 /// children are the root's children. Any other node is the root's only child.
 pub fn render<M>(ui: &mut Ui<M>, view: fn(&Document<M>) -> Node) -> () {
-  let mut tree = Tree.make(ui.isDispatching(), ui.dispatched().kind)
+  let mut tree = Tree.make(ui.isDispatching(), ui.dispatched().kind, ui.passSizes)
   let mut slots = Slots<M>.make()
   let builder = Document<M> {
     tree: Pointer.fromMutRef(&mut tree),
@@ -1112,6 +1187,8 @@ pub fn render<M>(ui: &mut Ui<M>, view: fn(&Document<M>) -> Node) -> () {
     event: Pointer.fromRef(ui.dispatched()),
   }
   let root = view(&builder)
+  ui.passSizes = tree.sizes()
+  ui.reserveNodes(tree.records.length())
   let record = tree.records.get(u32.toUsize(root.index))
   let replies = Pointer.fromMutRef(&mut slots)
   if record.shape == Shape.Box && !record.keyed {

@@ -47,26 +47,50 @@ const PREVENT_KEYS = 4;
 const STATES = [null, ":hover", ":active", ":focus", ":focus-visible"];
 const STATE_ORDER = [1, 3, 4, 2];
 
-// The same rules as `RESET` in `src/html.silk`, which a server render carries.
+// The same rules as `RESET` in `src/html.silk`, which a server render carries. `:where` gives
+// them no specificity, so the page's own stylesheets win. A pseudo-element rule that matches
+// every element makes the browser style that pseudo-element for each one, which costs about a
+// third more style and layout time on a large table: `::selection` only matches the nodes that
+// set a selection color (their descendants inherit it), `::placeholder` only inputs.
 const RESET = `
-[data-silk] { outline: none; border-width: 0; -webkit-tap-highlight-color: transparent; }
-[data-silk][role="button"] { user-select: none; -webkit-user-select: none; }
-a[data-silk] { display: block; color: inherit; text-decoration: none; }
-input[data-silk], textarea[data-silk] {
+:where([data-silk]) { outline: none; border-width: 0; -webkit-tap-highlight-color: transparent; }
+:where([data-silk][role="button"]) { user-select: none; -webkit-user-select: none; }
+:where(a[data-silk]) { display: block; color: inherit; text-decoration: none; }
+:where(input[data-silk]), :where(textarea[data-silk]) {
   font: inherit; color: inherit; background: transparent; border: 0 solid; margin: 0;
   padding: 0; min-width: 0; resize: none; appearance: none; border-radius: 0;
 }
-[data-silk-icon] {
+:where([data-silk-icon]) {
   display: inline-block; flex: none; width: 1em; height: 1em; background-color: currentColor;
   -webkit-mask: var(--silk-icon) center / contain no-repeat;
   mask: var(--silk-icon) center / contain no-repeat;
 }
-[data-silk]::selection { background: var(--silk-selection-color, highlight); }
-[data-silk]::placeholder { color: var(--silk-placeholder-color, gray); opacity: 1; }
+:where([data-silk][style*="--silk-selection-color"])::selection { background: var(--silk-selection-color, highlight); }
+:where(input[data-silk], textarea[data-silk])::placeholder { color: var(--silk-placeholder-color, gray); opacity: 1; }
 `;
 
 const FOCUSABLE =
   '[tabindex]:not([tabindex="-1"]), input:not([tabindex="-1"]), textarea:not([tabindex="-1"]), a[href]:not([tabindex="-1"])';
+
+// A map from node ids to values, in an array: the ids a program hands out are small and dense.
+class IdTable {
+  constructor() {
+    this.values = [];
+  }
+  get(id) {
+    return this.values[id];
+  }
+  set(id, value) {
+    this.values[id] = value;
+  }
+  delete(id) {
+    this.values[id] = undefined;
+  }
+  *[Symbol.iterator]() {
+    const values = this.values;
+    for (let id = 0; id < values.length; id++) if (values[id] !== undefined) yield [id, values[id]];
+  }
+}
 
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
@@ -95,9 +119,20 @@ class Reader {
   }
   text() {
     const length = this.u32();
-    const value = decoder.decode(this.bytes.subarray(this.at, this.at + length));
+    const bytes = this.bytes;
+    const start = this.at;
     this.at += length;
-    return value;
+    // Short ASCII text (labels, numbers, class names) without a decoder call.
+    if (length <= 64) {
+      let value = "";
+      for (let i = start; i < start + length; i++) {
+        const byte = bytes[i];
+        if (byte > 127) return decoder.decode(bytes.subarray(start, start + length));
+        value += String.fromCharCode(byte);
+      }
+      return value;
+    }
+    return decoder.decode(bytes.subarray(start, start + length));
   }
   // A copy: the program's memory moves.
   data() {
@@ -215,8 +250,11 @@ class Page {
     // Addresses this page made for resources the program defined, to revoke.
     this.made = new Map();
     this.anchored = new Set();
-    this.nodes = new Map();
-    this.meta = new Map();
+    // By node id: ids are small and dense, so arrays beat maps here.
+    this.nodes = new IdTable();
+    this.meta = new IdTable();
+    // Nodes destroyed in this batch, still to take out of the document (see `removeDestroyed`).
+    this.destroyed = [];
     this.rootId = 0;
     this.busy = false;
     this.queued = [];
@@ -328,6 +366,7 @@ class Page {
     this.adopt.clear();
     for (const [id, meta] of this.meta) {
       const node = this.nodes.get(id);
+      if (meta.tag) continue;
       if (node.tagName === "A" && !meta.href) this.swap(id, "div");
       else if (node.tagName === "TEXTAREA" && !meta.multiline) this.swap(id, "input");
     }
@@ -400,10 +439,20 @@ class Page {
     const r = new Reader(this.exports.memory.buffer, pointer, length);
     while (!r.done) {
       const op = r.u8();
+      if (op !== 4 && this.destroyed.length) this.removeDestroyed();
       switch (op) {
-        case 1:
-          this.create(r.u32(), r.u8());
+        case 1: {
+          const id = r.u32();
+          const kind = r.u8();
+          // An element the program names (op 28) right after: made in place of the kind's own.
+          let tag;
+          if (!r.done && r.bytes[r.at] === 28 && r.view.getUint32(r.at + 1, true) === id) {
+            r.at += 5;
+            tag = r.text();
+          }
+          this.create(id, kind, tag);
           break;
+        }
         case 2: {
           const parent = this.nodes.get(r.u32());
           const child = this.nodes.get(r.u32());
@@ -456,7 +505,8 @@ class Page {
           const bit = 1 << EVENT.layout;
           const node = this.nodes.get(id);
           if (node.nodeType === 1 && (before & bit) !== (meta.listeners & bit)) {
-            if (meta.listeners & bit) this.layout.observe(node);
+            meta.observed = (meta.listeners & bit) !== 0;
+            if (meta.observed) this.layout.observe(node);
             else this.layout.unobserve(node);
           }
           break;
@@ -571,6 +621,14 @@ class Page {
           }
           break;
         }
+        case 28: {
+          const id = r.u32();
+          const tag = r.text();
+          const meta = this.meta.get(id);
+          meta.tag = tag || undefined;
+          this.swap(id, tag || TAGS[meta.kind][0].toLowerCase());
+          break;
+        }
         case 27: {
           // The first root closes: the mounted element shows nothing.
           if (r.u32() !== 0) break;
@@ -582,6 +640,7 @@ class Page {
           throw new Error(`silk-ui: unknown mutation ${op}`);
       }
     }
+    if (this.destroyed.length) this.removeDestroyed();
     this.place();
   }
 
@@ -712,9 +771,9 @@ class Page {
     }
   }
 
-  create(id, kind) {
+  create(id, kind, tag) {
     let node = this.adopt.get(id);
-    if (node && TAGS[kind].includes(node.nodeName)) {
+    if (node && (tag ? node.nodeName === tag.toUpperCase() : TAGS[kind].includes(node.nodeName))) {
       // A node of the server render: the program sets it up as it would a new one.
       this.adopt.delete(id);
       if (node.nodeType === 1) {
@@ -723,26 +782,60 @@ class Page {
         }
       }
     } else if (kind === KIND_TEXT) node = document.createTextNode("");
-    else node = document.createElement(TAGS[kind][0].toLowerCase());
-    if (node.nodeType === 1) node.dataset.silk = id;
+    else node = document.createElement(tag || TAGS[kind][0].toLowerCase());
+    if (node.nodeType === 1) node.setAttribute("data-silk", id);
+    node.silkId = id;
     if (kind === KIND_ICON) node.setAttribute("data-silk-icon", "");
     if (kind === KIND_CANVAS) this.canvases.observe(node);
     this.nodes.set(id, node);
-    this.meta.set(id, { kind, listeners: 0, prevent: 0 });
+    this.meta.set(id, { kind, listeners: 0, prevent: 0, tag });
   }
 
+  // Frees node `id` and its whole subtree. The subtree leaves the document with the other
+  // nodes this batch destroys, in `removeDestroyed`.
   destroy(id) {
     const node = this.nodes.get(id);
     if (!node) return;
-    if (node.nodeType === 1) {
-      this.layout.unobserve(node);
-      this.canvases.unobserve(node);
+    this.forget(node);
+    this.destroyed.push(node);
+  }
+
+  forget(top) {
+    const ruled = this.sheets.some((sheet) => sheet && sheet.rules.size);
+    for (let node = top; node; ) {
+      const id = node.silkId;
+      if (id !== undefined) {
+        const meta = this.meta.get(id);
+        if (meta?.observed) this.layout.unobserve(node);
+        if (meta?.kind === KIND_CANVAS) this.canvases.unobserve(node);
+        if (ruled) for (const state of STATE_ORDER) this.dropRule(id, state);
+        if (this.anchored.size) this.anchored.delete(id);
+        if (this.nodes.get(id) === node) {
+          this.nodes.delete(id);
+          this.meta.delete(id);
+        }
+      }
+      // Depth first, without recursion: down, then along, then up and along.
+      if (node.firstChild) {
+        node = node.firstChild;
+        continue;
+      }
+      while (node !== top && !node.nextSibling) node = node.parentNode;
+      node = node === top ? null : node.nextSibling;
     }
-    node.remove();
-    this.nodes.delete(id);
-    this.meta.delete(id);
-    this.anchored.delete(id);
-    for (const state of STATE_ORDER) this.dropRule(id, state);
+  }
+
+  // Takes the destroyed nodes out of the document. When they are all of a parent's children,
+  // the parent is emptied in one step, as a clear of a long list needs.
+  removeDestroyed() {
+    const nodes = this.destroyed;
+    this.destroyed = [];
+    const parent = nodes[0].parentNode;
+    if (parent && nodes.length > 1 && parent.childNodes.length === nodes.length && nodes.every((node) => node.parentNode === parent)) {
+      parent.textContent = "";
+      return;
+    }
+    for (const node of nodes) node.remove();
   }
 
   styleOf(id, state, make) {
@@ -759,6 +852,7 @@ class Page {
 
   dropRule(id, state) {
     const { sheet, rules } = this.sheets[state];
+    if (!rules.size) return;
     const rule = rules.get(id);
     if (!rule) return;
     rules.delete(id);
@@ -860,7 +954,8 @@ class Page {
         // A box with an address is an `a`, so the document treats it as the link it is.
         meta.href = r.text();
         let link = node;
-        if (meta.href && node.tagName === "DIV") link = this.swap(id, "a");
+        if (meta.tag) link = node;
+        else if (meta.href && node.tagName === "DIV") link = this.swap(id, "a");
         else if (!meta.href && node.tagName === "A") link = this.swap(id, "div");
         if (meta.href) link.setAttribute("href", this.address(meta.href));
         else link.removeAttribute("href");
@@ -868,6 +963,15 @@ class Page {
       }
       case 17:
         this.fix(id, "transition", [["transition", r.text()]]);
+        break;
+      case 18: {
+        const value = r.text();
+        if (value) node.className = value;
+        else node.removeAttribute("class");
+        break;
+      }
+      case 19:
+        set("id", r.text());
         break;
       default:
         throw new Error(`silk-ui: unknown attribute ${code}`);
@@ -886,6 +990,7 @@ class Page {
       this.layout.observe(next);
     }
     node.replaceWith(next);
+    next.silkId = id;
     this.nodes.set(id, next);
     return next;
   }
@@ -909,14 +1014,14 @@ class Page {
   // Events.
 
   idOf(node) {
-    return node?.dataset?.silk ? Number(node.dataset.silk) : 0;
+    return node?.silkId ?? 0;
   }
 
   // The program's elements from the root down to the one that holds `node`.
   pathTo(node) {
     const path = [];
     for (let at = node; at && at !== this.root; at = at.parentNode) {
-      if (at.nodeType === 1 && at.dataset.silk) path.push(at);
+      if (at.nodeType === 1 && at.silkId !== undefined) path.push(at);
     }
     if (!path.length || this.idOf(path[path.length - 1]) !== this.rootId) return [];
     return path.reverse();
