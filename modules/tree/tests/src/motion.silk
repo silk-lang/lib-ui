@@ -14,6 +14,8 @@ import ui_tree.legacy {
   EventKind,
   StyleState,
   Input,
+  Keyframe,
+  Declaration,
   LISTEN_ALL,
   info
 }
@@ -104,6 +106,10 @@ effect fn records(tree: &mut UiTree<'_>) -> String
       EventKind.TransitionStart => "start:"
       EventKind.TransitionEnd => "end:"
       EventKind.TransitionCancel => "cancel:"
+      EventKind.AnimationStart => "astart:"
+      EventKind.AnimationIteration => "aiter:"
+      EventKind.AnimationEnd => "aend:"
+      EventKind.AnimationCancel => "acancel:"
       _ => ""
     }
     if String.byteLength(kind) != 0 {
@@ -263,4 +269,116 @@ test effect fn hoverTransitionsAndInheritance() -> ()
   ! AssertionError<'static> | TreeError | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   run hoverBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn frameOf(offset: f32, declarations: &[Declaration]) -> Keyframe
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut list = List<Declaration>.make()
+  let mut i: usize = 0
+  while i < declarations.length {
+    run list.append(run css.cloneDeclaration(&declarations[i]))
+    i = i + 1
+  }
+  return Keyframe { offset: offset, declarations: move list }
+}
+
+effect fn animationBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  let mut batch = Batch.make()
+  let mut frames = List<Keyframe>.make()
+  run frames.append(run frameOf(1.0, &[css.opacity(1.0)]))
+  run frames.append(run frameOf(0.0, &[css.opacity(0.0)]))
+  run batch.keyframes("fade", move frames)
+  run batch.create(1, NodeKind.Box)
+  run batch.box(1, 2, &[
+    css.width(px(10.0)),
+    css.height(px(10.0)),
+    css.opacity(0.5),
+    css.declare(Property.Animation, run css.text(b"fade 1s linear 2 alternate")),
+  ])
+  run batch.listen(2, LISTEN_ALL)
+  run batch.root(1)
+  run tree.apply(run batch.take())
+  run tree.frame(at(0.0))
+  run Testing.expect(near(opacityOf(&tree, 2), 0.0), "an animation starts at its first frame")
+  run Testing.expect(String.view(&run records(&mut tree)) == "astart:fade", "animationstart names the rule")
+  run Testing.expect(tree.needsFrame(), "a playing animation asks for frames")
+
+  run tree.frame(at(0.25))
+  run Testing.expect(near(opacityOf(&tree, 2), 0.25), "it moves with the frame clock")
+  run tree.frame(at(1.25))
+  run Testing.expect(near(opacityOf(&tree, 2), 0.75), "alternate plays the second iteration backwards")
+  run Testing.expect(String.view(&run records(&mut tree)) == "aiter:fade", "animationiteration at the iteration boundary")
+  run tree.frame(at(2.5))
+  run Testing.expect(near(opacityOf(&tree, 2), 0.5), "without a fill the end shows the underlying style")
+  run Testing.expect(String.view(&run records(&mut tree)) == "aend:fade", "animationend at the end")
+  run tree.frame(at(3.0))
+  run Testing.expect(!tree.needsFrame(), "an ended animation leaves nothing to draw")
+
+  // Fill forwards keeps the end; changing the name cancels nothing that ended, then restarts.
+  let mut fill = Batch.make()
+  run fill.style(2, &[css.declare(Property.Animation, run css.text(b"fade 1s linear forwards"))])
+  run tree.apply(run fill.take())
+  run tree.frame(at(3.0))
+  run tree.frame(at(4.5))
+  run Testing.expect(near(opacityOf(&tree, 2), 1.0), "fill forwards holds the last frame")
+
+  // A delay without a backwards fill shows the underlying style; renaming cancels.
+  let mut none = Batch.make()
+  run none.style(2, &[css.declare(Property.Animation, run css.text(b"none"))])
+  run tree.apply(run none.take())
+  run tree.frame(at(5.0))
+  run Testing.expect((run records(&mut tree)).ownedByteLength() == 0, "removing an ended animation cancels nothing")
+  let mut again = Batch.make()
+  run again.style(2, &[css.declare(Property.Animation, run css.text(b"fade 2s linear 1s infinite"))])
+  run tree.apply(run again.take())
+  run tree.frame(at(5.0))
+  run Testing.expect(near(opacityOf(&tree, 2), 0.5), "a delay without a backwards fill shows the underlying style")
+  run tree.frame(at(6.5))
+  run Testing.expect(near(opacityOf(&tree, 2), 0.25), "it starts after its delay")
+  drop run records(&mut tree)
+  let mut renamed = Batch.make()
+  run renamed.style(2, &[css.declare(Property.Animation, run css.text(b"slide 2s linear 1s infinite"))])
+  run tree.apply(run renamed.take())
+  run tree.frame(at(7.0))
+  run Testing.expect(String.view(&run records(&mut tree)) == "acancel:fade", "a renamed animation cancels the old one")
+  run Testing.expect(near(opacityOf(&tree, 2), 0.5), "an unknown name plays nothing")
+  run Testing.expect(!tree.needsFrame(), "an unknown name asks for no frames")
+
+  // Pausing holds the clock and running again picks up where it paused.
+  let mut back = Batch.make()
+  run back.style(2, &[css.declare(Property.Animation, run css.text(b"fade 2s linear"))])
+  run tree.apply(run back.take())
+  run tree.frame(at(8.0))
+  run tree.frame(at(8.5))
+  run Testing.expect(near(opacityOf(&tree, 2), 0.25), "a returning name starts again")
+  let mut pause = Batch.make()
+  run pause.style(2, &[css.declare(Property.AnimationPlayState, run css.text(b"paused"))])
+  run tree.apply(run pause.take())
+  run tree.frame(at(8.5))
+  run tree.frame(at(15.0))
+  run Testing.expect(near(opacityOf(&tree, 2), 0.25), "a paused animation holds its place")
+  run Testing.expect(!tree.needsFrame(), "a paused animation asks for no frames")
+  let mut play = Batch.make()
+  run play.style(2, &[css.declare(Property.AnimationPlayState, run css.text(b"running"))])
+  run tree.apply(run play.take())
+  run tree.frame(at(15.0))
+  run tree.frame(at(15.5))
+  run Testing.expect(near(opacityOf(&tree, 2), 0.5), "running again picks up where it paused")
+  drop run records(&mut tree)
+  let mut hide = Batch.make()
+  run hide.style(2, &[css.display(Keyword.None)])
+  run tree.apply(run hide.take())
+  run tree.frame(at(15.6))
+  run Testing.expect(String.view(&run records(&mut tree)) == "acancel:fade", "display none cancels the animation")
+}
+
+test effect fn keyframeAnimationsPlayOnTheFrameClock() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run animationBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }

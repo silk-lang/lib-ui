@@ -30,7 +30,7 @@ const CANCELABLE = new Set(["pointerdown", "pointerup", "click", "wheel", "keydo
 // Properties whose numbers are not lengths. Every other number is CSS pixels.
 const UNITLESS = new Set([
   "opacity", "flexGrow", "flexShrink", "flex", "order", "zIndex", "fontWeight", "lineHeight",
-  "aspectRatio", "tabSize", "scale",
+  "aspectRatio", "tabSize", "scale", "animationIterationCount",
 ]);
 
 const nodes = new Map();
@@ -422,6 +422,30 @@ export function createInput(style) {
 let rootNode = null;
 
 /** Makes `node` the root of the window's tree. */
+/**
+ * Defines `@keyframes name` as CSS would: `{ from: { opacity: 0 }, "50%": {...}, to: {...} }`,
+ * with selectors such as `"0%, 100%"` too. Style objects name it in `animation` or
+ * `animationName`. Defining a name again replaces its rule; `null` removes it.
+ */
+export function defineKeyframes(name, frames) {
+  for (const selector of Object.keys(frames ?? {})) {
+    let css = "";
+    const declarations = frames[selector];
+    for (const property of Object.keys(declarations)) {
+      const value = declarations[property];
+      if (value === null || value === undefined || value === "") continue;
+      css += cssName(property) + ":" + cssValue(property, value) + ";";
+    }
+    for (const part of selector.split(",")) {
+      const text = part.trim().toLowerCase();
+      const offset = text === "from" ? 0 : text === "to" ? 1 : parseFloat(text) / 100;
+      if (!(offset >= 0 && offset <= 1)) throw new Error(`@silk/ui: bad keyframe selector '${part}'`);
+      native.keyframe(offset, css);
+    }
+  }
+  native.keyframes(String(name));
+}
+
 export function mount(node) {
   rootNode = node;
   native.root(node.id);

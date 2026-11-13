@@ -43,6 +43,9 @@ import edit { EditState, HostRequest, Keymap, ImeArea, NATIVE_KEYMAP }
 import style { Computed, TextStyle }
 import motion
 import motion { Running }
+import animation
+import animation { Rule, Playing }
+import timing
 import properties.computed { Display as CssDisplay, DisplayOutside, DisplayInside }
 import node {
   NONE,
@@ -367,10 +370,29 @@ effect fn applyAll(computed: &mut Computed, list: &List<Declaration>) -> ()
     if which != NONE {
       let text = run values.cssText(&items[i].value)
       motion.declare(&mut computed.transition, which, text.asSlice())
+    } else if animationList(property) != NONE {
+      let text = run values.cssText(&items[i].value)
+      timing.declareAnimation(&mut computed.animation, animationList(property), text.asSlice())
     } else if property != CssProperty.FontSize {
       computed.apply(&items[i])
     }
     i = i + 1
+  }
+}
+
+/// Which `animation-*` list `property` sets (see `timing.declareAnimation`), or NONE.
+fn animationList(property: CssProperty) -> u32 {
+  return match property {
+    CssProperty.Animation => timing.ANIMATION
+    CssProperty.AnimationName => timing.ANIMATION_NAME
+    CssProperty.AnimationDuration => timing.ANIMATION_DURATION
+    CssProperty.AnimationTimingFunction => timing.ANIMATION_TIMING
+    CssProperty.AnimationDelay => timing.ANIMATION_DELAY
+    CssProperty.AnimationIterationCount => timing.ANIMATION_ITERATIONS
+    CssProperty.AnimationDirection => timing.ANIMATION_DIRECTION
+    CssProperty.AnimationFillMode => timing.ANIMATION_FILL
+    CssProperty.AnimationPlayState => timing.ANIMATION_PLAY_STATE
+    _ => NONE
   }
 }
 
@@ -573,6 +595,10 @@ pub struct UiTree<'a> {
   overrides: List<StyleOverride>,
   /// The running CSS transitions of every root (see `motion`).
   pub transitions: List<Running>,
+  /// The `@keyframes` rules the client defined (see `animation`).
+  pub keyframes: List<Rule>,
+  /// The CSS animations every root plays.
+  pub animations: List<Playing>,
 }
 
 impl<'a> UiTree<'a> {
@@ -685,6 +711,8 @@ impl<'a> UiTree<'a> {
       empty: Scene.make(),
       overrides: List<StyleOverride>.make(),
       transitions: List<Running>.make(),
+      keyframes: List<Rule>.make(),
+      animations: List<Playing>.make(),
     }
   }
 
@@ -1146,6 +1174,16 @@ impl<'a> UiTree<'a> {
           }
           i = i + 1
         }
+        self.stylesDirty = true
+        let parked = self.parked.asMutSlice()
+        let mut p: usize = 0
+        while p < parked.length {
+          parked[p].touched = true
+          p = p + 1
+        }
+      }
+      Mutation.DefineKeyframes { name, frames } => {
+        run animation.define(&mut self, move name, move frames)
         self.stylesDirty = true
         let parked = self.parked.asMutSlice()
         let mut p: usize = 0
@@ -2894,12 +2932,16 @@ impl<'a> UiTree<'a> {
     anchoring.apply(&self, node.id, &mut computed)
     let kind = node.kind
     let parentRendered = parent == NONE || self.node(parent).rendered
+    let rendered = parentRendered && !computed.layout.display.isNone()
     if kind != NodeKind.Text {
       let before = node.computed
       let hasBefore = node.rendered && parentRendered
-      run motion.transition(&mut self, slot, &before, hasBefore, &mut computed)
+      let animated = run animation.update(&mut self, slot, rendered, &computed)
+      run motion.transition(&mut self, slot, &before, hasBefore, &mut computed, animated)
+      if animated != 0 {
+        run animation.apply(&self, slot, &mut computed)
+      }
     }
-    let rendered = parentRendered && !computed.layout.display.isNone()
     let css = self.node(slot).css
     let sizeChanged = self.node(slot).computed.text.size != computed.text.size
     let fontKey = run self.fontKeyOf(computed.text)
@@ -3087,6 +3129,7 @@ impl<'a> UiTree<'a> {
     return self.applied || self.stylesDirty || self.stylesPending || self.paintDirty || self.scrolled
       || cssom_view.scrollAnimating(self)
       || motion.animating(self)
+      || animation.animating(self)
       || self.layout.revision() != self.laidOutRevision
       || self.layout.scrollRevision() != self.laidOutScrolls
       || self.reveal.length() != 0
@@ -3114,6 +3157,7 @@ impl<'a> UiTree<'a> {
     self.stats = FrameStats.zero()
     self.stats.frame = self.frameNumber
     run motion.tick(&mut self)
+    run animation.tick(&mut self)
     run self.resolveStyles()
     run virtual.prepare(&mut self)
     run self.layoutFrame()

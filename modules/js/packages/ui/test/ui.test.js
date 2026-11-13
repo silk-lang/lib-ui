@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { installMock } from "./mock.js";
 
 const mock = installMock();
-const { createBox, createText, createInput, mount, nodeById, setErrorHandler } = await import("../src/index.js");
+const { createBox, createText, createInput, mount, nodeById, setErrorHandler, defineKeyframes } = await import("../src/index.js");
 
 test("nodes queue their mutations", () => {
   mock.take();
@@ -148,6 +148,19 @@ test("a font family list is defined once and named by number", () => {
     ["style", a.id, "font-family:" + id + ";", 0],
     ["style", b.id, "font-family:" + id + ";", 0],
   ]);
+});
+
+test("keyframes are defined frame by frame, with CSS selectors", () => {
+  mock.take();
+  defineKeyframes("pulse", { "0%, 100%": { opacity: 1 }, "50%": { opacity: 0.5, width: 10 } });
+  assert.deepEqual(mock.take(), [
+    ["keyframe", 0, "opacity:1;"],
+    ["keyframe", 1, "opacity:1;"],
+    ["keyframe", 0.5, "opacity:0.5;width:10px;"],
+    ["keyframes", "pulse"],
+  ]);
+  defineKeyframes("pulse", null);
+  assert.deepEqual(mock.take(), [["keyframes", "pulse"]]);
 });
 
 test("a click inside a link opens its address unless a listener prevents it", () => {

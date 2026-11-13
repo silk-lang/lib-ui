@@ -300,6 +300,9 @@ class Page {
       document.head.append(style);
       this.sheets[state] = { sheet: style.sheet, rules: new Map() };
     }
+    const keyframes = document.createElement("style");
+    document.head.append(keyframes);
+    this.keyframes = { sheet: keyframes.sheet, rules: new Map() };
     this.layout = new ResizeObserver((entries) => {
       for (const entry of entries) {
         const id = this.idOf(entry.target);
@@ -683,6 +686,19 @@ class Page {
         case 30:
           this.clone(r);
           break;
+        case 31: {
+          // `@keyframes`, in a sheet of their own, one rule per name.
+          const name = r.text();
+          const frames = [];
+          for (let count = r.u32(); count > 0; count--) {
+            const offset = r.f32();
+            const declarations = [];
+            for (let n = r.u32(); n > 0; n--) declarations.push(r.text());
+            frames.push(`${+(offset * 100).toFixed(4)}% { ${declarations.join("; ")} }`);
+          }
+          this.defineKeyframes(name, frames);
+          break;
+        }
         case 27: {
           // The first root closes: the mounted element shows nothing.
           if (r.u32() !== 0) break;
@@ -849,6 +865,18 @@ class Page {
   // document order, as the program handed them out; then come the texts that differ. Only the
   // top node goes in the tables now: most rows of a long list are never named again, so the
   // others wait until one of them is (`fill`, `reveal`).
+  defineKeyframes(name, frames) {
+    const { sheet, rules } = this.keyframes;
+    const old = rules.get(name);
+    if (old) {
+      sheet.deleteRule(Array.prototype.indexOf.call(sheet.cssRules, old));
+      rules.delete(name);
+    }
+    if (!frames.length) return;
+    const at = sheet.insertRule(`@keyframes ${CSS.escape(name)} { ${frames.join(" ")} }`, sheet.cssRules.length);
+    rules.set(name, sheet.cssRules[at]);
+  }
+
   clone(r) {
     const template = this.templates[r.u32()];
     const top = r.u32();

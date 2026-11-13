@@ -9,6 +9,7 @@ export function installMock() {
   for (const name of [
     "create", "append", "insertBefore", "root", "setText", "listen", "style", "clearStyle",
     "attribute", "focus", "remove", "destroy", "scrollTo", "select", "fontFamily", "open",
+    "keyframe", "keyframes",
   ]) {
     native[name] = record(name);
   }
