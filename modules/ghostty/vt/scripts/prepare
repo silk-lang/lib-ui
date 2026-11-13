@@ -7,6 +7,8 @@
 macOS and Windows use the official prebuilt static libraries. Linux and wasm32 are built from
 the official source and dependency tarballs with Zig 0.17 (set ZIG to name the executable);
 the build is offline. Every download is checked against the SHA-256 the release publishes.
+
+The wasm32 build is patched to allocate from the module's own heap (see `share_heap`).
 """
 import hashlib
 import json
@@ -71,6 +73,69 @@ def zig():
     return executable
 
 
+# A WebAssembly module has one linear memory. Silk's heap owns its end: it grows by adding the
+# new pages to its last chunk. Stock libghostty-vt grows the same memory itself (Zig's
+# WasmAllocator and WasmPageAllocator), so the two would hand out the same bytes. These edits
+# make the library allocate through `malloc` and `free`, which the Silk module exports from its
+# heap, terminal pages included, as the library already does on native freestanding targets.
+HOST_HEAP = """
+
+// Added by ghostty-vt's prepare script: the embedding module's heap, through the `malloc` and
+// `free` it exports, so the library and its host share one heap in one linear memory.
+extern fn malloc(size: usize) ?[*]u8;
+extern fn free(pointer: ?[*]u8) void;
+
+const host_heap_vtable: std.mem.Allocator.VTable = .{
+    .alloc = hostAlloc,
+    .resize = std.mem.Allocator.noResize,
+    .remap = std.mem.Allocator.noRemap,
+    .free = hostFree,
+};
+
+pub const host_heap: std.mem.Allocator = .{ .ptr = undefined, .vtable = &host_heap_vtable };
+
+// The heap aligns every block to 16; a stricter alignment over-allocates and keeps the
+// block's address just below the aligned one.
+fn hostAlloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, _: usize) ?[*]u8 {
+    const bytes = alignment.toByteUnits();
+    if (bytes <= 16) return malloc(len);
+    const raw = malloc(len + bytes + @sizeOf(usize)) orelse return null;
+    const base = @intFromPtr(raw);
+    const aligned = std.mem.alignForward(usize, base + @sizeOf(usize), bytes);
+    @as(*usize, @ptrFromInt(aligned - @sizeOf(usize))).* = base;
+    return @ptrFromInt(aligned);
+}
+
+fn hostFree(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, _: usize) void {
+    if (alignment.toByteUnits() <= 16) return free(memory.ptr);
+    free(@ptrFromInt(@as(*usize, @ptrFromInt(@intFromPtr(memory.ptr) - @sizeOf(usize))).*));
+}
+"""
+
+SHARE_HEAP = [
+    ("src/lib/allocator.zig",
+     "if (comptime builtin.target.cpu.arch.isWasm()) return std.heap.wasm_allocator;",
+     "if (comptime builtin.target.cpu.arch.isWasm()) return host_heap;"),
+    ("src/terminal/PageList.zig",
+     "const native_freestanding = builtin.target.os.tag == .freestanding and\n    !builtin.target.cpu.arch.isWasm();",
+     "const native_freestanding = builtin.target.os.tag == .freestanding;"),
+    ("src/lib_vt.zig",
+     "    if (native_freestanding) {\n        // Freestanding targets don't have an OS page size.",
+     "    if (native_freestanding or builtin.target.cpu.arch.isWasm()) {\n        // Freestanding targets don't have an OS page size."),
+]
+
+
+def share_heap(source):
+    for name, old, new in SHARE_HEAP:
+        path = source / name
+        text = path.read_text()
+        if text.count(old) != 1:
+            raise SystemExit(f"Cannot patch {name} for wasm32: its source changed")
+        path.write_text(text.replace(old, new))
+    allocator = source / "src/lib/allocator.zig"
+    allocator.write_text(allocator.read_text() + HOST_HEAP)
+
+
 def build(target, destination):
     """Builds the static library from source with Zig, offline, into `destination`."""
     executable = zig()
@@ -79,6 +144,8 @@ def build(target, destination):
         for name in (f"libghostty-vt-{VERSION}.tar.gz", f"libghostty-vt-{VERSION}-deps.tar.gz"):
             with tarfile.open(download(name)) as tar:
                 tar.extractall(work, filter="data")
+        if target == "wasm32":
+            share_heap(work / f"libghostty-vt-{VERSION}")
         command = [executable, "build", "-Demit-lib-vt", "--prefix", str(work / "out"),
                    "--system", str(work / f"libghostty-vt-{VERSION}-deps")]
         if target == "wasm32":
@@ -109,6 +176,8 @@ def prepare(target):
         library = BUILD / "lib" / "libghostty-vt.a"
     stamp = library.parent / "prepared.json"
     identity = {"version": VERSION, "target": target, "os": system, "arch": machine}
+    if target == "wasm32":
+        identity["heap"] = "host"
     if library.is_file() and stamp.is_file() and json.loads(stamp.read_text()) == identity:
         print(f"Already prepared: {library}")
         return
