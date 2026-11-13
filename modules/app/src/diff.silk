@@ -18,6 +18,7 @@ import ui_protocol.css { Declaration }
 import ui_protocol.grid { Grid }
 import silk.mem.box { Box }
 import ui { Arena, Entry, Extra, NO_ENTRY, ROOT_ID }
+import backend { Backend }
 import equal { sameCommand }
 import ui_protocol.css { Property }
 import ui_protocol.mutation {
@@ -66,6 +67,9 @@ pub struct DiffState {
   /// Whether the backend copies what it needs out of a batch and keeps none of it
   /// (`Backend.copiesBatches`): the text of the mutations then comes from `scratch`.
   pub transient: bool,
+  /// How many mutations of this render the backend took before its end (`Backend.mutateEarly`).
+  /// The runtime sets it to 0 when a render starts.
+  pub taken: usize,
   /// A bump allocator for the text of one render's mutations, reset at the next render. A
   /// string there costs a pointer bump instead of a heap allocation, and dropping it a count.
   scratch: BumpArena<SystemAllocator>,
@@ -89,6 +93,7 @@ impl DiffState {
       tails: List<usize>.make(),
       previous: List<usize>.make(),
       transient: false,
+      taken: 0,
       scratch: BumpArena<SystemAllocator>.make(Allocator.systemAllocatorProvider()),
     }
   }
@@ -134,24 +139,30 @@ impl DiffState {
 /// Writes the mutations that turn the tree from `old` (the last render, empty at first) into
 /// `next`, and gives every entry of `next` its tree id. The root entry is the runtime's root
 /// box, which the runtime created.
-pub effect fn diff(
+pub effect fn diff<B: Backend>(
   next: &mut Arena,
   old: &Arena,
   state: &mut DiffState,
   out: &mut List<Mutation>,
+  tree: &mut B,
 ) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
-  run diffFrom(&mut next, old, &mut state, &mut out, ROOT_ID)
+  run diffFrom(&mut next, old, &mut state, &mut out, &mut tree, ROOT_ID)
 }
 
 /// [`diff`] for a root entry whose tree id is `rootId`: the root box of a window the model
 /// declared, which the runtime created.
-pub effect fn diffFrom(
+///
+/// `tree` is the backend the batch is for. When the batch grows past [`EARLY`] mutations and
+/// the backend copies batches, it is offered what there is (`Backend.mutateEarly`), so a large
+/// render does not hold all its mutations at once.
+pub effect fn diffFrom<B: Backend>(
   next: &mut Arena,
   old: &Arena,
   state: &mut DiffState,
   out: &mut List<Mutation>,
+  tree: &mut B,
   rootId: u32,
 ) -> ()
   ! OutOfMemoryError
@@ -176,12 +187,17 @@ pub effect fn diffFrom(
   }
   // A new node is a create, an insert and a few attributes: room for them at once, so a large
   // mount does not grow the batch (and copy it) many times.
-  run out.reserve(fresh * 6 + 16)
+  let room = fresh * 6 + 16
+  run out.reserve(if state.transient && room > EARLY + 64 {
+    EARLY + 64
+  } else {
+    room
+  })
   let mut root = next.entry(0)
   root.id = rootId
   next.setEntry(0, root)
   run props(&next, 0, &old, root.old, rootId, &mut state, &mut out)
-  run children(&mut next, 0, &old, root.old, &mut state, &mut out)
+  run children(&mut next, 0, &old, root.old, &mut state, &mut out, &mut tree)
 
   // Focus requests, once every node is in place: the last node that asks now and did not ask
   // in the last render.
@@ -235,13 +251,29 @@ pub effect fn diffFrom(
   }
 }
 
+/// How long a batch gets before a backend that copies batches is offered it during the diff.
+pub const EARLY: usize = 4096
+
+/// Offers the backend the mutations made so far (`Backend.mutateEarly`).
+effect fn offer<B: Backend>(state: &mut DiffState, out: &mut List<Mutation>, tree: &mut B) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !state.transient {
+    return ()
+  }
+  let before = out.length()
+  run Backend.mutateEarly(&mut tree, &mut out)
+  state.taken = state.taken + (before - out.length())
+}
+
 /// Creates entry `index` and its subtree. Returns its id.
-effect fn create(
+effect fn create<B: Backend>(
   next: &mut Arena,
   index: u32,
   old: &Arena,
   state: &mut DiffState,
   out: &mut List<Mutation>,
+  tree: &mut B,
 ) -> u32
   ! OutOfMemoryError
   ? &mut Allocator {
@@ -254,20 +286,24 @@ effect fn create(
   run props(&next, index, &old, NO_ENTRY, id, &mut state, &mut out)
   let mut child = entry.firstChild
   while child != NO_ENTRY {
-    let childId = run create(&mut next, child, &old, &mut state, &mut out)
+    let childId = run create(&mut next, child, &old, &mut state, &mut out, &mut tree)
     run out.append(Mutation.InsertBefore { parent: id, child: childId, before: Option<u32>.None })
+    if out.length() >= EARLY {
+      run offer(&mut state, &mut out, &mut tree)
+    }
     child = next.entryRef(child).next
   }
   return id
 }
 
 /// Brings matched entry `index` up to date with its old entry. Returns its id.
-effect fn update(
+effect fn update<B: Backend>(
   next: &mut Arena,
   index: u32,
   old: &Arena,
   state: &mut DiffState,
   out: &mut List<Mutation>,
+  tree: &mut B,
 ) -> u32
   ! OutOfMemoryError
   ? &mut Allocator {
@@ -281,18 +317,19 @@ effect fn update(
     return id
   }
   run props(&next, index, &old, entry.old, id, &mut state, &mut out)
-  run children(&mut next, index, &old, entry.old, &mut state, &mut out)
+  run children(&mut next, index, &old, entry.old, &mut state, &mut out, &mut tree)
   return id
 }
 
 /// Reconciles the children of `index` with those of its old entry `before` (or none).
-effect fn children(
+effect fn children<B: Backend>(
   next: &mut Arena,
   index: u32,
   old: &Arena,
   before: u32,
   state: &mut DiffState,
   out: &mut List<Mutation>,
+  tree: &mut B,
 ) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
@@ -331,15 +368,18 @@ effect fn children(
     let current = state.children.get(i)
     let matched = next.entryRef(current).old
     if matched == NO_ENTRY {
-      let id = run create(&mut next, current, &old, &mut state, &mut out)
+      let id = run create(&mut next, current, &old, &mut state, &mut out, &mut tree)
       run out.append(Mutation.InsertBefore { parent: parentId, child: id, before: after })
       after = Option<u32>.Some { value: id }
     } else {
-      let id = run update(&mut next, current, &old, &mut state, &mut out)
+      let id = run update(&mut next, current, &old, &mut state, &mut out, &mut tree)
       if !state.stable.get(stableStart + (i - start)) {
         run out.append(Mutation.InsertBefore { parent: parentId, child: id, before: after })
       }
       after = Option<u32>.Some { value: id }
+    }
+    if out.length() >= EARLY {
+      run offer(&mut state, &mut out, &mut tree)
     }
   }
   state.children.truncate(start)
