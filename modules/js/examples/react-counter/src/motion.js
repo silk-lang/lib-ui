@@ -31,7 +31,7 @@ export function startMotion(nodes, theme, clicks) {
     for (let c = 0; c < 40; c++) {
       const node = createBox({ position: "absolute", left: c * GAP + 20, top: r * GAP + 18, width: 2, height: 2, borderRadius: 1 });
       nodes.field.append(node);
-      dots.push({ node, x: c * GAP + 21, y: r * GAP + 19, level: -1, size: 2 });
+      dots.push({ node, x: c * GAP + 21, y: r * GAP + 19, level: -1, size: 2, shimmer: 0 });
     }
   }
   const waves = [];
@@ -66,19 +66,34 @@ export function startMotion(nodes, theme, clicks) {
     const ringSize = Math.round(28 + pulse * 30);
     nodes.pointerRing.style.set({ left: Math.round(ringX - ringSize / 2), top: Math.round(ringY - ringSize / 2), width: ringSize, height: ringSize, borderRadius: ringSize / 2, borderColor: rgb(color, view.inside ? 0.9 : 0) });
 
-    // Dots light up around the pointer and on the front of each click's wave.
+    // Dots light up around the pointer and on the front of each click's wave. Most dots
+    // are far from both in any frame, and those cost a few comparisons.
     while (waves.length && time - waves[0].at > 1.8) waves.shift();
-    for (const dot of dots) {
+    for (const wave of waves) {
+      const age = time - wave.at;
+      wave.front = age * 900;
+      wave.gain = (1 - age / 1.8) * 1.2;
+    }
+    const shimmerTurn = Math.floor(time * 30) % 8;
+    for (let i = 0; i < dots.length; i++) {
+      const dot = dots[i];
       if (dot.x > view.width + GAP || dot.y > view.height + GAP) continue;
-      const dx = dot.x - ringX;
-      const dy = dot.y - ringY;
-      let energy = view.inside ? Math.exp(-(dx * dx + dy * dy) / 14000) * 0.7 : 0;
-      for (const wave of waves) {
-        const age = time - wave.at;
-        const band = (Math.hypot(dot.x - wave.x, dot.y - wave.y) - age * 900) / 70;
-        energy += Math.exp(-band * band) * (1 - age / 1.8) * 1.2;
+      let energy = 0;
+      if (view.inside) {
+        const dx = dot.x - ringX;
+        const dy = dot.y - ringY;
+        const distance = dx * dx + dy * dy;
+        if (distance < 70000) energy = Math.exp(-distance / 14000) * 0.7;
       }
-      energy += 0.06 * Math.sin(time * 1.2 + dot.x * 0.012 + dot.y * 0.02);
+      for (const wave of waves) {
+        const dx = dot.x - wave.x;
+        const dy = dot.y - wave.y;
+        const band = (Math.sqrt(dx * dx + dy * dy) - wave.front) / 70;
+        if (band > -2.5 && band < 2.5) energy += Math.exp(-band * band) * wave.gain;
+      }
+      // A slow shimmer, refreshed for an eighth of the dots each frame.
+      if (i % 8 === shimmerTurn) dot.shimmer = 0.06 * Math.sin(time * 1.2 + dot.x * 0.012 + dot.y * 0.02);
+      energy += dot.shimmer;
       const level = Math.round(Math.min(1, 0.12 + energy) * 20) / 20;
       const dotSize = energy > 0.35 ? (energy > 0.8 ? 6 : 4) : 2;
       if (level === dot.level && dotSize === dot.size) continue;

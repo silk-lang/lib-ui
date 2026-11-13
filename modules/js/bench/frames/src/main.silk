@@ -1,0 +1,134 @@
+//! Times the animation frames of a ui-js application on the embedded engine and the tree,
+//! with no window and no GPU: `ui-js-bench-frames <bundle.js>` from the repository root. It
+//! runs the bundle, then three phases of 120 frames at 60 per second (idle, the pointer
+//! moving, a click every 10 frames) and prints for each the mean milliseconds of a frame's
+//! JavaScript (timers and animation frame callbacks), of applying its mutations to the
+//! tree, and of the tree's frame (style, layout, paint).
+import ui_js.lib { JsHost, JsError }
+import ui_tree.lib { Tree, TreeError, ProtocolError, Viewport, Input }
+import ui_fixtures.fixtures as fixtures
+import silkjs.js_atomics_native { WaiterDomain, SynchronizationError }
+import silkjs.runtime_memory { RuntimeAllocator }
+import silkjs.js_libc_platform as platform
+import silk.collections.bytes { Bytes }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.io.writer_native { StderrWriter }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.host_input { HostInput }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
+import silk.system.system_clock { SystemClock }
+import silk.num.i64
+import silk.num.u32
+
+/// The window size of the demo host.
+fn viewport() -> Viewport {
+  return Viewport { width: 1040.0, height: 720.0, scale: 2.0 }
+}
+
+/// Milliseconds on the monotonic clock.
+effect fn now() -> f64 {
+  let mut clock = OsMonotonicClock.make()
+  let at = run MonotonicClock.now() |> Effect.provideMut<MonotonicClock>(&mut clock)
+  return i64.toF64(SystemClock.seconds(&at)) * 1000.0 + i64.toF64(SystemClock.nanoseconds(&at)) / 1000000.0
+}
+
+/// 120 frames. With `pointer` the pointer moves every frame; with `clicks` it clicks every
+/// tenth.
+effect fn phase(host: &mut JsHost<'_>, tree: &mut Tree<'_>, name: string, start: f64, pointer: bool, clicks: bool) -> f64
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError
+  ? &mut Allocator {
+  let mut time = start
+  let mut js = 0.0
+  let mut apply = 0.0
+  let mut frame = 0.0
+  let mut worst = 0.0
+  let mut mutations: usize = 0
+  let mut i: u32 = 0
+  while i < 120 {
+    let x = 200.0 + u32.toF32(i) * 5.0
+    let y = 300.0 + u32.toF32(i % 40) * 4.0
+    let began = run now()
+    if pointer || clicks {
+      run host.input(&mut tree, Input.moveTo(x, y))
+    }
+    if clicks && i % 10 == 0 {
+      run host.input(&mut tree, Input.press(x, y))
+      run host.input(&mut tree, Input.release(x, y))
+    }
+    run host.tick(time, true)
+    let ticked = run now()
+    mutations = mutations + host.pending()
+    run host.flush(&mut tree)
+    let applied = run now()
+    drop run tree.frame(viewport(), time)
+    let framed = run now()
+    js = js + (ticked - began)
+    apply = apply + (applied - ticked)
+    frame = frame + (framed - applied)
+    if framed - began > worst { worst = framed - began }
+    time = time + 1.0 / 60.0
+    i = i + 1
+  }
+  StderrWriter.print("frames: {} js={} apply={} frame={} total={} worst={} ms, {} mutations a frame\n",
+    &(name, js / 120.0, apply / 120.0, frame / 120.0, (js + apply + frame) / 120.0, worst, mutations / 120))
+  return time
+}
+
+effect fn bench(entry: &[u8]) -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run Tree.make(&fonts)
+  let domain = run WaiterDomain.make()
+  let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let memory = run allocator.observe()
+  let mut host = run JsHost.open(&memory, domain.handle()) |> Effect.provideMut<Allocator>(&mut allocator)
+  let bundle = run platform.readFile(entry)
+  run host.module(bundle.asSlice(), b"app.js") |> Effect.provideMut<Allocator>(&mut allocator)
+  run host.flush(&mut tree) |> Effect.provideMut<Allocator>(&mut allocator)
+  drop run tree.frame(viewport(), 0.0)
+  // Effects and the first frame callbacks start on timers.
+  run host.tick(0.5, true) |> Effect.provideMut<Allocator>(&mut allocator)
+  run host.flush(&mut tree) |> Effect.provideMut<Allocator>(&mut allocator)
+  drop run tree.frame(viewport(), 0.5)
+  let mut time = 1.0
+  time = run phase(&mut host, &mut tree, "idle", time, false, false) |> Effect.provideMut<Allocator>(&mut allocator)
+  time = run phase(&mut host, &mut tree, "pointer", time, true, false) |> Effect.provideMut<Allocator>(&mut allocator)
+  time = run phase(&mut host, &mut tree, "clicks", time, true, true) |> Effect.provideMut<Allocator>(&mut allocator)
+  drop time
+  run host.close() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn failed<E>(error: E) -> i32 {
+  drop error
+  StderrWriter.print("ui-js-bench-frames: the app failed\n", &())
+  return 2
+}
+
+effect fn ran(entry: &[u8]) -> i32
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError
+  ? &mut Allocator {
+  run bench(entry)
+  return 0
+}
+
+effect fn noArgument<E>(error: E) -> Option<Bytes> {
+  drop error
+  return Option<Bytes>.None
+}
+
+pub effect fn main() -> i32
+  ? &mut HostInput {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let entry = match run Effect.catchAll(HostInput.argument(1), noArgument) |> Effect.provideMut<Allocator>(&mut allocator) {
+    Option<Bytes>.Some { value } => move value
+    Option<Bytes>.None => {
+      StderrWriter.print("usage: ui-js-bench-frames <bundle.js>\n", &())
+      return 2
+    }
+  }
+  return run Effect.catchAll(ran(Bytes.asSlice(&entry)), failed)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
