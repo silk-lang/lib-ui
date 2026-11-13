@@ -88,4 +88,4 @@ The functions are generic over the message type `M`, which is why any program ca
 - Share a look by writing a function that returns an `Attr`.
 - `css.raw` passes any CSS through when there is no helper for it.
 
-Next: [Events and input](/core/events/).
+Next: [Images and fonts](/core/images-and-fonts/).
