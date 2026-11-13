@@ -629,10 +629,12 @@ pub struct Ui<M> {
   claimed: List<bool>,
   /// The lazy records of the last render by parent and ordinal (see `lazyKey`).
   lazyIndex: HashMap<Word, u32>,
-  /// Whether `lookup` and `lazyIndex` hold this render's previous tree. They are built on the
+  /// Whether `lazyIndex` holds this render's previous tree. It and `lookup` are built on the
   /// first miss of the guesses that match old entries in order, so a render that keeps its
   /// structure never hashes.
   indexed: bool,
+  /// The entries of the previous tree whose children are in `lookup`.
+  childrenIndexed: List<bool>,
   /// The lazy record after the last one reused: the guess for the next `lazy` call.
   lazyCursor: usize,
   current: u32,
@@ -745,6 +747,7 @@ impl<M> Ui<M> {
       claimed: List<bool>.make(),
       lazyIndex: HashMap<Word, u32>.make(Hash.seed(0x6C617A79)),
       indexed: false,
+      childrenIndexed: List<bool>.make(),
       lazyCursor: 0,
       current: 0,
       hasPendingKey: false,
@@ -803,6 +806,8 @@ impl<M> Ui<M> {
     self.previousMarked = self.marked
     self.lazyIndex.clear()
     self.indexed = false
+    self.childrenIndexed.clear()
+    run self.childrenIndexed.appendRepeated(false, u32.toUsize(self.previous.length()))
     self.noReuse = false
     self.resetRender()
   }
@@ -1025,19 +1030,29 @@ impl<M> Ui<M> {
     return Identity { keyed: false, value: u32.toU64(ordinal) }
   }
 
-  /// Builds `lookup` and `lazyIndex` from the previous tree, once a render.
+  /// Adds the children of `oldParent`, an entry of the previous tree, to `lookup`, once a
+  /// render: only the parents whose children did not match in order are hashed.
+  fn indexChildren(self: &mut Self, oldParent: u32) -> () {
+    if self.childrenIndexed.get(u32.toUsize(oldParent)) {
+      return ()
+    }
+    self.childrenIndexed.set(u32.toUsize(oldParent), true)
+    let mut at = self.previous.entryRef(oldParent).firstChild
+    while at != NO_ENTRY {
+      let entry = self.previous.entryRef(at)
+      let key = Hash.word(slotKey(oldParent, entry.identity))
+      let next = entry.next
+      drop self.heap.alloc(self.lookup.insert(key, at))
+      at = next
+    }
+  }
+
+  /// Builds `lazyIndex` from the previous tree, once a render.
   fn index(self: &mut Self) -> () {
     if self.indexed {
       return ()
     }
     self.indexed = true
-    let count = self.previous.length()
-    let mut i: u32 = 1
-    while i < count {
-      let entry = self.previous.entry(i)
-      drop self.heap.alloc(self.lookup.insert(Hash.word(slotKey(entry.parent, entry.identity)), i))
-      i = i + 1
-    }
     let mut l: usize = 0
     while l < self.previous.lazies.length() {
       let record = self.previous.lazies.get(l)
@@ -1087,7 +1102,7 @@ impl<M> Ui<M> {
     }
     let mut collided = false
     if found == NO_ENTRY {
-      self.index()
+      self.indexChildren(oldParent)
       if let Option<u32>.Some { value } = self.lookup.get(Hash.word(slotKey(oldParent, identity))) {
         let entry = self.previous.entryRef(value)
         if entry.parent == oldParent && entry.identity.same(&identity) {
