@@ -223,7 +223,7 @@ warm runs + 3 cold (the whole page cache dropped before each), medians.
 
 The ui-js window's first launch (GPU cache empty) is 288 ms. The browser builds wait for
 their fonts (`document.fonts.ready`) before counting two frames; the ui-js fonts are in
-the binary. ui-js's web-free bundle is 0.23 MB (0.06 gzip); the web build is 0.23 MB of
+the binary. The ui-js bundle is 0.23 MB (0.06 gzip); the web build is 0.23 MB of
 JavaScript plus 0.28 MB of the same fonts.
 
 - **Startup and memory** keep the counter's order: ui-js starts first and uses the least
