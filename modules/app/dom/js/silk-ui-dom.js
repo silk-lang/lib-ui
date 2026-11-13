@@ -65,7 +65,7 @@ const RESET = `
   -webkit-mask: var(--silk-icon) center / contain no-repeat;
   mask: var(--silk-icon) center / contain no-repeat;
 }
-:where([data-silk][style*="--silk-selection-color"])::selection { background: var(--silk-selection-color, highlight); }
+:where([style*="--silk-selection-color"])::selection { background: var(--silk-selection-color, highlight); }
 :where(input[data-silk], textarea[data-silk])::placeholder { color: var(--silk-placeholder-color, gray); opacity: 1; }
 `;
 
@@ -294,15 +294,16 @@ class Page {
     });
   }
 
-  // The nodes of a server render, by id: elements carry theirs in `data-silk`, and a text
-  // follows a comment that holds its id.
+  // The nodes of a server render, by id: elements carry theirs in `data-silk` (`data-silk-html`
+  // for plain HTML elements), and a text follows a comment that holds its id.
   found() {
     const found = new Map();
     const markers = [];
     const walker = document.createTreeWalker(this.root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_COMMENT);
     for (let node = walker.nextNode(); node; node = walker.nextNode()) {
       if (node.nodeType === 1) {
-        if (node.dataset.silk) found.set(Number(node.dataset.silk), node);
+        const id = node.dataset.silk ?? node.dataset.silkHtml;
+        if (id) found.set(Number(id), node);
       } else if (/^\d+$/.test(node.data)) markers.push(node);
     }
     for (const marker of markers) {
@@ -626,7 +627,10 @@ class Page {
           const tag = r.text();
           const meta = this.meta.get(id);
           meta.tag = tag || undefined;
-          this.swap(id, tag || TAGS[meta.kind][0].toLowerCase());
+          const next = this.swap(id, tag || TAGS[meta.kind][0].toLowerCase());
+          // Plain HTML has no `data-silk` (see `create`); a state rule names it by either.
+          if (!tag) next.setAttribute("data-silk", id);
+          else if (!next.hasAttribute("data-silk-html")) next.removeAttribute("data-silk");
           break;
         }
         case 27: {
@@ -777,13 +781,13 @@ class Page {
       // A node of the server render: the program sets it up as it would a new one.
       this.adopt.delete(id);
       if (node.nodeType === 1) {
-        for (const name of node.getAttributeNames()) {
-          if (name !== "data-silk") node.removeAttribute(name);
-        }
+        for (const name of node.getAttributeNames()) node.removeAttribute(name);
       }
     } else if (kind === KIND_TEXT) node = document.createTextNode("");
     else node = document.createElement(tag || TAGS[kind][0].toLowerCase());
-    if (node.nodeType === 1) node.setAttribute("data-silk", id);
+    // An element whose name the view chose is plain HTML: no `data-silk`, so the reset sheet
+    // leaves it to the page's styles (and a large table skips an attribute per cell).
+    if (node.nodeType === 1 && !tag) node.setAttribute("data-silk", id);
     node.silkId = id;
     if (kind === KIND_ICON) node.setAttribute("data-silk-icon", "");
     if (kind === KIND_CANVAS) this.canvases.observe(node);
@@ -843,7 +847,13 @@ class Page {
     const { sheet, rules } = this.sheets[state];
     let rule = rules.get(id);
     if (!rule && make) {
-      const at = sheet.insertRule(`[data-silk="${id}"]${STATES[state]} {}`, sheet.cssRules.length);
+      const node = this.nodes.get(id);
+      let attribute = "data-silk";
+      if (!node.hasAttribute(attribute)) {
+        attribute = "data-silk-html";
+        node.setAttribute(attribute, id);
+      }
+      const at = sheet.insertRule(`[${attribute}="${id}"]${STATES[state]} {}`, sheet.cssRules.length);
       rule = sheet.cssRules[at];
       rules.set(id, rule);
     }
