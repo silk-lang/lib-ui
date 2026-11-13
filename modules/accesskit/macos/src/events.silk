@@ -1,0 +1,320 @@
+//! The NSAccessibility notifications a tree update causes.
+//!
+//! Ported from AccessKit (`accesskit_macos/src/event.rs`), Copyright 2022 The AccessKit Authors,
+//! under the MIT or Apache-2.0 license. Elements that go away are not reported here: the adapter
+//! drops the elements missing from the new tree and AppKit posts their destruction then.
+import accesskit.lib { Role, Live }
+import accesskit_consumer.lib {
+  NodeRef,
+  IdSet,
+  ChangeHandler,
+  FilterResult,
+  CommonFilter,
+  commonFilter
+}
+import node { MacValue, elementId, included, label, title, value, isItemLike, sameValue, sameText }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.string { String }
+
+/// The NSAccessibility notifications the adapter posts on an element.
+pub enum Notification {
+  /// `NSAccessibilityFocusedUIElementChangedNotification`.
+  FocusedElementChanged,
+  /// `NSAccessibilityValueChangedNotification`.
+  ValueChanged,
+  /// `NSAccessibilityTitleChangedNotification`.
+  TitleChanged,
+  /// `NSAccessibilitySelectedTextChangedNotification`.
+  SelectedTextChanged,
+  /// `NSAccessibilitySelectedRowsChangedNotification`.
+  SelectedRowsChanged,
+}
+
+impl Notification {
+  /// The number the AppKit side knows the notification by.
+  pub fn code(self: Self) -> u32 {
+    return match self {
+      Notification.FocusedElementChanged => 1
+      Notification.ValueChanged => 2
+      Notification.TitleChanged => 3
+      Notification.SelectedTextChanged => 4
+      Notification.SelectedRowsChanged => 5
+    }
+  }
+
+  /// The AppKit name of the notification.
+  pub fn name(self: Self) -> string<'static> {
+    return match self {
+      Notification.FocusedElementChanged => "AXFocusedUIElementChanged"
+      Notification.ValueChanged => "AXValueChanged"
+      Notification.TitleChanged => "AXTitleChanged"
+      Notification.SelectedTextChanged => "AXSelectedTextChanged"
+      Notification.SelectedRowsChanged => "AXSelectedRowsChanged"
+    }
+  }
+}
+
+/// One event the adapter raises after an update.
+pub union MacEvent {
+  /// A notification posted on element `id`.
+  Generic { pub id: u64, pub notification: Notification },
+  /// `NSAccessibilityAnnouncementRequestedNotification` on the window, for a live region.
+  Announcement { pub text: String, pub assertive: bool },
+}
+
+impl MacEvent {
+  pub fn focus(id: u64) -> MacEvent {
+    return MacEvent.Generic { id: id, notification: Notification.FocusedElementChanged }
+  }
+
+  fn announcement(text: String, live: Live) -> MacEvent {
+    return MacEvent.Announcement { text: move text, assertive: live == Live.Assertive }
+  }
+}
+
+/// Collects the events of one update, as AccessKit's `EventGenerator` does.
+pub struct EventGenerator {
+  /// Events that go before the others, newest first.
+  front: List<MacEvent>,
+  back: List<MacEvent>,
+  textChanged: IdSet,
+  selectedRowsChanged: IdSet,
+}
+
+impl EventGenerator {
+  pub fn make() -> EventGenerator {
+    return EventGenerator {
+      front: List<MacEvent>.make(),
+      back: List<MacEvent>.make(),
+      textChanged: IdSet.make(),
+      selectedRowsChanged: IdSet.make(),
+    }
+  }
+
+  /// The events in the order they are raised.
+  pub effect fn finish(self: Self) -> List<MacEvent>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut front = move self.front
+    let mut back = move self.back
+    let mut out = List<MacEvent>.make()
+    while let Option.Some { value } = front.pop() {
+      run out.append(move value)
+    }
+    let mut taken = List<MacEvent>.make()
+    while let Option.Some { value } = back.pop() {
+      run taken.append(move value)
+    }
+    while let Option.Some { value } = taken.pop() {
+      run out.append(move value)
+    }
+    return move out
+  }
+
+  effect fn push(self: &mut Self, event: MacEvent) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.back.append(move event)
+  }
+
+  effect fn pushFront(self: &mut Self, event: MacEvent) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.front.append(move event)
+  }
+
+  effect fn textChangeForParent(self: &mut Self, node: &NodeRef<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !node.supportsTextRanges() {
+      return
+    }
+    if self.textChanged.contains(node.id) {
+      return
+    }
+
+    // Text changes come before selection changes; their place among other events does not
+    // matter.
+    let event = MacEvent.Generic { id: elementId(node), notification: Notification.ValueChanged }
+    run self.pushFront(move event)
+    drop run self.textChanged.insert(node.id)
+  }
+
+  effect fn textChange(self: &mut Self, node: &NodeRef<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if node.accessRole() != Role.TextRun {
+      return
+    }
+    match node.filteredParent(&CommonFilter {}) {
+      Option.Some { value } => run self.textChangeForParent(&value)
+      Option.None => {}
+    }
+  }
+
+  effect fn selectedRowsChange(self: &mut Self, node: &NodeRef<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !isItemLike(node) {
+      return
+    }
+    match node.selectionContainer(&CommonFilter {}) {
+      Option.Some { value: container } => {
+        if self.selectedRowsChanged.contains(container.id) {
+          return
+        }
+        let event = MacEvent.Generic {
+          id: elementId(&container),
+          notification: Notification.SelectedRowsChanged,
+        }
+        run self.push(move event)
+        drop run self.selectedRowsChanged.insert(container.id)
+      }
+      Option.None => {}
+    }
+  }
+}
+
+fn selectedTrue(node: &NodeRef<'_>) -> bool {
+  return match node.isSelected() {
+    Option.Some { value } => value
+    Option.None => false
+  }
+}
+
+fn sameSelected(left: Option<bool>, right: Option<bool>) -> bool {
+  return match left {
+    Option.Some { value: mine } => match right {
+      Option.Some { value: theirs } => mine == theirs
+      Option.None => false
+    }
+    Option.None => right.isNone()
+  }
+}
+
+fn isBoolValue(value: &Option<MacValue>) -> bool {
+  return match &value.* {
+    Option.Some { value: shown } => shown.isBool()
+    Option.None => false
+  }
+}
+
+impl ChangeHandler for EventGenerator {
+  effect fn nodeAdded(self: &mut Self, node: &NodeRef<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.textChange(node)
+    if !included(node) {
+      return
+    }
+    if selectedTrue(node) {
+      run self.selectedRowsChange(node)
+    }
+    if node.live() != Live.Off {
+      match run label(node) {
+        Option.Some { value } => {
+          let event = MacEvent.announcement(move value, node.live())
+          run self.push(move event)
+        }
+        Option.None => {}
+      }
+    }
+  }
+
+  effect fn nodeUpdated(self: &mut Self, old: &NodeRef<'_>, new: &NodeRef<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let rawChanged = match old.rawValue() {
+      Option.Some { value: before } => match new.rawValue() {
+        Option.Some { value: after } => before != after
+        Option.None => true
+      }
+      Option.None => new.rawValue().isSome()
+    }
+    if rawChanged {
+      run self.textChange(new)
+    }
+    let before = commonFilter(old)
+    let after = commonFilter(new)
+    if after != FilterResult.Include {
+      if before == FilterResult.Include && selectedTrue(old) {
+        run self.selectedRowsChange(old)
+      }
+      return
+    }
+    let id = elementId(new)
+    let oldTitle = run title(old)
+    let newTitle = run title(new)
+    if !sameText(&oldTitle, &newTitle) {
+      let event = MacEvent.Generic { id: id, notification: Notification.TitleChanged }
+      run self.push(move event)
+    }
+    let oldValue = run value(old)
+    let newValue = run value(new)
+    if !sameValue(&oldValue, &newValue) {
+      let event = MacEvent.Generic { id: id, notification: Notification.ValueChanged }
+      if !new.isFocused() && isBoolValue(&newValue) {
+        // A focused node's checked change must come last for VoiceOver to announce it.
+        run self.pushFront(move event)
+      } else {
+        run self.push(move event)
+      }
+    }
+    if old.supportsTextRanges() && new.supportsTextRanges() {
+      let selectionChanged = match old.rawTextSelection() {
+        Option.Some { value: mine } => match new.rawTextSelection() {
+          Option.Some { value: theirs } => !mine.equals(theirs)
+          Option.None => true
+        }
+        Option.None => new.rawTextSelection().isSome()
+      }
+      if selectionChanged {
+        let event = MacEvent.Generic { id: id, notification: Notification.SelectedTextChanged }
+        run self.push(move event)
+      }
+    }
+    if new.live() != Live.Off {
+      let newLabel = run label(new)
+      let oldLabel = run label(old)
+      let changed = !sameText(&newLabel, &oldLabel) || new.live() != old.live()
+        || before != FilterResult.Include
+      if changed {
+        match move newLabel {
+          Option.Some { value } => {
+            let event = MacEvent.announcement(move value, new.live())
+            run self.push(move event)
+          }
+          Option.None => {}
+        }
+      }
+    }
+    if !sameSelected(new.isSelected(), old.isSelected())
+      || (before != FilterResult.Include && selectedTrue(new)) {
+      run self.selectedRowsChange(new)
+    }
+  }
+
+  effect fn focusMoved(self: &mut Self, old: Option<NodeRef<'_>>, new: Option<NodeRef<'_>>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match new {
+      Option.Some { value } => {
+        if included(&value) {
+          run self.push(MacEvent.focus(elementId(&value)))
+        }
+      }
+      Option.None => {}
+    }
+  }
+
+  effect fn nodeRemoved(self: &mut Self, node: &NodeRef<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.textChange(node)
+    if selectedTrue(node) {
+      run self.selectedRowsChange(node)
+    }
+  }
+}

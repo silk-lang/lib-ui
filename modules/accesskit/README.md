@@ -10,8 +10,9 @@ hands their requests back as [`ActionRequest`](src/update.silk)s.
 | `accesskit` (this directory) | `accesskit` | The schema: nodes, roles, actions, geometry, updates |
 | `accesskit-consumer` ([consumer](consumer)) | `accesskit_consumer` | The tree adapters keep: applies updates, reports changes, filters, navigation, text ranges |
 | `accesskit-unix` ([unix](unix)) | `accesskit_unix`, `accesskit_atspi_common` | The Linux adapter: AT-SPI over D-Bus, with the D-Bus client in [`modules/dbus`](../dbus) |
+| `accesskit-macos` ([macos](macos)) | `accesskit_macos` | The macOS adapter: NSAccessibility elements for a view |
 
-The macOS and Windows adapters follow in this directory.
+The Windows adapter follows in this directory.
 
 ## Linux
 
@@ -49,6 +50,31 @@ python3 modules/accesskit/unix/examples/atspi_client.py
 
 Object paths are `/org/a11y/atspi/accessible/<window>/<node>`, where `<node>` is the consumer's
 64-bit node id (`FullNodeId.toU64`) instead of AccessKit's 128-bit one.
+
+## macOS
+
+[`Adapter`](macos/src/adapter.silk) keeps the NSAccessibility elements of one view in step with
+the tree. AccessKit's elements ask the tree on every AppKit call; here the Silk side computes the
+same answers ahead of time and sends each element as a byte record (layout in
+[`record.silk`](macos/src/record.silk)) whenever it changes, and the AppKit side in
+[`native/adapter.m`](macos/native/adapter.m) answers from it. Text fields carry their lines,
+character boxes and format runs, so the text range calls (`accessibilityRangeForPosition:`,
+`accessibilityFrameForRange:`, `accessibilityAttributedStringForRange:`, ...) need no round trip.
+As AccessKit's `SubclassingAdapter` does, the view's class is swapped for a subclass whose
+accessibility children, focused element and hit test are the adapter's.
+
+```silk
+// The platform window host's content view for window `id`:
+let sink = NativeSink.forWindow(id.value).unwrap()
+let mut adapter = run Adapter.make(move sink, initialUpdate, true)
+run adapter.update(nextUpdate)          // raises the notifications it causes
+run adapter.updateViewFocus(false)      // when the window loses key status
+run adapter.pump()                      // after the event loop ran
+let requests = run adapter.takeRequests()
+```
+
+`RecordingSink` stands in for AppKit in tests, so the adapter's behaviour is tested on every
+platform; on macOS the tests also read the elements back through AppKit.
 
 The consumer differs from the Rust crate where Silk has no equivalent: filters are values of a
 `NodeFilter` interface instead of closures, iterators are `FilteredCursor`s or fill a `List`, and
