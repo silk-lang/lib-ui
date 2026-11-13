@@ -91,23 +91,30 @@ pub const OP_RELEASE_RESOURCE: u8 = 26
 /// Closes a root: the root id.
 pub const OP_CLOSE_ROOT: u8 = 27
 
+/// Node `id` shows as an element of the tag name that follows (`Attribute.Element`). Right
+/// after the node's `OP_CREATE` the page makes that element in place of the kind's own.
+pub const OP_ELEMENT: u8 = 28
+
 effect fn byte(out: &mut Bytes, value: u8) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
-  run out.append(&[value])
+  if !out.appendWithinCapacity(value) {
+    run out.append(&[value])
+  }
 }
 
 effect fn word(out: &mut Bytes, value: u32) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
-  run out.append(
-    &[
-      u32.toU8(u32.bitAnd(value, 255)),
-      u32.toU8(u32.bitAnd(u32.shiftRight(value, 8), 255)),
-      u32.toU8(u32.bitAnd(u32.shiftRight(value, 16), 255)),
-      u32.toU8(u32.shiftRight(value, 24)),
-    ],
-  )
+  let bytes = [
+    u32.toU8(u32.bitAnd(value, 255)),
+    u32.toU8(u32.bitAnd(u32.shiftRight(value, 8), 255)),
+    u32.toU8(u32.bitAnd(u32.shiftRight(value, 16), 255)),
+    u32.toU8(u32.shiftRight(value, 24)),
+  ]
+  if !out.appendSliceWithinCapacity(&bytes) {
+    run out.append(&bytes)
+  }
 }
 
 effect fn float(out: &mut Bytes, value: f32) -> ()
@@ -120,7 +127,9 @@ effect fn text(out: &mut Bytes, value: &[u8]) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   run word(&mut out, usize.toU32(value.length))
-  run out.append(value)
+  if !out.appendSliceWithinCapacity(value) {
+    run out.append(value)
+  }
 }
 
 effect fn flag(out: &mut Bytes, value: bool) -> ()
@@ -245,6 +254,10 @@ const ATTR_PREVENT: u8 = 15
 const ATTR_HREF: u8 = 16
 
 const ATTR_TRANSITION: u8 = 17
+
+const ATTR_CLASS: u8 = 18
+
+const ATTR_ID: u8 = 19
 
 effect fn color(out: &mut Bytes, value: Rgba<f32>) -> ()
   ! OutOfMemoryError
@@ -396,6 +409,17 @@ effect fn writeAttribute(out: &mut Bytes, entry: &Attribute) -> ()
       run byte(&mut out, ATTR_TRANSITION)
       run text(&mut out, value.ownedUtf8Bytes())
     }
+    Attribute.Element { .. } => {
+      // Written as `OP_ELEMENT` (see `writeMutation`).
+    }
+    Attribute.ClassName { value } => {
+      run byte(&mut out, ATTR_CLASS)
+      run text(&mut out, value.ownedUtf8Bytes())
+    }
+    Attribute.ElementId { value } => {
+      run byte(&mut out, ATTR_ID)
+      run text(&mut out, value.ownedUtf8Bytes())
+    }
   }
 }
 
@@ -456,9 +480,18 @@ pub effect fn writeMutation(out: &mut Bytes, mutation: &Mutation) -> bool
       run word(&mut out, usize.toU32(focus))
     }
     Mutation.SetAttribute { id, attribute } => {
-      run byte(&mut out, OP_ATTRIBUTE)
-      run word(&mut out, id)
-      run writeAttribute(&mut out, &attribute)
+      match &attribute {
+        Attribute.Element { name } => {
+          run byte(&mut out, OP_ELEMENT)
+          run word(&mut out, id)
+          run text(&mut out, name.ownedUtf8Bytes())
+        }
+        _ => {
+          run byte(&mut out, OP_ATTRIBUTE)
+          run word(&mut out, id)
+          run writeAttribute(&mut out, &attribute)
+        }
+      }
     }
     Mutation.SetListeners { id, flags } => {
       run byte(&mut out, OP_LISTENERS)

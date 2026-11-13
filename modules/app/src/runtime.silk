@@ -408,6 +408,7 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
       top.listeners = u32.bitOr(top.listeners, LISTEN_KEY_DOWN)
       self.ui.arena.setEntry(0, top)
     }
+    self.diffState.marked = self.ui.hasMarks()
     run diffFrom(
       &mut self.ui.arena,
       &self.ui.previous,
@@ -415,8 +416,28 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
       &mut self.batch,
       self.ui.rootId,
     )
+    // Anchored placement is rare: skip both passes when no entry, new or old, has it.
+    let mut placing = false
+    let mut scan: usize = if self.ui.hasMarks() {
+      0
+    } else {
+      self.ui.arena.entries.length()
+    }
+    while scan < self.ui.arena.entries.length() {
+      let old = self.ui.arena.entries.asSlice()[scan].old
+      if self.ui.arena.entries.asSlice()[scan].hasPlacement
+        || (old != NO_ENTRY && self.ui.previous.entries.asSlice()[u32.toUsize(old)].hasPlacement) {
+        placing = true
+        break
+      }
+      scan = scan + 1
+    }
     let mut anchors = HashMap<u64, u32>.make(Hash.seed(0x616e6368))
-    let mut entryIndex: u32 = 0
+    let mut entryIndex: u32 = if placing {
+      0
+    } else {
+      self.ui.arena.length()
+    }
     while entryIndex < self.ui.arena.length() {
       let entry = self.ui.arena.entry(entryIndex)
       if entry.hasAnchor {
@@ -424,7 +445,11 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
       }
       entryIndex = entryIndex + 1
     }
-    entryIndex = 0
+    entryIndex = if placing {
+      0
+    } else {
+      self.ui.arena.length()
+    }
     while entryIndex < self.ui.arena.length() {
       let entry = self.ui.arena.entry(entryIndex)
       if entry.hasPlacement {
@@ -765,9 +790,20 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
     ? &mut Allocator {
     self.ui.viewportBounds = Backend.viewport(&tree, root)
     self.ui.anchors.clear()
-    let count = self.ui.arena.length()
+    // The arena still holds the last render: without marks, none of its nodes has an anchor.
+    let count = if self.ui.marked {
+      self.ui.arena.length()
+    } else {
+      0
+    }
     let mut i: u32 = 0
     while i < count {
+      // Read in place: an entry is large, and almost none has an anchor.
+      let hasAnchor = self.ui.arena.entries.asSlice()[u32.toUsize(i)].hasAnchor
+      if !hasAnchor {
+        i = i + 1
+        continue
+      }
       let entry = self.ui.arena.entry(i)
       if entry.hasAnchor && entry.id != 0 {
         if let Option<Measured>.Some { value: node } = run Backend.measure(&tree, entry.id) {
@@ -1102,12 +1138,16 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
 
     // The link the record is in, if any: the innermost one.
     let mut link = List<u8>.make()
+    // The entries on the path, root first, for `answerKept`.
+    let mut entries = run List<u32>.makeWithCapacity(ids.length)
+    run entries.append(0)
     let mut i: usize = 1
     while i < ids.length {
       let entry = run self.diffState.entryOf(&self.ui.arena, ids[i])
       if entry == NO_ENTRY {
         return ()
       }
+      run entries.append(entry)
       let found = self.ui.arena.entry(entry)
       run self.path.append(found.identity)
       typing = isTextInput(found.kind)
@@ -1131,7 +1171,11 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
     let kind = record.kind
     let target = record.target
     run self.ui.beginDispatch(move record, self.path.asSlice())
-    self.runView()
+    // A record whose path only has handlers with fixed messages is answered from the replies
+    // the last render kept; any other runs the view to ask its handlers.
+    if !self.ui.answerKept(entries.asSlice()) {
+      self.runView()
+    }
     let before = self.queue.length()
     run self.ui.endDispatch(&mut self.queue)
     if self.journal.on && self.queue.length() != before {

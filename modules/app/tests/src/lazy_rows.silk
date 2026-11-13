@@ -1,0 +1,179 @@
+//! `h.lazy`: keyed rows the last render made with the same hash are copied, not described
+//! again, and stay right when rows change, move and go.
+import ui_app.lib { Document, drain, NoCommand, Node, NoOutput, Program, Update, textKey }
+import ui_app.program as program
+import ui_app.backend { TreeError }
+import ui_app_dom.html { Html }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u64
+import silk.num.usize
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+struct Line {
+  id: u64,
+  label: String,
+}
+
+struct Lines {
+  rows: List<Line>,
+  selected: u64,
+}
+
+union Message {
+  Select { id: u64 },
+  Rename { id: u64 },
+  Reverse,
+  RemoveFirst,
+}
+
+type Next = Update<Lines, NoCommand, NoOutput>
+
+effect fn line(id: u64, label: string) -> Line
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return Line { id: id, label: run String.copy(label) }
+}
+
+impl Program<Message, NoCommand> for Lines {
+  effect fn init() -> Next
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut rows = List<Line>.make()
+    run rows.append(run line(1, "alpha"))
+    run rows.append(run line(2, "bravo"))
+    run rows.append(run line(3, "charlie"))
+    run rows.append(run line(4, "delta"))
+    return Next.of(Lines { rows: move rows, selected: 0 })
+  }
+
+  effect fn update(mut model: Lines, message: Message) -> Next
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match move message {
+      Message.Select { id } => {
+        model.selected = id
+      }
+      Message.Rename { id } => {
+        let rows = model.rows.asMutSlice()
+        let mut i: usize = 0
+        while i < rows.length {
+          if rows[i].id == id {
+            run rows[i].label.append(" renamed")
+          }
+          i = i + 1
+        }
+      }
+      Message.Reverse => {
+        let mut reversed = List<Line>.make()
+        while model.rows.length() > 0 {
+          let last = model.rows.length() - 1
+          run reversed.append(model.rows.remove(last))
+        }
+        model.rows = move reversed
+      }
+      Message.RemoveFirst => {
+        drop model.rows.remove(0)
+      }
+    }
+    return Next.of(move model)
+  }
+
+  fn view(model: &Lines, h: &Document<Message>) -> Node {
+    return h.column(
+      &[],
+      &[
+        h.each(
+          model.rows.asSlice(),
+          |row| h.lazy(row.id, hashOf(row, model.selected), || rowView(h, row, model.selected)),
+        ),
+      ],
+    )
+  }
+}
+
+fn hashOf(row: &Line, selected: u64) -> u64 {
+  let hash = textKey(String.view(&row.label))
+  return if row.id == selected {
+    u64.bitXor(hash, 1)
+  } else {
+    hash
+  }
+}
+
+fn rowView(h: &Document<Message>, row: &Line, selected: u64) -> Node {
+  return h.row(
+    &[
+      if row.id == selected {
+        h.className("picked")
+      } else {
+        h.none()
+      },
+      h.onClick(Message.Select { id: row.id }),
+    ],
+    &[h.text(String.view(&row.label)), h.number(u64.toI64(row.id))],
+  )
+}
+
+fn find(text: &[u8], wanted: string) -> usize {
+  let token = String.utf8Bytes(wanted)
+  let mut at: usize = 0
+  while at + token.length <= text.length {
+    let mut i: usize = 0
+    while i < token.length && text[at + i] == token[i] {
+      i = i + 1
+    }
+    if i == token.length {
+      return at
+    }
+    at = at + 1
+  }
+  return usize.MAX
+}
+
+effect fn lazyRowsBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut page = Html.make()
+  let mut app = run program.make<Lines, Message, NoCommand>()
+  run app.start(&mut page, 0.0)
+  run drain(&mut app, &mut page)
+  run Testing.expect(app.stats.reused == 0, "the first render describes every row")
+
+  app.send(Message.Select { id: 2 })
+  run drain(&mut app, &mut page)
+  let markup = run page.markup()
+  let text = Bytes.asSlice(&markup)
+  run Testing.expect(app.stats.reused > 0, "rows that did not change are copied")
+  run Testing.expect(find(text, "picked") != usize.MAX, "the selected row is described again")
+  run Testing.expect(find(text, "picked") < find(text, "bravo"), "on the row selected")
+  run Testing.expect(find(text, "bravo") < find(text, "charlie"), "copied rows keep their order")
+
+  app.send(Message.Rename { id: 3 })
+  run drain(&mut app, &mut page)
+  let renamed = run page.markup()
+  run Testing.expect(find(Bytes.asSlice(&renamed), "charlie renamed") != usize.MAX, "a changed row")
+
+  app.send(Message.Reverse)
+  run drain(&mut app, &mut page)
+  let reversed = run page.markup()
+  let order = Bytes.asSlice(&reversed)
+  run Testing.expect(app.stats.reused > 0, "moved rows are copied too")
+  run Testing.expect(find(order, "delta") < find(order, "alpha"), "in their new order")
+  run Testing.expect(find(order, "charlie renamed") < find(order, "bravo"), "every one of them")
+
+  app.send(Message.RemoveFirst)
+  run drain(&mut app, &mut page)
+  let removed = run page.markup()
+  run Testing.expect(find(Bytes.asSlice(&removed), "delta") == usize.MAX, "a removed row is gone")
+  run Testing.expect(find(Bytes.asSlice(&removed), "alpha") != usize.MAX, "and the others stay")
+}
+
+test effect fn lazyRowsAreCopied() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run lazyRowsBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
