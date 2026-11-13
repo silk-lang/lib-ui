@@ -3,7 +3,8 @@
 //! there, as the fixture fonts are. Pass --check for a GPU smoke test, and the path of
 //! another entry module (a bundle, for example) to run that instead. With --watch the entry
 //! is reloaded whenever the file `<entry>.stamp` changes, which `@silk/vite` writes after
-//! each build.
+//! each build. With --dev <port> the application comes from the development server at
+//! that port on this machine, as `vite` with `@silk/vite` runs one.
 import ui_js.lib { JsError }
 import ui_js_window.lib { JsApp, JsClient }
 import ui_tree.legacy { TreeError, Mutation }
@@ -25,9 +26,11 @@ import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.core.result { Result }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u8
+import silk.num.u32
 import silk.system.host_input { HostInput }
 
-effect fn program(check: bool, watch: bool, entry: &[u8], launched: Option<Launched>) -> i32
+effect fn program(check: bool, watch: bool, port: u16, entry: &[u8], launched: Option<Launched>) -> i32
   ! TreeError | WindowError | GpuError | AtlasError | GeometryError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError
   ? &mut Allocator {
   let fonts = run fixtures.fonts()
@@ -43,6 +46,7 @@ effect fn program(check: bool, watch: bool, entry: &[u8], launched: Option<Launc
   let mut app = run JsApp.open(&memory, move allocator, domain.handle())
   run app.define(b"@silk/ui", library.asSlice())
   run app.entry(b"app.js", source.asSlice())
+  if port != 0 { app.dev(port) }
   if watch && entry.length != 0 {
     let mut stamp = List<u8>.make()
     run stamp.appendSlice(entry)
@@ -75,9 +79,9 @@ effect fn failed<E>(error: E) -> i32 {
   return 2
 }
 
-fn runApp(check: bool, watch: bool, entry: Bytes, launched: Option<Launched>) -> i32 {
+fn runApp(check: bool, watch: bool, port: u16, entry: Bytes, launched: Option<Launched>) -> i32 {
   let mut allocator = Allocator.systemAllocatorProvider()
-  return run Effect.catchAll(program(check, watch, Bytes.asSlice(&entry), move launched), failed)
+  return run Effect.catchAll(program(check, watch, port, Bytes.asSlice(&entry), move launched), failed)
     |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
@@ -101,6 +105,19 @@ fn same(left: &[u8], right: &[u8]) -> bool {
   return true
 }
 
+/// The port number `text` spells, or 0 when it is not one.
+fn portOf(text: &[u8]) -> u16 {
+  let mut value: u32 = 0
+  let mut i: usize = 0
+  while i < text.length {
+    if text[i] < 48 || text[i] > 57 { return 0 }
+    value = value * 10 + u8.toU32(text[i] - 48)
+    if value > 65535 { return 0 }
+    i = i + 1
+  }
+  return u32.toU16(value)
+}
+
 /// Opens the JavaScript counter, or verifies its GPU output with --check.
 pub effect fn main() -> i32
   ? &mut HostInput {
@@ -108,11 +125,18 @@ pub effect fn main() -> i32
   let count = run Effect.catchAll(HostInput.argumentCount(), noArguments)
   let mut check = false
   let mut watch = false
+  let mut port: u16 = 0
+  let mut portNext = false
   let mut entry = Bytes.make()
   let mut i: usize = 1
   while i < count {
     if let Option<Bytes>.Some { value } = run Effect.catchAll(HostInput.argument(i), noArgument) |> Effect.provideMut<Allocator>(&mut allocator) {
-      if same(Bytes.asSlice(&value), b"--check") {
+      if portNext {
+        portNext = false
+        port = portOf(Bytes.asSlice(&value))
+      } else if same(Bytes.asSlice(&value), b"--dev") {
+        portNext = true
+      } else if same(Bytes.asSlice(&value), b"--check") {
         check = true
       } else if same(Bytes.asSlice(&value), b"--watch") {
         watch = true
@@ -124,12 +148,13 @@ pub effect fn main() -> i32
   }
   let checking = check
   let watching = watch
+  let serving = port
   let path = move entry
   // The main thread keeps the OS event loop; the app runs on its own thread.
   return run Effect.catchAll(
     launch(
       fn(launched: Option<Launched>) -> i32 {
-        return runApp(checking, watching, move path, move launched)
+        return runApp(checking, watching, serving, move path, move launched)
       },
     ),
     failed,

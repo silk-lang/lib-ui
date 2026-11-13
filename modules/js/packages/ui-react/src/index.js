@@ -225,6 +225,8 @@ const hostConfig = {
 };
 
 const reconciler = Reconciler(hostConfig);
+// Fast Refresh and devtools find the renderer through the global hook, when one is there.
+reconciler.injectIntoDevTools?.();
 
 function report(kind) {
   return (error, info) => {

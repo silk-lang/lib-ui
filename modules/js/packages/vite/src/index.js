@@ -4,9 +4,13 @@
 // single output file. After each successful build it writes `<bundle>.stamp`; a host
 // started with --watch reloads the application when that file changes. With `host` set
 // and `vite build --watch`, the plugin starts the host after the first build.
+//
+// Under `vite` (the dev server) the host runs the application's modules as Vite serves
+// them, and an edit replaces only the modules it touches: see dev.js.
 import { spawn } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { devPlugins } from "./dev.js";
 
 /**
  * @param {object} [options]
@@ -15,7 +19,11 @@ import { resolve } from "node:path";
  * @param {string | false} [options.jsx] Package whose JSX runtime compiles JSX, or false to
  *   leave JSX settings alone. Default `@silk/ui-react`.
  * @param {{ command: string, args?: string[], cwd?: string }} [options.host] Host binary to
- *   start in watch mode. It is given `--watch <bundle>` after `args`.
+ *   start. In watch mode it is given `--watch <bundle>` after `args`, under the dev
+ *   server `--dev <port>`.
+ * @param {boolean} [options.refresh] React Fast Refresh under the dev server. Default true.
+ * @param {number} [options.port] Port the dev server listens on for the host. Default: any
+ *   free one.
  */
 export default function silk(options = {}) {
   const entry = options.entry ?? "src/main.jsx";
@@ -36,8 +44,9 @@ export default function silk(options = {}) {
     process.on("exit", () => child.kill());
   }
 
-  return {
+  const buildPlugin = {
     name: "silk",
+    apply: "build",
 
     config(_user, { mode }) {
       const config = {
@@ -65,4 +74,5 @@ export default function silk(options = {}) {
       if (watching && options.host && child === null) startHost();
     },
   };
+  return [buildPlugin, ...devPlugins({ entry, jsx, refresh: options.refresh ?? true, port: options.port ?? 0, host: options.host })];
 }

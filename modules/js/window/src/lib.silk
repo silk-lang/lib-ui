@@ -20,6 +20,15 @@
 import ui_js.lib { JsHost, JsError }
 import ui_tree.legacy { UiTree, TreeError }
 import ui_tree_window.host { WindowClient }
+import ui_tree_window.platform_thread { HostPlatform }
+import ui_inspect_server.channel { Channel, SocketChannel }
+import ui_inspect_server.client { openSession }
+import ui_inspect_server.server { Address }
+import window.types { WindowId }
+import silk.concurrency.thread_native { SpawnError }
+import silk.net.socket_native { NativeSocketError }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
 import ui_tree_window.console { StderrWriter }
 import silkjs.js_atomics_native { Domain }
 import silkjs.runtime_memory { RuntimeAllocator, AllocationObserver }
@@ -55,6 +64,17 @@ pub struct JsApp<'m> {
   stampPath: List<u8>,
   stamp: List<u8>,
   nextCheck: f64,
+  /// The port of the development server on this machine, or 0 without [`JsApp.dev`].
+  devPort: u16,
+  /// The connection to the development server, once the window is open.
+  channel: Option<SocketChannel>,
+  /// The message being received: the server splits long ones over several lines.
+  frame: String,
+  /// The script the server sent first. It starts the application, and runs again in each
+  /// new realm.
+  bootstrap: String,
+  /// Whether the loss of the server was reported.
+  lost: bool,
 }
 
 /// How often a watching application looks at its stamp file, in seconds.
@@ -113,6 +133,11 @@ impl<'m> JsApp<'m> {
       stampPath: List<u8>.make(),
       stamp: List<u8>.make(),
       nextCheck: 0.0,
+      devPort: 0,
+      channel: Option<SocketChannel>.None,
+      frame: String.make(),
+      bootstrap: String.make(),
+      lost: false,
     }
   }
 
@@ -138,6 +163,139 @@ impl<'m> JsApp<'m> {
     self.stamp = run readOrEmpty(stamp)
   }
 
+  /// Takes the application from a development server at `port` on this machine, as
+  /// `@silk/vite` runs one: the window connects when it opens, runs the script the server
+  /// sends first, and passes the lines that follow to JavaScript (`__ui.devMessage`). What
+  /// JavaScript sends (`__ui.devSend`) goes back. The entry given to [`JsApp.entry`] is not
+  /// run.
+  ///
+  /// A line is a kind (`b` for the first script, `m` for a message), then `+` when the
+  /// message continues on the next line or `.` when it ends, then text. The first script
+  /// arrives as a JSON string.
+  pub fn dev(self: &mut Self, port: u16) -> () {
+    self.devPort = port
+  }
+
+  /// Connects to the development server. `platform` wakes the window when a line arrives.
+  effect fn connect(self: &mut Self, platform: &HostPlatform) -> () ! OutOfMemoryError {
+    let mut clock = OsMonotonicClock.make()
+    let address = Address.Tcp { port: self.devPort }
+    let opened = run Effect.result(openSession(&address, platform.nudge())) |> Effect.provideMut<MonotonicClock>(&mut clock)
+    match move opened {
+      Result<SocketChannel, NativeSocketError | SpawnError | OutOfMemoryError>.Success { value } => {
+        self.channel = Option<SocketChannel>.some(move value)
+      }
+      Result<SocketChannel, NativeSocketError | SpawnError | OutOfMemoryError>.Failure { error } => match move error {
+        OutOfMemoryError allocation => { fail move allocation }
+        _ => { write("dev: could not connect to the development server\n") }
+      }
+    }
+  }
+
+  /// Sends what JavaScript queued for the development server.
+  effect fn sendOut(self: &mut Self) -> () ! OutOfMemoryError {
+    let lines = self.host.takeOutbox()
+    if let Option<SocketChannel>.Some { value: channel } = &mut self.channel {
+      let items = lines.asSlice()
+      let mut i: usize = 0
+      while i < items.length {
+        drop run Channel.send(String.view(&items[i])) |> Effect.provideMut<Channel>(&mut channel) |> Effect.provideMut<Allocator>(&mut self.allocator)
+        i = i + 1
+      }
+    }
+  }
+
+  /// Takes the lines the development server sent and runs what they complete. Says whether
+  /// anything ran.
+  effect fn receive(self: &mut Self, tree: &mut UiTree<'_>) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let mut ran = false
+    while true {
+      let mut line = String.make()
+      let got = match &mut self.channel {
+        Option<SocketChannel>.Some { value: channel } => run Channel.receive(&mut line) |> Effect.provideMut<Channel>(&mut channel)
+        Option<SocketChannel>.None => false
+      }
+      if !got { break }
+      let text = String.view(&line)
+      let length = String.byteLength(text)
+      if length < 2 { continue }
+      let bytes = String.utf8Bytes(text)
+      run self.frame.append(String.slice(text, 2, length - 2))
+      if bytes[1] == 43 { continue }
+      let message = Intrinsic.replace(self.frame, String.make())
+      ran = true
+      if bytes[0] == 98 {
+        self.bootstrap = move message
+        run self.boot(&mut tree)
+      } else {
+        let handed = run Effect.result(self.host.devMessage(String.view(&message))) |> Effect.provideMut<Allocator>(&mut self.allocator)
+        run self.settle(move handed)
+        run self.host.flushRaw(&mut tree)
+      }
+    }
+    if !self.lost {
+      let gone = match &self.channel {
+        Option<SocketChannel>.Some { value: channel } => !channel.open()
+        Option<SocketChannel>.None => false
+      }
+      if gone {
+        self.lost = true
+        write("dev: the development server closed the connection\n")
+      }
+    }
+    if self.host.takeReload() {
+      run self.restart(&mut tree)
+      ran = true
+    }
+    return ran
+  }
+
+  /// Runs the development server's first script, which starts the application.
+  effect fn boot(self: &mut Self, tree: &mut UiTree<'_>) -> () ! TreeError | OutOfMemoryError ? &mut Allocator {
+    // The server sends the script as a JSON string, which is a JavaScript string literal.
+    let mut source = List<u8>.make()
+    run source.appendSlice(b"(0, eval)(")
+    run source.appendSlice(String.utf8Bytes(String.view(&self.bootstrap)))
+    run source.appendSlice(b")")
+    let ran = run Effect.result(self.host.evaluate(source.asSlice(), b"dev.js")) |> Effect.provideMut<Allocator>(&mut self.allocator)
+    run self.settle(move ran)
+    run self.host.flushRaw(&mut tree)
+  }
+
+  /// Destroys the application's nodes and replaces the realm. Says whether there is a new
+  /// realm.
+  effect fn fresh(self: &mut Self, tree: &mut UiTree<'_>) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let unloaded = run Effect.result(self.host.unload()) |> Effect.provideMut<Allocator>(&mut self.allocator)
+    run self.settle(move unloaded)
+    run self.host.flushRaw(&mut tree)
+    run self.host.close() |> Effect.provideMut<Allocator>(&mut self.allocator)
+    let opened = run Effect.result(JsHost.open(self.memory, self.domain)) |> Effect.provideMut<Allocator>(&mut self.allocator)
+    match move opened {
+      Result<JsHost<'m>, OutOfMemoryError | JsError>.Success { value } => { self.host = move value }
+      Result<JsHost<'m>, OutOfMemoryError | JsError>.Failure { error } => match move error {
+        OutOfMemoryError allocation => { fail move allocation }
+        JsError { message } => {
+          uncaught(JsError { message: move message })
+          return false
+        }
+      }
+    }
+    let items = self.modules.asSlice()
+    let mut i: usize = 0
+    while i < items.length {
+      run self.host.define(items[i].name.asSlice(), items[i].source.asSlice()) |> Effect.provideMut<Allocator>(&mut self.allocator)
+      i = i + 1
+    }
+    return true
+  }
+
+  /// A full reload the development server asked for: a new realm, and its first script again.
+  effect fn restart(self: &mut Self, tree: &mut UiTree<'_>) -> () ! TreeError | OutOfMemoryError ? &mut Allocator {
+    if !(run self.fresh(&mut tree)) { return }
+    write("reloaded\n")
+    run self.boot(&mut tree)
+  }
+
   /// Whether the stamp file changed since the last look. Looks at most every
   /// `WATCH_INTERVAL` seconds.
   effect fn changed(self: &mut Self, time: f64) -> bool ! OutOfMemoryError ? &mut Allocator {
@@ -159,27 +317,7 @@ impl<'m> JsApp<'m> {
       return
     }
     self.source = move fresh
-    let unloaded = run Effect.result(self.host.unload()) |> Effect.provideMut<Allocator>(&mut self.allocator)
-    run self.settle(move unloaded)
-    run self.host.flushRaw(&mut tree)
-    run self.host.close() |> Effect.provideMut<Allocator>(&mut self.allocator)
-    let opened = run Effect.result(JsHost.open(self.memory, self.domain)) |> Effect.provideMut<Allocator>(&mut self.allocator)
-    match move opened {
-      Result<JsHost<'m>, OutOfMemoryError | JsError>.Success { value } => { self.host = move value }
-      Result<JsHost<'m>, OutOfMemoryError | JsError>.Failure { error } => match move error {
-        OutOfMemoryError allocation => { fail move allocation }
-        JsError { message } => {
-          uncaught(JsError { message: move message })
-          return
-        }
-      }
-    }
-    let items = self.modules.asSlice()
-    let mut i: usize = 0
-    while i < items.length {
-      run self.host.define(items[i].name.asSlice(), items[i].source.asSlice()) |> Effect.provideMut<Allocator>(&mut self.allocator)
-      i = i + 1
-    }
+    if !(run self.fresh(&mut tree)) { return }
     write("reloaded\n")
     run self.startEntry(&mut tree)
   }
@@ -201,11 +339,13 @@ impl<'m> JsApp<'m> {
 
   /// Frees the realm.
   pub effect fn close(self: &mut Self) -> () ? &mut Allocator {
+    if let Option<SocketChannel>.Some { value: channel } = &mut self.channel { channel.close() }
     run self.host.close() |> Effect.provideMut<Allocator>(&mut self.allocator)
   }
 
   /// Prints what JavaScript wrote to the console, and `outcome`'s exception when it failed.
   effect fn settle(self: &mut Self, outcome: Result<(), OutOfMemoryError | JsError>) -> () ! OutOfMemoryError {
+    run self.sendOut()
     let logs = self.host.takeLogs()
     let lines = logs.asSlice()
     let mut i: usize = 0
@@ -248,18 +388,27 @@ impl<'m> WindowClient<JsApp<'m>, never, never> for JsClient {
   effect fn start(self: &mut Self, state: &mut JsApp<'m>, tree: &mut UiTree<'_>) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
-    run state.startEntry(&mut tree)
+    if state.devPort == 0 { run state.startEntry(&mut tree) }
+  }
+
+  effect fn opened(self: &mut Self, state: &mut JsApp<'m>, platform: &mut HostPlatform, window: WindowId) -> ()
+    ! WindowError | OutOfMemoryError
+    ? &mut Allocator {
+    if state.devPort != 0 { run state.connect(&platform.*) }
   }
 
   effect fn poll(self: &mut Self, state: &mut JsApp<'m>, tree: &mut UiTree<'_>, time: f64) -> bool
     ! WindowError | TreeError | OutOfMemoryError
     ? &mut Allocator {
+    if state.devPort != 0 { return run state.receive(&mut tree) }
     if !(run state.changed(time)) { return false }
     run state.reload(&mut tree)
     return true
   }
 
   fn wakeAfter(self: &Self, state: &JsApp<'m>) -> Option<f64> {
+    // The window looks for the development server's lines on a short interval.
+    if state.devPort != 0 { return Option<f64>.some(0.008) }
     if state.stampPath.length() == 0 { return Option<f64>.None }
     return Option<f64>.some(WATCH_INTERVAL)
   }
