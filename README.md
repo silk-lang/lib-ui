@@ -103,7 +103,7 @@ intentional module bindings, not warning suppression or removal of test/browser 
 
 Extracted without removing UI packages, fixtures, goldens, demos, inspector tools, or browser surfaces from `silk-lang/nonstd` commit `7d6c3693a9ad1fec24127985626ab4224f9f1995`. Packages live under `modules/`; public package names and import namespaces are unchanged. Applications such as Notes, Studio, Scroll Lab, Showcase, and Graphics Demo live in the application repositories linked above; they are consumers, not dependencies of this repository.
 
-Use Silk **0.1.0-dev.69+366225ca4dc5** and LLVM **22.1.8**. `silk.toml` pins Silk; the official launcher installs and verifies that release. Repository maintenance uses typed, cached `silk task` commands. Browser runtime JavaScript remains runtime code, not task orchestration.
+Use Silk **0.1.0-dev.72+9c780a04d6ef** and LLVM **22.1.8**. `silk.toml` pins Silk; the official launcher installs and verifies that release. Repository maintenance uses typed, cached `silk task` commands. Browser runtime JavaScript remains runtime code, not task orchestration.
 
 Hosted CI bootstraps Clang and the pinned Silk release before running any compiled task. The official installer is pinned to the compiler commit. `silk task setup-ci` invokes the exact native dependency's tasks; `--linux-gpu` provisions lavapipe and `--browser` selects Chromium. There are no old script entrypoints or Playwright compatibility aliases.
 
