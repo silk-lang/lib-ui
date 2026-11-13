@@ -1,0 +1,98 @@
+//! Opens an address outside the application, as `window.open` asks: `xdg-open` on Linux,
+//! `open` on macOS. The opener runs on its own and the window does not wait for it; its exit
+//! is collected on a later call, so no process is left behind.
+static if (Intrinsic.targetOperatingSystem() == "darwin" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64") && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText("libc") == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64")) {
+  import silk.collections.list { List }
+  import silk.core.effect { Effect }
+  import silk.core.option { Option }
+  import silk.core.result { Result }
+  import silk.mem.allocator { Allocator, OutOfMemoryError }
+  import silk.system.child_process { ChildProcess }
+  import silk.system.filesystem { FileError, Path }
+  import silk.system.subprocess { ExitStatus, SpawnOptions, Stdio, Subprocess, SubprocessError }
+
+  /// The openers started so far that have not ended yet.
+  pub struct Openers {
+    running: List<i32>,
+  }
+
+  impl Openers {
+    pub fn make() -> Openers {
+      return Openers { running: List<i32>.make() }
+    }
+
+    /// Starts the system's opener for `address`. Says whether it started.
+    pub effect fn open(self: &mut Self, address: &[u8]) -> bool ! OutOfMemoryError ? &mut Allocator {
+      run self.collect()
+      let started = run Effect.result(start(address))
+      return match move started {
+        Result<i32, FileError | SubprocessError | OutOfMemoryError>.Success { value } => {
+          run self.running.append(value)
+          true
+        }
+        Result<i32, FileError | SubprocessError | OutOfMemoryError>.Failure { error } => match move error {
+          OutOfMemoryError allocation => { fail move allocation }
+          _ => false
+        }
+      }
+    }
+
+    /// Collects the exit of every opener that has ended.
+    pub effect fn collect(self: &mut Self) -> () {
+      let mut i: usize = 0
+      while i < self.running.length() {
+        let pid = self.running.asSlice()[i]
+        let waited = run Effect.result(Subprocess.tryWait(pid))
+        let ended = match move waited {
+          Result<Option<ExitStatus>, SubprocessError>.Success { value } => match value {
+            Option<ExitStatus>.Some { .. } => true
+            Option<ExitStatus>.None => false
+          }
+          Result<Option<ExitStatus>, SubprocessError>.Failure { .. } => true
+        }
+        if ended {
+          drop self.running.remove(i)
+        } else {
+          i = i + 1
+        }
+      }
+    }
+  }
+
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    const PROGRAM: string = "/usr/bin/open"
+  } else {
+    const PROGRAM: string = "/usr/bin/xdg-open"
+  }
+
+  effect fn start(address: &[u8]) -> i32 ! FileError | SubprocessError | OutOfMemoryError ? &mut Allocator {
+    let path = run Path.make(PROGRAM)
+    let mut request = run ChildProcess.request(&path)
+    run ChildProcess.addArgumentBytes(&mut request, address)
+    run Subprocess.inheritEnvironment(&mut request)
+    let mut options = SpawnOptions.make()
+    run options.setStdio(0, Stdio.ignore())
+    run options.setStdio(1, Stdio.ignore())
+    run options.setStdio(2, Stdio.ignore())
+    options.setDetached(true)
+    let child = run Subprocess.spawn(&request, &options)
+    return child.pid()
+  }
+} else {
+  import silk.mem.allocator { Allocator, OutOfMemoryError }
+
+  /// Opening addresses is not supported on this target yet.
+  pub struct Openers {}
+
+  impl Openers {
+    pub fn make() -> Openers {
+      return Openers {}
+    }
+
+    pub effect fn open(self: &mut Self, address: &[u8]) -> bool ! OutOfMemoryError ? &mut Allocator {
+      return false
+    }
+
+    pub effect fn collect(self: &mut Self) -> () {}
+  }
+}

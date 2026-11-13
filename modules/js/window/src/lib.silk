@@ -22,13 +22,14 @@
 //! run app.close()
 //! ```
 import ui_js.lib { JsHost, JsError }
+import opener { Openers }
 import ui_tree.legacy { UiTree, TreeError }
 import ui_tree_window.host { WindowClient }
 import ui_tree_window.platform_thread { HostPlatform }
 import ui_tree_window.console { StderrWriter }
 import silkjs.js_atomics_native { Domain }
 import silkjs.runtime_memory { RuntimeAllocator, AllocationObserver }
-import window.types { WindowError, WindowId }
+import window.types { WindowError, WindowId, WindowOptions, TitleBar }
 import silk.collections.list { List }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
@@ -53,6 +54,8 @@ pub struct JsApp<'m> {
   modules: List<Defined>,
   name: List<u8>,
   source: List<u8>,
+  /// The system programs started for `window.open`.
+  openers: Openers,
 }
 
 /// Writes `text` to standard error.
@@ -89,6 +92,7 @@ impl<'m> JsApp<'m> {
       modules: List<Defined>.make(),
       name: List<u8>.make(),
       source: List<u8>.make(),
+      openers: Openers.make(),
     }
   }
 
@@ -186,6 +190,19 @@ impl<'m> JsApp<'m> {
       write("\n")
       i = i + 1
     }
+    let opened = self.host.takeOpened()
+    let addresses = opened.asSlice()
+    i = 0
+    while i < addresses.length {
+      let address = String.utf8Bytes(String.view(&addresses[i]))
+      let started = run self.openers.open(address) |> Effect.provideMut<Allocator>(&mut self.allocator)
+      if !started {
+        write("Could not open ")
+        write(String.view(&addresses[i]))
+        write("\n")
+      }
+      i = i + 1
+    }
     match move outcome {
       Result<(), OutOfMemoryError | JsError>.Success { .. } => ()
       Result<(), OutOfMemoryError | JsError>.Failure { error } => match move error {
@@ -239,15 +256,26 @@ impl JsTools for NoTools {}
 /// The window client of a [`JsApp`], with the tools `T`.
 pub struct JsClient<T> {
   pub tools: T,
+  /// How the window's title bar is drawn. `TitleBar.Transparent` puts the application under
+  /// the bar on macOS, with the window controls over it; other systems keep their bar.
+  pub titleBar: TitleBar,
+  /// With a transparent title bar, the height of the bar the application draws at its top:
+  /// the window controls are centred in it, and the window is dragged by it.
+  pub titleBarHeight: f64,
 }
 
 impl<T: JsTools> JsClient<T> {
   pub fn make(tools: T) -> JsClient<T> {
-    return JsClient<T> { tools: move tools }
+    return JsClient<T> { tools: move tools, titleBar: TitleBar.Standard, titleBarHeight: 0.0 }
   }
 }
 
 impl<'m, T: JsTools> WindowClient<JsApp<'m>, never, never> for JsClient<T> {
+  fn configure(self: &Self, state: &JsApp<'m>, options: &mut WindowOptions<'_>) -> () {
+    options.titleBar = self.titleBar
+    options.titleBarHeight = self.titleBarHeight
+  }
+
   effect fn start(self: &mut Self, state: &mut JsApp<'m>, tree: &mut UiTree<'_>) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {

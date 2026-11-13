@@ -92,4 +92,13 @@
   };
 
   globalThis.reportError = (error) => native.log(3, "Uncaught " + show(error, 0));
+
+  // As `window.open` in a browser, for an address outside the application: the host opens
+  // it with the system's browser or mail program. Only http, https and mailto addresses go.
+  globalThis.open = (url) => {
+    const address = String(url ?? "");
+    if (!/^(https?:\/\/|mailto:)/i.test(address)) throw new TypeError("open takes an http, https or mailto address, not '" + address + "'");
+    native.open(address);
+    return null;
+  };
 })();

@@ -20,6 +20,7 @@ const TYPES = [
   "gotpointercapture", "lostpointercapture", "load", "error",
 ];
 const KIND_OF = new Map(TYPES.map((type, kind) => [type, kind]));
+const CLICK = KIND_OF.get("click");
 // As on the web: these reach the target alone.
 const NO_BUBBLE = new Set(["pointerenter", "pointerleave", "focus", "blur", "scroll", "layout", "load", "error"]);
 // The tree has a default action to skip for these.
@@ -47,7 +48,24 @@ function cssName(name) {
   return css;
 }
 
+// The tree names font family lists by number: each `fontFamily` text is defined once, as a
+// list of its own. The numbers start high, clear of the lists a host defines, and stay
+// small enough to be exact in the 32-bit float a style value is.
+const FAMILIES = new Map();
+let nextFamily = 0x10000;
+
+function familyOf(names) {
+  let id = FAMILIES.get(names);
+  if (id === undefined) {
+    id = nextFamily++;
+    FAMILIES.set(names, id);
+    native.fontFamily(id, names);
+  }
+  return String(id);
+}
+
 function cssValue(name, value) {
+  if (name === "fontFamily") return familyOf(String(value));
   return typeof value === "number" && !UNITLESS.has(name) ? value + "px" : String(value);
 }
 
@@ -225,9 +243,25 @@ export class Node {
     return (this.#looks[state] ??= new Look(this, STATES[state]));
   }
 
-  /** Sets a tree attribute: tabIndex, disabled, label, testId, placeholder and so on. */
+  /**
+   * Sets a tree attribute: tabIndex, disabled, label, testId, placeholder and so on. A node
+   * with an `href` is a link: a click on it or inside it that no listener prevented opens
+   * the address with `open`, as a click on an `<a>` follows it.
+   */
   setAttribute(name, value) {
+    if (name === "href") {
+      this._href = value ? String(value) : null;
+      this.#want(KIND_OF.get("click"));
+    }
     native.attribute(this.id, name, value);
+  }
+
+  // Tells the tree which events this node wants: its listeners', and clicks on a link.
+  #want(kind) {
+    const list = this.#listeners?.get(TYPES[kind]);
+    const wanted = (list && list.length > 0) || (kind === CLICK && this._href);
+    const flags = wanted ? this.#flags | (1 << kind) : this.#flags & ~(1 << kind);
+    if (flags !== this.#flags) native.listen(this.id, (this.#flags = flags));
   }
 
   set tabIndex(value) {
@@ -259,7 +293,7 @@ export class Node {
     if (!list) this.#listeners.set(type, (list = []));
     if (list.some((entry) => entry.listener === listener && entry.capture === capture)) return;
     list.push({ listener, capture, once: !!options?.once });
-    if (!(this.#flags & (1 << kind))) native.listen(this.id, (this.#flags |= 1 << kind));
+    this.#want(kind);
   }
 
   removeEventListener(type, listener, options) {
@@ -269,7 +303,7 @@ export class Node {
     const index = list.findIndex((entry) => entry.listener === listener && entry.capture === capture);
     if (index < 0) return;
     list.splice(index, 1);
-    if (list.length === 0) native.listen(this.id, (this.#flags &= ~(1 << KIND_OF.get(type))));
+    this.#want(KIND_OF.get(type));
   }
 
   /** Runs the capture or the bubble listeners of `event.type`. Used by the dispatcher. */
@@ -523,8 +557,23 @@ native.dispatch = function (kind, id, a, b, modifiers, d, e, first, second) {
   const event = new Event(TYPES[kind], target);
   fill(event, kind, a, b, modifiers, d, e, first, second);
   dispatchEvent(event);
+  if (kind === CLICK && !event.defaultPrevented) follow(target);
   return event.defaultPrevented;
 };
+
+// The default action of a click: the nearest link around the target opens.
+function follow(target) {
+  for (let node = target; node; node = node.parentNode) {
+    if (node._href) {
+      try {
+        globalThis.open(node._href);
+      } catch (error) {
+        reportError(error);
+      }
+      return;
+    }
+  }
+}
 
 // The host calls this before it replaces the realm, on a reload: every node goes, so the
 // next realm starts on an empty tree.
