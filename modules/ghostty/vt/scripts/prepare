@@ -75,31 +75,44 @@ def zig():
 
 # A WebAssembly module has one linear memory. Silk's heap owns its end: it grows by adding the
 # new pages to its last chunk. Stock libghostty-vt grows the same memory itself (Zig's
-# WasmAllocator and WasmPageAllocator), so the two would hand out the same bytes. These edits
+# WasmAllocator, and the WasmPagePool behind terminal pages), so the two would hand out the
+# same bytes. These edits
 # make the library allocate through `malloc` and `free`, which the Silk module exports from its
 # heap, terminal pages included, as the library already does on native freestanding targets.
 HOST_HEAP = """
 
 // Added by ghostty-vt's prepare script: the embedding module's heap, through the `malloc` and
 // `free` it exports, so the library and its host share one heap in one linear memory.
-extern fn malloc(size: usize) ?[*]u8;
-extern fn free(pointer: ?[*]u8) void;
-
-const host_heap_vtable: std.mem.Allocator.VTable = .{
-    .alloc = hostAlloc,
-    .resize = std.mem.Allocator.noResize,
-    .remap = std.mem.Allocator.noRemap,
-    .free = hostFree,
+const host = struct {
+    extern fn malloc(size: usize) ?[*]u8;
+    extern fn free(pointer: ?[*]u8) void;
 };
 
-pub const host_heap: std.mem.Allocator = .{ .ptr = undefined, .vtable = &host_heap_vtable };
+pub const host_heap: std.mem.Allocator = .{ .ptr = undefined, .vtable = &HostHeap.vtable };
+
+const HostHeap = struct {
+    pub const vtable: std.mem.Allocator.VTable = .{
+        .alloc = hostAlloc,
+        .resize = hostResize,
+        .remap = hostRemap,
+        .free = hostFree,
+    };
+};
+
+fn hostResize(_: *anyopaque, memory: []u8, _: std.mem.Alignment, new_len: usize, _: usize) bool {
+    return new_len <= memory.len;
+}
+
+fn hostRemap(_: *anyopaque, memory: []u8, _: std.mem.Alignment, new_len: usize, _: usize) ?[*]u8 {
+    return if (new_len <= memory.len) memory.ptr else null;
+}
 
 // The heap aligns every block to 16; a stricter alignment over-allocates and keeps the
 // block's address just below the aligned one.
 fn hostAlloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, _: usize) ?[*]u8 {
     const bytes = alignment.toByteUnits();
-    if (bytes <= 16) return malloc(len);
-    const raw = malloc(len + bytes + @sizeOf(usize)) orelse return null;
+    if (bytes <= 16) return host.malloc(len);
+    const raw = host.malloc(len + bytes + @sizeOf(usize)) orelse return null;
     const base = @intFromPtr(raw);
     const aligned = std.mem.alignForward(usize, base + @sizeOf(usize), bytes);
     @as(*usize, @ptrFromInt(aligned - @sizeOf(usize))).* = base;
@@ -107,8 +120,8 @@ fn hostAlloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, _: usize) 
 }
 
 fn hostFree(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, _: usize) void {
-    if (alignment.toByteUnits() <= 16) return free(memory.ptr);
-    free(@ptrFromInt(@as(*usize, @ptrFromInt(@intFromPtr(memory.ptr) - @sizeOf(usize))).*));
+    if (alignment.toByteUnits() <= 16) return host.free(memory.ptr);
+    host.free(@ptrFromInt(@as(*usize, @ptrFromInt(@intFromPtr(memory.ptr) - @sizeOf(usize))).*));
 }
 """
 
@@ -119,6 +132,9 @@ SHARE_HEAP = [
     ("src/terminal/PageList.zig",
      "const native_freestanding = builtin.target.os.tag == .freestanding and\n    !builtin.target.cpu.arch.isWasm();",
      "const native_freestanding = builtin.target.os.tag == .freestanding;"),
+    ("src/terminal/PageList.zig",
+     "const wasm_page_pool = builtin.target.cpu.arch.isWasm() and !builtin.is_test;",
+     "const wasm_page_pool = false;"),
     ("src/lib_vt.zig",
      "    if (native_freestanding) {\n        // Freestanding targets don't have an OS page size.",
      "    if (native_freestanding or builtin.target.cpu.arch.isWasm()) {\n        // Freestanding targets don't have an OS page size."),
@@ -158,6 +174,21 @@ def build(target, destination):
         shutil.copyfile(work / "out" / "lib" / "libghostty-vt.a", destination)
 
 
+def headers():
+    """Puts the C headers in native/build/include, from the source tarball."""
+    destination = BUILD / "include"
+    if (destination / "ghostty" / "vt.h").is_file():
+        return
+    prefix = f"libghostty-vt-{VERSION}/include/"
+    with tarfile.open(download(f"libghostty-vt-{VERSION}.tar.gz")) as tar:
+        for member in tar.getmembers():
+            if member.isfile() and member.name.startswith(prefix):
+                target = destination / member.name[len(prefix):]
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with tar.extractfile(member) as data, open(target, "wb") as out:
+                    shutil.copyfileobj(data, out)
+
+
 def unzip(name, member, destination):
     with zipfile.ZipFile(download(name)) as zipped:
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -166,6 +197,7 @@ def unzip(name, member, destination):
 
 
 def prepare(target):
+    headers()
     system = platform.system()
     machine = platform.machine().lower()
     if target == "wasm32":
@@ -177,7 +209,9 @@ def prepare(target):
     stamp = library.parent / "prepared.json"
     identity = {"version": VERSION, "target": target, "os": system, "arch": machine}
     if target == "wasm32":
-        identity["heap"] = "host"
+        # A change to the patch builds again.
+        patch = HOST_HEAP + repr(SHARE_HEAP)
+        identity["heap"] = hashlib.sha256(patch.encode()).hexdigest()[:16]
     if library.is_file() and stamp.is_file() and json.loads(stamp.read_text()) == identity:
         print(f"Already prepared: {library}")
         return
