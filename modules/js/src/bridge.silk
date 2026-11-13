@@ -4,11 +4,17 @@
 //! flushes. The functions take plain numbers and strings, so a call costs tens of nanoseconds.
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.text.string { String }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
 import silk.num.i32
 import silk.num.f64
-import ui_tree.css
-import ui_tree.css { px }
-import ui_tree.legacy { Batch, NodeKind, Attribute }
+import ui_tree.css { Declaration }
+import ui_tree.legacy { Batch, NodeKind, Attribute, Mutation, StyleState }
+import css_style.tokens { CssError }
+import css_style.written as written
 import silkjs.js_engine { Engine }
 import silkjs.js_engine_host { EngineServices }
 import silkjs.js_value { ValueBits }
@@ -16,8 +22,14 @@ import silkjs.js_realm { Realm, Arguments }
 import silkjs.js_owned_value { ValueRef }
 import silkjs.js_exceptions { JsException }
 import silkjs.js_strings { Strings }
+import silkjs.js_core_types { NativeFunctionId, NativeErrorKind, ModuleDef }
+import silkjs.js_heap { CellRef }
+import silkjs.js_coercion_host { CoercionHooks }
+import silkjs.js_eval as evaluation
+import silkjs.js_eval_compile as flags
 
-/// `__ui.create(id, kind)`: kind 0 is a box, 1 text, 2 an input.
+/// `__ui.create(id, kind)`: kind 0 is a box, 1 text, 2 an input, 3 an image, 4 an icon,
+/// 5 a canvas.
 pub const CREATE: u32 = 1
 /// `__ui.append(parent, child)`.
 pub const APPEND: u32 = 2
@@ -29,24 +41,120 @@ pub const ROOT: u32 = 4
 pub const SET_TEXT: u32 = 5
 /// `__ui.listen(id, flags)`: the ui-protocol `LISTEN_*` flags.
 pub const LISTEN: u32 = 6
-/// `__ui.size(id, width, height)` in CSS pixels; a height of 0 leaves the height alone.
-pub const SIZE: u32 = 7
-/// `__ui.tabIndex(id, value)`.
-pub const TAB_INDEX: u32 = 8
+/// `__ui.style(id, css, state)`: sets the declarations of `css` (`"width: 10px; color: red"`)
+/// in a look of the node. State 0 is the base look, 1 hover, 2 active, 3 focus, 4
+/// focus-visible. Declarations that do not parse are dropped, as in CSS.
+pub const STYLE: u32 = 7
+/// `__ui.clearStyle(id, state)`: forgets every declaration of that look.
+pub const CLEAR_STYLE: u32 = 8
+/// `__ui.attribute(id, name, value)`. Throws a `TypeError` for a name the tree does not have.
+pub const ATTRIBUTE: u32 = 9
 /// `__ui.focus(id)`.
-pub const FOCUS: u32 = 9
+pub const FOCUS: u32 = 10
+/// `__ui.remove(id)`: detaches the node and its subtree; it can be inserted again.
+pub const REMOVE: u32 = 11
+/// `__ui.destroy(id)`: detaches and frees the node and its subtree.
+pub const DESTROY: u32 = 12
+/// `__ui.scrollTo(id, x, y)`.
+pub const SCROLL_TO: u32 = 13
+/// `__ui.select(id, anchor, focus)`: UTF-8 byte offsets in an input's value.
+pub const SELECT: u32 = 14
+/// `__ui.log(level, text)`: a console line. Level 0 is debug, 1 log, 2 warn, 3 error.
+pub const LOG: u32 = 15
+/// `__ui.now()`: the host's clock in milliseconds, as `performance.now()`.
+pub const NOW: u32 = 16
+/// `__ui.timer(id, delay)`: asks for `__ui.fire(id)` once, `delay` milliseconds from now.
+/// Asking again for the same id moves it.
+pub const TIMER: u32 = 17
+/// `__ui.cancelTimer(id)`.
+pub const CANCEL_TIMER: u32 = 18
+/// `__ui.requestFrame()`: asks for `__ui.frame(time)` before the next frame.
+pub const REQUEST_FRAME: u32 = 19
 /// The number of native functions, for the installer.
-pub const LAST: u32 = 9
+pub const LAST: u32 = 19
 
-/// The engine's services for a UI host: the batch JavaScript appends to.
+/// The runtime's module loader callback: [`Bridge`] answers it from the defined modules.
+pub const MODULE_LOAD: u32 = 100
+
+/// A module an application can import by `name`.
+pub struct ModuleSource {
+  pub name: List<u8>,
+  pub source: List<u8>,
+}
+
+/// A timer JavaScript asked for: `__ui.fire(id)` is due at `due`, in the host clock's
+/// milliseconds.
+pub struct Timer {
+  pub id: u32,
+  pub due: f64,
+}
+
+impl Copy for Timer {}
+
+/// A console line. `level` 0 is debug, 1 log, 2 warn, 3 error.
+pub struct LogEntry {
+  pub level: u32,
+  pub text: String,
+}
+
+/// The engine's services for a UI host: the batch JavaScript appends to, the modules it can
+/// import, and what its timers, frame requests and console calls left for the host.
 pub struct Bridge {
   pub batch: Batch,
+  pub modules: List<ModuleSource>,
+  /// The host clock in milliseconds, as of the host's last `advance`.
+  pub now: f64,
+  pub timers: List<Timer>,
+  /// Whether JavaScript asked for an animation frame callback.
+  pub frame: bool,
+  pub logs: List<LogEntry>,
 }
 
 impl Bridge {
   pub fn make() -> Bridge {
-    return Bridge { batch: Batch.make() }
+    return Bridge {
+      batch: Batch.make(),
+      modules: List<ModuleSource>.make(),
+      now: 0.0,
+      timers: List<Timer>.make(),
+      frame: false,
+      logs: List<LogEntry>.make(),
+    }
   }
+
+  /// Takes timer `id` out. Says whether it was there.
+  pub fn cancel(self: &mut Self, id: u32) -> bool {
+    let items = self.timers.asSlice()
+    let mut i: usize = 0
+    while i < items.length {
+      if items[i].id == id {
+        drop self.timers.remove(i)
+        return true
+      }
+      i = i + 1
+    }
+    return false
+  }
+
+  fn find(self: &Self, name: &[u8]) -> Option<usize> {
+    let items = self.modules.asSlice()
+    let mut i: usize = 0
+    while i < items.length {
+      if same(items[i].name.asSlice(), name) { return Option<usize>.some(i) }
+      i = i + 1
+    }
+    return Option<usize>.none()
+  }
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut i: usize = 0
+  while i < left.length {
+    if left[i] != right[i] { return false }
+    i = i + 1
+  }
+  return true
 }
 
 /// The JavaScript name of native function `id`.
@@ -57,15 +165,26 @@ pub fn name(id: u32) -> &'static [u8] {
   if id == ROOT { return b"root" }
   if id == SET_TEXT { return b"setText" }
   if id == LISTEN { return b"listen" }
-  if id == SIZE { return b"size" }
-  if id == TAB_INDEX { return b"tabIndex" }
-  return b"focus"
+  if id == STYLE { return b"style" }
+  if id == CLEAR_STYLE { return b"clearStyle" }
+  if id == ATTRIBUTE { return b"attribute" }
+  if id == FOCUS { return b"focus" }
+  if id == REMOVE { return b"remove" }
+  if id == DESTROY { return b"destroy" }
+  if id == SCROLL_TO { return b"scrollTo" }
+  if id == SELECT { return b"select" }
+  if id == LOG { return b"log" }
+  if id == NOW { return b"now" }
+  if id == TIMER { return b"timer" }
+  if id == CANCEL_TIMER { return b"cancelTimer" }
+  return b"requestFrame"
 }
 
 /// The declared argument count of native function `id`.
 pub fn arity(id: u32) -> i32 {
-  if id == ROOT || id == FOCUS { return 1 }
-  if id == INSERT_BEFORE || id == SIZE { return 3 }
+  if id == NOW || id == REQUEST_FRAME { return 0 }
+  if id == ROOT || id == FOCUS || id == REMOVE || id == DESTROY || id == CANCEL_TIMER { return 1 }
+  if id == INSERT_BEFORE || id == STYLE || id == ATTRIBUTE || id == SCROLL_TO || id == SELECT { return 3 }
   return 2
 }
 
@@ -85,16 +204,69 @@ fn id(value: ValueBits) -> u32 {
   }
 }
 
+fn truthy(value: ValueBits) -> bool {
+  return match value {
+    ValueBits.Bool { value: flag } => flag
+    ValueBits.Int { value: integer } => integer != 0
+    ValueBits.Float64 { value: float } => float != 0.0
+    ValueBits.Undefined => false
+    ValueBits.Null => false
+    _ => true
+  }
+}
+
 fn kind(code: u32) -> NodeKind {
   if code == 1 { return NodeKind.Text }
   if code == 2 { return NodeKind.Input }
+  if code == 3 { return NodeKind.Image }
+  if code == 4 { return NodeKind.Icon }
+  if code == 5 { return NodeKind.Canvas }
   return NodeKind.Box
+}
+
+fn state(code: u32) -> StyleState {
+  if code == 1 { return StyleState.Hover }
+  if code == 2 { return StyleState.Active }
+  if code == 3 { return StyleState.Focus }
+  if code == 4 { return StyleState.FocusVisible }
+  return StyleState.Base
 }
 
 effect fn text<'v>(value: ValueRef<'v>) -> String ! OutOfMemoryError ? &mut Allocator {
   if !value.view().isString() { return String.make() }
   let bytes = run Strings.toUtf8(value.view(), false)
   return run String.copy(unsafe String.fromUtf8Unchecked(bytes.asSlice()))
+}
+
+/// The attribute `name` with `value`, or None for a name the tree does not have.
+effect fn attributeOf<'v>(name: string, value: ValueRef<'v>) -> Option<Attribute> ! OutOfMemoryError ? &mut Allocator {
+  let bits = value.view()
+  if name == "tabIndex" { return Option<Attribute>.some(Attribute.TabIndex { value: f64.toI32(number(bits)) }) }
+  if name == "disabled" { return Option<Attribute>.some(Attribute.Disabled { value: truthy(bits) }) }
+  if name == "focusTrap" { return Option<Attribute>.some(Attribute.FocusTrap { value: truthy(bits) }) }
+  if name == "multiline" { return Option<Attribute>.some(Attribute.Multiline { value: truthy(bits) }) }
+  if name == "readOnly" { return Option<Attribute>.some(Attribute.ReadOnly { value: truthy(bits) }) }
+  if name == "checked" { return Option<Attribute>.some(Attribute.Checked { value: truthy(bits) }) }
+  if name == "selected" { return Option<Attribute>.some(Attribute.Selected { value: truthy(bits) }) }
+  if name == "expanded" { return Option<Attribute>.some(Attribute.Expanded { value: truthy(bits) }) }
+  if name == "label" { return Option<Attribute>.some(Attribute.Label { value: run text(value) }) }
+  if name == "testId" { return Option<Attribute>.some(Attribute.TestId { value: run text(value) }) }
+  if name == "placeholder" { return Option<Attribute>.some(Attribute.Placeholder { value: run text(value) }) }
+  if name == "href" { return Option<Attribute>.some(Attribute.Href { value: run text(value) }) }
+  if name == "transition" { return Option<Attribute>.some(Attribute.Transition { value: run text(value) }) }
+  return Option<Attribute>.none()
+}
+
+/// The declarations of `css`. Text the tokenizer rejects sets nothing.
+effect fn declarationsOf(css: &String) -> List<Declaration> ! OutOfMemoryError ? &mut Allocator {
+  let parsed = run Effect.result(written.declarations(String.utf8Bytes(String.view(css))))
+  return match move parsed {
+    Result<List<Declaration>, CssError | OutOfMemoryError>.Success { value } => move value
+    Result<List<Declaration>, CssError | OutOfMemoryError>.Failure { error } => match move error {
+      OutOfMemoryError allocation => { fail move allocation }
+      CssError _ => List<Declaration>.make()
+    }
+  }
 }
 
 impl EngineServices for Bridge {
@@ -121,19 +293,73 @@ impl EngineServices for Bridge {
       run engine.services.batch.setText(first, String.view(&value))
     } else if function == LISTEN {
       run engine.services.batch.listen(first, id(argv.get(1).view()))
-    } else if function == SIZE {
-      let width = f64.toF32(number(argv.get(1).view()))
-      let height = f64.toF32(number(argv.get(2).view()))
-      if height == 0.0 {
-        run engine.services.batch.style(first, &[css.width(px(width))])
-      } else {
-        run engine.services.batch.style(first, &[css.width(px(width)), css.height(px(height))])
+    } else if function == STYLE {
+      let css = run text(argv.get(1))
+      let declarations = run declarationsOf(&css)
+      run engine.services.batch.push(Mutation.SetStyle { id: first, state: state(id(argv.get(2).view())), declarations: move declarations })
+    } else if function == CLEAR_STYLE {
+      run engine.services.batch.push(Mutation.ClearStyle { id: first, state: state(id(argv.get(1).view())) })
+    } else if function == ATTRIBUTE {
+      let attribute = run text(argv.get(1))
+      match run attributeOf(String.view(&attribute), argv.get(2)) {
+        Option<Attribute>.Some { value } => { run engine.services.batch.attribute(first, move value) }
+        Option<Attribute>.None => {
+          let mut message = List<u8>.make()
+          run message.appendSlice(b"the tree has no attribute '")
+          run message.appendSlice(String.utf8Bytes(String.view(&attribute)))
+          run message.append(39)
+          return run engine.throwError(realm, NativeErrorKind.Type, message.asSlice())
+        }
       }
-    } else if function == TAB_INDEX {
-      run engine.services.batch.attribute(first, Attribute.TabIndex { value: f64.toI32(number(argv.get(1).view())) })
     } else if function == FOCUS {
       run engine.services.batch.focus(first)
+    } else if function == REMOVE {
+      run engine.services.batch.push(Mutation.Remove { id: first })
+    } else if function == DESTROY {
+      run engine.services.batch.push(Mutation.Destroy { id: first })
+    } else if function == SCROLL_TO {
+      run engine.services.batch.scrollTo(first, f64.toF32(number(argv.get(1).view())), f64.toF32(number(argv.get(2).view())))
+    } else if function == LOG {
+      let line = run text(argv.get(1))
+      run engine.services.logs.append(LogEntry { level: first, text: move line })
+    } else if function == NOW {
+      return ValueBits.number(engine.services.now)
+    } else if function == TIMER {
+      drop engine.services.cancel(first)
+      let delay = number(argv.get(1).view())
+      run engine.services.timers.append(Timer { id: first, due: engine.services.now + if delay > 0.0 { delay } else { 0.0 } })
+    } else if function == CANCEL_TIMER {
+      drop engine.services.cancel(first)
+    } else if function == REQUEST_FRAME {
+      engine.services.frame = true
+    } else if function == SELECT {
+      run engine.services.batch.select(first, f64.toUsize(number(argv.get(1).view())), f64.toUsize(number(argv.get(2).view())))
     }
     return ValueBits.Undefined
+  }
+
+  /// A module the application defined, compiled when something first imports it.
+  unsafe effect fn loadModule<'r, 'v, 'm>(engine: &mut Engine<'m, Self>, realm: Realm<'r>,
+    callback: NativeFunctionId, opaque: ?*mut u8, name: &[u8], attributes: ValueRef<'v>) -> CellRef<ModuleDef> ! OutOfMemoryError | JsException ? &mut Allocator {
+    let source = match engine.services.find(name) {
+      Option<usize>.Some { value: index } => {
+        let mut copy = List<u8>.make()
+        run copy.appendSlice(engine.services.modules.asSlice()[index].source.asSlice())
+        move copy
+      }
+      Option<usize>.None => {
+        let mut message = List<u8>.make()
+        run message.appendSlice(b"could not load module '")
+        run message.appendSlice(name)
+        run message.append(39)
+        return run engine.throwError(realm, NativeErrorKind.Reference, message.asSlice())
+      }
+    }
+    let memory = engine.memory
+    let compiled = run evaluation.evaluate(&mut engine, memory, realm, source.asSlice(), name, flags.TYPE_MODULE | flags.FLAG_COMPILE_ONLY)
+    return match compiled.view() {
+      ValueBits.Module { reference } => unsafe CellRef<ModuleDef>.of(reference)
+      _ => Intrinsic.trap("the module compiler returned something else")
+    }
   }
 }

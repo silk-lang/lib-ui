@@ -2,7 +2,7 @@
 //! between the tree's begin and finish, and reports what it throws.
 //! Run from the repository root (the fixtures read fonts and scripts from there).
 import ui_js.lib { JsHost, JsError }
-import ui_tree.lib { Tree, TreeError, ProtocolError, Viewport, NodeId, Input }
+import ui_tree.lib { Tree, TreeError, ProtocolError, Viewport, NodeId, Input, StyleState }
 import ui_fixtures.fixtures as fixtures
 import silkjs.js_atomics_native { WaiterDomain, SynchronizationError }
 import silkjs.runtime_memory { RuntimeAllocator }
@@ -79,7 +79,134 @@ effect fn errors(host: &mut JsHost<'_>) -> ()
   run host.evaluate(b"globalThis.after = 1 + 1", b"test")
 }
 
-effect fn withHost() -> ()
+effect fn fails(host: &mut JsHost<'_>, source: &[u8], expected: string, what: string<'static>) -> ()
+  ! OutOfMemoryError | JsError | AssertionError<'static>
+  ? &mut Allocator {
+  let failed = run Effect.result(host.evaluate(source, b"test"))
+  match move failed {
+    Result<(), OutOfMemoryError | JsError>.Success { .. } => { run Testing.expect(false, what) }
+    Result<(), OutOfMemoryError | JsError>.Failure { error } => {
+      match move error {
+        JsError { message } => { run Testing.expect(String.view(&message) == expected, what) }
+        OutOfMemoryError allocation => { fail move allocation }
+      }
+    }
+  }
+}
+
+effect fn click(host: &mut JsHost<'_>, tree: &mut Tree<'_>, x: f32, y: f32) -> ()
+  ! ProtocolError | OutOfMemoryError | JsError
+  ? &mut Allocator {
+  run host.input(&mut tree, Input.press(x, y))
+  run host.input(&mut tree, Input.release(x, y))
+}
+
+/// The same counter as an ES module on @silk/ui: DOM style listeners with capture and
+/// bubbling, promise jobs before the mutations apply, typing, removal, and a listener that
+/// throws.
+effect fn library(host: &mut JsHost<'_>, tree: &mut Tree<'_>) -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>
+  ? &mut Allocator {
+  let package = run platform.readFile(b"modules/js/packages/ui/src/index.js")
+  run host.define(b"@silk/ui", package.asSlice())
+  let source = run platform.readFile(b"modules/js/tests/fixtures/app.js")
+  run host.module(source.asSlice(), b"app.js")
+  run host.flush(&mut tree)
+  drop run tree.frame(viewport(), 0.0)
+  run Testing.expect(focusIs(&tree.*, 2), "the module focused the field")
+  run Testing.expect(run labelIs(&tree.*, "Click me"), "the label holds its first text")
+  let named = match tree.view(NodeId.of(3)) {
+    Option.Some { value } => value.testId() == "counter"
+    Option.None => false
+  }
+  run Testing.expect(named, "setAttribute reached the tree")
+  // The hover look holds its two declarations; the base look lost the margin it set and
+  // then took out, and keeps width, height and background.
+  let looks = match tree.view(NodeId.of(3)) {
+    Option.Some { value } => value.style(StyleState.Hover).length == 2 && value.style(StyleState.Base).length == 3
+    Option.None => false
+  }
+  run Testing.expect(looks, "the looks hold what the module set")
+
+  // Capture runs from the root down, then the target, then the bubble back up; the promise
+  // job the click queued ran before the mutations were applied.
+  run click(&mut host, &mut tree, 10.0, 50.0)
+  run Testing.expect(focusIs(&tree.*, 2), "a prevented press keeps focus on the field")
+  run Testing.expect(run labelIs(&tree.*, "Clicked 1"), "the promise job set the label")
+  run host.evaluate(b"if (log.join(';') !== 'root capture 1;button 10,50 true;root bubble 3') throw new Error('order was ' + log.join(';'))", b"test")
+
+  run host.evaluate(b"keepFocus = false", b"test")
+  run click(&mut host, &mut tree, 10.0, 50.0)
+  run Testing.expect(focusIs(&tree.*, 3), "an unprevented press focuses the button")
+
+  // stopPropagation at the button keeps the root's bubble listener out.
+  run host.evaluate(b"log.length = 0; app.button.addEventListener('click', (event) => event.stopPropagation())", b"test")
+  run click(&mut host, &mut tree, 10.0, 50.0)
+  run host.evaluate(b"if (log.join(';') !== 'root capture 1;button 10,50 true') throw new Error('order was ' + log.join(';'))", b"test")
+
+  // Typing reaches the input listener with the value, and the Input node follows it.
+  run click(&mut host, &mut tree, 10.0, 10.0)
+  run Testing.expect(focusIs(&tree.*, 2), "a press on the field focuses it")
+  run host.input(&mut tree, run Input.text("hi"))
+  run host.evaluate(b"if (typed !== 'hi|insertText|hi') throw new Error('typed was ' + typed)", b"test")
+  run host.input(&mut tree, run Input.key("Escape"))
+  run host.evaluate(b"if (lastKey !== 'Escape') throw new Error('key was ' + lastKey)", b"test")
+
+  // A listener that throws does not stop the others, and the host reports it afterwards.
+  run host.evaluate(b"log.length = 0; app.root.addEventListener('click', () => { throw new Error('boom') }, true)", b"test")
+  let failed = run Effect.result(click(&mut host, &mut tree, 10.0, 50.0))
+  match move failed {
+    Result<(), ProtocolError | OutOfMemoryError | JsError>.Success { .. } => { run Testing.expect(false, "a listener that throws must be reported") }
+    Result<(), ProtocolError | OutOfMemoryError | JsError>.Failure { error } => {
+      match move error {
+        JsError { message } => { run Testing.expect(String.view(&message) == "Error: boom", "the report carries the listener's error") }
+        ProtocolError protocol => { fail move protocol }
+        OutOfMemoryError allocation => { fail move allocation }
+      }
+    }
+  }
+
+  // An attribute the tree does not have is an error the application sees.
+  run fails(&mut host, b"app.root.setAttribute('nope', 1)", "TypeError: the tree has no attribute 'nope'", "an unknown attribute throws")
+
+  // A removed node leaves the tree and takes no more events.
+  run host.evaluate(b"log.length = 0; app.button.remove()", b"test")
+  run host.flush(&mut tree)
+  drop run tree.frame(viewport(), 1.0)
+  let detached = match tree.view(NodeId.of(3)) {
+    Option.Some { value } => value.parent().isNone()
+    Option.None => false
+  }
+  run Testing.expect(detached, "remove detached the button")
+  run host.evaluate(b"if (app.root.childNodes.length !== 1 || app.button.parentNode !== null) throw new Error('the JavaScript tree kept the button')", b"test")
+}
+
+/// Timers fire in order of their time when the host ticks, intervals repeat until cleared,
+/// animation frame callbacks run on a tick with animation, and console lines reach the host.
+effect fn globals(host: &mut JsHost<'_>) -> ()
+  ! OutOfMemoryError | JsError | AssertionError<'static>
+  ? &mut Allocator {
+  run host.evaluate(b"globalThis.order = []; setTimeout(() => order.push('b'), 20); setTimeout((x) => order.push(x), 10, 'a'); const every = setInterval(() => { order.push('i'); if (order.filter((x) => x === 'i').length === 2) clearInterval(every) }, 15); clearTimeout(setTimeout(() => order.push('never'), 5)); requestAnimationFrame((time) => order.push('frame ' + time)); queueMicrotask(() => order.push('micro')); console.log('hello', { a: [1, 'x'] }, 2); console.error(new TypeError('bad').message)", b"test")
+  let first = match host.nextDeadline() {
+    Option.Some { value } => value == 0.01
+    Option.None => false
+  }
+  run Testing.expect(first, "the earliest timer is 10 milliseconds away")
+  run Testing.expect(host.wantsFrame(), "the script asked for a frame")
+  run host.tick(0.012, false)
+  run host.tick(0.03, true)
+  run Testing.expect(!host.wantsFrame(), "the frame callback ran")
+  run host.tick(0.05, true)
+  run Testing.expect(host.nextDeadline().isNone(), "the cleared interval left no timer")
+  run host.evaluate(b"if (order.join() !== 'micro,a,i,b,frame 30,i') throw new Error('order was ' + order.join()); if (performance.now() !== 50) throw new Error('now was ' + performance.now())", b"test")
+  let logs = host.takeLogs()
+  let lines = logs.asSlice()
+  run Testing.expect(lines.length == 2, "two console lines reached the host")
+  run Testing.expect(lines[0].level == 1 && String.view(&lines[0].text) == "hello { a: [1, \"x\"] } 2", "console.log formats its values")
+  run Testing.expect(lines[1].level == 3 && String.view(&lines[1].text) == "bad", "console.error has the error level")
+}
+
+effect fn withHost(scenario: u32) -> ()
   ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static>
   ? &mut Allocator {
   let fonts = run fixtures.fonts()
@@ -88,8 +215,16 @@ effect fn withHost() -> ()
   let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
   let memory = run allocator.observe()
   let mut host = run JsHost.open(&memory, domain.handle()) |> Effect.provideMut<Allocator>(&mut allocator)
-  let ran = run Effect.result(counter(&mut host, &mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
-  let checked = run Effect.result(errors(&mut host)) |> Effect.provideMut<Allocator>(&mut allocator)
+  let ran = if scenario == 0 {
+    run Effect.result(counter(&mut host, &mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
+  } else {
+    run Effect.result(library(&mut host, &mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
+  }
+  let checked = if scenario == 2 {
+    run Effect.result(globals(&mut host)) |> Effect.provideMut<Allocator>(&mut allocator)
+  } else {
+    run Effect.result(errors(&mut host)) |> Effect.provideMut<Allocator>(&mut allocator)
+  }
   run host.close() |> Effect.provideMut<Allocator>(&mut allocator)
   match move ran {
     Result<(), TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>>.Success { .. } => ()
@@ -104,5 +239,67 @@ effect fn withHost() -> ()
 test effect fn javascriptCounterHandlesEventsSynchronously() -> ()
   ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
-  run withHost() |> Effect.provideMut<Allocator>(&mut allocator)
+  run withHost(0) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn libraryModuleRunsDomStyleEvents() -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run withHost(1) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn timersFramesAndConsoleReachTheHost() -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run withHost(2) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// Runs the library fixture and shows its first frame.
+effect fn load(host: &mut JsHost<'_>, tree: &mut Tree<'_>) -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>
+  ? &mut Allocator {
+  let package = run platform.readFile(b"modules/js/packages/ui/src/index.js")
+  run host.define(b"@silk/ui", package.asSlice())
+  let source = run platform.readFile(b"modules/js/tests/fixtures/app.js")
+  run host.module(source.asSlice(), b"app.js")
+  run host.flush(&mut tree)
+  drop run tree.frame(viewport(), 0.0)
+  run Testing.expect(run labelIs(&tree.*, "Click me"), "the label holds its first text")
+}
+
+/// What a reload does to the first realm: unload destroys
+/// every node the application made.
+effect fn leave(host: &mut JsHost<'_>, tree: &mut Tree<'_>) -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>
+  ? &mut Allocator {
+  run load(&mut host, &mut tree)
+  run host.unload()
+  run host.flush(&mut tree)
+  drop run tree.frame(viewport(), 1.0)
+  run Testing.expect(tree.view(NodeId.of(1)).isNone() && tree.view(NodeId.of(4)).isNone(), "unload destroyed the application's nodes")
+}
+
+test effect fn reloadStartsANewRealmOnAnEmptyTree() -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static> {
+  let mut own = Allocator.systemAllocatorProvider()
+  let fonts = run fixtures.fonts() |> Effect.provideMut<Allocator>(&mut own)
+  let mut tree = run Tree.make(&fonts) |> Effect.provideMut<Allocator>(&mut own)
+  let domain = run WaiterDomain.make() |> Effect.provideMut<Allocator>(&mut own)
+  let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let memory = run allocator.observe()
+  let mut first = run JsHost.open(&memory, domain.handle()) |> Effect.provideMut<Allocator>(&mut allocator)
+  let left = run Effect.result(leave(&mut first, &mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
+  run first.close() |> Effect.provideMut<Allocator>(&mut allocator)
+  // The second realm numbers its nodes from 1 again, on the same tree.
+  let mut second = run JsHost.open(&memory, domain.handle()) |> Effect.provideMut<Allocator>(&mut allocator)
+  let again = run Effect.result(load(&mut second, &mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
+  run second.close() |> Effect.provideMut<Allocator>(&mut allocator)
+  match move left {
+    Result<(), TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>>.Success { .. } => ()
+    Result<(), TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>>.Failure { error } => { fail move error }
+  }
+  match move again {
+    Result<(), TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>>.Success { .. } => ()
+    Result<(), TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>>.Failure { error } => { fail move error }
+  }
 }

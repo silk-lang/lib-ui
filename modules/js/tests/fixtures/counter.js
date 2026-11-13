@@ -8,7 +8,7 @@ const KIND = { pointerdown: 0, pointerup: 1, click: 2 };
 function box(parent, width, height) {
   const id = ++next;
   __ui.create(id, 0);
-  __ui.size(id, width, height);
+  __ui.style(id, "width:" + width + "px;height:" + height + "px", 0);
   __ui.append(parent, id);
   parents.set(id, parent);
   return id;
@@ -45,9 +45,9 @@ __ui.dispatch = function (kind, target, x, y) {
 __ui.create(1, 0);
 __ui.root(1);
 const field = box(1, 200, 30);
-__ui.tabIndex(field, 0);
+__ui.attribute(field, "tabIndex", 0);
 const button = box(1, 180, 70);
-__ui.tabIndex(button, 0);
+__ui.attribute(button, "tabIndex", 0);
 __ui.listen(button, 1 | 4);
 const label = text(button, "Click me");
 __ui.focus(field);
