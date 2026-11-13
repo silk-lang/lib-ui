@@ -1,0 +1,302 @@
+//! A cache of whole shaped lines.
+//!
+//! A user interface shapes the same short texts again and again: the labels of a list's
+//! rows, a counter that returns to an earlier value. [`LineCache`] keeps the runs `shapeLine`
+//! returned for a request of plain horizontal text, keyed by everything the shaping read, so a
+//! repeated request copies its runs.
+import glyphs { GlyphStore }
+import analysis { tokenLength }
+import layout.lib { TextShapeRequest, TextRun, TextTokenKind, WritingMode }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.string { String }
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+
+// A kept line; `count` is 0 in an empty slot.
+struct Line {
+  hash: u64,
+  keyStart: usize,
+  keyLength: usize,
+  runStart: usize,
+  count: usize,
+}
+
+impl Copy for Line {}
+
+// A run of a kept line, with its unit counted from the request's first.
+struct Kept {
+  unit: usize,
+  start: usize,
+  end: usize,
+  advance: f32,
+  fontKey: usize,
+  bidiLevel: u8,
+  shapeKey: usize,
+}
+
+impl Copy for Kept {}
+
+const SLOTS: usize = 16384
+
+// The cache starts over once its keys hold this many bytes.
+const KEY_BYTES: usize = 1048576
+
+/// Lines shaped before, in a direct-mapped table.
+pub struct LineCache {
+  slots: List<Line>,
+  keys: List<u8>,
+  runs: List<Kept>,
+  // The key of the request being looked up, and its hash.
+  key: List<u8>,
+  hash: u64,
+  // The glyph store generation the kept shape keys belong to.
+  epoch: usize,
+}
+
+fn mix(hash: u64, value: u64) -> u64 {
+  return u64.wrappingMultiply(u64.bitXor(hash, value), 0x100000001B3)
+}
+
+// The table index of `hash`: the top 14 bits of a multiplicative mix, since the low bits of
+// FNV hashes of short similar keys collide often.
+fn slot(hash: u64) -> usize {
+  return u64.toUsize(u64.wrappingMultiply(hash, 0x9E3779B97F4A7C15) / 0x4000000000000)
+}
+
+// The other slot of the pair `index` belongs to.
+fn partner(index: usize) -> usize {
+  if index % 2 == 0 {
+    return index + 1
+  }
+  return index - 1
+}
+
+effect fn number(key: &mut List<u8>, value: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut rest = value
+  let mut count: usize = 0
+  while count < 8 {
+    run key.append(usize.toU8(rest % 256))
+    rest = rest / 256
+    count = count + 1
+  }
+}
+
+impl LineCache {
+  pub fn make() -> LineCache {
+    return LineCache {
+      slots: List<Line>.make(),
+      keys: List<u8>.make(),
+      runs: List<Kept>.make(),
+      key: List<u8>.make(),
+      hash: 0,
+      epoch: 0,
+    }
+  }
+
+  fn clear(self: &mut Self) -> () {
+    let slots = self.slots.asMutSlice()
+    let mut index: usize = 0
+    while index < slots.length {
+      slots[index].count = 0
+      index = index + 1
+    }
+    self.keys.clear()
+    self.runs.clear()
+  }
+
+  /// Writes `request`'s key and returns whether its line can be kept: unjustified,
+  /// unhyphenated horizontal text and collapsed spaces at one bidi level. The key holds
+  /// everything `shapeLine` reads for such a request.
+  effect fn describe(self: &mut Self, request: &TextShapeRequest<'_, '_>) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let analysis = request.analysis
+    if request.hyphenated || request.justificationSpace != 0.0 || request.hangingRanges.length != 0
+      || analysis.levels.length() != 0
+      || analysis.paragraphs.length() != 0
+      || analysis.paragraph.end.before(request.end)
+      || request.end.before(request.start) {
+      return false
+    }
+    let tokens = request.context.tokens
+    self.key.clear()
+    run number(&mut self.key, request.start.offset)
+    run number(&mut self.key, u8.toUsize(analysis.level) * 2 + u8.toUsize(analysis.paragraph.level))
+    let mut unit = request.start.unit
+    while unit < tokens.length && unit <= request.end.unit {
+      let token = &tokens[unit]
+      let mut start: usize = 0
+      if unit == request.start.unit {
+        start = request.start.offset
+      }
+      let mut end = tokenLength(token)
+      if unit == request.end.unit {
+        end = request.end.offset
+      }
+      if start < end {
+        let mut kind: usize = 1
+        if token.kind == TextTokenKind.Space {
+          kind = 2
+        } else if token.kind != TextTokenKind.Text {
+          return false
+        }
+        if token.writingMode != WritingMode.HorizontalTb {
+          return false
+        }
+        let bytes = String.utf8Bytes(token.text)
+        if end > bytes.length {
+          return false
+        }
+        run number(&mut self.key, token.fontKey * 4 + kind)
+        run number(&mut self.key, end - start)
+        run self.key.appendSlice(Slice.view(bytes, start, end - start))
+      } else {
+        // An empty unit keeps its place, so that kept units count the same.
+        run number(&mut self.key, 0)
+      }
+      unit = unit + 1
+    }
+    let key = self.key.asSlice()
+    let mut hash: u64 = 0xCBF29CE484222325
+    let mut index: usize = 0
+    while index < key.length {
+      hash = mix(hash, u8.toU64(key[index]))
+      index = index + 1
+    }
+    self.hash = hash
+    return true
+  }
+
+  // Whether `line` holds the key last described.
+  fn matches(self: &Self, line: &Line) -> bool {
+    if line.count == 0 || line.hash != self.hash || line.keyLength != self.key.length() {
+      return false
+    }
+    let key = self.key.asSlice()
+    let stored = Slice.view(self.keys.asSlice(), line.keyStart, line.keyLength)
+    let mut index: usize = 0
+    while index < key.length {
+      if key[index] != stored[index] {
+        return false
+      }
+      index = index + 1
+    }
+    return true
+  }
+
+  /// Appends the runs kept for `request` to `output` and returns true, or returns false
+  /// after writing the request's key for [`LineCache.keep`]. `kept` tells whether the
+  /// request can be kept at all.
+  pub effect fn find(
+    self: &mut Self,
+    store: &GlyphStore,
+    request: &TextShapeRequest<'_, '_>,
+    output: &mut List<TextRun>,
+    kept: &mut bool,
+  ) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    kept.* = run self.describe(request)
+    if !kept.* {
+      return false
+    }
+    if self.epoch != store.epoch() {
+      self.clear()
+      self.epoch = store.epoch()
+    }
+    if self.slots.length() == 0 {
+      return false
+    }
+    let first = slot(self.hash)
+    let mut line = self.slots.get(first)
+    if !self.matches(&line) {
+      line = self.slots.get(partner(first))
+      if !self.matches(&line) {
+        return false
+      }
+    }
+    let runs = Slice.view(self.runs.asSlice(), line.runStart, line.count)
+    let mut index: usize = 0
+    while index < runs.length {
+      let value = runs[index]
+      run output.append(
+        TextRun.Text {
+          unit: request.start.unit + value.unit,
+          start: value.start,
+          end: value.end,
+          advance: value.advance,
+          fontKey: value.fontKey,
+          bidiLevel: value.bidiLevel,
+          shapeKey: value.shapeKey,
+        },
+      )
+      index = index + 1
+    }
+    return true
+  }
+
+  /// Keeps `runs`, which `shapeLine` returned for the request [`LineCache.find`] last looked
+  /// up and said can be kept.
+  pub effect fn keep(self: &mut Self, base: usize, runs: &[TextRun]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if runs.length == 0 {
+      return
+    }
+    if self.keys.length() + self.key.length() > KEY_BYTES {
+      self.clear()
+    }
+    if self.slots.length() == 0 {
+      run self.slots.appendRepeated(
+        Line { hash: 0, keyStart: 0, keyLength: 0, runStart: 0, count: 0 },
+        SLOTS,
+      )
+    }
+    let runStart = self.runs.length()
+    let mut index: usize = 0
+    while index < runs.length {
+      match runs[index] {
+        TextRun.Text { unit, start, end, advance, fontKey, bidiLevel, shapeKey } => {
+          run self.runs.append(
+            Kept {
+              unit: unit - base,
+              start: start,
+              end: end,
+              advance: advance,
+              fontKey: fontKey,
+              bidiLevel: bidiLevel,
+              shapeKey: shapeKey,
+            },
+          )
+        }
+        TextRun.Object { unit: _, bidiLevel: _, lineLeftSpacing: _, lineRightSpacing: _ } => {
+          self.runs.truncate(runStart)
+          return
+        }
+      }
+      index = index + 1
+    }
+    let keyStart = self.keys.length()
+    run self.keys.appendSlice(self.key.asSlice())
+    // A line whose slot holds another line takes the partner slot, so two lines that share
+    // a slot do not replace each other on every frame.
+    let mut place = slot(self.hash)
+    if self.slots.get(place).count != 0 {
+      place = partner(place)
+    }
+    self.slots.set(
+      place,
+      Line {
+        hash: self.hash,
+        keyStart: keyStart,
+        keyLength: self.key.length(),
+        runStart: runStart,
+        count: runs.length,
+      },
+    )
+  }
+}
