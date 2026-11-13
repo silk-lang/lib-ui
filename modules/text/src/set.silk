@@ -1,0 +1,705 @@
+//! [`FontSet`]: the faces text draws with. Installed fonts come from a borrowed
+//! [`FontCollection`]; faces added while the program runs belong to the set, the way a page's
+//! `@font-face` rules add faces to the fonts it was given (CSS Fonts 4 #font-face-rule).
+//!
+//! A face is added two ways:
+//!
+//! - [`FontSet.addFont`] adds the faces of a font file at once, under the family names the
+//!   file gives.
+//! - [`FontSet.declare`] describes a face as an `@font-face` rule does (family, weight, width,
+//!   style, `unicode-range`) before its file is there. Text that needs a character the face
+//!   covers asks for it ([`FontSet.takeWanted`]) and draws with a fallback meanwhile; once
+//!   [`FontSet.load`] gives the file, text laid out again uses it (`font-display: swap`).
+//!
+//! A family that has added or declared faces hides installed faces of the same name, as on
+//! the web. Generic families and the fallback for characters no requested family has use
+//! installed fonts only, as browsers do.
+import font_collection.lib {
+  FontCollection,
+  FontMatcher,
+  Family,
+  Request,
+  Selection,
+  Style,
+  Face,
+  Range,
+  ignoredForFallback
+}
+import faces.database { FontDatabase, FaceStyle }
+import faces.names { same as sameName }
+import read_fonts.lib { FontRef, ReadError }
+import read_fonts.model.charmap { Charmap }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.text.unicode_script { Script }
+import silk.num.f64
+import silk.num.usize
+
+/// An inclusive range of code points, as one entry of `unicode-range`.
+pub struct UnicodeRange {
+  pub first: u32,
+  pub last: u32,
+}
+
+impl Copy for UnicodeRange {}
+
+impl UnicodeRange {
+  /// Every code point, the `unicode-range` default.
+  pub fn all() -> UnicodeRange {
+    return UnicodeRange { first: 0, last: 0x10FFFF }
+  }
+}
+
+/// An `@font-face` rule: the family a face joins and the descriptors font matching reads.
+pub struct FaceRule {
+  /// `font-family`: the name text asks for.
+  pub family: Bytes,
+  /// `font-weight`, as a range for a variable face (`100 900`) or one value.
+  pub weight: Range,
+  /// `font-stretch` / `font-width` percentages.
+  pub width: Range,
+  /// `font-style`.
+  pub style: FaceStyle,
+  /// `unicode-range`; empty means every code point.
+  pub ranges: List<UnicodeRange>,
+}
+
+impl FaceRule {
+  /// A rule for an upright face of `family` at normal width, for every character, at `weight`.
+  pub effect fn make(family: &[u8], weight: Range) -> FaceRule
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut name = Bytes.make()
+    run Bytes.append(&mut name, family)
+    return FaceRule {
+      family: move name,
+      weight: weight,
+      width: Range.point(100.0),
+      style: FaceStyle.Normal,
+      ranges: List<UnicodeRange>.make(),
+    }
+  }
+}
+
+/// Where a declared face is.
+pub enum FaceState {
+  /// Declared; no text has needed it yet.
+  Unloaded,
+  /// Text needed it: its file was asked for.
+  Loading,
+  /// Its file was given and text can use it.
+  Ready,
+  /// Its file failed to load or did not read as a font; text keeps its fallback.
+  Failed,
+}
+
+struct Declared {
+  family: Bytes,
+  weight: Range,
+  width: Range,
+  style: FaceStyle,
+  ranges: List<UnicodeRange>,
+  state: FaceState,
+  /// The face in the set once ready, else `usize.MAX`.
+  face: usize,
+}
+
+/// One entry of the faces text in a style tries, in order: an installed face, or a member of
+/// an added family (`declared`), which has no face until it is ready.
+pub struct Link {
+  pub selection: Selection,
+  /// The declared face behind this link, or `usize.MAX` for an installed face.
+  pub declared: usize,
+}
+
+impl Copy for Link {}
+
+/// Installed faces of a borrowed collection plus faces added at run time.
+pub struct FontSet<'a> {
+  base: &'a FontCollection,
+  installed: FontMatcher<'a>,
+  /// Faces added at run time. Their font files are never changed or removed while the set
+  /// lives, so borrows of them can carry `'a` (see `font`).
+  local: FontDatabase,
+  charmaps: List<Option<Charmap<'a>>>,
+  loaded: List<bool>,
+  declared: List<Declared>,
+  /// Declared faces text needed, oldest first, for the host to load.
+  wanted: List<usize>,
+  /// Counts changes to what font matching can return.
+  pub generation: u64,
+}
+
+fn covers(ranges: &[UnicodeRange], cp: u32) -> bool {
+  if ranges.length == 0 {
+    return true
+  }
+  let mut i: usize = 0
+  while i < ranges.length {
+    if ranges[i].first <= cp && cp <= ranges[i].last {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+fn clamp(range: Range, value: f64) -> f64 {
+  if value < range.min {
+    return range.min
+  }
+  if value > range.max {
+    return range.max
+  }
+  return value
+}
+
+/// How far `range` is from `desired` in CSS Fonts 4 font-weight matching order: 0 when it
+/// holds it, then the faces it checks first rank lower.
+fn weightRank(range: Range, desired: f64) -> f64 {
+  if range.contains(desired) {
+    return 0.0
+  }
+  if desired >= 400.0 && desired <= 500.0 {
+    // Weights from desired up to 500 first, then below desired descending, then above 500.
+    if range.min > desired && range.min <= 500.0 {
+      return range.min - desired
+    }
+    if range.max < desired {
+      return 1000.0 + (desired - range.max)
+    }
+    return 2000.0 + (range.min - desired)
+  }
+  if desired < 400.0 {
+    if range.max < desired {
+      return desired - range.max
+    }
+    return 1000.0 + (range.min - desired)
+  }
+  if range.min > desired {
+    return range.min - desired
+  }
+  return 1000.0 + (desired - range.max)
+}
+
+/// font-width matching: narrower first for a desired width at or under 100%, wider first
+/// above it.
+fn widthRank(range: Range, desired: f64) -> f64 {
+  if range.contains(desired) {
+    return 0.0
+  }
+  if desired <= 100.0 {
+    if range.max < desired {
+      return desired - range.max
+    }
+    return 1000.0 + (range.min - desired)
+  }
+  if range.min > desired {
+    return range.min - desired
+  }
+  return 1000.0 + (desired - range.max)
+}
+
+/// font-style matching: italic asks for italic, then oblique, then upright; oblique asks for
+/// oblique, then italic, then upright; normal asks for upright, then oblique, then italic.
+fn styleRank(style: FaceStyle, desired: Style) -> f64 {
+  let kind: u32 = match style {
+    FaceStyle.Normal => 0
+    FaceStyle.Italic => 1
+    FaceStyle.Oblique { .. } => 2
+  }
+  return match desired {
+    Style.Normal => if kind == 0 {
+      0.0
+    } else if kind == 2 {
+      1.0
+    } else {
+      2.0
+    }
+    Style.Italic => if kind == 1 {
+      0.0
+    } else if kind == 2 {
+      1.0
+    } else {
+      2.0
+    }
+    Style.Oblique { .. } => if kind == 2 {
+      0.0
+    } else if kind == 1 {
+      1.0
+    } else {
+      2.0
+    }
+  }
+}
+
+fn sameStyle(left: FaceStyle, right: FaceStyle) -> bool {
+  return match left {
+    FaceStyle.Normal => match right {
+      FaceStyle.Normal => true
+      _ => false
+    }
+    FaceStyle.Italic => match right {
+      FaceStyle.Italic => true
+      _ => false
+    }
+    FaceStyle.Oblique { min: a, max: b } => match right {
+      FaceStyle.Oblique { min: c, max: d } => a == c && b == d
+      _ => false
+    }
+  }
+}
+
+fn sameDescriptors(left: &Declared, right: &Declared) -> bool {
+  return left.weight.min == right.weight.min && left.weight.max == right.weight.max
+    && left.width.min == right.width.min
+    && left.width.max == right.width.max
+    && sameStyle(left.style, right.style)
+}
+
+fn faceStyleOf(face: &Face) -> FaceStyle {
+  if let Option<Range>.Some { value } = face.italic {
+    if value.max >= 1.0 {
+      return FaceStyle.Italic
+    }
+  }
+  if let Option<Range>.Some { value } = face.oblique {
+    if value.max > 0.0 || value.min < 0.0 {
+      return FaceStyle.Oblique { min: value.min, max: value.max }
+    }
+  }
+  return FaceStyle.Normal
+}
+
+impl<'a> FontSet<'a> {
+  /// A set of the installed faces of `base` and no added ones.
+  pub fn make(base: &'a FontCollection) -> FontSet<'a> {
+    return FontSet {
+      base: base,
+      installed: FontMatcher.make(base),
+      local: FontDatabase.make(),
+      charmaps: List<Option<Charmap<'a>>>.make(),
+      loaded: List<bool>.make(),
+      declared: List<Declared>.make(),
+      wanted: List<usize>.make(),
+      generation: 0,
+    }
+  }
+
+  /// The installed fonts.
+  pub fn installedFonts(self: &Self) -> &'a FontCollection {
+    return self.base
+  }
+
+  /// Installed faces, then added ones.
+  pub fn faceCount(self: &Self) -> usize {
+    return self.base.faceCount() + self.local.faceCount()
+  }
+
+  pub fn face(self: &Self, index: usize) -> &Face {
+    let installed = self.base.faceCount()
+    if index < installed {
+      return self.base.face(index)
+    }
+    return self.local.face(index - installed)
+  }
+
+  /// Face `index` as a font, or None when its data does not read.
+  pub fn font(self: &Self, index: usize) -> Option<FontRef<'a>> {
+    let installed = self.base.faceCount()
+    if index < installed {
+      return self.base.font(index)
+    }
+    let local = index - installed
+    let data = self.local.data(local)
+    let start = match Pointer.nonNullMany<u8>(Pointer.fromSlice<u8>(data)) {
+      Option<[*]const u8>.Some { value } => value
+      Option<[*]const u8>.None => {
+        return Option<FontRef<'a>>.None
+      }
+    }
+    // Added font files stay in `local`, unchanged, for the life of the set, and a database
+    // keeps each file's bytes in their own allocation, which adding more files never moves.
+    // The set itself lives no longer than 'a (it borrows `base` for 'a), so the bytes outlive
+    // every borrow handed out here as long as no `'a` value outlives the set, which owners
+    // of the set (TextSystem, the tree) guarantee by owning those values too.
+    let bytes = unsafe Pointer.borrowMany<FontCollection, u8>(self.base, start, data.length)
+    return match move FontRef.fromIndex(bytes, self.local.face(local).index) {
+      Result<FontRef<'a>, ReadError>.Success { value } => Option<FontRef<'a>>.Some { value: value }
+      Result<FontRef<'a>, ReadError>.Failure { error: _ } => Option<FontRef<'a>>.None
+    }
+  }
+
+  effect fn localCharmap(self: &mut Self, face: usize) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    while self.loaded.length() <= face {
+      run self.loaded.append(false)
+      run self.charmaps.append(Option<Charmap<'a>>.None)
+    }
+    if self.loaded.get(face) {
+      return
+    }
+    self.loaded.set(face, true)
+    if let Option<FontRef<'a>>.Some { value: font } = self.font(face) {
+      self.charmaps.set(face, Option<Charmap<'a>>.Some { value: Charmap.new(&font) })
+    }
+  }
+
+  /// Whether face `face` maps `cp` to a glyph (and, for a declared face, covers it).
+  pub effect fn supports(self: &mut Self, face: usize, cp: u32) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if face < self.base.faceCount() {
+      return run self.installed.supports(face, cp)
+    }
+    run self.localCharmap(face)
+    if let Option<Charmap<'a>>.Some { value } = &self.charmaps.asSlice()[face] {
+      return value.mapUnicode(cp).isSome()
+    }
+    return false
+  }
+
+  // Adding faces.
+
+  /// Adds every usable face of an sfnt font or collection under the family names the file
+  /// gives, ready at once, and returns how many were added.
+  pub effect fn addFont(self: &mut Self, data: Bytes) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let first = self.local.faceCount()
+    let added = run self.local.add(move data)
+    let installed = self.base.faceCount()
+    let mut i = first
+    while i < first + added {
+      let face = self.local.face(i)
+      let mut family = Bytes.make()
+      if face.families.length() > 0 {
+        run Bytes.append(&mut family, Bytes.asSlice(&face.families.asSlice()[0]))
+      }
+      let entry = Declared {
+        family: move family,
+        weight: face.weight,
+        width: face.width,
+        style: faceStyleOf(&face),
+        ranges: List<UnicodeRange>.make(),
+        state: FaceState.Ready,
+        face: installed + i,
+      }
+      run self.declared.append(move entry)
+      i = i + 1
+    }
+    if added > 0 {
+      self.generation = self.generation + 1
+    }
+    return added
+  }
+
+  /// Declares a face whose file comes later and returns its index. Text needing a character
+  /// in its `unicode-range` asks for it through `takeWanted`.
+  pub effect fn declare(self: &mut Self, rule: FaceRule) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.declared.append(
+      Declared {
+        family: move rule.family,
+        weight: rule.weight,
+        width: rule.width,
+        style: rule.style,
+        ranges: move rule.ranges,
+        state: FaceState.Unloaded,
+        face: usize.MAX,
+      },
+    )
+    self.generation = self.generation + 1
+    return self.declared.length() - 1
+  }
+
+  /// Gives declared face `declared` its file (face `index` of an sfnt font or collection),
+  /// under the rule's family and descriptors. Returns false, marking the face failed, when
+  /// the data is no usable font, and does nothing for a face already ready.
+  pub effect fn load(self: &mut Self, declared: usize, data: Bytes, index: u32) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if declared >= self.declared.length() {
+      return false
+    }
+    if self.declared.asSlice()[declared].state == FaceState.Ready {
+      return true
+    }
+    let entry = &self.declared.asSlice()[declared]
+    let mut family = Bytes.make()
+    run Bytes.append(&mut family, Bytes.asSlice(&entry.family))
+    let weight = entry.weight
+    let width = entry.width
+    let style = entry.style
+    let face = self.local.faceCount()
+    let ok = run self.local.addFace(
+      move data,
+      index,
+      Bytes.asSlice(&family),
+      Option<Range>.Some { value: weight },
+      Option<Range>.Some { value: width },
+      Option<FaceStyle>.Some { value: style },
+    )
+    let target = &mut self.declared.asMutSlice()[declared]
+    if ok {
+      target.state = FaceState.Ready
+      target.face = self.base.faceCount() + face
+    } else {
+      target.state = FaceState.Failed
+    }
+    self.generation = self.generation + 1
+    return ok
+  }
+
+  /// Marks declared face `declared` failed: text keeps drawing with its fallback.
+  pub fn markFailed(self: &mut Self, declared: usize) -> () {
+    if declared < self.declared.length()
+      && self.declared.asSlice()[declared].state != FaceState.Ready {
+      let entries = self.declared.asMutSlice()
+      entries[declared].state = FaceState.Failed
+    }
+  }
+
+  /// The number of added and declared faces.
+  pub fn declaredCount(self: &Self) -> usize {
+    return self.declared.length()
+  }
+
+  pub fn state(self: &Self, declared: usize) -> FaceState {
+    return self.declared.asSlice()[declared].state
+  }
+
+  /// The family declared face `declared` belongs to.
+  pub fn familyOf(self: &Self, declared: usize) -> &[u8] {
+    return Bytes.asSlice(&self.declared.asSlice()[declared].family)
+  }
+
+  /// Takes the declared faces text needed since the last call, oldest first. Each is asked
+  /// for once; it stays loading until `load` or `markFailed`.
+  pub effect fn takeWanted(self: &mut Self, out: &mut List<usize>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run out.appendSlice(self.wanted.asSlice())
+    self.wanted.clear()
+  }
+
+  /// Whether any declared face waits to be asked for.
+  pub fn hasWanted(self: &Self) -> bool {
+    return self.wanted.length() > 0
+  }
+
+  // Matching.
+
+  /// Whether `name` is a family of added or declared faces.
+  pub fn hasFamily(self: &Self, name: &[u8]) -> bool {
+    let entries = self.declared.asSlice()
+    let mut i: usize = 0
+    while i < entries.length {
+      if entries[i].state != FaceState.Failed && sameName(Bytes.asSlice(&entries[i].family), name) {
+        return true
+      }
+      i = i + 1
+    }
+    return false
+  }
+
+  /// Font matching within an added family: the members of the best descriptor set, the last
+  /// declared first, as CSS checks overlapping `unicode-range`s.
+  effect fn matchAdded(self: &Self, name: &[u8], request: Request, out: &mut List<Link>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let entries = self.declared.asSlice()
+    let mut best = usize.MAX
+    let mut bestWidth: f64 = 0.0
+    let mut bestStyle: f64 = 0.0
+    let mut bestWeight: f64 = 0.0
+    let mut i: usize = 0
+    while i < entries.length {
+      let entry = &entries[i]
+      if entry.state != FaceState.Failed && sameName(Bytes.asSlice(&entry.family), name) {
+        // Width narrows first, then style, then weight (#font-style-matching).
+        let width = widthRank(entry.width, request.width)
+        let style = styleRank(entry.style, request.style)
+        let weight = weightRank(entry.weight, request.weight)
+        let better = best == usize.MAX || width < bestWidth
+          || (width == bestWidth
+            && (style < bestStyle || (style == bestStyle && weight < bestWeight)))
+        if better {
+          best = i
+          bestWidth = width
+          bestStyle = style
+          bestWeight = weight
+        }
+      }
+      i = i + 1
+    }
+    if best == usize.MAX {
+      return
+    }
+    let mut j = entries.length
+    while j > 0 {
+      j = j - 1
+      let entry = &entries[j]
+      if entry.state != FaceState.Failed && sameName(Bytes.asSlice(&entry.family), name)
+        && sameDescriptors(&entry, &entries[best]) {
+        let italic = match entry.style {
+          FaceStyle.Italic => Option<f64>.Some { value: 1.0 }
+          _ => Option<f64>.None
+        }
+        let oblique = match entry.style {
+          FaceStyle.Oblique { min, max } => Option<f64>.Some {
+            value: clamp(Range { min: min, max: max }, 14.0),
+          }
+          _ => Option<f64>.None
+        }
+        let wantsSlant = match request.style {
+          Style.Normal => false
+          _ => true
+        }
+        let upright = match entry.style {
+          FaceStyle.Normal => true
+          _ => false
+        }
+        run out.append(
+          Link {
+            selection: Selection {
+              face: entry.face,
+              weight: clamp(entry.weight, request.weight),
+              width: clamp(entry.width, request.width),
+              italic: italic,
+              oblique: oblique,
+              syntheticOblique: if wantsSlant && upright {
+                14.0
+              } else {
+                0.0
+              },
+              syntheticBold: request.weight >= 600.0 && entry.weight.max < 600.0,
+            },
+            declared: j,
+          },
+        )
+      }
+    }
+  }
+
+  /// The faces to try for text asking for `families`: per family, the members of an added
+  /// family, or one CSS-matched installed face, without repeats.
+  pub effect fn chain(
+    self: &Self,
+    families: &[Family],
+    request: Request,
+    out: &mut List<Link>,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut index: usize = 0
+    while index < families.length {
+      let mut added = false
+      if let Family.Named { name } = &families[index] {
+        if self.hasFamily(Bytes.asSlice(&name)) {
+          run self.matchAdded(Bytes.asSlice(&name), request, &mut out)
+          added = true
+        }
+      }
+      if !added {
+        if let Option<Selection>.Some { value } = run self.base.matchFamily(
+          &families[index],
+          request,
+        ) {
+          let mut seen = false
+          let mut at: usize = 0
+          while at < out.length() {
+            if out.asSlice()[at].declared == usize.MAX && out.asSlice()[at].selection.face == value.face {
+              seen = true
+            }
+            at = at + 1
+          }
+          if !seen {
+            run out.append(Link { selection: value, declared: usize.MAX })
+          }
+        }
+      }
+      index = index + 1
+    }
+  }
+
+  /// The first available font of `chain` (#first-available-font): the first face there that
+  /// is ready and covers U+0020.
+  pub fn primary(self: &Self, chain: &[Link]) -> Option<Selection> {
+    let mut i: usize = 0
+    while i < chain.length {
+      let link = chain[i]
+      if link.declared == usize.MAX {
+        return Option<Selection>.Some { value: link.selection }
+      }
+      let entry = &self.declared.asSlice()[link.declared]
+      if link.selection.face != usize.MAX && covers(entry.ranges.asSlice(), 0x20) {
+        return Option<Selection>.Some { value: link.selection }
+      }
+      i = i + 1
+    }
+    return Option<Selection>.None
+  }
+
+  /// The face for a cluster that starts with `cp`: the first face of `chain` that is ready,
+  /// covers it and has it, then installed fallback for `script` and any installed face. A
+  /// declared face that covers it and was never asked for is asked for here. Returns the
+  /// first available font when no face has the character, so it draws as `.notdef`, and
+  /// None only when there is none.
+  pub effect fn select(
+    self: &mut Self,
+    chain: &[Link],
+    request: Request,
+    cp: u32,
+    script: Script,
+  ) -> Option<Selection>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if ignoredForFallback(cp) {
+      if let Option<Selection>.Some { value } = self.primary(chain) {
+        return Option<Selection>.Some { value: value }
+      }
+    }
+    let mut index: usize = 0
+    while index < chain.length {
+      let link = chain[index]
+      if link.declared == usize.MAX {
+        if run self.installed.supports(link.selection.face, cp) {
+          return Option<Selection>.Some { value: link.selection }
+        }
+      } else if covers(self.declared.asSlice()[link.declared].ranges.asSlice(), cp) {
+        let state = self.declared.asSlice()[link.declared].state
+        if state == FaceState.Ready {
+          if run self.supports(link.selection.face, cp) {
+            return Option<Selection>.Some { value: link.selection }
+          }
+        } else if state == FaceState.Unloaded {
+          let entries = self.declared.asMutSlice()
+          entries[link.declared].state = FaceState.Loading
+          run self.wanted.append(link.declared)
+        }
+      }
+      index = index + 1
+    }
+    if let Option<Selection>.Some { value } = run self.fallback(request, cp, script) {
+      return Option<Selection>.Some { value: value }
+    }
+    return self.primary(chain)
+  }
+
+  /// The installed face for `cp` when no requested family has it: the fallbacks for
+  /// `script`, then any installed face, or None.
+  pub effect fn fallback(self: &mut Self, request: Request, cp: u32, script: Script) -> Option<Selection>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let none: [Selection; 0] = []
+    return run self.installed.select(&none, request, cp, script)
+  }
+}
