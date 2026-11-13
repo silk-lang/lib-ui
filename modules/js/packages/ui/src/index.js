@@ -49,9 +49,10 @@ function cssName(name) {
 }
 
 // The tree names font family lists by number: each `fontFamily` text is defined once, as a
-// list of its own. The numbers start high, clear of the lists a host defines.
+// list of its own. The numbers start high, clear of the lists a host defines, and stay
+// small enough to be exact in the 32-bit float a style value is.
 const FAMILIES = new Map();
-let nextFamily = 0x40000000;
+let nextFamily = 0x10000;
 
 function familyOf(names) {
   let id = FAMILIES.get(names);
