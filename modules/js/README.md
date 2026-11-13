@@ -271,7 +271,10 @@ their title bar.
 silk run --manifest-path modules/js/demo/silk.toml
 ```
 
-Run it from the repository root. `silk task native check` runs it with `--check`.
+`@silk/ui` and the starter page are part of the binary (`uiPackage()` from `ui_js.lib` and
+`Source.read("app.js")`), so the executable runs from any directory. After an edit to
+`packages/ui/src/index.js`, `silk task embed-assets` regenerates
+`src/generated_library.silk`. `silk task native check` runs the demo with `--check`.
 
 ### Production builds
 
