@@ -199,6 +199,48 @@ native counter 93 ms warm (from 101).
 - **JavaScript speed and memory per node** are the gap on the 1,000 rows: the interpreter
   and bridge for speed, 30 KB per row for memory.
 
+## The starter page
+
+The starter page ([examples/react-counter](../examples/react-counter)) is a heavier app:
+about 1,100 nodes, most of them restyled on every animation frame. Its `src/` runs
+unchanged on all three hosts (the README there says how the browser build does it), in the
+same 1040x720 window, so `--app starter` compares them on a real page instead of the
+counter. There are no clicks: the page animates all the time, so the CPU column is while
+it animates rather than idle.
+
+```sh
+(cd modules/js/examples/react-counter && npm run build && npm run build:web)
+(cd modules/js/examples/react-counter/electron && npm install && node node_modules/electron/install.js)
+(cd modules/js/examples/react-counter/tauri && cargo build --release)
+silk build --manifest-path modules/js/demo/silk.toml --profile production
+node modules/js/bench/run.mjs --app starter --runs 5 --cold-runs 3
+```
+
+Measured 2026-11-13T20:33Z in the same kind of container (Intel Xeon @ 2.10GHz, 4 cores,
+Xvfb, lavapipe), the production ui-js build, Electron 45.3, Tauri 2 on WebKitGTK 2.52; 5
+warm runs + 3 cold (the whole page cache dropped before each), medians.
+
+|  | shipped MB | gzip MB | system libs MB | cold first frame ms | warm first frame ms | processes | PSS MB | RSS MB | CPU % animating |
+|---|---|---|---|---|---|---|---|---|---|
+| ui-js (SilkJS + React) | 38.3 | 14.2 |  | 246 | 156 | 1 | 162 | 185 | 208 |
+| Electron + React DOM | 287.4 | 125.8 |  | 488 | 262 | 6 | 291 | 604 | 116 |
+| Tauri + React DOM | 4.8 | 2.1 | 127.0 | 1047 | 875 | 3 | 377 | 537 | 162 |
+
+The ui-js window's first launch (GPU cache empty) is 288 ms. The browser builds wait for
+their fonts (`document.fonts.ready`) before counting two frames; the ui-js fonts are in
+the binary. The ui-js bundle is 0.23 MB (0.06 gzip); the web build is 0.23 MB of
+JavaScript plus 0.28 MB of the same fonts.
+
+- **Startup and memory** keep the counter's order: ui-js starts first and uses the least
+  memory, Electron is second, Tauri last on both.
+- **CPU while animating** is where ui-js is behind here, and most of it is drawing on the
+  CPU: per thread, lavapipe's four rasterizer threads take about 190% of a core and the
+  app's own threads about 100% (JavaScript, style, layout and text for the restyled
+  nodes), at 59 frames a second. Chromium and WebKit draw this page in software more
+  cheaply than lavapipe does. On a machine with a GPU the rasterizer share leaves the CPU,
+  so this column needs a run on real hardware before it says much; the app-thread share
+  is the part to bring down.
+
 ## Caveats
 
 - The container has no GPU. The tree windows draw with lavapipe (Mesa's Vulkan on the CPU,
