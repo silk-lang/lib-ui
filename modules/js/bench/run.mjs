@@ -4,7 +4,10 @@
 // under Xvfb, and xdotool sends the clicks. See README.md for the method and what each
 // number means.
 //
-//   node run.mjs [--runs N] [--cold-runs N] [--only name,name] [--json out.json] [--markdown out.md]
+//   node run.mjs [--app counter|starter] [--runs N] [--cold-runs N] [--only name,name] [--json out.json] [--markdown out.md]
+//
+// `--app starter` measures the starter page (examples/react-counter) instead: the same
+// App.jsx on ui-js, in Electron and in Tauri, with no clicks; its CPU is while it animates.
 //
 // Build the targets first (README.md). A target whose files are missing is skipped.
 import { spawn, spawnSync } from "node:child_process";
@@ -29,6 +32,7 @@ const COLD_RUNS = Number(option("--cold-runs", "5"));
 const ONLY = option("--only", "")?.split(",").filter(Boolean) ?? [];
 const JSON_OUT = option("--json", "");
 const MD_OUT = option("--markdown", "");
+const APP = option("--app", "counter");
 const CLICKS = 10;
 const SETTLE_MS = 1500;
 const IDLE_MS = 5000;
@@ -51,7 +55,7 @@ const silkBundle = join(here, "dist/silk/app.js");
 const webDist = join(here, "dist/web");
 
 /** Everything a target ships: [label, path] (a directory counts with all its files). */
-const targets = [
+const counterTargets = [
   {
     name: "ui-js",
     label: "ui-js (SilkJS + React)",
@@ -129,6 +133,55 @@ const targets = [
     interactive: false,
   },
 ];
+
+const starter = join(repo, "modules/js/examples/react-counter");
+const starterElectron = join(starter, "electron/node_modules/electron/dist");
+const starterTauri = join(starter, "tauri/target/release/react-counter-tauri");
+const starterFirstFrame = /^react starter: first frame/;
+
+/** The starter page (examples/react-counter): one App.jsx, three hosts. */
+const starterTargets = [
+  {
+    name: "ui-js",
+    label: "ui-js (SilkJS + React)",
+    command: silkBuild("production", "ui-js-demo"),
+    args: [join(starter, "dist/app.js")],
+    cwd: repo,
+    env: { SILK_UI_TRACE_FRAMES: "1" },
+    gpuCache: true,
+    title: "Silk UI",
+    firstFrame: starterFirstFrame,
+    ships: [["binary", silkBuild("production", "ui-js-demo")], ["bundle", join(starter, "dist/app.js")], ["@silk/ui", join(repo, "modules/js/packages/ui/src/index.js")]],
+    interactive: false,
+  },
+  {
+    name: "electron",
+    label: "Electron + React DOM",
+    command: join(starterElectron, "electron"),
+    args: process.getuid?.() === 0 ? ["--no-sandbox", join(starter, "electron")] : [join(starter, "electron")],
+    cwd: starter,
+    env: { NODE_OPTIONS: "" },
+    title: "Silk UI",
+    firstFrame: starterFirstFrame,
+    ships: [["electron", starterElectron], ["app", join(starter, "electron/main.cjs")], ["web", join(starter, "dist-web")]],
+    interactive: false,
+  },
+  {
+    name: "tauri",
+    label: "Tauri + React DOM",
+    command: starterTauri,
+    args: [],
+    cwd: starter,
+    env: {},
+    title: "Silk UI",
+    firstFrame: starterFirstFrame,
+    ships: [["binary", starterTauri]],
+    system: ["libwebkit2gtk-4.1.so.0", "libjavascriptcoregtk-4.1.so.0"],
+    interactive: false,
+  },
+];
+
+const targets = APP === "starter" ? starterTargets : counterTargets;
 
 // ---------------------------------------------------------------- files
 
@@ -488,7 +541,7 @@ function sizes(target) {
 async function main() {
   const display = startDisplay();
   await sleep(1500);
-  const report = { date: new Date().toISOString(), host: hostInfo(), runs: RUNS, coldRuns: COLD_RUNS, targets: [] };
+  const report = { app: APP, date: new Date().toISOString(), host: hostInfo(), runs: RUNS, coldRuns: COLD_RUNS, targets: [] };
   try {
     for (const target of targets) {
       if (ONLY.length && !ONLY.includes(target.name)) continue;
@@ -563,6 +616,7 @@ function table(report) {
     const s = t.sizes;
     out += line([t.label, MB(s.shipped), MB(s.gzip), MB(s.binary), MB(s.stripped), MB(s.debug), s.bundle ? `${MB(s.bundle)} (${MB(s.bundleGzip)})` : "", MB(s.system)]) + "\n";
   }
+  if (report.app === "starter") return out + starterTables(rows, head, line);
   out += "\nStartup and input (ms)\n\n";
   out += head(["", "first launch first frame", "cold first frame", "warm first frame", "warm first frame presented", "click to frame", "click to presented", "1000 rows to frame"]) + "\n";
   for (const t of rows) {
@@ -588,6 +642,20 @@ function table(report) {
     const w = t.warm;
     const peak = w.afterRows?.peak ?? w.afterClicks?.peak ?? w.idle.peak;
     out += line([t.label, w.idle.processes, MB(w.idle.rss), MB(w.idle.pss), MB(w.afterClicks?.pss), MB(w.afterRows?.pss), MB(peak), (w.idleCpu * 100).toFixed(1)]) + "\n";
+  }
+  return out;
+}
+
+// The starter page has no clicks, and it animates all the time: its CPU is while animating.
+function starterTables(rows, head, line) {
+  let out = "\nStartup (ms)\n\n";
+  out += head(["", "first launch first frame", "cold first frame", "warm first frame", "warm first frame presented"]) + "\n";
+  for (const t of rows) out += line([t.label, MS(t.first?.firstFrameJs), MS(t.cold.firstFrameJs), MS(t.warm.firstFrameJs), MS(t.warm.firstFramePresented)]) + "\n";
+  out += "\nMemory (MB, all processes of the app, 1.5 s after the first frame) and CPU while the page animates\n\n";
+  out += head(["", "processes", "RSS", "PSS", "peak RSS", "CPU % of one core"]) + "\n";
+  for (const t of rows) {
+    const w = t.warm;
+    out += line([t.label, w.idle.processes, MB(w.idle.rss), MB(w.idle.pss), MB(w.idle.peak), (w.idleCpu * 100).toFixed(1)]) + "\n";
   }
   return out;
 }
