@@ -12,7 +12,7 @@ import silk.core.ownership { Copy }
 import silk.num.i32
 import silk.num.f64
 import ui_tree.css { Declaration }
-import ui_tree.legacy { Batch, NodeKind, Attribute, Mutation, StyleState }
+import ui_tree.legacy { Batch, NodeKind, Attribute, Mutation, StyleState, Cursor }
 import css_style.tokens { CssError }
 import css_style.written as written
 import silkjs.js_engine { Engine }
@@ -74,8 +74,13 @@ pub const REQUEST_FRAME: u32 = 19
 pub const DEV_SEND: u32 = 20
 /// `__ui.devReload()`: asks the host to start a new realm and run the application again.
 pub const DEV_RELOAD: u32 = 21
+/// `__ui.fontFamily(id, names)`: defines family list `id` from CSS `font-family` text, for
+/// `font-family: <id>` in a style.
+pub const FONT_FAMILY: u32 = 22
+/// `__ui.open(url)`: asks the host to open an address outside the application.
+pub const OPEN: u32 = 23
 /// The number of native functions, for the installer.
-pub const LAST: u32 = 21
+pub const LAST: u32 = 23
 
 /// The runtime's module loader callback: [`Bridge`] answers it from the defined modules.
 pub const MODULE_LOAD: u32 = 100
@@ -116,6 +121,8 @@ pub struct Bridge {
   pub outbox: List<String>,
   /// Whether JavaScript asked for a new realm.
   pub reload: bool,
+  /// Addresses JavaScript asked the host to open, oldest first.
+  pub opened: List<String>,
 }
 
 impl Bridge {
@@ -129,6 +136,7 @@ impl Bridge {
       logs: List<LogEntry>.make(),
       outbox: List<String>.make(),
       reload: false,
+      opened: List<String>.make(),
     }
   }
 
@@ -189,13 +197,15 @@ pub fn name(id: u32) -> &'static [u8] {
   if id == CANCEL_TIMER { return b"cancelTimer" }
   if id == DEV_SEND { return b"devSend" }
   if id == DEV_RELOAD { return b"devReload" }
+  if id == FONT_FAMILY { return b"fontFamily" }
+  if id == OPEN { return b"open" }
   return b"requestFrame"
 }
 
 /// The declared argument count of native function `id`.
 pub fn arity(id: u32) -> i32 {
   if id == NOW || id == REQUEST_FRAME || id == DEV_RELOAD { return 0 }
-  if id == DEV_SEND { return 1 }
+  if id == DEV_SEND || id == OPEN { return 1 }
   if id == ROOT || id == FOCUS || id == REMOVE || id == DESTROY || id == CANCEL_TIMER { return 1 }
   if id == INSERT_BEFORE || id == STYLE || id == ATTRIBUTE || id == SCROLL_TO || id == SELECT { return 3 }
   return 2
@@ -267,7 +277,28 @@ effect fn attributeOf<'v>(name: string, value: ValueRef<'v>) -> Option<Attribute
   if name == "placeholder" { return Option<Attribute>.some(Attribute.Placeholder { value: run text(value) }) }
   if name == "href" { return Option<Attribute>.some(Attribute.Href { value: run text(value) }) }
   if name == "transition" { return Option<Attribute>.some(Attribute.Transition { value: run text(value) }) }
+  if name == "cursor" {
+    let word = run text(value)
+    return Option<Attribute>.some(Attribute.Cursor { value: cursorOf(String.utf8Bytes(String.view(&word))) })
+  }
   return Option<Attribute>.none()
+}
+
+/// The tree's cursor for a CSS `cursor` keyword. A keyword the tree has no cursor for is the
+/// default arrow.
+fn cursorOf(word: &[u8]) -> Cursor {
+  if same(word, b"pointer") { return Cursor.Pointer }
+  if same(word, b"text") { return Cursor.Text }
+  if same(word, b"move") { return Cursor.Move }
+  if same(word, b"grab") { return Cursor.Grab }
+  if same(word, b"grabbing") { return Cursor.Grabbing }
+  if same(word, b"not-allowed") { return Cursor.NotAllowed }
+  if same(word, b"ew-resize") || same(word, b"col-resize") { return Cursor.ResizeHorizontal }
+  if same(word, b"ns-resize") || same(word, b"row-resize") { return Cursor.ResizeVertical }
+  if same(word, b"nwse-resize") { return Cursor.ResizeNorthWestSouthEast }
+  if same(word, b"nesw-resize") { return Cursor.ResizeNorthEastSouthWest }
+  if same(word, b"crosshair") { return Cursor.Crosshair }
+  return Cursor.Default
 }
 
 /// The declarations of `css`. Text the tokenizer rejects sets nothing.
@@ -352,8 +383,14 @@ impl EngineServices for Bridge {
     } else if function == DEV_SEND {
       let line = run text(argv.get(0))
       run engine.services.outbox.append(move line)
+    } else if function == OPEN {
+      let address = run text(argv.get(0))
+      run engine.services.opened.append(move address)
     } else if function == DEV_RELOAD {
       engine.services.reload = true
+    } else if function == FONT_FAMILY {
+      let names = run text(argv.get(1))
+      run engine.services.batch.fontFamily(first, String.view(&names))
     } else if function == SELECT {
       run engine.services.batch.select(first, f64.toUsize(number(argv.get(1).view())), f64.toUsize(number(argv.get(2).view())))
     }

@@ -1,5 +1,5 @@
 import { createRoot } from "@silk/ui-react";
-import { Counter } from "./Counter.jsx";
+import { App } from "./App.jsx";
 
-createRoot().render(<Counter />);
-console.log("react counter started");
+createRoot().render(<App />);
+console.log("react starter started");
