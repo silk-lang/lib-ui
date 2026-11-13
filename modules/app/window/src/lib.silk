@@ -45,6 +45,7 @@ import webgpu.runtime { GpuError }
 import silk.collections.list { List }
 import silk.core.option { Option }
 import silk.num.u32
+import silk.num.f64
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 
 /// Custom drawing integrated with the standard window, input, inspection and GPU lifecycle.
@@ -54,6 +55,11 @@ pub interface WindowContent<A, M, C> {
   /// Initializes resources before the first view and configures native window options.
   effect fn setup(self: &mut Self, tree: &mut UiTree<'_>) -> ()
     ! TreeError | OutOfMemoryError
+    ? &mut Allocator {}
+
+  /// Gives `loader` the files the program carries, served for relative URLs.
+  effect fn files(self: &mut Self, loader: &mut Loader) -> ()
+    ! OutOfMemoryError
     ? &mut Allocator {}
 
   fn configure(self: &Self, options: &mut WindowOptions<'_>) -> () {}
@@ -157,6 +163,7 @@ pub import ui_tree_window.platform_thread { Driver, HostPlatform, Launched, laun
 pub import ui_tree_window.host { startInspector }
 import ui_tree_window.host as host
 import ui_tree_window.host { WindowClient }
+pub import ui_tree_window.loader { Loader }
 
 // The browser has no system fonts: pass a collection to `runWindow` there.
 static if Intrinsic.targetArchitecture() != "wasm32" {
@@ -232,6 +239,7 @@ pub effect fn runWindowHosted<
   let mut client: AppClient<A, M, C, H> = AppClient<A, M, C, H> {
     content: &mut content,
     silkUi: SilkUi.make(),
+    loader: Loader.make(),
   }
   let mut inspector = move inspector
   run inspector.extend(run SilkUi.extension())
@@ -251,6 +259,31 @@ struct AppClient<'a, A, M, C, H> {
   content: &'a mut H,
   /// The `silk-ui` inspector extension: the program's messages and model.
   silkUi: SilkUi,
+  /// Loads the image and icon URLs the views name.
+  loader: Loader,
+}
+
+impl<'a, A, M, C, H> AppClient<'a, A, M, C, H> {
+  /// Starts the loads the last batch asked for; the ones the loader has at hand are installed
+  /// before the frame that shows them.
+  effect fn load(self: &mut Self, tree: &mut UiTree<'_>) -> bool
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    return run self.loader.serve(&mut tree)
+  }
+}
+
+/// `loader.serve`, then the `load` and `error` records of what ended go to the app at once.
+effect fn loadNow<A: App<M, C>, M, C: Perform<M, E, R>, E, ? R>(
+  loader: &mut Loader,
+  state: &mut Runtime<A, M, C>,
+  tree: &mut UiTree<'_>,
+) -> ()
+  ! E | TreeError | OutOfMemoryError
+  ? R | &mut Allocator {
+  if run loader.serve(&mut tree) {
+    drop run pump(&mut state, &mut tree)
+  }
 }
 
 impl<'a, A: App<M, C>, M, C: Perform<M, E, R>, H: WindowContent<A, M, C>, E, ? R> WindowClient<
@@ -261,6 +294,7 @@ impl<'a, A: App<M, C>, M, C: Perform<M, E, R>, H: WindowContent<A, M, C>, E, ? R
   effect fn setup(self: &mut Self, state: &mut Runtime<A, M, C>, tree: &mut UiTree<'_>) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
+    run WindowContent<A, M, C>.files(&mut self.content.*, &mut self.loader)
     return run WindowContent<A, M, C>.setup(&mut self.content.*, &mut tree)
   }
 
@@ -340,11 +374,21 @@ impl<'a, A: App<M, C>, M, C: Perform<M, E, R>, H: WindowContent<A, M, C>, E, ? R
   ) -> bool
     ! WindowError | TreeError | OutOfMemoryError
     ? &mut Allocator {
-    return run WindowContent<A, M, C>.poll(&mut self.content.*, &mut state, &mut tree, time)
+    let loaded = run self.load(&mut tree)
+    let polled = run WindowContent<A, M, C>.poll(&mut self.content.*, &mut state, &mut tree, time)
+    return loaded || polled
   }
 
   fn wakeAfter(self: &Self, state: &Runtime<A, M, C>) -> Option<f64> {
-    return WindowContent<A, M, C>.wakeAfter(&self.content.*)
+    let wanted = WindowContent<A, M, C>.wakeAfter(&self.content.*)
+    if !self.loader.pending() {
+      return wanted
+    }
+    // Collect running loads about once a frame.
+    return match wanted {
+      Option<f64>.Some { value } => Option<f64>.some(f64.min(value, 0.016))
+      Option<f64>.None => Option<f64>.some(0.016)
+    }
   }
 
   effect fn frame(
@@ -382,6 +426,7 @@ impl<'a, A: App<M, C>, M, C: Perform<M, E, R>, H: WindowContent<A, M, C>, E, ? R
     ! E | TreeError | OutOfMemoryError
     ? R | &mut Allocator {
     run state.start(&mut tree, 0.0)
+    run loadNow(&mut self.loader, &mut state, &mut tree)
   }
 
   effect fn pump(self: &mut Self, state: &mut Runtime<A, M, C>, tree: &mut UiTree<'_>) -> ()
@@ -389,6 +434,7 @@ impl<'a, A: App<M, C>, M, C: Perform<M, E, R>, H: WindowContent<A, M, C>, E, ? R
     ? R | &mut Allocator {
     run WindowContent<A, M, C>.intercept(&mut self.content.*, &mut state, &mut tree)
     drop run pump(&mut state, &mut tree)
+    run loadNow(&mut self.loader, &mut state, &mut tree)
   }
 
   effect fn decide(self: &mut Self, state: &mut Runtime<A, M, C>, tree: &mut UiTree<'_>) -> bool
@@ -396,6 +442,7 @@ impl<'a, A: App<M, C>, M, C: Perform<M, E, R>, H: WindowContent<A, M, C>, E, ? R
     ? R | &mut Allocator {
     run WindowContent<A, M, C>.intercept(&mut self.content.*, &mut state, &mut tree)
     drop run pump(&mut state, &mut tree)
+    run loadNow(&mut self.loader, &mut state, &mut tree)
     return state.takePrevented()
   }
 
@@ -409,6 +456,7 @@ impl<'a, A: App<M, C>, M, C: Perform<M, E, R>, H: WindowContent<A, M, C>, E, ? R
     ! E | TreeError | OutOfMemoryError
     ? R | &mut Allocator {
     run tick(&mut state, &mut tree, time, animation)
+    run loadNow(&mut self.loader, &mut state, &mut tree)
   }
 
   effect fn resize(
@@ -421,6 +469,7 @@ impl<'a, A: App<M, C>, M, C: Perform<M, E, R>, H: WindowContent<A, M, C>, E, ? R
     ! E | TreeError | OutOfMemoryError
     ? R | &mut Allocator {
     run resize(&mut state, &mut tree, width, height)
+    run loadNow(&mut self.loader, &mut state, &mut tree)
   }
 
   effect fn layout(
@@ -432,6 +481,7 @@ impl<'a, A: App<M, C>, M, C: Perform<M, E, R>, H: WindowContent<A, M, C>, E, ? R
     ! E | TreeError | OutOfMemoryError
     ? R | &mut Allocator {
     run frame(&mut state, &mut tree, input)
+    run loadNow(&mut self.loader, &mut state, &mut tree)
   }
 
   effect fn layoutRoot(
@@ -444,6 +494,7 @@ impl<'a, A: App<M, C>, M, C: Perform<M, E, R>, H: WindowContent<A, M, C>, E, ? R
     ! E | TreeError | OutOfMemoryError
     ? R | &mut Allocator {
     run frameRoot(&mut state, &mut tree, root, input)
+    run loadNow(&mut self.loader, &mut state, &mut tree)
   }
 
   fn nextDeadline(self: &Self, state: &Runtime<A, M, C>) -> Option<f64> {

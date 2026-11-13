@@ -39,8 +39,9 @@ const page = await mount({
   wasm: "./app.wasm",
   root: document.getElementById("app"),
   fonts: { 1: "Inter, system-ui, sans-serif" }, // css.fontFamily(1)
-  images: { 1: "/logo.png" }, // h.image(1)
-  icons: { 1: "/chevron.svg" }, // h.icon(1), drawn in the text color
+  // h.image("logo.png") and h.icon("chevron.svg") load relative to the app's root;
+  // loaders add schemes of the app's own.
+  loaders: { db: async (url) => new Blob([await read(url)]) }, // h.image("db:42")
   base: "", // "/docs" when the site is under /docs
   imports: { app: { share: (pointer, length) => {} } }, // the program's own host imports
 });
