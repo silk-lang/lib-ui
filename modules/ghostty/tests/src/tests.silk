@@ -1,0 +1,263 @@
+//! The terminal component on a real tree, driven through the tree's dispatch path.
+import ui_ghostty.view { TerminalView, TerminalMessage, Options, Outgoing }
+import ghostty_vt.terminal { GhosttyError }
+import ui_app.lib { Document, NoCommand, NoOutput, Node, Program, Update }
+import ui_app.program as program
+import ui_app.css
+import ui_app.runtime { Runtime, pump, drain as deliver }
+import ui_app.program { Hosted, Run }
+import ui_app.harness { drag, press, typeText, wheel, locate, snapshot }
+import ui_tree.legacy { UiTree, TreeError, FrameInput, MOD_CONTROL, MOD_SHIFT }
+import ui_tree.inspect { NodeInfo }
+import ui_fixtures.fixtures as fixtures
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.num.u32
+import silk.text.string { String, InvalidUtf8 }
+
+struct Shell {
+  term: TerminalView,
+  /// Everything the terminal sent the program.
+  sent: String,
+  copied: String,
+  resizes: u32,
+}
+
+union ShellMessage {
+  Term { message: TerminalMessage },
+  /// Output of the program, as a PTY would deliver it.
+  Output { text: String },
+}
+
+type Next = Update<Shell, NoCommand, NoOutput>
+
+effect fn drain(model: &mut Shell) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = model.term.take()
+  while out.length() > 0 {
+    match out.remove(0) {
+      Outgoing.Send { bytes } => {
+        match String.fromUtf8(bytes.asSlice()) {
+          Result<string, InvalidUtf8>.Success { value } => {
+            run model.sent.append(value)
+          }
+          Result<string, InvalidUtf8>.Failure { error: _e } => {}
+        }
+      }
+      Outgoing.Copy { text } => {
+        model.copied = run String.copy(text.view())
+      }
+      Outgoing.Resize { columns: _c, rows: _r } => {
+        model.resizes = model.resizes + 1
+      }
+      Outgoing.Title { text: _t } => {}
+    }
+  }
+}
+
+impl Program<ShellMessage, NoCommand> for Shell {
+  effect fn init() -> Next
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let made = run Effect.result(TerminalView.make(40, 10, Options.defaults(fixtures.SANS)))
+    let term = match move made {
+      Result<TerminalView, GhosttyError | OutOfMemoryError>.Success { value } => move value
+      Result<TerminalView, GhosttyError | OutOfMemoryError>.Failure { error: _e } => Intrinsic.trap("terminal")
+    }
+    return Next.of(
+      Shell { term: move term, sent: String.make(), copied: String.make(), resizes: 0 },
+    )
+  }
+
+  effect fn update(mut model: Shell, message: ShellMessage) -> Next
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match move message {
+      ShellMessage.Term { message: inner } => {
+        run model.term.update(move inner)
+      }
+      ShellMessage.Output { text } => {
+        run model.term.write(String.utf8Bytes(text.view()))
+      }
+    }
+    run drain(&mut model)
+    return Next.of(move model)
+  }
+
+  fn view(model: &Shell, h: &Document<ShellMessage>) -> Node {
+    return h.box(
+      &[h.style(&[css.width(css.px(400.0)), css.height(css.px(200.0))])],
+      &[h.map(|inner: &Document<TerminalMessage>| model.term.view(inner), |message| ShellMessage.Term { message: move message })],
+    )
+  }
+}
+
+fn viewport() -> FrameInput {
+  return FrameInput { width: 400.0, height: 200.0, scale: 1.0, time: 0.0 }
+}
+
+type Shells = Runtime<Hosted<Shell>, ShellMessage, Run<NoCommand>>
+
+/// Draws until layout has settled: the cell measurement and the fit to the box both arrive as
+/// layout messages.
+effect fn settle(app: &mut Shells, tree: &mut UiTree<'_>) -> ()
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut i = 0
+  while i < 4 {
+    run tree.frame(viewport())
+    drop run pump(&mut app, &mut tree)
+    i = i + 1
+  }
+}
+
+effect fn output(app: &mut Shells, tree: &mut UiTree<'_>, text: string) -> ()
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  app.send(ShellMessage.Output { text: run String.copy(text) })
+  run deliver(&mut app, &mut tree)
+  run settle(&mut app, &mut tree)
+}
+
+effect fn terminalBounds(tree: &mut UiTree<'_>) -> NodeInfo
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let found = run locate(&mut tree, viewport(), "terminal")
+  run Testing.expect(found.isSome(), "the terminal is on the tree")
+  match move found {
+    Option<NodeInfo>.Some { value } => {
+      return value
+    }
+    Option<NodeInfo>.None => {
+      return Intrinsic.trap("unreachable")
+    }
+  }
+}
+
+effect fn screenBody() -> ()
+  ! AssertionError<'static> | TreeError | GhosttyError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  let mut app = run program.make<Shell, ShellMessage, NoCommand>()
+  run app.start(&mut tree, 0.0)
+  run settle(&mut app, &mut tree)
+
+  let geometry = app.model.value.term.geometry()
+  run Testing.expect(app.model.value.resizes >= 1, "the grid fits itself to its box")
+  run Testing.expect(geometry.rows == 200 / geometry.cellHeight, "rows fill the height")
+  run Testing.expect(geometry.columns > 20, "columns fill the width")
+  run output(&mut app, &mut tree, "hello \x1b[1;31mred\x1b[0m world\r\n$ ")
+  let text = run snapshot(&mut tree, viewport())
+  run Testing.expect(String.contains(text.view(), "\"hello \""), "plain text draws")
+  run Testing.expect(String.contains(text.view(), "\"red\""), "styled text draws in its own run")
+  let shot = run app.model.value.term.terminal.snapshot()
+  let cursor = shot.cursor()
+  run Testing.expect(cursor.column == 2 && cursor.row == 1, "the cursor follows the output")
+  run Testing.expect(String.contains(text.view(), "terminal-cursor"), "the cursor draws")
+}
+
+test effect fn drawsTheScreenAndFitsTheBox() -> ()
+  ! AssertionError<'static> | TreeError | GhosttyError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run screenBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn typingBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  let mut app = run program.make<Shell, ShellMessage, NoCommand>()
+  run app.start(&mut tree, 0.0)
+  run settle(&mut app, &mut tree)
+
+  run typeText(&mut app, &mut tree, viewport(), "ls")
+  run press(&mut app, &mut tree, viewport(), "Enter", 0)
+  run press(&mut app, &mut tree, viewport(), "c", MOD_CONTROL)
+  run press(&mut app, &mut tree, viewport(), "ArrowUp", 0)
+  run Testing.expect(app.model.value.sent.view() == "ls\r\x03\x1b[A", "text, Enter, Ctrl+C and arrows reach the program")
+}
+
+test effect fn keysAndTextGoToTheProgram() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run typingBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn selectionBody() -> ()
+  ! AssertionError<'static> | TreeError | GhosttyError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  let mut app = run program.make<Shell, ShellMessage, NoCommand>()
+  run app.start(&mut tree, 0.0)
+  run settle(&mut app, &mut tree)
+  run output(&mut app, &mut tree, "hello world")
+
+  let box = run terminalBounds(&mut tree)
+  let geometry = app.model.value.term.geometry()
+  let cell = u32.toF32(geometry.cellWidth)
+  let y = box.bounds.yMin + u32.toF32(geometry.cellHeight) * 0.5
+  // From the middle of "h" to past the middle of "o".
+  run drag(
+    &mut app,
+    &mut tree,
+    viewport(),
+    box.bounds.xMin + cell * 0.5,
+    y,
+    box.bounds.xMin + cell * 4.8,
+    y,
+    4,
+  )
+  run Testing.expect(app.model.value.term.terminal.hasSelection(), "a drag selects")
+  run press(&mut app, &mut tree, viewport(), "C", MOD_CONTROL | MOD_SHIFT)
+  run Testing.expect(app.model.value.copied.view() == "hello", "the copy shortcut copies it")
+  run Testing.expect(app.model.value.sent.view() == "", "and sends nothing to the program")
+}
+
+test effect fn dragSelectsAndCopies() -> ()
+  ! AssertionError<'static> | TreeError | GhosttyError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run selectionBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn scrollBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  let mut app = run program.make<Shell, ShellMessage, NoCommand>()
+  run app.start(&mut tree, 0.0)
+  run settle(&mut app, &mut tree)
+  let mut lines = String.make()
+  let mut i = 0
+  while i < 60 {
+    run lines.append("line\r\n")
+    i = i + 1
+  }
+  run output(&mut app, &mut tree, lines.view())
+  let none = run locate(&mut tree, viewport(), "terminal-scrollbar")
+  run Testing.expect(none.isNone(), "no scrollbar at the bottom")
+
+  drop run wheel(&mut app, &mut tree, viewport(), "terminal", -120.0)
+  run settle(&mut app, &mut tree)
+  let bar = app.model.value.term.terminal.scrollbar()
+  run Testing.expect(bar.offset + bar.length < bar.total, "the wheel scrolls back")
+  let some = run locate(&mut tree, viewport(), "terminal-scrollbar")
+  run Testing.expect(some.isSome(), "the scrollbar shows while scrolled back")
+
+  run typeText(&mut app, &mut tree, viewport(), "x")
+  let back = app.model.value.term.terminal.scrollbar()
+  run Testing.expect(back.offset + back.length == back.total, "typing returns to live output")
+}
+
+test effect fn wheelScrollsTheScrollback() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run scrollBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}

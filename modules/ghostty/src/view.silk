@@ -1,0 +1,1164 @@
+//! A terminal on the UI tree: [`TerminalView`] owns a Ghostty terminal and draws its screen
+//! with ordinary nodes, so it works on every host the tree and ui-app run on.
+//!
+//! It behaves as a terminal on the web would: a press and drag selects text (two clicks a
+//! word, three a line, Alt-drag a block), the wheel scrolls the scrollback, a click focuses
+//! it, and the system's copy and paste shortcuts work. Programs that track the mouse get
+//! the pointer instead, unless Shift is held.
+//!
+//! The view never talks to a process. Feed it the program's output with
+//! [`TerminalView.write`], and after each update [`TerminalView.take`] what it has for the
+//! world: bytes for the program, text for the clipboard, a new size for the PTY.
+import ghostty_vt.terminal {
+  Terminal,
+  Snapshot,
+  Cell,
+  CursorStyle,
+  Geometry,
+  GhosttyError,
+  MouseAction,
+  MouseEvent,
+  Autoscroll,
+  Span,
+  BOLD,
+  ITALIC,
+  FAINT,
+  INVERSE,
+  INVISIBLE,
+  STRIKETHROUGH,
+  UNDERLINE_MASK
+}
+import ui_app.lib { Document, Node, Attr, Reply, Event, EventKind, Cursor as PointerCursor, Heap }
+import ui_app.css
+import ui_app.css { px, Position, Overflow, WhiteSpace, FontStyle, Keyword, BorderStyle, BoxSizing }
+import ui_app.keys { MOD_SHIFT, MOD_CONTROL, MOD_ALT, MOD_META, BUTTON_PRIMARY, BUTTON_AUXILIARY, BUTTON_SECONDARY }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.color.rgba { Rgba }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.geometry.rect { Rect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.i64
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.u8
+import silk.num.i32
+import silk.num.usize
+import silk.text.string { String }
+
+/// How a terminal looks. Colors are `0xRRGGBB`.
+pub struct Options {
+  /// The font family id of a monospace family registered with the host.
+  pub font: u32,
+  pub fontSize: f32,
+  /// The height of a row as a multiple of the font size.
+  pub lineHeight: f32,
+  pub foreground: u32,
+  pub background: u32,
+  pub selection: u32,
+  /// Whether the terminal takes focus when it first shows.
+  pub autofocus: bool,
+}
+
+impl Options {
+  pub fn defaults(font: u32) -> Options {
+    return Options {
+      font: font,
+      fontSize: 14.0,
+      lineHeight: 1.3,
+      foreground: 0xd4d8de,
+      background: 0x14171c,
+      selection: 0x3a4d6b,
+      autofocus: true,
+    }
+  }
+}
+
+impl Copy for Options {}
+
+/// What the view has for the world, taken with [`TerminalView.take`].
+pub union Outgoing {
+  /// Bytes for the program: keys, pasted text, mouse and focus reports, replies to queries.
+  Send { pub bytes: Bytes },
+  /// Text to put on the clipboard: the user copied the selection.
+  Copy { pub text: String },
+  /// The grid changed size; tell the PTY (`TIOCSWINSZ`).
+  Resize { pub columns: u16, pub rows: u16 },
+  /// The program set the title.
+  Title { pub text: String },
+}
+
+/// A message of the view. Route the ones its `view` sends back to [`TerminalView.update`].
+pub union TerminalMessage {
+  Measured { pub width: f32, pub height: f32 },
+  Laid { pub bounds: Rect<f32> },
+  Pressed { pub x: f32, pub y: f32, pub button: u32, pub modifiers: u32, pub clicks: u32 },
+  Moved { pub x: f32, pub y: f32, pub modifiers: u32 },
+  Released { pub x: f32, pub y: f32, pub button: u32, pub modifiers: u32 },
+  Cancelled,
+  Wheel { pub x: f32, pub y: f32, pub deltaY: f32, pub modifiers: u32 },
+  Key { pub key: String, pub modifiers: u32 },
+  Typed { pub text: String },
+  Pasted { pub text: String },
+  Focused,
+  Blurred,
+  CopySelection,
+  SelectAll,
+  /// A step of autoscroll while a selection is dragged past an edge.
+  Ticked,
+}
+
+/// The characters measured to find the width of a cell.
+const PROBE: string = "MMMMMMMMMMMMMMMMMMMM"
+
+const PROBE_LENGTH: f32 = 20.0
+
+/// The smallest grid the view shrinks to.
+const MIN_COLUMNS: f32 = 2.0
+
+const MIN_ROWS: f32 = 1.0
+
+pub struct TerminalView {
+  pub terminal: Terminal,
+  frame: Snapshot,
+  options: Options,
+  cellWidth: f32,
+  cellHeight: f32,
+  /// The grid's border box in viewport pixels, from its last layout.
+  bounds: Rect<f32>,
+  measured: bool,
+  pub focused: bool,
+  /// Keys the hidden input; a new one starts empty after text is committed.
+  epoch: u64,
+  /// What the left button is doing: 0 nothing, 1 selecting, 2 reporting to the program.
+  pressing: u32,
+  /// A press time Ghostty counts repeat clicks with, made from the host's click count.
+  clock: u64,
+  pointerX: f32,
+  pointerY: f32,
+  scrolling: bool,
+  rectangle: bool,
+  /// Wheel pixels not yet turned into whole rows.
+  wheel: f32,
+  title: String,
+  outbox: List<Outgoing>,
+  /// The last terminal error code, 0 when none.
+  pub error: i32,
+}
+
+/// The terminal's grid size from available pixels.
+fn fit(available: f32, cell: f32, least: f32) -> u16 {
+  return f32.toU16(f32.max(least, f32.min(1000.0, f32.floor(available / cell))))
+}
+
+fn rgb(hex: u32) -> Rgba<f32> {
+  let r = u32.toF32(u32.bitAnd(u32.shiftRight(hex, 16), 255)) / 255.0
+  let g = u32.toF32(u32.bitAnd(u32.shiftRight(hex, 8), 255)) / 255.0
+  let b = u32.toF32(u32.bitAnd(hex, 255)) / 255.0
+  return Rgba<f32> { r: r, g: g, b: b, a: 1.0 }
+}
+
+/// Between `a` and `b`: `amount` 0 is `a`, 1 is `b`. For faint text.
+fn mix(a: u32, b: u32, amount: f32) -> u32 {
+  let mut out: u32 = 0
+  let mut shift: u32 = 0
+  while shift <= 16 {
+    let x = u32.toF32(u32.bitAnd(u32.shiftRight(a, shift), 255))
+    let y = u32.toF32(u32.bitAnd(u32.shiftRight(b, shift), 255))
+    let v = f32.toU32(f32.round(x + (y - x) * amount))
+    out = u32.bitOr(out, u32.shiftLeft(v, shift))
+    shift = shift + 8
+  }
+  return out
+}
+
+impl TerminalView {
+  /// A view of a new terminal of `columns` by `rows` cells. It resizes itself to fill the
+  /// space its parent gives it.
+  pub effect fn make(columns: u16, rows: u16, options: Options) -> TerminalView
+    ! GhosttyError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut terminal = run Terminal.make(columns, rows)
+    // The default colors, as OSC 10 and 11 would set them.
+    let mut colors = String.make()
+    run colors.append("\x1b]10;#")
+    run hex(&mut colors, options.foreground)
+    run colors.append("\x07\x1b]11;#")
+    run hex(&mut colors, options.background)
+    run colors.append("\x07")
+    terminal.writeText(colors.view())
+    let frame = run terminal.snapshot()
+    let size = options.fontSize
+    return TerminalView {
+      terminal: move terminal,
+      frame: move frame,
+      options: options,
+      cellWidth: f32.round(size * 0.6 * 100.0) / 100.0,
+      cellHeight: f32.round(size * options.lineHeight),
+      bounds: Rect<f32>.new(0.0, 0.0, 0.0, 0.0),
+      measured: false,
+      focused: options.autofocus,
+      epoch: 1,
+      pressing: 0,
+      clock: 0,
+      pointerX: 0.0,
+      pointerY: 0.0,
+      scrolling: false,
+      rectangle: false,
+      wheel: 0.0,
+      title: String.make(),
+      outbox: List<Outgoing>.make(),
+      error: 0,
+    }
+  }
+
+  /// Feeds the program's output and captures the screen again. Replies the terminal makes
+  /// to queries go to the outbox as `Send`.
+  pub effect fn write(self: &mut Self, bytes: &[u8]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.terminal.write(bytes)
+    run self.refresh()
+  }
+
+  /// Captures the screen again after changing [`TerminalView.terminal`] directly.
+  pub effect fn refresh(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let result = run Effect.result(self.capture())
+    match move result {
+      Result<(), GhosttyError | OutOfMemoryError>.Success { value: _value } => {}
+      Result<(), GhosttyError | OutOfMemoryError>.Failure { error } => match move error {
+        OutOfMemoryError e => {
+          fail move e
+        }
+        GhosttyError e => {
+          self.error = e.code
+        }
+      }
+    }
+  }
+
+  effect fn capture(self: &mut Self) -> ()
+    ! GhosttyError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut buffer: [u8; 4096] = [0; 4096]
+    while true {
+      let count = run self.terminal.readReplies(&mut buffer)
+      if count == 0 {
+        break
+      }
+      run self.send(Slice.view(&buffer, 0, count))
+    }
+    if self.terminal.title() != self.title.view() {
+      self.title = run String.copy(self.terminal.title())
+      run self.outbox.append(Outgoing.Title { text: run String.copy(self.title.view()) })
+    }
+    self.frame = run self.terminal.snapshot()
+  }
+
+  effect fn send(self: &mut Self, bytes: &[u8]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if bytes.length == 0 {
+      return ()
+    }
+    let mut owned = run Bytes.makeWithCapacity(bytes.length)
+    drop owned.appendSliceWithinCapacity(bytes)
+    run self.outbox.append(Outgoing.Send { bytes: move owned })
+  }
+
+  /// What the view has for the world since the last call, oldest first.
+  pub fn take(self: &mut Self) -> List<Outgoing> {
+    return Intrinsic.replace(self.outbox, List<Outgoing>.make())
+  }
+
+  /// Whether a dragged selection is scrolling: send `Ticked` about every 50 ms meanwhile
+  /// (`subs.every(key, 0.05, |time| wrap(TerminalMessage.Ticked))`).
+  pub fn autoscrolling(self: &Self) -> bool {
+    return self.scrolling
+  }
+
+  /// The grid, in cells and whole pixels, as Ghostty's encoders want it.
+  pub fn geometry(self: &Self) -> Geometry {
+    return Geometry {
+      columns: self.frame.columns(),
+      rows: self.frame.rows(),
+      cellWidth: f32.toU32(f32.round(self.cellWidth)),
+      cellHeight: f32.toU32(f32.round(self.cellHeight)),
+    }
+  }
+
+  /// The cell under a viewport point, clamped to the grid.
+  fn cellAt(self: &Self, x: f32, y: f32) -> Place {
+    let columns = u32.toF32(self.frame.columns())
+    let rows = u32.toF32(self.frame.rows())
+    let column = f32.max(0.0, f32.min(columns - 1.0, f32.floor((x - self.bounds.xMin) / self.cellWidth)))
+    let row = f32.max(0.0, f32.min(rows - 1.0, f32.floor((y - self.bounds.yMin) / self.cellHeight)))
+    return Place { column: f32.toU32(column), row: f32.toU32(row) }
+  }
+
+  /// Whether pointer input goes to the program rather than to selection.
+  fn reports(self: &Self, modifiers: u32) -> bool {
+    return self.terminal.tracksMouse() && u32.bitAnd(modifiers, MOD_SHIFT) == 0
+  }
+
+  effect fn report(
+    self: &mut Self,
+    action: MouseAction,
+    button: u32,
+    modifiers: u32,
+    pressed: bool,
+    x: f32,
+    y: f32,
+  ) -> ()
+    ! GhosttyError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut buffer: [u8; 64] = [0; 64]
+    let event = MouseEvent {
+      action: action,
+      button: button,
+      modifiers: modifiers,
+      pressed: pressed,
+      x: x - self.bounds.xMin,
+      y: y - self.bounds.yMin,
+    }
+    let geometry = self.geometry()
+    let count = run self.terminal.encodeMouse(event, geometry, &mut buffer)
+    run self.send(Slice.view(&buffer, 0, count))
+  }
+
+  effect fn key(self: &mut Self, key: string, modifiers: u32) -> ()
+    ! GhosttyError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut buffer: [u8; 128] = [0; 128]
+    let count = run self.terminal.encodeKey(key, modifiers, &mut buffer)
+    run self.send(Slice.view(&buffer, 0, count))
+  }
+
+  /// Typing or pasting returns the viewport to live output and drops the selection, as in
+  /// most terminals.
+  effect fn toLive(self: &mut Self) -> ()
+    ! GhosttyError {
+    run self.terminal.scrollToBottom()
+  }
+
+  /// Handles a message its view sent. Errors from the terminal are kept in `error`.
+  pub effect fn update(self: &mut Self, message: TerminalMessage) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let result = run Effect.result(self.apply(move message))
+    match move result {
+      Result<(), GhosttyError | OutOfMemoryError>.Success { value: _value } => {}
+      Result<(), GhosttyError | OutOfMemoryError>.Failure { error } => match move error {
+        OutOfMemoryError e => {
+          fail move e
+        }
+        GhosttyError e => {
+          self.error = e.code
+        }
+      }
+    }
+    run self.refresh()
+  }
+
+  effect fn apply(self: &mut Self, message: TerminalMessage) -> ()
+    ! GhosttyError | OutOfMemoryError
+    ? &mut Allocator {
+    match move message {
+      TerminalMessage.Measured { width, height } => {
+        if width > 0.0 && height > 0.0 {
+          self.cellWidth = width / PROBE_LENGTH
+          self.measured = true
+          let bounds = self.bounds
+          run self.fitTo(bounds)
+        }
+      }
+      TerminalMessage.Laid { bounds } => {
+        run self.fitTo(bounds)
+      }
+      TerminalMessage.Pressed { x, y, button, modifiers, clicks } => {
+        self.pointerX = x
+        self.pointerY = y
+        if !self.focused {
+          self.focused = true
+          self.epoch = self.epoch + 1
+          run self.focusReport(true)
+        }
+        if self.reports(modifiers) {
+          let code: u32 = if button == BUTTON_PRIMARY {
+            1
+          } else if button == BUTTON_SECONDARY {
+            2
+          } else if button == BUTTON_AUXILIARY {
+            3
+          } else {
+            0
+          }
+          if code != 0 {
+            self.pressing = 2
+            run self.report(MouseAction.Press, code, modifiers, true, x, y)
+          }
+          return ()
+        }
+        if button != BUTTON_PRIMARY {
+          return ()
+        }
+
+        // Ghostty counts repeat clicks by time; the host already counted them.
+        self.clock = if clicks <= 1 {
+          self.clock + 10000000000
+        } else {
+          self.clock + 1000000
+        }
+        let cell = self.cellAt(x, y)
+        self.pressing = 1
+        self.rectangle = u32.bitAnd(modifiers, MOD_ALT) != 0
+        run self.terminal.selectionPress(
+          cell.column,
+          cell.row,
+          f32.toF64(x - self.bounds.xMin),
+          f32.toF64(y - self.bounds.yMin),
+          self.clock,
+        )
+      }
+      TerminalMessage.Moved { x, y, modifiers } => {
+        self.pointerX = x
+        self.pointerY = y
+        if self.pressing == 2 || self.pressing == 0 && self.reports(modifiers) {
+          let held = self.pressing == 2
+          run self.report(MouseAction.Motion, 0, modifiers, held, x, y)
+          return ()
+        }
+        if self.pressing == 1 {
+          run self.drag()
+        }
+      }
+      TerminalMessage.Released { x, y, button, modifiers } => {
+        if self.pressing == 2 {
+          let code: u32 = if button == BUTTON_SECONDARY {
+            2
+          } else if button == BUTTON_AUXILIARY {
+            3
+          } else {
+            1
+          }
+          run self.report(MouseAction.Release, code, modifiers, false, x, y)
+        } else if self.pressing == 1 {
+          run self.terminal.selectionRelease()
+        }
+        self.pressing = 0
+        self.scrolling = false
+      }
+      TerminalMessage.Cancelled => {
+        if self.pressing == 1 {
+          run self.terminal.selectionRelease()
+        }
+        self.pressing = 0
+        self.scrolling = false
+      }
+      TerminalMessage.Wheel { x, y, deltaY, modifiers } => {
+        self.wheel = self.wheel + deltaY / self.cellHeight
+        let rows = f32.toI64(f32.trunc(self.wheel))
+        if rows == 0 {
+          return ()
+        }
+        self.wheel = self.wheel - i64.toF32(rows)
+        let up = rows < 0
+        let count = if rows < 0 { 0 - rows } else { rows }
+        if self.reports(modifiers) {
+          let mut i: i64 = 0
+          while i < count {
+            run self.report(MouseAction.Press, if up { 4 } else { 5 }, modifiers, false, x, y)
+            i = i + 1
+          }
+        } else if self.terminal.alternateScreen() {
+          // Full-screen programs without mouse tracking scroll with the arrow keys.
+          let mut i: i64 = 0
+          while i < count {
+            run self.key(if up { "ArrowUp" } else { "ArrowDown" }, 0)
+            i = i + 1
+          }
+        } else {
+          run self.terminal.scroll(rows)
+        }
+      }
+      TerminalMessage.Key { key, modifiers } => {
+        run self.toLive()
+        run self.key(key.view(), modifiers)
+      }
+      TerminalMessage.Typed { text } => {
+        self.epoch = self.epoch + 1
+        run self.toLive()
+        run self.send(String.utf8Bytes(text.view()))
+      }
+      TerminalMessage.Pasted { text } => {
+        self.epoch = self.epoch + 1
+        run self.toLive()
+        let mut buffer = run Bytes.zeroed(String.byteLength(text.view()) + 16)
+        let count = run self.terminal.encodePaste(text.view(), buffer.asMutSlice())
+        run self.send(Slice.view(buffer.asSlice(), 0, count))
+      }
+      TerminalMessage.Focused => {
+        if !self.focused {
+          self.focused = true
+          run self.focusReport(true)
+        }
+      }
+      TerminalMessage.Blurred => {
+        if self.focused {
+          self.focused = false
+          run self.focusReport(false)
+        }
+      }
+      TerminalMessage.CopySelection => {
+        let text = run self.terminal.selectedText()
+        if String.byteLength(text.view()) != 0 {
+          run self.outbox.append(Outgoing.Copy { text: move text })
+        }
+      }
+      TerminalMessage.SelectAll => {
+        run self.terminal.selectAll()
+      }
+      TerminalMessage.Ticked => {
+        if self.pressing == 1 && self.scrolling {
+          let cell = self.cellAt(self.pointerX, self.pointerY)
+          let geometry = self.geometry()
+          run self.terminal.selectionTick(
+            cell.column,
+            cell.row,
+            f32.toF64(self.pointerX - self.bounds.xMin),
+            f32.toF64(self.pointerY - self.bounds.yMin),
+            geometry,
+            self.rectangle,
+          )
+          self.scrolling = match self.terminal.selectionAutoscroll() {
+            Autoscroll.None => false
+            Autoscroll.Up => true
+            Autoscroll.Down => true
+          }
+        }
+      }
+    }
+  }
+
+  effect fn drag(self: &mut Self) -> ()
+    ! GhosttyError {
+    let cell = self.cellAt(self.pointerX, self.pointerY)
+    let geometry = self.geometry()
+    run self.terminal.selectionDrag(
+      cell.column,
+      cell.row,
+      f32.toF64(self.pointerX - self.bounds.xMin),
+      f32.toF64(self.pointerY - self.bounds.yMin),
+      geometry,
+      self.rectangle,
+    )
+    self.scrolling = match self.terminal.selectionAutoscroll() {
+      Autoscroll.None => false
+      Autoscroll.Up => true
+      Autoscroll.Down => true
+    }
+  }
+
+  effect fn focusReport(self: &mut Self, focused: bool) -> ()
+    ! GhosttyError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut buffer: [u8; 16] = [0; 16]
+    let count = run self.terminal.encodeFocus(focused, &mut buffer)
+    run self.send(Slice.view(&buffer, 0, count))
+  }
+
+  /// Fits the grid to the space the view was given.
+  effect fn fitTo(self: &mut Self, bounds: Rect<f32>) -> ()
+    ! GhosttyError | OutOfMemoryError
+    ? &mut Allocator {
+    self.bounds = bounds
+    let width = bounds.xMax - bounds.xMin
+    let height = bounds.yMax - bounds.yMin
+    if !self.measured || width <= 0.0 || height <= 0.0 {
+      return ()
+    }
+    let columns = fit(width, self.cellWidth, MIN_COLUMNS)
+    let rows = fit(height, self.cellHeight, MIN_ROWS)
+    if u16.toU32(columns) == self.frame.columns() && u16.toU32(rows) == self.frame.rows() {
+      return ()
+    }
+    let geometry = self.geometry()
+    run self.terminal.resize(columns, rows, geometry.cellWidth, geometry.cellHeight)
+    run self.outbox.append(Outgoing.Resize { columns: columns, rows: rows })
+  }
+
+  // Drawing.
+
+  /// The terminal. It fills its parent: give the parent a size.
+  pub fn view(self: &Self, h: &Document<TerminalMessage>) -> Node {
+    let mut heap = Heap.make()
+    let mut children = List<Node>.make()
+    heap.alloc(children.append(self.probe(h)))
+    let mut text = String.make()
+    let rows = self.frame.rows()
+    let mut row: u32 = 0
+    while row < rows {
+      heap.alloc(children.append(self.row(h, row, &mut text)))
+      row = row + 1
+    }
+    heap.alloc(children.append(self.cursorNode(h)))
+    heap.alloc(children.append(self.scrollbarNode(h)))
+    heap.alloc(children.append(h.keyed(self.epoch, self.input(h))))
+    let dragging = self.pressing != 0
+    let listensToMoves = self.pressing != 0 || self.terminal.tracksMouse()
+    return h.box(
+      &[
+        h.testId("terminal"),
+        h.label("Terminal"),
+        h.cursor(PointerCursor.Text),
+        h.style(
+          &[
+            css.position(Position.Relative),
+            css.width(css.percent(100.0)),
+            css.height(css.percent(100.0)),
+            css.overflow(Overflow.Hidden),
+            css.backgroundColor(rgb(self.frame.background())),
+            css.color(rgb(self.frame.foreground())),
+            css.fontFamily(self.options.font),
+            css.fontSize(px(self.options.fontSize)),
+            css.lineHeight(px(self.cellHeight)),
+            css.whiteSpace(WhiteSpace.Pre),
+          ],
+        ),
+        h.onLayout(|bounds| TerminalMessage.Laid { bounds: bounds }),
+        h.on(
+          EventKind.PointerDown,
+          |event| Reply<TerminalMessage>.Custom {
+            message: Option<TerminalMessage>.Some {
+              value: TerminalMessage.Pressed {
+                x: event.x,
+                y: event.y,
+                button: event.button,
+                modifiers: event.modifiers,
+                clicks: event.detail,
+              },
+            },
+            stopPropagation: true,
+            // Focus goes to the hidden input, not the box.
+            preventDefault: true,
+          },
+        ),
+        h.on(
+          EventKind.PointerMove,
+          |event| if listensToMoves {
+            Reply<TerminalMessage>.EmitAndStop {
+              message: TerminalMessage.Moved { x: event.x, y: event.y, modifiers: event.modifiers },
+            }
+          } else {
+            Reply<TerminalMessage>.Pass
+          },
+        ),
+        h.on(
+          EventKind.PointerUp,
+          |event| if dragging {
+            Reply<TerminalMessage>.EmitAndStop {
+              message: TerminalMessage.Released {
+                x: event.x,
+                y: event.y,
+                button: event.button,
+                modifiers: event.modifiers,
+              },
+            }
+          } else {
+            Reply<TerminalMessage>.Pass
+          },
+        ),
+        h.onPointerCancel(TerminalMessage.Cancelled),
+        h.onWheel(
+          |event| Reply<TerminalMessage>.Custom {
+            message: Option<TerminalMessage>.Some {
+              value: TerminalMessage.Wheel {
+                x: event.x,
+                y: event.y,
+                deltaY: event.deltaY,
+                modifiers: event.modifiers,
+              },
+            },
+            stopPropagation: true,
+            preventDefault: true,
+          },
+        ),
+        if dragging {
+          h.capturePointer()
+        } else {
+          h.none()
+        },
+      ],
+      children.asSlice(),
+    )
+  }
+
+  /// Hidden text whose width gives the cell width of the font.
+  fn probe(self: &Self, h: &Document<TerminalMessage>) -> Node {
+    return h.box(
+      &[
+        h.style(
+          &[
+            css.position(Position.Absolute),
+            css.left(px(0.0)),
+            css.top(px(0.0)),
+            css.opacity(0.0),
+            css.pointerEvents(false),
+          ],
+        ),
+        h.onLayout(
+          |bounds| TerminalMessage.Measured {
+            width: bounds.xMax - bounds.xMin,
+            height: bounds.yMax - bounds.yMin,
+          },
+        ),
+      ],
+      &[h.text(PROBE)],
+    )
+  }
+
+  /// One row: runs of cells that share a look, each an absolutely placed box. Plain ASCII
+  /// runs share a box; any other glyph gets its own, so a fallback font cannot shift the
+  /// cells after it.
+  fn row(
+    self: &Self,
+    h: &Document<TerminalMessage>,
+    row: u32,
+    text: &mut String,
+  ) -> Node {
+    let mut heap = Heap.make()
+    let mut runs = List<Node>.make()
+    let columns = self.frame.columns()
+    let selected = self.frame.selection(row)
+    let base = self.frame.background()
+    let mut column: u32 = 0
+    while column < columns {
+      let look = self.look(row, column, selected)
+      let cell = self.frame.cell(column, row) |> Option<Cell<'_>>.unwrapOr(blank())
+      if cell.width == 0 {
+        column = column + 1
+        continue
+      }
+      let start = column
+      text.clear()
+      heap.alloc(text.append(glyph(cell.text)))
+      let mut end = column + cell.width
+      let ascii = cell.width == 1 && String.byteLength(cell.text) <= 1
+      if ascii {
+        while end < columns {
+          let next = self.frame.cell(end, row) |> Option<Cell<'_>>.unwrapOr(blank())
+          if next.width != 1 || String.byteLength(next.text) > 1 || !sameLook(self.look(row, end, selected), look) {
+            break
+          }
+          heap.alloc(text.append(glyph(next.text)))
+          end = end + 1
+        }
+      }
+      let blankRun = String.trim(text.view()) == ""
+      if !blankRun || look.background != base || look.flags & UNDERLINE_MASK != 0 {
+        heap.alloc(runs.append(self.span(h, start, end, text.view(), look)))
+      }
+      column = end
+    }
+    return h.box(
+      &[
+        h.style(
+          &[
+            css.position(Position.Absolute),
+            css.left(px(0.0)),
+            css.top(px(u32.toF32(row) * self.cellHeight)),
+            css.width(px(u32.toF32(columns) * self.cellWidth)),
+            css.height(px(self.cellHeight)),
+            css.pointerEvents(false),
+          ],
+        ),
+      ],
+      runs.asSlice(),
+    )
+  }
+
+  /// How the cell at a position is drawn, with inverse, faint, invisible and the selection
+  /// applied.
+  fn look(self: &Self, row: u32, column: u32, selected: Option<Span>) -> Look {
+    let cell = self.frame.cell(column, row) |> Option<Cell<'_>>.unwrapOr(blank())
+    let inverse = cell.flags & INVERSE != 0
+    let mut foreground = if inverse { cell.background } else { cell.foreground }
+    let mut background = if inverse { cell.foreground } else { cell.background }
+    if cell.flags & FAINT != 0 {
+      foreground = mix(foreground, background, 0.4)
+    }
+    if cell.flags & INVISIBLE != 0 {
+      foreground = background
+    }
+    if let Option<Span>.Some { value } = selected {
+      if column >= value.first && column <= value.last {
+        background = self.options.selection
+      }
+    }
+    return Look { foreground: foreground, background: background, flags: cell.flags }
+  }
+
+  fn span(
+    self: &Self,
+    h: &Document<TerminalMessage>,
+    start: u32,
+    end: u32,
+    text: string,
+    look: Look,
+  ) -> Node {
+    let underline = look.flags & UNDERLINE_MASK != 0
+    let strike = look.flags & STRIKETHROUGH != 0
+    return h.box(
+      &[
+        h.style(
+          &[
+            css.position(Position.Absolute),
+            css.left(px(u32.toF32(start) * self.cellWidth)),
+            css.top(px(0.0)),
+            css.width(px(u32.toF32(end - start) * self.cellWidth)),
+            css.height(px(self.cellHeight)),
+            css.color(rgb(look.foreground)),
+            if look.background != self.frame.background() {
+              css.backgroundColor(rgb(look.background))
+            } else {
+              css.noBackground()
+            },
+            css.fontWeight(if look.flags & BOLD != 0 { 700.0 } else { 400.0 }),
+            css.fontStyle(if look.flags & ITALIC != 0 { FontStyle.Italic } else { FontStyle.Normal }),
+            css.textDecorationLine(
+              if underline && strike {
+                Keyword.Underline
+              } else if underline {
+                Keyword.Underline
+              } else if strike {
+                Keyword.LineThrough
+              } else {
+                Keyword.None
+              },
+            ),
+          ],
+        ),
+      ],
+      &[h.text(text)],
+    )
+  }
+
+  fn cursorNode(self: &Self, h: &Document<TerminalMessage>) -> Node {
+    let cursor = self.frame.cursor()
+    if !cursor.visible {
+      return h.empty()
+    }
+    let x = u32.toF32(cursor.column) * self.cellWidth
+    let y = u32.toF32(cursor.row) * self.cellHeight
+    let cell = self.frame.cell(cursor.column, cursor.row) |> Option<Cell<'_>>.unwrapOr(blank())
+    let width = u32.toF32(if cell.width == 2 { 2 } else { 1 }) * self.cellWidth
+    let block = self.focused && match cursor.style {
+      CursorStyle.Block => true
+      CursorStyle.BlockHollow => false
+      CursorStyle.Bar => false
+      CursorStyle.Underline => false
+    }
+    let hollow = !self.focused || match cursor.style {
+      CursorStyle.BlockHollow => true
+      CursorStyle.Block => false
+      CursorStyle.Bar => false
+      CursorStyle.Underline => false
+    }
+    let bar = self.focused && match cursor.style {
+      CursorStyle.Bar => true
+      CursorStyle.Block => false
+      CursorStyle.BlockHollow => false
+      CursorStyle.Underline => false
+    }
+    let color = rgb(cursor.color)
+    let mut look = h.style(
+      &[
+        css.position(Position.Absolute),
+        css.left(px(x)),
+        css.top(px(y + self.cellHeight - 2.0)),
+        css.width(px(width)),
+        css.height(px(2.0)),
+        css.backgroundColor(color),
+        css.pointerEvents(false),
+      ],
+    )
+    if block {
+      look = h.style(
+        &[
+          css.position(Position.Absolute),
+          css.left(px(x)),
+          css.top(px(y)),
+          css.width(px(width)),
+          css.height(px(self.cellHeight)),
+          css.backgroundColor(color),
+          css.color(rgb(self.frame.background())),
+          css.pointerEvents(false),
+        ],
+      )
+    } else if hollow {
+      look = h.style(
+        &[
+          css.position(Position.Absolute),
+          css.left(px(x)),
+          css.top(px(y)),
+          css.width(px(width)),
+          css.height(px(self.cellHeight)),
+          css.borderWidth(px(1.0)),
+          css.borderStyle(BorderStyle.Solid),
+          css.borderColor(color),
+          css.boxSizing(BoxSizing.BorderBox),
+          css.pointerEvents(false),
+        ],
+      )
+    } else if bar {
+      look = h.style(
+        &[
+          css.position(Position.Absolute),
+          css.left(px(x)),
+          css.top(px(y)),
+          css.width(px(2.0)),
+          css.height(px(self.cellHeight)),
+          css.backgroundColor(color),
+          css.pointerEvents(false),
+        ],
+      )
+    }
+    let glyph = if block && String.byteLength(cell.text) != 0 { cell.text } else { "" }
+    return h.box(&[h.testId("terminal-cursor"), look], &[h.text(glyph)])
+  }
+
+  /// A thin overlay scrollbar, shown while the viewport is in the scrollback.
+  fn scrollbarNode(self: &Self, h: &Document<TerminalMessage>) -> Node {
+    let bar = self.terminal.scrollbar()
+    if bar.total <= bar.length || bar.offset + bar.length >= bar.total {
+      return h.empty()
+    }
+    let height = u32.toF32(self.frame.rows()) * self.cellHeight
+    let total = u64.toF32(bar.total)
+    let thumb = f32.max(16.0, height * u64.toF32(bar.length) / total)
+    let top = (height - thumb) * u64.toF32(bar.offset) / f32.max(1.0, total - u64.toF32(bar.length))
+    return h.box(
+      &[
+        h.testId("terminal-scrollbar"),
+        h.style(
+          &[
+            css.position(Position.Absolute),
+            css.right(px(2.0)),
+            css.top(px(top)),
+            css.width(px(6.0)),
+            css.height(px(thumb)),
+            css.borderRadius(px(3.0)),
+            css.backgroundColor(rgb(mix(self.frame.background(), self.frame.foreground(), 0.45))),
+            css.pointerEvents(false),
+          ],
+        ),
+      ],
+      &[],
+    )
+  }
+
+  /// The focused input under the cursor: it receives keys, committed text (IME included)
+  /// and pastes. It is transparent; the cursor box draws the caret.
+  fn input(self: &Self, h: &Document<TerminalMessage>) -> Node {
+    let cursor = self.frame.cursor()
+    return h.input(
+      "",
+      &[
+        h.testId("terminal-input"),
+        h.label("Terminal input"),
+        h.style(
+          &[
+            css.position(Position.Absolute),
+            css.left(px(u32.toF32(cursor.column) * self.cellWidth)),
+            css.top(px(u32.toF32(cursor.row) * self.cellHeight)),
+            css.width(px(self.cellWidth)),
+            css.height(px(self.cellHeight)),
+            css.opacity(0.0),
+            css.pointerEvents(false),
+          ],
+        ),
+        if self.focused {
+          h.takeFocus()
+        } else {
+          h.none()
+        },
+        h.onFocus(TerminalMessage.Focused),
+        h.onBlur(TerminalMessage.Blurred),
+        h.on(EventKind.Input, |event| inputReply(event)),
+        h.onKeyDown(|event| keyReply(event, self.terminal.hasSelection())),
+      ],
+    )
+  }
+}
+
+struct Place {
+  column: u32,
+  row: u32,
+}
+
+impl Copy for Place {}
+
+struct Look {
+  foreground: u32,
+  background: u32,
+  flags: u32,
+}
+
+impl Copy for Look {}
+
+fn sameLook(a: Look, b: Look) -> bool {
+  return a.foreground == b.foreground && a.background == b.background && a.flags == b.flags
+}
+
+fn glyph<'a>(text: string<'a>) -> string<'a> {
+  if String.byteLength(text) == 0 {
+    return " "
+  }
+  return text
+}
+
+fn blank() -> Cell<'static> {
+  return Cell<'static> { text: "", foreground: 0, background: 0, flags: 0, width: 1 }
+}
+
+effect fn hex(out: &mut String, value: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let digits = "0123456789abcdef"
+  let mut shift: i32 = 20
+  while shift >= 0 {
+    let digit = u32.toUsize(u32.bitAnd(u32.shiftRight(value, i32.toU32(shift)), 15))
+    run out.append(String.slice(digits, digit, 1))
+    shift = shift - 4
+  }
+}
+
+fn owned(value: string) -> String {
+  let mut heap = Heap.make()
+  return heap.alloc(String.copy(value))
+}
+
+/// Committed text goes to the program; a paste is encoded as one.
+fn inputReply(event: &Event) -> Reply<TerminalMessage> {
+  let kind = String.view(&event.inputType)
+  let value = String.view(&event.value)
+  if String.byteLength(value) == 0 {
+    return Reply<TerminalMessage>.Stop
+  }
+  if kind == "insertFromPaste" {
+    return Reply<TerminalMessage>.EmitAndStop {
+      message: TerminalMessage.Pasted { text: owned(value) },
+    }
+  }
+  return Reply<TerminalMessage>.EmitAndStop { message: TerminalMessage.Typed { text: owned(value) } }
+}
+
+fn letter(name: string, wanted: string) -> bool {
+  if name == wanted {
+    return true
+  }
+  let bytes = String.utf8Bytes(name)
+  let other = String.utf8Bytes(wanted)
+  return bytes.length == 1 && other.length == 1 && (bytes[0] == other[0] || u8.toU32(bytes[0]) + 32 == u8.toU32(other[0]))
+}
+
+fn named(name: string) -> bool {
+  return name == "Enter" || name == "Tab" || name == "Backspace" || name == "Escape"
+    || name == "Delete"
+    || name == "Insert"
+    || name == "Home"
+    || name == "End"
+    || name == "PageUp"
+    || name == "PageDown"
+    || name == "ArrowUp"
+    || name == "ArrowDown"
+    || name == "ArrowLeft"
+    || name == "ArrowRight"
+    || String.byteLength(name) >= 2 && String.byteLength(name) <= 3 && String.utf8Bytes(name)[0] == 70
+}
+
+fn mac() -> bool {
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    return true
+  } else {
+    return false
+  }
+}
+
+/// The system's command modifier: Cmd on macOS, Ctrl+Shift elsewhere (plain Ctrl+C is an
+/// interrupt).
+fn commandKey(control: bool, shift: bool, meta: bool) -> bool {
+  if mac() {
+    return meta && !control
+  }
+  return control && shift && !meta
+}
+
+fn handled(message: TerminalMessage) -> Reply<TerminalMessage> {
+  return Reply<TerminalMessage>.Custom {
+    message: Option<TerminalMessage>.Some { value: move message },
+    stopPropagation: true,
+    preventDefault: true,
+  }
+}
+
+/// Which keys the terminal takes from the input, and which it leaves to it: printable text
+/// becomes an `Input` record (so IMEs and dead keys work), the system's paste shortcut
+/// becomes a paste, everything else is encoded for the program.
+fn keyReply(event: &Event, hasSelection: bool) -> Reply<TerminalMessage> {
+  let name = String.view(&event.key)
+  let mods = event.modifiers
+  let shift = u32.bitAnd(mods, MOD_SHIFT) != 0
+  let control = u32.bitAnd(mods, MOD_CONTROL) != 0
+  let alt = u32.bitAnd(mods, MOD_ALT) != 0
+  let meta = u32.bitAnd(mods, MOD_META) != 0
+  if name == "Shift" || name == "Control" || name == "Alt" || name == "Meta" || name == "CapsLock" {
+    return Reply<TerminalMessage>.Pass
+  }
+
+  // Copy, select all and paste with the system's keys: Cmd on macOS, Ctrl+Shift elsewhere
+  // (plain Ctrl+C is an interrupt).
+  let command = commandKey(control, shift, meta)
+  if command && letter(name, "c") {
+    return if hasSelection {
+      handled(TerminalMessage.CopySelection)
+    } else {
+      Reply<TerminalMessage>.Prevent
+    }
+  }
+  if command && letter(name, "a") {
+    return handled(TerminalMessage.SelectAll)
+  }
+  if command && letter(name, "v") {
+    // The input reads the clipboard and reports `insertFromPaste`.
+    return Reply<TerminalMessage>.Pass
+  }
+  if shift && (name == "PageUp" || name == "PageDown") {
+    return handled(
+      TerminalMessage.Wheel {
+        x: 0.0,
+        y: 0.0,
+        deltaY: if name == "PageUp" { -400.0 } else { 400.0 },
+        modifiers: 0,
+      },
+    )
+  }
+  if meta {
+    // Other Cmd shortcuts belong to the app and the system.
+    return Reply<TerminalMessage>.Pass
+  }
+  // On macOS, Option stays with the input method for accents and composed characters.
+  let modified = control || alt && !mac()
+  if named(name) || modified {
+    return handled(TerminalMessage.Key { key: owned(name), modifiers: mods })
+  }
+  return Reply<TerminalMessage>.Pass
+}
