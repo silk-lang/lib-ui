@@ -37,6 +37,8 @@ mkdir -p "$out"
 cp "$root/modules/app/dom/js/silk-ui-dom.js" "$out/silk-ui-dom.js"
 cp "$here/web/favicon.svg" "$out/favicon.svg"
 cp -R "$here/web/fonts" "$out/fonts"
+# The album's photos, icons and fonts, which its page shows.
+cp -R "$here/examples/apps/album/assets" "$out/album"
 cp "$root/build/llvm/wasm32-unknown-unknown/release-size/ui-docs-site" "$out/site.wasm"
 debug="$(ls -d "$root"/build/llvm/*/debug | grep -v wasm32 | head -1)"
 mkdir -p "$out/shots"

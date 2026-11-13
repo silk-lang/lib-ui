@@ -1,0 +1,109 @@
+# Images and fonts
+
+A program shows photos, icons and text in fonts of its own. This page builds an album with all three: photos that are PNG and JPEG files, icons that are SVG files, and titles and labels in two fonts that ship with the app.
+
+## An album
+
+::demo album
+
+Click a photo to open it, like it with the heart, search by title, or list only the ones you like.
+
+::source examples/src/core/album.silk
+
+## Resources are numbers
+
+A view never holds a file. It names a picture or a font by a number, and whoever runs the program says what each number is.
+
+```silk
+pub const PHOTO: u32 = 101
+
+pub const HEART: u32 = 121
+
+pub const DISPLAY: u32 = 11
+```
+
+| In the view | What it shows | The file |
+| --- | --- | --- |
+| `h.image(PHOTO + i, attrs)` | A raster image | A PNG or JPEG |
+| `h.icon(HEART, attrs)` | A vector icon | An SVG |
+| `css.fontFamily(DISPLAY)` | Text in a font family | TTF, OTF or WOFF2 files |
+
+This keeps the program the same everywhere it runs. A page loads files from addresses, a native window has their bytes, and a test needs neither: the view is the same value in all three.
+
+## Raster images
+
+`h.image` is the `<img>` of Silk UI. It takes the resource number and the usual attributes. Give it a label, which is its alt text.
+
+::source examples/src/core/album.silk "fn viewer"
+
+The style sizes it. `css.objectFit(ObjectFit.Cover)` fills the box and crops what does not fit, as `object-fit` does in CSS. `ObjectFit.Contain` shows all of it instead. `css.borderRadius` rounds its corners.
+
+## Vector icons
+
+`h.icon` draws an SVG in the color of the text, like an icon font. The heart is one file, and the like button makes it red or gray with `css.color`.
+
+::source examples/src/core/album.silk "fn like(h"
+
+Draw an icon's shapes in any color: only their shape is used. In the album, `heart.svg` is filled and `search.svg` is drawn with strokes, and both work the same way.
+
+```html
+<!-- docs/examples/apps/album/assets/icons/heart.svg -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 21 C5 15.5 2 12.5 2 8.5 A5 5 0 0 1 12 6 A5 5 0 0 1 22 8.5 C22 12.5 19 15.5 12 21 Z"/></svg>
+```
+
+An icon scales without blurring, so size it with `css.width` and `css.height` and use the same file everywhere.
+
+## Fonts
+
+A font family number stands for a CSS `font-family` list. The album uses two: Geist for titles and Geist Mono for small labels and numbers.
+
+```silk
+css.fontFamily(DISPLAY),
+css.fontWeight(650.0),
+css.fontSize(px(22.0)),
+```
+
+`css.fontWeight` takes any weight from 1 to 1000, as CSS does. Geist is a variable font, so one file has every weight from 100 to 900, and 650 is drawn as 650. With a family of separate files (a regular and a bold, say), add each file and the closest weight is used.
+
+Family `1` is the default for all text, so set it too.
+
+## Giving the files: in a page
+
+The page says where each file is when it mounts the program. Fonts are loaded the way any page loads them, with `@font-face`, and `fonts` maps each family number to a `font-family` value.
+
+::source examples/apps/album-web/web/index.html
+
+The build copies the files next to the page, so the addresses are relative ones:
+
+```sh
+cp -R docs/examples/apps/album/assets dist/assets
+```
+
+Run `sh docs/examples/apps/album-web/build.sh serve` and open http://localhost:8019.
+
+## Giving the files: in a native window
+
+In a window, the bytes are part of the program. `Source.read` reads a file of the package while it compiles, so the app is one file with nothing to ship beside it. The files sit in `assets/`, next to the app's `silk.toml`.
+
+::source examples/apps/album/src/files.silk
+
+The window gets the images, the icons and the font families, and the font collection gets the font files:
+
+::source examples/apps/album/src/main.silk
+
+`systemFonts()` is the fonts installed on the machine, and `add` puts the album's two files in with them. A family name in `window.font` matches the name inside the font file.
+
+::shot native-album "The same album in a window. In the docs the GPU draws it, from the same photos, icons and fonts."
+
+Run it with `silk run --manifest-path docs/examples/apps/album/silk.toml`.
+
+## Recap
+
+- A view names images, icons and font families by number: `h.image`, `h.icon`, `css.fontFamily`.
+- The host says what each number is. A page gives addresses to `mount`, and a window gets bytes with `window.image`, `window.icon` and `window.font`.
+- Icons are SVGs drawn in the text color. Images are PNGs or JPEGs, sized with CSS and fitted with `object-fit`.
+- `css.fontWeight` takes any weight a font has. A variable font has all of them in one file.
+
+The tree has the same three, without the numbers: see [Fonts and pictures](/tree/nodes-and-styles/#fonts-and-pictures).
+
+Next: [Events and input](/core/events/).

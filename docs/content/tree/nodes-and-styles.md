@@ -96,6 +96,8 @@ let logo = run tree.defineImage(bytes)
 
 `defineImage` takes the bytes of a PNG or JPEG and `defineIcon` those of an SVG. Both return a `Resource` for `tree.image` and `tree.icon`. `tree.release(resource)` frees one.
 
+A program on Silk UI core names the same things by number instead, and its host loads them. [Images and fonts](/core/images-and-fonts/) has a whole app with photos, icons and two fonts.
+
 ## Names for people and tools
 
 ```silk
