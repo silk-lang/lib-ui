@@ -1,0 +1,510 @@
+//! The timing half of CSS transitions: easing functions, and the `transition-*` lists of a
+//! computed style, read from CSS text.
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.num.f32
+import silk.num.u32
+import silk.num.u64
+import silk.num.u8
+
+/// The mask of every field `motion` transitions (`transition-property: all`).
+pub const ALL: u64 = 0xFFFFFFFFFFF
+
+/// How many entries each `transition-*` list keeps; later ones are dropped.
+pub const LIST: usize = 8
+
+pub const LINEAR: u8 = 0
+pub const BEZIER: u8 = 1
+pub const STEPS: u8 = 2
+
+pub const JUMP_END: u8 = 0
+pub const JUMP_START: u8 = 1
+pub const JUMP_NONE: u8 = 2
+pub const JUMP_BOTH: u8 = 3
+
+/// An easing function (CSS Easing 1): linear, a cubic Bézier curve or steps.
+pub struct Easing {
+  pub kind: u8,
+  pub x1: f32,
+  pub y1: f32,
+  pub x2: f32,
+  pub y2: f32,
+  pub steps: u32,
+  pub jump: u8,
+}
+
+impl Copy for Easing {}
+
+impl Easing {
+  pub fn linear() -> Easing {
+    return Easing { kind: LINEAR, x1: 0.0, y1: 0.0, x2: 1.0, y2: 1.0, steps: 1, jump: JUMP_END }
+  }
+
+  pub fn bezier(x1: f32, y1: f32, x2: f32, y2: f32) -> Easing {
+    return Easing { kind: BEZIER, x1: x1, y1: y1, x2: x2, y2: y2, steps: 1, jump: JUMP_END }
+  }
+
+  /// `ease`, the initial `transition-timing-function`.
+  pub fn ease() -> Easing {
+    return Easing.bezier(0.25, 0.1, 0.25, 1.0)
+  }
+
+  pub fn stepped(steps: u32, jump: u8) -> Easing {
+    return Easing { kind: STEPS, x1: 0.0, y1: 0.0, x2: 1.0, y2: 1.0, steps: steps, jump: jump }
+  }
+
+  /// The output progress at input progress `p`, 0 to 1.
+  pub fn at(self: &Self, p: f32) -> f32 {
+    if self.kind == BEZIER {
+      if p <= 0.0 {
+        return 0.0
+      }
+      if p >= 1.0 {
+        return 1.0
+      }
+      let t = solveX(self.x1, self.x2, p)
+      return bezierAt(self.y1, self.y2, t)
+    }
+    if self.kind == STEPS {
+      let steps = u32.toF32(self.steps)
+      let mut step = f32.floor(p * steps)
+      if self.jump == JUMP_START || self.jump == JUMP_BOTH {
+        step = step + 1.0
+      }
+      let jumps = if self.jump == JUMP_BOTH {
+        steps + 1.0
+      } else if self.jump == JUMP_NONE {
+        f32.max(1.0, steps - 1.0)
+      } else {
+        steps
+      }
+      if p >= 0.0 && step < 0.0 {
+        step = 0.0
+      }
+      if p <= 1.0 && step > jumps {
+        step = jumps
+      }
+      return step / jumps
+    }
+    return p
+  }
+}
+
+// One coordinate of a cubic Bézier from (0, 0) to (1, 1) with control points a and b.
+fn bezierAt(a: f32, b: f32, t: f32) -> f32 {
+  let u = 1.0 - t
+  return 3.0 * u * u * t * a + 3.0 * u * t * t * b + t * t * t
+}
+
+fn bezierSlope(a: f32, b: f32, t: f32) -> f32 {
+  let u = 1.0 - t
+  return 3.0 * u * u * a + 6.0 * u * t * (b - a) + 3.0 * t * t * (1.0 - b)
+}
+
+// The curve parameter whose x is `x`: Newton steps, then bisection if they stall.
+fn solveX(x1: f32, x2: f32, x: f32) -> f32 {
+  let mut t = x
+  let mut i: u32 = 0
+  while i < 8 {
+    let error = bezierAt(x1, x2, t) - x
+    if f32.abs(error) < 0.000001 {
+      return t
+    }
+    let slope = bezierSlope(x1, x2, t)
+    if f32.abs(slope) < 0.000001 {
+      break
+    }
+    t = t - error / slope
+    i = i + 1
+  }
+  let mut low: f32 = 0.0
+  let mut high: f32 = 1.0
+  t = x
+  i = 0
+  while i < 40 {
+    let value = bezierAt(x1, x2, t)
+    if f32.abs(value - x) < 0.000001 {
+      return t
+    }
+    if value < x {
+      low = t
+    } else {
+      high = t
+    }
+    t = (low + high) * 0.5
+    i = i + 1
+  }
+  return t
+}
+
+/// The `transition-*` lists of a computed style. `properties` holds a mask of the
+/// transitioned fields per entry (see `motion`); `none` is `transition-property: none`.
+pub struct TransitionLists {
+  pub properties: [u64; 8],
+  pub propertyCount: usize,
+  pub none: bool,
+  pub durations: [f32; 8],
+  pub durationCount: usize,
+  pub delays: [f32; 8],
+  pub delayCount: usize,
+  pub easings: [Easing; 8],
+  pub easingCount: usize,
+  pub discrete: [bool; 8],
+  pub discreteCount: usize,
+}
+
+impl Copy for TransitionLists {}
+
+/// What one field transitions with.
+pub struct TransitionSpec {
+  pub duration: f32,
+  pub delay: f32,
+  pub easing: Easing,
+  pub allowDiscrete: bool,
+}
+
+impl Copy for TransitionSpec {}
+
+impl TransitionLists {
+  /// The initial values: `all 0s ease 0s normal`, which transitions nothing.
+  pub fn initial(all: u64) -> TransitionLists {
+    return TransitionLists {
+      properties: [all; 8],
+      propertyCount: 1,
+      none: false,
+      durations: [0.0; 8],
+      durationCount: 1,
+      delays: [0.0; 8],
+      delayCount: 1,
+      easings: [Easing.ease(); 8],
+      easingCount: 1,
+      discrete: [false; 8],
+      discreteCount: 1,
+    }
+  }
+
+  /// Whether some entry could run a transition: a combined duration above zero.
+  pub fn any(self: &Self) -> bool {
+    if self.none || self.propertyCount == 0 {
+      return false
+    }
+    let mut i: usize = 0
+    while i < self.propertyCount {
+      let duration = f32.max(0.0, self.durations[i % self.durationCount])
+      if duration + self.delays[i % self.delayCount] > 0.0 && self.properties[i] != 0 {
+        return true
+      }
+      i = i + 1
+    }
+    return false
+  }
+
+  /// The transition of field `field`, from the last entry that names it, when one does.
+  pub fn spec(self: &Self, field: u32) -> TransitionSpec {
+    let bit = u64.shiftLeft(1, u32.toU64(field))
+    let mut found = LIST
+    let mut i: usize = 0
+    while i < self.propertyCount {
+      if u64.bitAnd(self.properties[i], bit) != 0 {
+        found = i
+      }
+      i = i + 1
+    }
+    if self.none || found == LIST {
+      return TransitionSpec { duration: 0.0, delay: 0.0, easing: Easing.linear(), allowDiscrete: false }
+    }
+    return TransitionSpec {
+      duration: f32.max(0.0, self.durations[found % self.durationCount]),
+      delay: self.delays[found % self.delayCount],
+      easing: self.easings[found % self.easingCount],
+      allowDiscrete: self.discrete[found % self.discreteCount],
+    }
+  }
+}
+
+// CSS text.
+
+/// A byte range of a text.
+pub struct Span {
+  pub start: usize,
+  pub end: usize,
+}
+
+impl Copy for Span {}
+
+fn lower(byte: u8) -> u8 {
+  return if byte >= 65 && byte <= 90 {
+    byte + 32
+  } else {
+    byte
+  }
+}
+
+fn isSpace(byte: u8) -> bool {
+  return byte == 32 || byte == 9 || byte == 10 || byte == 12 || byte == 13
+}
+
+fn isDigit(byte: u8) -> bool {
+  return byte >= 48 && byte <= 57
+}
+
+/// Whether `a` is `b` (lowercase) in ASCII case-insensitive comparison.
+pub fn named(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < a.length {
+    if lower(a[i]) != b[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+/// The bytes of `text` from `start` to `end`.
+pub fn part(text: &[u8], start: usize, end: usize) -> &[u8] {
+  return Slice.view<u8>(text, start, end - start)
+}
+
+/// The end of the item that starts at `at`: the next comma (or space) outside parentheses.
+fn itemEnd(text: &[u8], at: usize, comma: bool) -> usize {
+  let mut depth: u32 = 0
+  let mut i = at
+  while i < text.length {
+    let byte = text[i]
+    if byte == 40 {
+      depth = depth + 1
+    } else if byte == 41 && depth > 0 {
+      depth = depth - 1
+    } else if depth == 0 && ((comma && byte == 44) || (!comma && isSpace(byte))) {
+      return i
+    }
+    i = i + 1
+  }
+  return text.length
+}
+
+fn trimStart(text: &[u8], start: usize, end: usize) -> usize {
+  let mut i = start
+  while i < end && isSpace(text[i]) {
+    i = i + 1
+  }
+  return i
+}
+
+fn trimEnd(text: &[u8], start: usize, end: usize) -> usize {
+  let mut i = end
+  while i > start && isSpace(text[i - 1]) {
+    i = i - 1
+  }
+  return i
+}
+
+/// How many bytes the number at the start of `text` takes (0 when there is none).
+fn numberLength(text: &[u8]) -> usize {
+  let mut i: usize = 0
+  if i < text.length && (text[i] == 45 || text[i] == 43) {
+    i = i + 1
+  }
+  let mut digits: usize = 0
+  while i < text.length && isDigit(text[i]) {
+    i = i + 1
+    digits = digits + 1
+  }
+  if i < text.length && text[i] == 46 {
+    i = i + 1
+    while i < text.length && isDigit(text[i]) {
+      i = i + 1
+      digits = digits + 1
+    }
+  }
+  return if digits == 0 {
+    0
+  } else {
+    i
+  }
+}
+
+/// The value of the number spelled by all of `text`.
+fn numberValue(text: &[u8]) -> f32 {
+  let mut i: usize = 0
+  let mut sign: f32 = 1.0
+  if i < text.length && (text[i] == 45 || text[i] == 43) {
+    if text[i] == 45 {
+      sign = -1.0
+    }
+    i = i + 1
+  }
+  let mut value: f32 = 0.0
+  while i < text.length && isDigit(text[i]) {
+    value = value * 10.0 + u32.toF32(u8.toU32(text[i]) - 48)
+    i = i + 1
+  }
+  if i < text.length && text[i] == 46 {
+    i = i + 1
+    let mut scale: f32 = 0.1
+    while i < text.length && isDigit(text[i]) {
+      value = value + scale * u32.toF32(u8.toU32(text[i]) - 48)
+      scale = scale * 0.1
+      i = i + 1
+    }
+  }
+  return sign * value
+}
+
+/// A `<time>` in seconds: `150ms`, `0.2s`, or a bare `0`.
+pub fn time(text: &[u8]) -> Option<f32> {
+  let used = numberLength(text)
+  if used == 0 {
+    return Option<f32>.None
+  }
+  let value = numberValue(part(text, 0, used))
+  let unit = part(text, used, text.length)
+  if named(unit, b"s") {
+    return Option<f32>.some(value)
+  }
+  if named(unit, b"ms") {
+    return Option<f32>.some(value / 1000.0)
+  }
+  if unit.length == 0 && value == 0.0 {
+    return Option<f32>.some(0.0)
+  }
+  return Option<f32>.None
+}
+
+/// Whether `text` is the function `name(...)`.
+fn isFunction(text: &[u8], name: &[u8]) -> bool {
+  return text.length >= name.length + 2 && text[text.length - 1] == 41
+    && named(part(text, 0, name.length), name)
+    && text[name.length] == 40
+}
+
+/// The `index`th comma-separated number of the arguments of the function `text` whose name
+/// is `skip` bytes long.
+fn argument(text: &[u8], skip: usize, index: u32) -> Option<f32> {
+  let inner = part(text, skip + 1, text.length - 1)
+  let mut at: usize = 0
+  let mut i: u32 = 0
+  while at <= inner.length {
+    let end = itemEnd(inner, at, true)
+    if i == index {
+      let start = trimStart(inner, at, end)
+      let stop = trimEnd(inner, start, end)
+      let spelled = part(inner, start, stop)
+      let used = numberLength(spelled)
+      if used == 0 || used != spelled.length {
+        return Option<f32>.None
+      }
+      return Option<f32>.some(numberValue(spelled))
+    }
+    at = end + 1
+    i = i + 1
+  }
+  return Option<f32>.None
+}
+
+fn argumentOr(text: &[u8], skip: usize, index: u32, ok: &mut bool) -> f32 {
+  let found = argument(text, skip, index)
+  if found.isNone() {
+    ok.* = false
+  }
+  return found.unwrapOr(0.0)
+}
+
+/// An `<easing-function>`.
+pub fn easing(text: &[u8]) -> Option<Easing> {
+  if named(text, b"linear") {
+    return Option<Easing>.some(Easing.linear())
+  }
+  if named(text, b"ease") {
+    return Option<Easing>.some(Easing.ease())
+  }
+  if named(text, b"ease-in") {
+    return Option<Easing>.some(Easing.bezier(0.42, 0.0, 1.0, 1.0))
+  }
+  if named(text, b"ease-out") {
+    return Option<Easing>.some(Easing.bezier(0.0, 0.0, 0.58, 1.0))
+  }
+  if named(text, b"ease-in-out") {
+    return Option<Easing>.some(Easing.bezier(0.42, 0.0, 0.58, 1.0))
+  }
+  if named(text, b"step-start") {
+    return Option<Easing>.some(Easing.stepped(1, JUMP_START))
+  }
+  if named(text, b"step-end") {
+    return Option<Easing>.some(Easing.stepped(1, JUMP_END))
+  }
+  if isFunction(text, b"cubic-bezier") {
+    let mut ok = true
+    let x1 = argumentOr(text, 12, 0, &mut ok)
+    let y1 = argumentOr(text, 12, 1, &mut ok)
+    let x2 = argumentOr(text, 12, 2, &mut ok)
+    let y2 = argumentOr(text, 12, 3, &mut ok)
+    if ok && x1 >= 0.0 && x1 <= 1.0 && x2 >= 0.0 && x2 <= 1.0 {
+      return Option<Easing>.some(Easing.bezier(x1, y1, x2, y2))
+    }
+    return Option<Easing>.None
+  }
+  if isFunction(text, b"steps") {
+    let mut ok = true
+    let count = argumentOr(text, 5, 0, &mut ok)
+    if !ok || count < 1.0 {
+      return Option<Easing>.None
+    }
+    let inner = part(text, 6, text.length - 1)
+    let comma = itemEnd(inner, 0, true)
+    let mut jump = JUMP_END
+    if comma < inner.length {
+      let start = trimStart(inner, comma + 1, inner.length)
+      let word = part(inner, start, trimEnd(inner, start, inner.length))
+      if named(word, b"jump-start") || named(word, b"start") {
+        jump = JUMP_START
+      } else if named(word, b"jump-none") {
+        jump = JUMP_NONE
+        if count < 2.0 {
+          return Option<Easing>.None
+        }
+      } else if named(word, b"jump-both") {
+        jump = JUMP_BOTH
+      } else if !(named(word, b"jump-end") || named(word, b"end")) {
+        return Option<Easing>.None
+      }
+    }
+    return Option<Easing>.some(Easing.stepped(f32.toU32(count), jump))
+  }
+  // `linear()` with stops is not supported yet; it eases linearly.
+  if isFunction(text, b"linear") {
+    return Option<Easing>.some(Easing.linear())
+  }
+  return Option<Easing>.None
+}
+
+/// The comma-separated items of `text`, trimmed, at most `LIST`. Returns the count.
+pub fn items(text: &[u8], out: &mut [Span; 8]) -> usize {
+  let mut count: usize = 0
+  let mut at: usize = 0
+  while at <= text.length && count < LIST {
+    let end = itemEnd(text, at, true)
+    let start = trimStart(text, at, end)
+    out[count] = Span { start: start, end: trimEnd(text, start, end) }
+    count = count + 1
+    at = end + 1
+  }
+  return count
+}
+
+/// The space-separated words of `text`, at most 8. Returns the count.
+pub fn words(text: &[u8], out: &mut [Span; 8]) -> usize {
+  let mut count: usize = 0
+  let mut at = trimStart(text, 0, text.length)
+  while at < text.length && count < 8 {
+    let end = itemEnd(text, at, false)
+    out[count] = Span { start: at, end: end }
+    count = count + 1
+    at = trimStart(text, end, text.length)
+  }
+  return count
+}
