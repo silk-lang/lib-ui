@@ -40,11 +40,11 @@ The style sizes it. `css.objectFit(ObjectFit.Cover)` fills the box and crops wha
 
 ## Vector icons
 
-`h.icon` draws an SVG in the color of the text, like an icon font. The heart is one file, and the like button makes it red or gray with `css.color`.
+`h.icon` draws an SVG the way a page draws an inline `<svg>`: its `currentColor` is the color of the text, so an icon drawn in `currentColor` takes that color, like an icon font. The heart is one file, and the like button makes it red or gray with `css.color`.
 
 ::source examples/src/core/album.silk "fn like(h"
 
-Draw an icon's shapes in any color: only their shape is used. In the album, `heart.svg` is filled and `search.svg` is drawn with strokes, and both work the same way.
+Draw an icon's shapes with `fill="currentColor"` or `stroke="currentColor"`. In the album, `heart.svg` is filled and `search.svg` is drawn with strokes, and both work the same way. Shapes in fixed colors, such as a logo's gradient, keep those colors.
 
 ```html
 <!-- docs/examples/apps/album/assets/icons/heart.svg -->
@@ -101,7 +101,7 @@ Run it with `silk run --manifest-path docs/examples/apps/album/silk.toml`.
 
 - A view names images, icons and font families by number: `h.image`, `h.icon`, `css.fontFamily`.
 - The host says what each number is. A page gives addresses to `mount`, and a window gets bytes with `window.image`, `window.icon` and `window.font`.
-- Icons are SVGs drawn in the text color. Images are PNGs or JPEGs, sized with CSS and fitted with `object-fit`.
+- Icons are SVGs whose `currentColor` is the text color. Images are PNGs or JPEGs, sized with CSS and fitted with `object-fit`.
 - `css.fontWeight` takes any weight a font has. A variable font has all of them in one file.
 
 The tree has the same three, without the numbers: see [Fonts and pictures](/tree/nodes-and-styles/#fonts-and-pictures).
