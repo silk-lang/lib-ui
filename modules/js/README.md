@@ -116,6 +116,31 @@ export default defineConfig({
 
 `vite build` writes `dist/app.js`, the bundle a host runs in production.
 
+### APIs the runtime does not have
+
+A realm has ECMAScript, the web globals below and `@silk/ui`: no `fetch`, `URL`, `Intl`,
+`document`, `process` or Node modules. Libraries written for browsers or Node often expect
+them, so the plugin reads every module of a build and reports the ones that are used, and
+by whom:
+
+```
+APIs used here that a ui-js runtime does not have:
+  fetch (network): src/api.js, ky
+  Intl (intl): date-fns
+  node:fs (node): some-package
+```
+
+- A name counts when a module reads it as a global. A `typeof` test for it, a local of the
+  same name, `process.env.NAME` and a `require("…")` the bundler resolves do not count.
+- `apis: "error"` fails the build instead, `apis: "off"` turns the report off, and
+  `allow: ["fetch"]` leaves out names the application provides itself.
+- Under the dev server the warning comes when the module is first served.
+- At run time, the window host adds a line of explanation to an uncaught
+  `ReferenceError: … is not defined`.
+
+The areas in parentheses are the units a build will choose from, once the engine's
+features can be picked for each build.
+
 ### Development: `vite`
 
 Under the dev server the host runs the application's modules as Vite serves them, and an
