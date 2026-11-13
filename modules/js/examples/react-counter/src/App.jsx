@@ -1,167 +1,126 @@
-import { useState } from "react";
-import { Counter } from "./Counter.jsx";
-import { Logo } from "./Logo.jsx";
-import { docs, themes } from "./theme.js";
+import { useEffect, useRef, useState } from "react";
+import { SIZE, startMotion } from "./motion.js";
+import { links, mono, rgb, sans, themes } from "./theme.js";
 
-const links = [
-  { title: "Docs", href: docs + "/", text: "Find out how Silk UI works, from the tree to whole apps." },
-  { title: "Tutorial", href: docs + "/core/tutorial/", text: "Build a complete app in five short steps." },
-  { title: "Native apps", href: docs + "/native/", text: "Windows, input and the GPU, without a browser." },
-  { title: "UI tree", href: docs + "/tree/", text: "The retained tree this page is drawn with." },
-];
+const row = { display: "flex", flexDirection: "row", alignItems: "center" };
+const column = { display: "flex", flexDirection: "column" };
+const layer = { position: "absolute", inset: 0, pointerEvents: "none" };
+const digit = { position: "absolute", left: 0, right: 0, top: 0, textAlign: "center", fontSize: SIZE, fontWeight: 700, lineHeight: 1, letterSpacing: -12 };
 
+// The counter is the page: click anywhere. The count and the theme are React state, and
+// what moves between clicks is drawn by motion.js on the nodes below.
 export function App() {
+  const [clicks, setClicks] = useState(0);
+  const [streak, setStreak] = useState(0);
   const [theme, setTheme] = useState(themes.dark);
-  const other = theme.name === "dark" ? themes.light : themes.dark;
+  const nodes = useRef({}).current;
+  const motion = useRef(null);
+  const ink = rgb(theme.ink);
+
+  useEffect(() => {
+    motion.current = startMotion(nodes, theme, clicks);
+    return () => motion.current.stop();
+  }, []);
+  useEffect(() => motion.current.setTheme(theme), [theme]);
+
+  const count = (event) => {
+    setStreak(motion.current.click(event.clientX, event.clientY, clicks + 1));
+    setClicks(clicks + 1);
+  };
+  const words = clicks === 0 ? "CLICK ANYWHERE" : (clicks === 1 ? "CLICKED" : "CLICKED " + clicks + " TIMES") + (streak > 2 ? "  ×" + streak : "");
 
   return (
     <box
-      style={{
-        display: "flex",
-        flexDirection: "column",
-        position: "absolute",
-        inset: 0,
-        overflowY: "auto",
-        backgroundColor: theme.page,
-        color: theme.text,
-        fontSize: 14,
-      }}
+      testId="counter"
+      cursor="pointer"
+      onClick={count}
+      onLayout={(event) => motion.current?.resize(event.bounds.width, event.bounds.height)}
+      onPointerMove={(event) => motion.current?.pointer(event.clientX, event.clientY)}
+      style={{ position: "absolute", inset: 0, overflow: "hidden", fontFamily: sans, backgroundColor: theme.page, color: ink }}
     >
-      <box style={{ display: "flex", flexDirection: "column", flexGrow: 1, padding: "28px 40px", gap: 32, backgroundImage: theme.glow }}>
-        <Header theme={theme} other={other} onToggle={() => setTheme(other)} />
-        <Hero theme={theme} />
-        <Cards theme={theme} />
+      <box ref={(node) => (nodes.field = node)} style={layer} />
+      <box ref={(node) => (nodes.effects = node)} style={layer}>
+        <box ref={(node) => (nodes.glow = node)} style={{ position: "absolute", width: 2, height: 2, borderRadius: 1 }} />
+        <box ref={(node) => (nodes.pointerRing = node)} style={{ position: "absolute", width: 28, height: 28, borderRadius: 14, borderWidth: 1.5, borderStyle: "solid" }} />
       </box>
-      <Footer theme={theme} />
-    </box>
-  );
-}
 
-function Header({ theme, other, onToggle }) {
-  return (
-    <box style={{ display: "flex", flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 16 }}>
-      <box
-        style={{
-          display: "flex",
-          flexDirection: "row",
-          alignItems: "center",
-          gap: 8,
-          padding: "8px 14px",
-          borderRadius: 999,
-          borderWidth: 1,
-          borderStyle: "solid",
-          borderColor: theme.border,
-          backgroundColor: theme.surface,
-          color: theme.muted,
-          fontSize: 13,
-        }}
-      >
-        Get started by editing
-        <box style={{ padding: "2px 8px", borderRadius: 6, backgroundColor: theme.code, color: theme.text, fontFamily: "monospace" }}>
-          src/App.jsx
+      <box style={{ ...column, position: "absolute", inset: 0 }}>
+        <TitleBar theme={theme} />
+        <box style={{ ...column, alignItems: "center", justifyContent: "center", flexGrow: 1, pointerEvents: "none" }}>
+          <box style={{ position: "relative", alignSelf: "stretch", height: SIZE }}>
+            <box ref={(node) => (nodes.previous = node)} style={{ ...digit, color: ink, opacity: 0 }}>{String(Math.max(0, clicks - 1))}</box>
+            <box ref={(node) => (nodes.ghostRed = node)} style={{ ...digit, color: "rgb(255, 40, 90)", opacity: 0 }}>{String(clicks)}</box>
+            <box ref={(node) => (nodes.ghostCyan = node)} style={{ ...digit, color: "rgb(40, 220, 255)", opacity: 0 }}>{String(clicks)}</box>
+            <box ref={(node) => (nodes.main = node)} style={digit}>{String(clicks)}</box>
+          </box>
+        </box>
+        <box style={column}>
+          <box style={{ ...row, justifyContent: "space-between", padding: "0 28px 18px", fontSize: 13 }}>
+            <box style={{ fontFamily: mono, fontSize: 12, letterSpacing: 2, color: theme.muted }}>{words}</box>
+            <box style={{ ...row, gap: 22 }}>
+              {links.map((link) => (
+                <Link key={link.title} theme={theme} {...link} />
+              ))}
+              <ThemeSwitch theme={theme} onSwitch={() => setTheme(theme === themes.dark ? themes.light : themes.dark)} />
+            </box>
+          </box>
+          <box style={{ height: 2, backgroundColor: theme.track }}>
+            <box ref={(node) => (nodes.streakBar = node)} style={{ height: 2, width: 0 }} />
+          </box>
         </box>
       </box>
-      <box
-        testId="theme"
-        tabIndex={0}
-        cursor="pointer"
-        onClick={onToggle}
-        style={{
-          display: "flex",
-          flexDirection: "row",
-          alignItems: "center",
-          gap: 8,
-          padding: "8px 14px",
-          borderRadius: 999,
-          borderWidth: 1,
-          borderStyle: "solid",
-          borderColor: theme.border,
-          backgroundColor: theme.surface,
-          color: theme.muted,
-          fontSize: 13,
-        }}
-        hoverStyle={{ borderColor: theme.borderHover, color: theme.text }}
-        focusVisibleStyle={{ borderColor: "rgb(139, 92, 246)" }}
-      >
-        <box style={{ width: 12, height: 12, borderRadius: 6, backgroundColor: other.page, borderWidth: 1, borderStyle: "solid", borderColor: theme.borderHover }} />
-        {other.name === "light" ? "Light mode" : "Dark mode"}
+    </box>
+  );
+}
+
+// The bar at the top is the window's title bar where the system lets the page draw it (on
+// macOS the window controls sit at its left), so nothing in it takes clicks.
+function TitleBar({ theme }) {
+  return (
+    <box style={{ ...row, position: "relative", justifyContent: "center", height: 56, flexShrink: 0 }}>
+      <box style={{ ...row, gap: 10, fontWeight: 600, fontSize: 15 }}>
+        <box style={{ width: 10, height: 10, borderRadius: 5, backgroundColor: rgb(theme.ink) }} />
+        Silk UI
+      </box>
+      <box style={{ ...row, gap: 8, position: "absolute", right: 28, top: 0, bottom: 0, fontFamily: mono, fontSize: 12, color: theme.faint }}>
+        edit
+        <box style={{ color: rgb(theme.ink) }}>src/App.jsx</box>
+        to make it yours
       </box>
     </box>
   );
 }
 
-function Hero({ theme }) {
-  return (
-    <box style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 22, flexGrow: 1, justifyContent: "center" }}>
-      <Logo theme={theme} />
-      <box style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 10 }}>
-        <box style={{ fontSize: 56, fontWeight: 700, lineHeight: 1.1 }}>Silk UI</box>
-        <box style={{ fontSize: 18, color: theme.muted, textAlign: "center", maxWidth: 520 }}>
-          Native apps in React and JavaScript. No browser inside, just a fast UI tree on the GPU.
-        </box>
-      </box>
-      <Counter theme={theme} />
-    </box>
-  );
-}
-
-function Cards({ theme }) {
-  return (
-    <box style={{ display: "flex", flexDirection: "row", flexWrap: "wrap", gap: 16 }}>
-      {links.map((link) => (
-        <Card key={link.title} theme={theme} {...link} />
-      ))}
-    </box>
-  );
-}
-
-function Card({ theme, title, href, text }) {
+// A click on a link opens it and does not count.
+function Link({ theme, title, href }) {
   return (
     <box
       href={href}
-      label={title}
       tabIndex={0}
       cursor="pointer"
-      style={{
-        display: "flex",
-        flexDirection: "column",
-        gap: 8,
-        flexGrow: 1,
-        flexBasis: 0,
-        minWidth: 180,
-        padding: "18px 20px",
-        borderRadius: 14,
-        borderWidth: 1,
-        borderStyle: "solid",
-        borderColor: theme.border,
-        backgroundColor: theme.surface,
-      }}
-      hoverStyle={{ borderColor: theme.borderHover, backgroundColor: theme.surfaceHover }}
-      activeStyle={{ borderColor: "rgb(139, 92, 246)" }}
-      focusVisibleStyle={{ borderColor: "rgb(139, 92, 246)" }}
+      onClick={(event) => event.stopPropagation()}
+      style={{ whiteSpace: "nowrap", color: theme.muted }}
+      hoverStyle={{ color: rgb(theme.ink) }}
     >
-      <box style={{ fontSize: 17, fontWeight: 700 }}>{title} →</box>
-      <box style={{ color: theme.muted, lineHeight: 1.45 }}>{text}</box>
+      {title + " ↗"}
     </box>
   );
 }
 
-function Footer({ theme }) {
+function ThemeSwitch({ theme, onSwitch }) {
   return (
     <box
-      style={{
-        display: "flex",
-        flexDirection: "row",
-        justifyContent: "center",
-        padding: "14px 40px",
-        borderTopWidth: 1,
-        borderTopStyle: "solid",
-        borderTopColor: theme.border,
-        color: theme.faint,
-        fontSize: 12,
+      testId="theme"
+      tabIndex={0}
+      cursor="pointer"
+      onClick={(event) => {
+        event.stopPropagation();
+        onSwitch();
       }}
+      style={{ padding: "3px 10px", borderRadius: 999, borderWidth: 1, borderStyle: "solid", borderColor: theme.track, color: theme.muted, fontFamily: mono, fontSize: 11 }}
+      hoverStyle={{ borderColor: theme.faint, color: rgb(theme.ink) }}
     >
-      React 19 on the SilkJS engine, drawn by the Silk UI tree.
+      {theme === themes.dark ? "LIGHT" : "DARK"}
     </box>
   );
 }

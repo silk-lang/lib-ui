@@ -93,9 +93,11 @@ createRoot().render(<Counter />);
 - **JSX.** Set the JSX import source to `@silk/ui-react`, or use React's own runtime: both
   work.
 
-[examples/react-counter](examples/react-counter) is a starter page in React (a logo, a
-counter, a controlled field, a light and dark theme and cards that open the documentation),
-bundled with Vite into one ES module. From `modules/js`, `npm ci && npm run build`, then from the repository root:
+[examples/react-counter](examples/react-counter) is a starter page in React where the counter
+is the page: click anywhere and the number rolls, with rings, sparks and a field of dots
+that answer the click and the pointer. The count and the theme are React state;
+[motion.js](examples/react-counter/src/motion.js) draws every frame on nodes it gets by
+ref. It is bundled with Vite into one ES module. From `modules/js`, `npm ci && npm run build`, then from the repository root:
 
 ```sh
 silk run --manifest-path modules/js/demo/silk.toml modules/js/examples/react-counter/dist/app.js
@@ -253,7 +255,10 @@ from [window/dev](window/dev) (`ui-js-window-dev`): `DevTools.watch` for `--watc
 `DevTools.server` for the dev server. Only a client with `DevTools` serves the inspector
 (`WindowClient.servesInspector`).
 
-[demo](demo) is the starter page in plain JavaScript, the React example's twin:
+[demo](demo) is the starter page in plain JavaScript, the React example's twin. Its window
+has a transparent title bar (`JsClient.titleBar`, `titleBarHeight`): on macOS the page
+reaches the top edge and the window controls sit over the bar it draws; other systems keep
+their title bar.
 
 ```sh
 silk run --manifest-path modules/js/demo/silk.toml
