@@ -58,6 +58,8 @@ import resources { Families, Resources, Resource, ResourceError }
 import provider { Provider }
 import ui_text.system { TextSystem }
 import ui_text.fonts { TextStyle as FontStyleRequest }
+import ui_text.set { FaceRule }
+import svg_fonts.names { same as sameFamilyName }
 import font_collection.lib { FontCollection, Family, Request, Style as FaceStyle }
 import font_raster.cache { GlyphCache }
 import font_raster.face { FontFace }
@@ -297,6 +299,15 @@ fn reachesEveryRoot(mutation: &Mutation) -> bool {
   }
 }
 
+/// A font face a client declared, by the client's id.
+struct FontFaceEntry {
+  id: u32,
+  /// Its index in the text system's font set.
+  declared: usize,
+}
+
+impl Copy for FontFaceEntry {}
+
 struct FontKeyEntry {
   family: u32,
   size: f32,
@@ -404,6 +415,7 @@ pub struct UiTree<'a> {
   families: Families,
   pub resources: Resources,
   fontKeys: List<FontKeyEntry>,
+  fontFaces: List<FontFaceEntry>,
   pub faces: List<FaceSlot<'a>>,
   pub atlas: Atlas,
   pub glyphs: GlyphCache,
@@ -566,6 +578,7 @@ impl<'a> UiTree<'a> {
       families: Families.make(),
       resources: move resources,
       fontKeys: List<FontKeyEntry>.make(),
+      fontFaces: List<FontFaceEntry>.make(),
       faces: List<FaceSlot<'a>>.make(),
       atlas: Atlas.make(AtlasOptions.default()),
       glyphs: GlyphCache.make(),
@@ -2292,10 +2305,12 @@ impl<'a> UiTree<'a> {
     return Vector2<f32> { x: self.node(slot).scrollX, y: self.node(slot).scrollY }
   }
 
-  /// Moves the queued host requests (clipboard reads and writes) to `out`, oldest first.
+  /// Moves the queued host requests (clipboard reads and writes, font faces to load) to `out`,
+  /// oldest first.
   pub effect fn takeRequests(self: &mut Self, out: &mut List<HostRequest>) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
+    run self.requestFontFaces()
     let mut reversed = List<HostRequest>.make()
     while true {
       match self.requests.pop() {
@@ -2543,6 +2558,146 @@ impl<'a> UiTree<'a> {
       },
     )
     return key
+  }
+
+  // Font faces added at run time.
+
+  /// Text whose font-family list names `family` lays out again: its styles get new font
+  /// keys, so css-layout measures it with the faces the font set has now.
+  effect fn fontFamilyChanged(self: &mut Self, family: &[u8]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut changed = false
+    let mut names = List<Family>.make()
+    let mut i: usize = 0
+    while i < self.fontKeys.length() {
+      let list = self.fontKeys.get(i).family
+      if list != NONE {
+        names.clear()
+        run self.families.copyOf(list, &mut names)
+        let mut j: usize = 0
+        while j < names.length() {
+          if let Family.Named { name } = &names.asSlice()[j] {
+            if sameFamilyName(Bytes.asSlice(&name), family) {
+              let entries = self.fontKeys.asMutSlice()
+              entries[i].family = NONE
+              changed = true
+              break
+            }
+          }
+          j = j + 1
+        }
+      }
+      i = i + 1
+    }
+    if !changed {
+      return
+    }
+    self.stylesDirty = true
+    let parked = self.parked.asMutSlice()
+    let mut p: usize = 0
+    while p < parked.length {
+      parked[p].touched = true
+      p = p + 1
+    }
+  }
+
+  /// Adds the faces of a font file (TTF, OTF or a collection) under the family names the file
+  /// gives, and returns how many it had. Text in those families lays out again with them.
+  pub effect fn addFont(self: &mut Self, data: Bytes) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let set = &mut self.provider.text.fonts.set
+    let first = set.declaredCount()
+    let added = run set.addFont(move data)
+    let mut i = first
+    while i < first + added {
+      let mut family = Bytes.make()
+      run Bytes.append(&mut family, self.provider.text.fonts.set.familyOf(i))
+      run self.fontFamilyChanged(Bytes.asSlice(&family))
+      i = i + 1
+    }
+    return added
+  }
+
+  fn fontFaceIndex(self: &Self, id: u32) -> usize {
+    let entries = self.fontFaces.asSlice()
+    let mut i: usize = 0
+    while i < entries.length {
+      if entries[i].id == id {
+        return entries[i].declared
+      }
+      i = i + 1
+    }
+    return usize.MAX
+  }
+
+  /// Declares font face `id` as an `@font-face` rule does, before its file is there. Its
+  /// family hides installed faces of the same name at once. When text laid out needs a
+  /// character in its `unicode-range`, `takeRequests` gives `HostRequest.LoadFontFace`; the
+  /// text draws with the next family that has the character until `loadFontFace`, then lays
+  /// out again with the face (`font-display: swap`). Declaring an id again does nothing.
+  pub effect fn declareFontFace(self: &mut Self, id: u32, rule: FaceRule) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.fontFaceIndex(id) != usize.MAX {
+      return
+    }
+    let mut family = Bytes.make()
+    run Bytes.append(&mut family, Bytes.asSlice(&rule.family))
+    let declared = run self.provider.text.fonts.set.declare(move rule)
+    run self.fontFaces.append(FontFaceEntry { id: id, declared: declared })
+    run self.fontFamilyChanged(Bytes.asSlice(&family))
+  }
+
+  /// Gives declared font face `id` its file, face `index` of a TTF, OTF or collection.
+  /// Text in its family lays out again. Returns false when the id is unknown or the data is
+  /// no usable font; the face then counts as failed and the fallback stays.
+  pub effect fn loadFontFace(self: &mut Self, id: u32, data: Bytes, index: u32) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let declared = self.fontFaceIndex(id)
+    if declared == usize.MAX {
+      return false
+    }
+    let ok = run self.provider.text.fonts.set.load(declared, move data, index)
+    if ok {
+      let mut family = Bytes.make()
+      run Bytes.append(&mut family, self.provider.text.fonts.set.familyOf(declared))
+      run self.fontFamilyChanged(Bytes.asSlice(&family))
+    }
+    return ok
+  }
+
+  /// Records that font face `id` could not load: its text keeps the fallback.
+  pub fn failFontFace(self: &mut Self, id: u32) -> () {
+    let declared = self.fontFaceIndex(id)
+    if declared != usize.MAX {
+      self.provider.text.fonts.set.markFailed(declared)
+    }
+  }
+
+  /// Moves the font faces text needed in the last layouts to the host requests.
+  effect fn requestFontFaces(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.provider.text.fonts.set.hasWanted() {
+      return
+    }
+    let mut wanted = List<usize>.make()
+    run self.provider.text.fonts.set.takeWanted(&mut wanted)
+    let mut i: usize = 0
+    while i < wanted.length() {
+      let entries = self.fontFaces.asSlice()
+      let mut j: usize = 0
+      while j < entries.length {
+        if entries[j].declared == wanted.get(i) {
+          run self.requests.append(HostRequest.LoadFontFace { face: entries[j].id })
+        }
+        j = j + 1
+      }
+      i = i + 1
+    }
   }
 
   /// Recomputes every node's style from its patches, variants and parent.

@@ -1,0 +1,151 @@
+//! Font faces added while the tree runs: a declared face is asked for when text needs it, the
+//! text draws with a fallback meanwhile, and lays out again once the face loads (the web's
+//! `font-display: swap`).
+import ui_tree.css
+import ui_tree.css { px }
+import ui_tree.lib {
+  Tree,
+  TreeError,
+  Viewport,
+  HostRequest,
+  FaceRule,
+  UnicodeRange,
+  Range,
+  BoxNode
+}
+import ui_fixtures.fixtures as fixtures
+import ui_assets.assets as assets
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.geometry.rect { Rect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+fn viewport() -> Viewport {
+  return Viewport { width: 800.0, height: 200.0, scale: 1.0 }
+}
+
+effect fn widthOf(tree: &Tree<'_>, node: BoxNode) -> f32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match run tree.bounds(node) {
+    Option<Rect<f32>>.Some { value } => value.xMax - value.xMin
+    Option<Rect<f32>>.None => 0.0
+  }
+}
+
+effect fn declaredFacesSwapInBody() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run Tree.make(&fonts)
+  // "Brand" is Geist Mono under another name, so the swap shows as wider text.
+  let mut latin = run FaceRule.make(String.utf8Bytes("Brand"), Range.point(400.0))
+  run latin.ranges.append(UnicodeRange { first: 0x0000, last: 0x024F })
+  let face = run tree.declareFontFace(move latin)
+  let mut greek = run FaceRule.make(String.utf8Bytes("Brand"), Range.point(400.0))
+  run greek.ranges.append(UnicodeRange { first: 0x0370, last: 0x03FF })
+  let unused = run tree.declareFontFace(move greek)
+  let brand = run tree.fontFamily("Brand, Noto Sans")
+  let root = run tree.box(&[css.fontFamily(brand.raw()), css.fontSize(px(16.0))])
+  let line = run tree.span(&[])
+  let text = run tree.text("iiiiiiiiii")
+  run tree.append(root, line)
+  run tree.append(line, text)
+  run tree.setRoot(root)
+  drop run tree.frame(viewport(), 0.0)
+  let fallback = run widthOf(&tree, line)
+  run Testing.expect(fallback > 0.0, "the text draws with the fallback while Brand loads")
+
+  let requests = run tree.requests()
+  run Testing.expect(requests.length() == 1, "text in Brand asks for one face")
+  match &requests.asSlice()[0] {
+    HostRequest.LoadFontFace { face: asked } => {
+      run Testing.expect(asked.raw() == face.raw(), "the face covering Latin is asked for")
+    }
+    _ => run Testing.expect(false, "the request is a font face load")
+  }
+  drop run tree.frame(viewport(), 0.0)
+  run Testing.expect((run tree.requests()).length() == 0, "a face is asked for once")
+  run Testing.expect(!tree.needsFrame(), "nothing changes while the face loads")
+  drop unused
+
+  run Testing.expect(
+    run tree.loadFontFace(face, assets.geistMonoFont()),
+    "the file reads as a font",
+  )
+  run Testing.expect(tree.needsFrame(), "a loaded face lays its text out again")
+  drop run tree.frame(viewport(), 0.0)
+  let swapped = run widthOf(&tree, line)
+  run Testing.expect(swapped > fallback * 1.5, "the monospaced face swaps in: i is much wider")
+  run Testing.expect((run tree.requests()).length() == 0, "the Greek face is never asked for")
+}
+
+test effect fn declaredFacesSwapIn() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run declaredFacesSwapInBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn failedFacesKeepTheFallbackBody() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run Tree.make(&fonts)
+  let face = run tree.declareFontFace(run FaceRule.make(String.utf8Bytes("Brand"), Range.point(400.0)))
+  let brand = run tree.fontFamily("Brand, Noto Sans")
+  let root = run tree.box(&[css.fontFamily(brand.raw())])
+  let line = run tree.span(&[])
+  run tree.append(root, line)
+  let hello = run tree.text("Hello")
+  run tree.append(line, hello)
+  run tree.setRoot(root)
+  drop run tree.frame(viewport(), 0.0)
+  let before = run widthOf(&tree, line)
+  run Testing.expect((run tree.requests()).length() == 1, "the face is asked for")
+  let loaded = run tree.loadFontFace(face, b"not a font")
+  run Testing.expect(!loaded, "bad data does not load")
+  drop run tree.frame(viewport(), 0.0)
+  let after = run widthOf(&tree, line)
+  run Testing.expect(after == before, "the fallback stays")
+  run Testing.expect((run tree.requests()).length() == 0, "a failed face is not asked for again")
+}
+
+test effect fn failedFacesKeepTheFallback() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run failedFacesKeepTheFallbackBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn addedFontsHideInstalledFamiliesBody() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run Tree.make(&fonts)
+  let sans = run tree.fontFamily("Noto Sans")
+  let root = run tree.box(&[css.fontFamily(sans.raw())])
+  let line = run tree.span(&[])
+  run tree.append(root, line)
+  let word = run tree.text("iiiiiiiiii")
+  run tree.append(line, word)
+  run tree.setRoot(root)
+  drop run tree.frame(viewport(), 0.0)
+  let installed = run widthOf(&tree, line)
+  // A face added under the family name "Noto Sans" hides the installed one, as an
+  // @font-face rule does on a page.
+  let mut rule = run FaceRule.make(String.utf8Bytes("Noto Sans"), Range.point(400.0))
+  let face = run tree.declareFontFace(move rule)
+  run Testing.expect(run tree.loadFontFace(face, assets.geistMonoFont()), "the face loads")
+  drop run tree.frame(viewport(), 0.0)
+  let replaced = run widthOf(&tree, line)
+  run Testing.expect(replaced > installed * 1.5, "text in the family uses it")
+  let added = run tree.addFont(assets.geistFont())
+  run Testing.expect(added == 1, "addFont adds a file's faces")
+}
+
+test effect fn addedFontsHideInstalledFamilies() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run addedFontsHideInstalledFamiliesBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
