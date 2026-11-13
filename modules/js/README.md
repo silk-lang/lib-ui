@@ -3,7 +3,8 @@
 Runs a JavaScript application on a UI tree, with the [SilkJS](https://github.com/silk-lang/lib-silkjs)
 engine embedded in the process. Four parts are here: the Silk host with its native bridge,
 `@silk/ui`, the node and event API, `@silk/ui-react`, a React renderer on it, and `@silk/vite`,
-a Vite plugin that builds an application and reloads it in the window after each change.
+a Vite plugin that builds an application and, in development, replaces edited modules in
+the running window.
 
 ## @silk/ui
 
@@ -113,22 +114,48 @@ export default defineConfig({
 });
 ```
 
-`vite build` writes `dist/app.js`. `vite build --watch --mode development` rebuilds on every
-change; with `host` set, the plugin starts that binary with `--watch <bundle>` after the
-first build, and the window reloads the application after each later one. A build that
-fails leaves the running application alone. Closing the window ends the session.
+`vite build` writes `dist/app.js`, the bundle a host runs in production.
 
-The reload is a full one: the plugin writes `<bundle>.stamp` after a successful build, the
-window host looks at that file five times a second (`JsApp.watch`), and when it changed
-the host destroys the application's nodes, starts a new realm and runs the new bundle.
-JavaScript state does not survive. Replacing single modules with state kept, as Vite does in
-a browser, is not here yet.
+### Development: `vite`
+
+Under the dev server the host runs the application's modules as Vite serves them, and an
+edit replaces only the modules it touches:
+
+- A component file (every export is a React component) is swapped where it is with React
+  Fast Refresh. Component state and the rest of the application stay as they were.
+- Any other module passes the update on to its importers. When nothing accepts it, the
+  window gets a new realm and the application starts again.
+- `import.meta.hot` works as in Vite: `accept`, `dispose`, `invalidate`, `data`.
+- A build error is printed and the running application is left alone.
+
+With `host` set the plugin starts that binary with `--dev <port>`; without it, it prints
+the port for a host you start yourself. Closing the window ends the session.
+
+How it works: the plugin adds a Vite environment named `silk` and listens on a local TCP
+port. The host connects when its window opens (`JsApp.dev(port)`), and the server sends one
+script first: Vite's module runner, bundled, with the host's line transport under it
+(`__ui.devSend` out, `__ui.devMessage` in). The runner asks the server for each module,
+already transformed, and evaluates it in the realm. Dependencies are pre-bundled by Vite,
+so CommonJS packages such as React load as ES modules. The host needs no module resolution
+of its own.
+
+### Development without the dev server: `vite build --watch`
+
+`vite build --watch --mode development` rebuilds the bundle on every change; with `host`
+set, the plugin starts that binary with `--watch <bundle>` after the first build, and the
+window reloads the whole application after each later one: the plugin writes
+`<bundle>.stamp` after a successful build, the window host looks at that file five times a
+second (`JsApp.watch`), and when it changed the host destroys the application's nodes,
+starts a new realm and runs the new bundle. JavaScript state does not survive. This is
+the same code path as production, so it is the mode to check a bundle in.
 
 For the React example, from `modules/js/examples/react-counter`:
 
 ```sh
 silk build --manifest-path ../../demo/silk.toml
-SILK_UI_HOST=$PWD/../../../../build/llvm/<target>/debug/ui-js-demo npm run dev
+export SILK_UI_HOST=$PWD/../../../../build/llvm/<target>/debug/ui-js-demo
+npm run dev     # dev server, Fast Refresh
+npm run watch   # rebuild and reload
 ```
 
 ## The host
@@ -203,7 +230,7 @@ Run it from the repository root. `silk task native check` runs it with `--check`
   `silk test --manifest-path modules/js/examples/tests/silk.toml --root src/tests.silk` for
   the bundled examples on the engine (build them first).
 - Not here yet: unhandled rejection reports, images and canvas commands from JavaScript,
-  module replacement that keeps state, and choosing engine features for each build.
+  source maps for errors under the dev server, and choosing engine features for each build.
 - Memory, release builds on Linux x86-64 under Xvfb with a software GPU, resident after six
   seconds: the Silk window demo 155 MB, the JavaScript counter 169 MB, the React counter
   174 MB. The GPU stack is most of each; the engine with `@silk/ui` adds about 14 MB and

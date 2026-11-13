@@ -1,8 +1,10 @@
 import { defineConfig } from "vite";
 import silk from "@silk/vite";
 
-// `npm run build` writes dist/app.js. `npm run dev` rebuilds on every change and, when
-// SILK_UI_HOST names a ui-js host binary, opens it and reloads the app after each build.
+// `npm run build` writes dist/app.js. `npm run dev` serves the modules to a ui-js host and
+// replaces the ones an edit touches, keeping component state. `npm run watch` rebuilds
+// the bundle on every change and reloads the whole application. Both open the host that
+// SILK_UI_HOST names.
 const host = process.env.SILK_UI_HOST;
 
 export default defineConfig({
