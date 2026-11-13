@@ -71,8 +71,9 @@ int32_t silk_term_pty_new(uint16_t cols, uint16_t rows, const uint8_t *command,
     WCHAR shell[MAX_PATH];
     DWORD shellLength = GetEnvironmentVariableW(L"COMSPEC", shell, MAX_PATH);
     if (shellLength == 0 || shellLength >= MAX_PATH) {
-        wcscpy(shell, L"C:\\Windows\\System32\\cmd.exe");
-        shellLength = (DWORD)wcslen(shell);
+        static const WCHAR fallback[] = L"C:\\Windows\\System32\\cmd.exe";
+        memcpy(shell, fallback, sizeof fallback);
+        shellLength = (DWORD)(sizeof fallback / sizeof fallback[0] - 1);
     }
     int wide = 0;
     if (command_length) {
