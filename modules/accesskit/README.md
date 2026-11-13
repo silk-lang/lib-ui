@@ -11,8 +11,7 @@ hands their requests back as [`ActionRequest`](src/update.silk)s.
 | `accesskit-consumer` ([consumer](consumer)) | `accesskit_consumer` | The tree adapters keep: applies updates, reports changes, filters, navigation, text ranges |
 | `accesskit-unix` ([unix](unix)) | `accesskit_unix`, `accesskit_atspi_common` | The Linux adapter: AT-SPI over D-Bus, with the D-Bus client in [`modules/dbus`](../dbus) |
 | `accesskit-macos` ([macos](macos)) | `accesskit_macos` | The macOS adapter: NSAccessibility elements for a view |
-
-The Windows adapter follows in this directory.
+| `accesskit-windows` ([windows](windows)) | `accesskit_windows` | The Windows adapter: UI Automation providers for a window |
 
 ## Linux
 
@@ -75,6 +74,33 @@ let requests = run adapter.takeRequests()
 
 `RecordingSink` stands in for AppKit in tests, so the adapter's behaviour is tested on every
 platform; on macOS the tests also read the elements back through AppKit.
+
+## Windows
+
+[`Adapter`](windows/src/adapter.silk) keeps the UI Automation providers of one window in step with
+the tree, in the same way: the Silk side computes each element's properties (by UIA property id),
+supported control patterns, relations and text (characters with their boxes, words, lines,
+paragraphs and format runs with their UIA text attributes) and sends them as a record (layout in
+[`record.silk`](windows/src/record.silk)); [`native/uia.c`](windows/native/uia.c) implements the COM
+providers (`IRawElementProviderSimple`, `Fragment`, `FragmentRoot`, the Toggle, Invoke, Value,
+RangeValue, ScrollItem, SelectionItem, Selection, Text, ExpandCollapse and Window patterns, and
+`ITextRangeProvider` on UTF-16 offsets) and answers from the records. Events come from diffing the
+old and new properties, as AccessKit's `enqueue_property_changes` does, plus its text, live region,
+window and selection events. The window is subclassed to answer `WM_GETOBJECT`, as AccessKit's
+`SubclassingAdapter` does. The C file declares the few Win32 and COM types it needs, since Silk
+passes no Windows SDK headers to clang.
+
+```silk
+// The HWND from the platform window host's RawSurface.Win32:
+let sink = NativeSink.forWindow(hwnd).unwrap()
+let mut adapter = run Adapter.make(move sink, initialUpdate, true)
+run adapter.update(nextUpdate)          // raises the UIA events it causes
+run adapter.pump()                      // after the event loop ran (actions post WM_NULL)
+let requests = run adapter.takeRequests()
+```
+
+UI Automation calls the providers from its own threads, so each adapter has a lock, and nothing
+that can wait on the window's thread runs while it is held.
 
 The consumer differs from the Rust crate where Silk has no equivalent: filters are values of a
 `NodeFilter` interface instead of closures, iterators are `FilteredCursor`s or fill a `List`, and

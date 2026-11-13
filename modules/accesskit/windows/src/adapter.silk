@@ -1,0 +1,695 @@
+//! AccessKit's Windows adapter: keeps the UI Automation elements of one window in step with an
+//! AccessKit tree, raises the events its updates cause, and turns what assistive technology
+//! asks for into [`ActionRequest`]s.
+//!
+//! Ported from AccessKit (`accesskit_windows/src/adapter.rs`, `context.rs` and `node.rs`),
+//! Copyright 2022 The AccessKit Authors, under the MIT or Apache-2.0 license.
+//!
+//! The adapter sends its elements to a [`Sink`]: [`NativeSink`] hands them to the UI Automation
+//! side in `native/uia.c`, and [`RecordingSink`] keeps them for tests on any platform.
+import accesskit.lib { Action, ActionData, ActionRequest, NodeId, ScrollHint, TreeUpdate }
+import accesskit_consumer.lib { Tree, TreeState, FullNodeId, TreeIndex, NodeRef, CommonFilter }
+import events { EventGenerator, WinEvent }
+import node { elementId, included, writeRecord }
+import record { Record, Value, fingerprint }
+import sys
+import silk.collections.bytes { Bytes }
+import silk.collections.hash { Hash }
+import silk.collections.hash_map { HashMap }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.text.string { String }
+
+/// `IInvokeProvider.Invoke`, `IToggleProvider.Toggle`, or a SelectionItem call that changes
+/// whether the element is selected.
+pub fn ACTION_CLICK() -> u32 {
+  return 1
+}
+
+/// `IRawElementProviderFragment.SetFocus`.
+pub fn ACTION_FOCUS() -> u32 {
+  return 2
+}
+
+/// `IExpandCollapseProvider.Expand`.
+pub fn ACTION_EXPAND() -> u32 {
+  return 3
+}
+
+/// `IExpandCollapseProvider.Collapse`.
+pub fn ACTION_COLLAPSE() -> u32 {
+  return 4
+}
+
+/// `IValueProvider.SetValue`.
+pub fn ACTION_SET_TEXT() -> u32 {
+  return 5
+}
+
+/// `IRangeValueProvider.SetValue`.
+pub fn ACTION_SET_NUMBER() -> u32 {
+  return 6
+}
+
+/// `ITextRangeProvider.Select`, from `start` to `end` in UTF-16 code units.
+pub fn ACTION_SET_SELECTION() -> u32 {
+  return 7
+}
+
+/// `IScrollItemProvider.ScrollIntoView`.
+pub fn ACTION_SCROLL_INTO_VIEW() -> u32 {
+  return 8
+}
+
+/// `ITextRangeProvider.ScrollIntoView`: the text at UTF-16 offset `start`, aligned to the top
+/// when `number` is not 0.
+pub fn ACTION_SCROLL_TEXT() -> u32 {
+  return 9
+}
+
+/// What the UI Automation side queued for the application.
+pub struct NativeAction {
+  pub kind: u32,
+  pub id: u64,
+  pub number: f64,
+  pub start: u32,
+  pub end: u32,
+  pub text: String,
+}
+
+/// Where the adapter sends its elements and events.
+pub interface Sink {
+  /// Element `id` is now described by `record`.
+  effect fn setNode(self: &mut Self, id: u64, record: &[u8]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator
+
+  /// Element `id` is gone.
+  effect fn removeNode(self: &mut Self, id: u64) -> () ! OutOfMemoryError ? &mut Allocator
+
+  /// The window's fragment root is element `id`.
+  effect fn setRoot(self: &mut Self, id: u64) -> () ! OutOfMemoryError ? &mut Allocator
+
+  /// The focused element, if any.
+  effect fn setFocus(self: &mut Self, id: Option<u64>) -> () ! OutOfMemoryError ? &mut Allocator
+
+  /// Raises UI Automation event `event` on element `id`.
+  effect fn raiseEvent(self: &mut Self, id: u64, event: i32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator
+
+  /// Raises a change of property `property` on element `id`, from `old` to `new`.
+  effect fn raiseProperty(self: &mut Self, id: u64, property: i32, old: &Value, new: &Value) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator
+
+  /// The next queued action, if any.
+  effect fn poll(self: &mut Self) -> Option<NativeAction> ! OutOfMemoryError ? &mut Allocator
+}
+
+effect fn readText(handle: u64, id: u64, describe: bool) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    let mut bytes = Bytes.make()
+    let length = if describe {
+      unsafe sys.silk_ak_win_describe(handle, id, Pointer.fromMutSlice(bytes.asMutSlice()), 0)
+    } else {
+      unsafe sys.silk_ak_win_action_text(handle, Pointer.fromMutSlice(bytes.asMutSlice()), 0)
+    }
+    bytes = run Bytes.zeroed(length)
+    if describe {
+      drop unsafe sys.silk_ak_win_describe(
+        handle,
+        id,
+        Pointer.fromMutSlice(bytes.asMutSlice()),
+        length,
+      )
+    } else {
+      drop unsafe sys.silk_ak_win_action_text(
+        handle,
+        Pointer.fromMutSlice(bytes.asMutSlice()),
+        length,
+      )
+    }
+    return run String.copy(String.fromUtf8(bytes.asSlice()).unwrapOr(""))
+  } else {
+    drop handle
+    drop id
+    drop describe
+    return String.make()
+  }
+}
+
+/// The UI Automation side, for the window behind `handle`. Elsewhere it drops everything.
+pub struct NativeSink {
+  pub handle: u64,
+}
+
+impl NativeSink {
+  /// The provider of window `hwnd` (an `HWND`, as the platform window host's
+  /// `RawSurface.Win32` gives it), or none when this is not Windows.
+  pub fn forWindow(hwnd: u64) -> Option<NativeSink> {
+    static if Intrinsic.targetOperatingSystem() == "windows" {
+      let handle = unsafe sys.silk_ak_win_attach(hwnd)
+      if handle == 0 {
+        return Option.None
+      }
+      return Option.Some { value: NativeSink { handle: handle } }
+    } else {
+      drop hwnd
+      return Option.None
+    }
+  }
+
+  /// A hidden window of its own, for tests of the UI Automation side.
+  pub fn detached() -> Option<NativeSink> {
+    static if Intrinsic.targetOperatingSystem() == "windows" {
+      let handle = unsafe sys.silk_ak_win_attach_test()
+      if handle == 0 {
+        return Option.None
+      }
+      return Option.Some { value: NativeSink { handle: handle } }
+    } else {
+      return Option.None
+    }
+  }
+
+  /// Gives the window its own accessibility back.
+  pub fn detach(self: Self) -> () {
+    static if Intrinsic.targetOperatingSystem() == "windows" {
+      unsafe sys.silk_ak_win_detach(self.handle)
+    } else {
+      drop self
+    }
+  }
+
+  /// What the providers report for element `id`, one `name: value` per line, for tests. Id
+  /// `u64` max describes what the window answers to `WM_GETOBJECT`.
+  pub effect fn describe(self: &Self, id: u64) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run readText(self.handle, id, true)
+  }
+
+  /// Calls provider method `kind` (an `ACTION_` number) on element `id`, as assistive
+  /// technology would, and returns whether it succeeded.
+  pub fn perform(self: &Self, id: u64, kind: u32) -> bool {
+    static if Intrinsic.targetOperatingSystem() == "windows" {
+      return unsafe sys.silk_ak_win_perform(self.handle, id, kind) != 0
+    } else {
+      drop id
+      drop kind
+      return false
+    }
+  }
+}
+
+effect fn valueBytes(value: &Value) -> Record ! OutOfMemoryError ? &mut Allocator {
+  let mut out = Record.make()
+  run out.value(value)
+  return move out
+}
+
+impl Sink for NativeSink {
+  effect fn setNode(self: &mut Self, id: u64, record: &[u8]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    static if Intrinsic.targetOperatingSystem() == "windows" {
+      unsafe sys.silk_ak_win_set_node(self.handle, id, Pointer.fromSlice(record), record.length)
+    } else {
+      drop id
+      drop record
+    }
+  }
+
+  effect fn removeNode(self: &mut Self, id: u64) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    static if Intrinsic.targetOperatingSystem() == "windows" {
+      unsafe sys.silk_ak_win_remove_node(self.handle, id)
+    } else {
+      drop id
+    }
+  }
+
+  effect fn setRoot(self: &mut Self, id: u64) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    static if Intrinsic.targetOperatingSystem() == "windows" {
+      unsafe sys.silk_ak_win_set_root(self.handle, id)
+    } else {
+      drop id
+    }
+  }
+
+  effect fn setFocus(self: &mut Self, id: Option<u64>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    static if Intrinsic.targetOperatingSystem() == "windows" {
+      match id {
+        Option.Some { value } => unsafe sys.silk_ak_win_set_focus(self.handle, 1, value)
+        Option.None => unsafe sys.silk_ak_win_set_focus(self.handle, 0, 0)
+      }
+    } else {
+      drop id
+    }
+  }
+
+  effect fn raiseEvent(self: &mut Self, id: u64, event: i32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    static if Intrinsic.targetOperatingSystem() == "windows" {
+      unsafe sys.silk_ak_win_raise_event(self.handle, id, event)
+    } else {
+      drop id
+      drop event
+    }
+  }
+
+  effect fn raiseProperty(self: &mut Self, id: u64, property: i32, old: &Value, new: &Value) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    static if Intrinsic.targetOperatingSystem() == "windows" {
+      let before = run valueBytes(old)
+      let after = run valueBytes(new)
+      unsafe sys.silk_ak_win_raise_property(
+        self.handle,
+        id,
+        property,
+        Pointer.fromSlice(before.asSlice()),
+        before.length(),
+        Pointer.fromSlice(after.asSlice()),
+        after.length(),
+      )
+    } else {
+      drop id
+      drop property
+      drop old
+      drop new
+    }
+  }
+
+  effect fn poll(self: &mut Self) -> Option<NativeAction>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    static if Intrinsic.targetOperatingSystem() == "windows" {
+      let mut id: u64 = 0
+      let mut number: f64 = 0.0
+      let mut start: u32 = 0
+      let mut end: u32 = 0
+      let kind = unsafe sys.silk_ak_win_poll(
+        self.handle,
+        Pointer.fromMutRef(&mut id),
+        Pointer.fromMutRef(&mut number),
+        Pointer.fromMutRef(&mut start),
+        Pointer.fromMutRef(&mut end),
+      )
+      if kind == 0 {
+        return Option.None
+      }
+      let text = run readText(self.handle, 0, false)
+      return Option.Some {
+        value: NativeAction {
+          kind: kind,
+          id: id,
+          number: number,
+          start: start,
+          end: end,
+          text: move text,
+        },
+      }
+    } else {
+      return Option.None
+    }
+  }
+}
+
+/// One thing the adapter sent to a [`RecordingSink`].
+pub union SinkCall {
+  SetNode { pub id: u64, pub record: List<u8> },
+  RemoveNode { pub id: u64 },
+  SetRoot { pub id: u64 },
+  SetFocus { pub id: Option<u64> },
+  RaiseEvent { pub id: u64, pub event: i32 },
+  RaiseProperty { pub id: u64, pub property: i32, pub old: Value, pub new: Value },
+}
+
+/// Keeps what the adapter sends, and hands it the actions a test queues.
+pub struct RecordingSink {
+  pub calls: List<SinkCall>,
+  pub actions: List<NativeAction>,
+}
+
+impl RecordingSink {
+  pub fn make() -> RecordingSink {
+    return RecordingSink { calls: List<SinkCall>.make(), actions: List<NativeAction>.make() }
+  }
+}
+
+impl Sink for RecordingSink {
+  effect fn setNode(self: &mut Self, id: u64, record: &[u8]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut copy = List<u8>.make()
+    run copy.appendBytes(record)
+    run self.calls.append(SinkCall.SetNode { id: id, record: move copy })
+  }
+
+  effect fn removeNode(self: &mut Self, id: u64) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.calls.append(SinkCall.RemoveNode { id: id })
+  }
+
+  effect fn setRoot(self: &mut Self, id: u64) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.calls.append(SinkCall.SetRoot { id: id })
+  }
+
+  effect fn setFocus(self: &mut Self, id: Option<u64>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.calls.append(SinkCall.SetFocus { id: id })
+  }
+
+  effect fn raiseEvent(self: &mut Self, id: u64, event: i32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.calls.append(SinkCall.RaiseEvent { id: id, event: event })
+  }
+
+  effect fn raiseProperty(self: &mut Self, id: u64, property: i32, old: &Value, new: &Value) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let before = run old.copy()
+    let after = run new.copy()
+    run self.calls.append(SinkCall.RaiseProperty {
+      id: id,
+      property: property,
+      old: move before,
+      new: move after,
+    })
+  }
+
+  effect fn poll(self: &mut Self) -> Option<NativeAction>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.actions.length() == 0 {
+      return Option.None
+    }
+    return Option.Some { value: self.actions.remove(0) }
+  }
+}
+
+/// The node id the UI Automation side knows as `value`.
+pub fn nodeIdOf(value: u64) -> FullNodeId {
+  return FullNodeId.make(
+    NodeId.of(u64.bitAnd(value, 281474976710655)),
+    TreeIndex { value: u64.wrappingToU32(u64.shiftRight(value, 48)) },
+  )
+}
+
+/// The adapter of one window.
+pub struct Adapter<S> {
+  pub sink: S,
+  tree: Tree,
+  /// The fingerprint of each element's record as last sent.
+  sent: HashMap<u64, u64>,
+  requests: List<ActionRequest>,
+}
+
+/// Sends the elements of `tree` that changed since `sent`, and drops the ones it lost. The root
+/// is always an element: it is the window's fragment root.
+effect fn sync<S: Sink>(tree: &Tree, sink: &mut S, sent: &mut HashMap<u64, u64>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let state = tree.state()
+  let filter = CommonFilter {}
+  let mut now = HashMap<u64, u64>.make(Hash.seed(9001))
+  let mut pending = List<NodeRef<'_>>.make()
+  let root = state.rootNode()
+  run pending.append(root)
+  let mut record = Record.make()
+  while let Option.Some { value: node } = pending.pop() {
+    let id = elementId(&node)
+    record.clear()
+    run writeRecord(&node, &mut record)
+    let print = fingerprint(record.asSlice())
+    let changed = match sent.get(id) {
+      Option.Some { value } => value != print
+      Option.None => true
+    }
+    if changed {
+      run sink.setNode(id, record.asSlice())
+    }
+    drop run now.insert(id, print)
+    let mut cursor = node.filteredChildren(&filter)
+    while let Option.Some { value: child } = cursor.next(&filter) {
+      run pending.append(child)
+    }
+  }
+  let mut i: usize = 0
+  while i < sent.bucketCount() {
+    if sent.occupiedAt(i) {
+      let id = sent.keyAt(i)
+      if !now.contains(id) {
+        run sink.removeNode(id)
+      }
+    }
+    i = i + 1
+  }
+  run sink.setRoot(elementId(&root))
+  let focus: Option<u64> = match state.focusNode() {
+    Option.Some { value } => if included(&value) || value.isRoot() {
+      Option.Some { value: elementId(&value) }
+    } else {
+      Option.None
+    }
+    Option.None => Option.None
+  }
+  run sink.setFocus(focus)
+  sent.* = move now
+}
+
+effect fn raise<S: Sink>(sink: &mut S, events: List<WinEvent>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut rest = move events
+  let mut ordered = List<WinEvent>.make()
+  while let Option.Some { value } = rest.pop() {
+    run ordered.append(move value)
+  }
+  while let Option.Some { value } = ordered.pop() {
+    match move value {
+      WinEvent.Simple { id, event } => run sink.raiseEvent(id, event)
+      WinEvent.PropertyChanged { id, property, old, new } => run sink.raiseProperty(
+        id,
+        property,
+        &old,
+        &new,
+      )
+    }
+  }
+}
+
+impl<S: Sink> Adapter<S> {
+  /// An adapter that shows `initial` through `sink`. `focused` tells whether the window has
+  /// keyboard focus.
+  pub effect fn make(sink: S, initial: TreeUpdate, focused: bool) -> Adapter<S>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let tree = run Tree.make(move initial, focused)
+    let mut adapter = Adapter {
+      sink: move sink,
+      tree: move tree,
+      sent: HashMap<u64, u64>.make(Hash.seed(9001)),
+      requests: List<ActionRequest>.make(),
+    }
+    run sync(&adapter.tree, &mut adapter.sink, &mut adapter.sent)
+    return move adapter
+  }
+
+  /// The tree as the adapter holds it.
+  pub fn state(self: &Self) -> &TreeState {
+    return self.tree.state()
+  }
+
+  /// Applies `update` and raises the events it causes.
+  pub effect fn update(self: &mut Self, update: TreeUpdate) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut generator = EventGenerator.make()
+    run self.tree.update(move update, &mut generator)
+    run sync(&self.tree, &mut self.sink, &mut self.sent)
+    let events = run generator.finish(self.tree.state())
+    run raise(&mut self.sink, move events)
+  }
+
+  /// Tells the adapter whether the window has keyboard focus.
+  pub effect fn updateWindowFocus(self: &mut Self, focused: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut generator = EventGenerator.make()
+    run self.tree.updateHostFocusState(focused, &mut generator)
+    run sync(&self.tree, &mut self.sink, &mut self.sent)
+    let events = run generator.finish(self.tree.state())
+    run raise(&mut self.sink, move events)
+  }
+
+  /// Turns the actions the UI Automation side queued into requests for [`takeRequests`].
+  pub effect fn pump(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    while let Option.Some { value } = run self.sink.poll() {
+      match run requestFor(self.tree.state(), move value) {
+        Option.Some { value: request } => run self.requests.append(move request)
+        Option.None => {}
+      }
+    }
+  }
+
+  /// The requests assistive technology made since the last call.
+  pub effect fn takeRequests(self: &mut Self) -> List<ActionRequest>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run self.requests.splitOff(0)
+  }
+
+  /// The sink, given back.
+  pub fn finish(self: Self) -> S {
+    let adapter = move self
+    return move adapter.sink
+  }
+}
+
+fn request(node: &NodeRef<'_>, action: Action, data: Option<ActionData>) -> Option<ActionRequest> {
+  return match node.treeState.locateNode(node.id) {
+    Option.Some { value } => Option.Some {
+      value: ActionRequest {
+        action: action,
+        targetTree: value.tree,
+        targetNode: value.local,
+        data: move data,
+      },
+    }
+    Option.None => Option.None
+  }
+}
+
+fn noData() -> Option<ActionData> {
+  return Option.None
+}
+
+/// The request for `action`, as AccessKit's providers make it, or none when the node cannot
+/// take it.
+pub effect fn requestFor(state: &TreeState, action: NativeAction) -> Option<ActionRequest>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let node = match state.nodeById(nodeIdOf(action.id)) {
+    Option.Some { value } => value
+    Option.None => {
+      return Option.None
+    }
+  }
+  let kind = action.kind
+  if kind == ACTION_SCROLL_INTO_VIEW() {
+    return request(&node, Action.ScrollIntoView, noData())
+  }
+  if kind == ACTION_SCROLL_TEXT() {
+    if !node.supportsTextRanges() {
+      return Option.None
+    }
+    let position = match node.textPositionFromGlobalUtf16Index(u32.toUsize(action.start)) {
+      Option.Some { value } => value
+      Option.None => {
+        return Option.None
+      }
+    }
+    let hint = if action.number != 0.0 {
+      ScrollHint.TopEdge
+    } else {
+      ScrollHint.BottomEdge
+    }
+    return request(
+      &position.innerNode(),
+      Action.ScrollIntoView,
+      Option.Some { value: ActionData.ScrollHint { value: hint } },
+    )
+  }
+  if node.isDisabled() {
+    return Option.None
+  }
+  if kind == ACTION_CLICK() {
+    return request(&node, Action.Click, noData())
+  }
+  if kind == ACTION_FOCUS() {
+    return request(&node, Action.Focus, noData())
+  }
+  if kind == ACTION_EXPAND() || kind == ACTION_COLLAPSE() {
+    let expand = kind == ACTION_EXPAND()
+    return match node.data().isExpanded() {
+      Option.Some { value } => if value == expand {
+        Option.None
+      } else {
+        request(
+          &node,
+          if expand {
+            Action.Expand
+          } else {
+            Action.Collapse
+          },
+          noData(),
+        )
+      }
+      Option.None => Option.None
+    }
+  }
+  if kind == ACTION_SET_TEXT() {
+    let text = move action.text
+    return request(
+      &node,
+      Action.SetValue,
+      Option.Some { value: ActionData.Value { value: move text } },
+    )
+  }
+  if kind == ACTION_SET_NUMBER() {
+    return request(
+      &node,
+      Action.SetValue,
+      Option.Some { value: ActionData.NumericValue { value: action.number } },
+    )
+  }
+  if kind == ACTION_SET_SELECTION() {
+    if !node.supportsTextRanges() {
+      return Option.None
+    }
+    let start = match node.textPositionFromGlobalUtf16Index(u32.toUsize(action.start)) {
+      Option.Some { value } => value
+      Option.None => {
+        return Option.None
+      }
+    }
+    let mut range = start.toDegenerateRange()
+    if action.end > action.start {
+      match node.textPositionFromGlobalUtf16Index(u32.toUsize(action.end)) {
+        Option.Some { value } => range.setEnd(value)
+        Option.None => {
+          return Option.None
+        }
+      }
+    }
+    return request(
+      &node,
+      Action.SetTextSelection,
+      Option.Some { value: ActionData.SetTextSelection { value: range.toTextSelection() } },
+    )
+  }
+  return Option.None
+}
