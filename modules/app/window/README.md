@@ -39,7 +39,7 @@ constrain their content to the available window space.
 Give an image its own dimensions, semantics and interaction handlers:
 
 ```silk
-ui.imageWith(photo, |ui| {
+ui.imageWith("photos/cover.png", |ui| {
   ui.width(px(320.0))
   ui.height(px(180.0))
   ui.label("Project cover")
@@ -48,36 +48,29 @@ ui.imageWith(photo, |ui| {
     ui.alloc(css.objectPosition(percent(50.0), percent(25.0))),
   ])
   ui.onClick(|| Message.OpenCover)
+  ui.onError(|| Message.CoverMissing)
 })
 ```
 
 `ObjectFit` supports Fill, Contain, Cover, None and ScaleDown. Position percentages refer to
 the space left over after fitting, including negative space for a crop. Rounded clipping
-uses the image's content box independently of its sampling rectangle. `ui.image(id)` remains
+uses the image's content box independently of its sampling rectangle. `ui.image(url)` remains
 the unstyled convenience form; `ui.iconWith` gives icons the same styling body.
 
-For embedded bytes, register `Batch.image(id, bytes)`. For files and HTTP(S) URLs, own an
-`images.Images` manager in your model or window content:
+A picture is named by URL, and the window loads each URL once, by its scheme:
 
-```silk
-run images.file(photo, "assets/cover.png")
-// Or: run images.url(photo, "https://example.org/cover.png")
-```
+- a relative URL (`"photos/cover.png"`) is one of the app's own files: one the program carries,
+  given with `window.file("photos/cover.png", Source.read("assets/photos/cover.png"))`, or else
+  the file at that path from the working directory;
+- `file:` reads a local file and `https:` or `http:` fetches, both on at most two native workers
+  (`ui-tree-window.images`); requests have a 15-second deadline and a 16 MiB body limit;
+- `data:` holds the bytes in the URL, base64 or percent-encoded.
 
-File paths resolve relative to the working directory at submission. Reading and decoding
-run on at most two native workers. Call `images.poll(tree)` from `WindowContent.poll`,
-render the app when it returns true, and return a short `wakeAfter` while `images.pending()`.
-A model-owned manager lets `view` inspect `images.state(photo)` directly for a placeholder
-or error message. States are Empty, Loading, Ready, Failed and Cancelled; `error` distinguishes
-file, network, HTTP status, decoding, size and worker-start failures.
-
-Replacement preserves the current image until the new decode succeeds and prevents stale
-workers from publishing. `cancel(id)` cancels publication; `release(tree, id)` also releases
-decoded pixels and its atlas tile. Cancelled blocking OS operations finish on their worker;
-keep polling until they finish. HTTP requests have a 15-second deadline and 16 MiB encoded
-body limit. Dropping a manager joins any remaining workers. For synchronous resources,
-`Batch.releaseResource` releases images or icons; destroying a view does not release a shared
-resource automatically. `UiTree.imageTile` provides managed atlas access for custom drawing.
+Until it loads, the node shows nothing. `ui.onLoad` and `ui.onError` hear how it ended, as DOM
+`load` and `error` do; a node that shows a URL after it loaded hears `load` too. The loader is
+`ui-tree-window.loader.Loader`, which the app host serves after every update; another host
+of a `UiTree` calls `loader.serve(tree)` the same way. `UiTree.imageTile` provides managed atlas
+access for custom drawing.
 
 Run the image-loading HTTP integration tests from the repository root with
 `silk task native http-test` (`--compiler PATH` and `--clang PATH` select toolchain binaries).
