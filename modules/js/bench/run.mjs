@@ -4,11 +4,12 @@
 // under Xvfb, and xdotool sends the clicks. See README.md for the method and what each
 // number means.
 //
-//   node run.mjs [--runs N] [--only name,name] [--json out.json] [--markdown out.md]
+//   node run.mjs [--runs N] [--cold-runs N] [--only name,name] [--json out.json] [--markdown out.md]
 //
 // Build the targets first (README.md). A target whose files are missing is skipped.
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, readFileSync, readdirSync, statSync, writeFileSync, lstatSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync, lstatSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { gzipSync } from "node:zlib";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,6 +25,7 @@ function option(name, fallback) {
   return i >= 0 ? args[i + 1] : fallback;
 }
 const RUNS = Number(option("--runs", "5"));
+const COLD_RUNS = Number(option("--cold-runs", "5"));
 const ONLY = option("--only", "")?.split(",").filter(Boolean) ?? [];
 const JSON_OUT = option("--json", "");
 const MD_OUT = option("--markdown", "");
@@ -57,6 +59,7 @@ const targets = [
     args: [silkBundle],
     cwd: repo,
     env: { SILK_UI_TRACE_FRAMES: "1" },
+    gpuCache: true,
     title: "JavaScript on the tree",
     ships: [["binary", silkBuild("production", "ui-js-demo")], ["bundle", silkBundle], ["@silk/ui", join(repo, "modules/js/packages/ui/src/index.js")]],
     debugBinary: silkBuild("debug", "ui-js-demo"),
@@ -106,6 +109,7 @@ const targets = [
     args: [],
     cwd: repo,
     env: { SILK_UI_TRACE_FRAMES: "1" },
+    gpuCache: true,
     title: "Tree counter",
     // No JavaScript: the first frame is the first one presented.
     firstFrame: /^silk-ui: frame 1 presented/,
@@ -367,10 +371,10 @@ async function windowOf(title) {
 
 // ---------------------------------------------------------------- one run
 
-async function measure(target, cold) {
+async function measure(target, cold, env = {}) {
   const result = { cold };
   if (cold) result.evicted = evict(target);
-  const app = launch(target, {});
+  const app = launch(target, env);
   const first = await app.wait(target.firstFrame ?? /^bench: first frame/);
   if (!first) {
     await app.stop();
@@ -484,7 +488,7 @@ function sizes(target) {
 async function main() {
   const display = startDisplay();
   await sleep(1500);
-  const report = { date: new Date().toISOString(), host: hostInfo(), runs: RUNS, targets: [] };
+  const report = { date: new Date().toISOString(), host: hostInfo(), runs: RUNS, coldRuns: COLD_RUNS, targets: [] };
   try {
     for (const target of targets) {
       if (ONLY.length && !ONLY.includes(target.name)) continue;
@@ -493,13 +497,28 @@ async function main() {
         continue;
       }
       console.error(`measuring ${target.name}`);
-      const runs = [];
-      for (let i = 0; i <= RUNS; i++) {
-        runs.push(await measure(target, i === 0));
+      // Cold runs first, each after dropping the page cache, then the warm ones.
+      const cold = [];
+      for (let i = 0; i < COLD_RUNS; i++) {
+        cold.push(await measure(target, true));
+        process.stderr.write("c");
+      }
+      // A first launch: cold, and the window host's GPU cache (translated shaders, pipelines)
+      // empty. Mesa's own shader cache stays.
+      const first = [];
+      for (let i = 0; target.gpuCache && i < COLD_RUNS; i++) {
+        const empty = mkdtempSync(join(tmpdir(), "silk-ui-gpu-"));
+        first.push(await measure(target, true, { SILK_UI_GPU_CACHE: empty }));
+        rmSync(empty, { recursive: true, force: true });
+        process.stderr.write("f");
+      }
+      const warm = [];
+      for (let i = 0; i < RUNS; i++) {
+        warm.push(await measure(target, false));
         process.stderr.write(".");
       }
       process.stderr.write("\n");
-      report.targets.push({ name: target.name, label: target.label, sizes: sizes(target), cold: runs[0], warm: summarize(runs.slice(1)) });
+      report.targets.push({ name: target.name, label: target.label, sizes: sizes(target), cold: { ...summarize(cold), evicted: cold[0]?.evicted, runs: cold.map((r) => r.firstFrameJs) }, first: first.length ? summarize(first) : null, warm: summarize(warm) });
     }
   } finally {
     display?.kill();
@@ -537,7 +556,7 @@ function table(report) {
   const head = (cells) => `| ${cells.join(" | ")} |\n|${cells.map(() => "---").join("|")}|`;
   const line = (cells) => `| ${cells.join(" | ")} |`;
   const evicted = rows[0]?.cold.evicted === "system" ? "the whole page cache dropped" : "the app's files dropped from the page cache";
-  let out = `Measured ${report.date.slice(0, 16)}Z on ${report.host.cpu} (${report.host.cores} cores), ${report.runs} warm runs + 1 cold (${evicted}), medians.\n\n`;
+  let out = `Measured ${report.date.slice(0, 16)}Z on ${report.host.cpu} (${report.host.cores} cores), ${report.runs} warm runs + ${report.coldRuns} cold (${evicted} before each), medians.\n\n`;
   out += "Size (MB)\n\n";
   out += head(["", "shipped", "gzip", "binary", "stripped", "debug binary", "JS bundle (gzip)", "system libs"]) + "\n";
   for (const t of rows) {
@@ -545,9 +564,9 @@ function table(report) {
     out += line([t.label, MB(s.shipped), MB(s.gzip), MB(s.binary), MB(s.stripped), MB(s.debug), s.bundle ? `${MB(s.bundle)} (${MB(s.bundleGzip)})` : "", MB(s.system)]) + "\n";
   }
   out += "\nStartup and input (ms)\n\n";
-  out += head(["", "cold first frame", "warm first frame", "warm first frame presented", "click to frame", "click to presented", "1000 rows to frame"]) + "\n";
+  out += head(["", "first launch first frame", "cold first frame", "warm first frame", "warm first frame presented", "click to frame", "click to presented", "1000 rows to frame"]) + "\n";
   for (const t of rows) {
-    out += line([t.label, MS(t.cold.firstFrameJs), MS(t.warm.firstFrameJs), MS(t.warm.firstFramePresented), MS(t.warm.clickToFrameJs), MS(t.warm.clickToPresent), MS(t.warm.rowsToFrameJs)]) + "\n";
+    out += line([t.label, MS(t.first?.firstFrameJs), MS(t.cold.firstFrameJs), MS(t.warm.firstFrameJs), MS(t.warm.firstFramePresented), MS(t.warm.clickToFrameJs), MS(t.warm.clickToPresent), MS(t.warm.rowsToFrameJs)]) + "\n";
   }
   const traced = rows.filter((t) => t.warm["phases.windowOpen"] != null);
   if (traced.length) {

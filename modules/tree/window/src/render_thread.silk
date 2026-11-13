@@ -203,6 +203,8 @@ struct SurfaceAnswer {
 impl Copy for SurfaceAnswer {}
 
 struct State {
+  /// The first window's surface, once it has one (see [`RenderThread.prepare`]).
+  surface: Option<SurfaceHandle>,
   job: Option<FrameJob>,
   /// The atlas pixels every frame handed over, oldest first, and the atlas's texture list as
   /// of the newest frame.
@@ -253,6 +255,18 @@ impl RenderThread {
   /// is ready. Fails with the thread's error when the surface or device cannot be made.
   pub effect fn start(raw: RawSurface, window: WindowId, settings: RenderSettings) -> RenderThread
     ! GpuError | OutOfMemoryError {
+    let mut thread = run RenderThread.prepare(settings, String.make())
+    run thread.attach(raw, window)
+    return move thread
+  }
+
+  /// Starts the render thread before there is a window. It makes the GPU device and the
+  /// renderer's pipelines while the caller opens the window and builds its first frame, which
+  /// is most of a window's startup; [`RenderThread.attach`] then hands it the window's surface.
+  /// With a `cache` directory, the device keeps its translated shaders and pipelines there,
+  /// which makes the pipelines of later runs faster.
+  pub effect fn prepare(settings: RenderSettings, cache: String) -> RenderThread
+    ! GpuError | OutOfMemoryError {
     let mut heap = Allocator.systemAllocatorProvider()
     let shared = run makeShared() |> Effect.provideMut<Allocator>(&mut heap)
     let parker = run Parker.make() |> Effect.provideMut<Allocator>(&mut heap)
@@ -260,15 +274,14 @@ impl RenderThread {
     let wake = theirParker.unparker()
     let wakeUi = parker.unparker()
     let theirs = shared.clone()
-    let surface = SurfaceHandle { raw: raw, window: window }
     let spawned = run Effect.result(
       NativeThread.spawn(
         fn() -> i32 {
           let shared = move theirs
-          let surface = move surface
           let parker = move theirParker
           let wakeUi = move wakeUi
-          return renderMain(&surface, &shared, &parker, &wakeUi, settings)
+          let cache = move cache
+          return renderMain(&shared, &parker, &wakeUi, settings, String.view(&cache))
         },
       ),
     )
@@ -292,8 +305,17 @@ impl RenderThread {
       handle: Option<JoinHandle<i32>>.some(move handle),
       nextSurface: 1,
     }
-    run thread.waitReady()
     return move thread
+  }
+
+  /// Gives a thread from [`RenderThread.prepare`] the surface `raw` of `window`, then waits until
+  /// the surface is set up. Fails with the thread's error when the surface or device cannot be
+  /// made.
+  pub effect fn attach(self: &mut Self, raw: RawSurface, window: WindowId) -> ()
+    ! GpuError {
+    giveSurface(&self.shared, SurfaceHandle { raw: raw, window: window })
+    self.wake.unpark()
+    run self.waitReady()
   }
 
   /// The surface's texture format, chosen by the render thread.
@@ -634,6 +656,7 @@ effect fn makeShared() -> Arc<Mutex<State>>
   ! OutOfMemoryError
   ? &mut Allocator {
   let state = State {
+    surface: Option<SurfaceHandle>.None,
     job: Option<FrameJob>.None,
     uploads: Pending.make(),
     textures: List<TextureInfo>.make(),
@@ -661,14 +684,14 @@ effect fn makeShared() -> Arc<Mutex<State>>
 
 /// The thread's body: runs the loop and passes its error, if any, to the UI thread.
 fn renderMain(
-  surface: &SurfaceHandle,
   shared: &Arc<Mutex<State>>,
   parker: &Parker,
   wakeUi: &Unparker,
   settings: RenderSettings,
+  cache: string,
 ) -> i32 {
   let mut heap = Allocator.systemAllocatorProvider()
-  let result = run Effect.result(renderLoop(surface, shared, parker, wakeUi, settings))
+  let result = run Effect.result(renderLoop(shared, parker, wakeUi, settings, cache))
     |> Effect.provideMut<Allocator>(&mut heap)
   let failure = match move result {
     Result.Success { value } => {
@@ -936,6 +959,30 @@ effect fn newerScrolls(shared: &Arc<Mutex<State>>, out: &mut List<ScrollPosition
   run out.appendSlice(guard.get().newer.asSlice())
 }
 
+fn giveSurface(shared: &Arc<Mutex<State>>, surface: SurfaceHandle) -> () {
+  let mut guard = shared.get().lock()
+  let state = guard.getMut()
+  state.surface = Option<SurfaceHandle>.some(move surface)
+}
+
+/// Waits for the first window's surface; None when the thread is told to quit first.
+fn awaitSurface(shared: &Arc<Mutex<State>>, parker: &Parker) -> Option<SurfaceHandle> {
+  while true {
+    let mut guard = shared.get().lock()
+    let state = guard.getMut()
+    if state.quit {
+      return Option<SurfaceHandle>.None
+    }
+    let taken = Intrinsic.replace(state.surface, Option<SurfaceHandle>.None)
+    drop guard
+    if Option<SurfaceHandle>.isSome(&taken) {
+      return move taken
+    }
+    parker.park()
+  }
+  return Option<SurfaceHandle>.None
+}
+
 fn markReady(shared: &Arc<Mutex<State>>, format: u32) -> () {
   let mut guard = shared.get().lock()
   let values = guard.getMut()
@@ -1003,15 +1050,31 @@ effect fn seconds(clock: &mut Clock) -> f64 {
 }
 
 effect fn renderLoop(
-  surface: &SurfaceHandle,
   shared: &Arc<Mutex<State>>,
   parker: &Parker,
   wakeUi: &Unparker,
   settings: RenderSettings,
+  cache: string,
 ) -> ()
   ! GpuError | OutOfMemoryError
   ? &mut Allocator {
   let mut clock = Clock.make()
+  // The device and the pipelines come first, before the window exists: they take most of the
+  // startup, and need no surface. The pipelines are made for BGRA8, the format almost every
+  // surface offers, and again below if this one does not.
+  let instance = run Instance.create()
+  let deviceOptions = DeviceDescriptor.cachedIn(String.utf8Bytes(cache))
+  let mut adapter = run instance.requestAdapter(&RequestAdapterOptions.default())
+  let mut device = run adapter.requestDevice(&deviceOptions)
+  let mut queue = run getQueue(&device)
+  let mut renderer = run UiRenderer.make(&device, flags.WGPUTextureFormat_BGRA8Unorm)
+
+  let surface = match move awaitSurface(shared, parker) {
+    Option<SurfaceHandle>.Some { value } => move value
+    Option<SurfaceHandle>.None => {
+      return ()
+    }
+  }
   let owner = surface.window
   let target = match unsafe targetOf(&owner, surface.raw) {
     Option<SurfaceTarget>.Some { value } => move value
@@ -1020,18 +1083,29 @@ effect fn renderLoop(
       fail GpuError.status(0)
     }
   }
-  let instance = run Instance.create()
   let gpuSurface = run Surface.create(&instance, &target, String.utf8Bytes("ui tree"))
-  let adapter = run instance.requestAdapter(&RequestAdapterOptions.forSurface(&gpuSurface))
-  let capabilities = run gpuSurface.getCapabilities(&adapter)
+  // An adapter picked without the surface may not present to it (a second GPU); then the
+  // surface picks the adapter, as it did before the window existed.
+  let probed = run Effect.result(gpuSurface.getCapabilities(&adapter))
+  let capabilities = match move probed {
+    Result.Success { value } => move value
+    Result.Failure { error } => {
+      drop error
+      adapter = run instance.requestAdapter(&RequestAdapterOptions.forSurface(&gpuSurface))
+      device = run adapter.requestDevice(&deviceOptions)
+      queue = run getQueue(&device)
+      renderer = run UiRenderer.make(&device, flags.WGPUTextureFormat_BGRA8Unorm)
+      run gpuSurface.getCapabilities(&adapter)
+    }
+  }
   let format = pickFormat(capabilities.formats())
   if format == 0 {
     StderrWriter.print("ui-tree: the surface offers neither BGRA8 nor RGBA8 unorm\n", &())
     fail GpuError.status(0)
   }
-  let device = run adapter.requestDevice(&DeviceDescriptor.default())
-  let queue = run getQueue(&device)
-  let mut renderer = run UiRenderer.make(&device, format)
+  if format != flags.WGPUTextureFormat_BGRA8Unorm {
+    renderer = run UiRenderer.make(&device, format)
+  }
   let mut textures = GpuAtlas.make()
   let mut configuration = SurfaceConfiguration.make(&device, format, 1, 1)
   if settings.check {
