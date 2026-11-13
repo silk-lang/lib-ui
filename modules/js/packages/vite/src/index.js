@@ -10,6 +10,7 @@
 import { spawn } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { missingApis, ownerOf, report } from "./apis.js";
 import { devPlugins } from "./dev.js";
 
 /**
@@ -24,6 +25,9 @@ import { devPlugins } from "./dev.js";
  * @param {boolean} [options.refresh] React Fast Refresh under the dev server. Default true.
  * @param {number} [options.port] Port the dev server listens on for the host. Default: any
  *   free one.
+ * @param {"warn" | "error" | "off"} [options.apis] What to do when the application or one
+ *   of its libraries uses a web or Node API a ui-js runtime does not have. Default `warn`.
+ * @param {string[]} [options.allow] Such APIs the application provides itself.
  */
 export default function silk(options = {}) {
   const entry = options.entry ?? "src/main.jsx";
@@ -74,5 +78,54 @@ export default function silk(options = {}) {
       if (watching && options.host && child === null) startHost();
     },
   };
-  return [buildPlugin, ...devPlugins({ entry, jsx, refresh: options.refresh ?? true, port: options.port ?? 0, host: options.host })];
+  const apis = options.apis ?? "warn";
+  const allow = new Set(options.allow ?? []);
+  let root = "";
+  let serving = false;
+  /** name → { area, owners } */
+  const uses = new Map();
+  const apiPlugin = {
+    name: "silk:apis",
+    enforce: "post",
+
+    configResolved(config) {
+      root = config.root;
+      serving = config.command === "serve";
+    },
+
+    buildStart() {
+      uses.clear();
+    },
+
+    // After the other transforms, so what is scanned is JavaScript.
+    transform(code, id) {
+      if (apis === "off" || id.startsWith("\0")) return;
+      if (serving && this.environment.name !== "silk") return;
+      if (!/\.[cm]?[jt]sx?$/.test(id.split("?")[0])) return;
+      let ast;
+      try {
+        ast = this.parse(code);
+      } catch {
+        return;
+      }
+      const owner = ownerOf(id, root);
+      for (const { name, area } of missingApis(ast)) {
+        if (allow.has(name)) continue;
+        let use = uses.get(name);
+        if (!use) uses.set(name, (use = { area, owners: new Set() }));
+        if (use.owners.has(owner)) continue;
+        use.owners.add(owner);
+        // The dev server has no end to report at: say it when the module is first served.
+        if (serving) this.warn(`${name} (${area}) is not in a ui-js runtime, and ${owner} uses it`);
+      }
+    },
+
+    buildEnd(error) {
+      if (error || serving || uses.size === 0) return;
+      if (apis === "error") this.error(report(uses));
+      this.warn(report(uses));
+    },
+  };
+
+  return [buildPlugin, apiPlugin, ...devPlugins({ entry, jsx, refresh: options.refresh ?? true, port: options.port ?? 0, host: options.host })];
 }

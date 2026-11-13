@@ -18,6 +18,8 @@ export default defineConfig({ plugins: [silk()] });
 | `host` | none | `{ command, args, cwd }`: a host binary to start, given `--dev <port>` under the dev server and `--watch <bundle>` in watch mode |
 | `refresh` | `true` | React Fast Refresh under the dev server |
 | `port` | any free one | Port the dev server listens on for the host |
+| `apis` | `warn` | What to do when the build uses a web or Node API a ui-js runtime does not have: `warn`, `error` or `off` |
+| `allow` | none | Names of such APIs the application provides itself |
 
 - `vite build` makes the production bundle.
 - `vite` serves the modules to the host and replaces the ones an edit touches. Component
