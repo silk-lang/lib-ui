@@ -8,9 +8,13 @@ hands their requests back as [`ActionRequest`](src/update.silk)s.
 | Package | AccessKit crate | What it holds |
 | --- | --- | --- |
 | `accesskit` (this directory) | `accesskit` | The schema: nodes, roles, actions, geometry, updates |
+| `accesskit-consumer` ([consumer](consumer)) | `accesskit_consumer` | The tree adapters keep: applies updates, reports changes, filters, navigation, text ranges |
 
-More packages (the consumer tree and the macOS, Windows and Linux adapters) follow in this
-directory.
+The macOS, Windows and Linux adapters follow in this directory.
+
+The consumer differs from the Rust crate where Silk has no equivalent: filters are values of a
+`NodeFilter` interface instead of closures, iterators are `FilteredCursor`s or fill a `List`, and
+functions that build strings take an `Allocator` effect (`label()`, `Range.text()`).
 
 Names follow Silk style: `set_label` is `setLabel`, `Node::new` is `Node.make`, and because `role`
 is a Silk keyword, `role()` and `set_role` are `accessRole()` and `setAccessRole`. Associated
