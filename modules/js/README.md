@@ -184,11 +184,18 @@ the same code path as production, so it is the mode to check a bundle in.
 For the React example, from `modules/js/examples/react-counter`:
 
 ```sh
-silk build --manifest-path ../../demo/silk.toml
-export SILK_UI_HOST=$PWD/../../../../build/llvm/<target>/debug/ui-js-demo
+silk build --manifest-path ../../demo/silk.toml --profile dev
+export SILK_UI_HOST=$PWD/../../../../build/llvm/<target>/dev/ui-js-demo
 npm run dev     # dev server, Fast Refresh
 npm run watch   # rebuild and reload
 ```
+
+The `dev` profile is the development host with optimizations on. Use it for JavaScript
+work: in a plain debug build the engine itself is unoptimized, and JavaScript runs tens of
+times slower (the starter page's motion drops well under 60 frames a second there).
+`ui-js-bench-frames <bundle>`
+([bench/frames](bench/frames)) prints what a frame of an application costs in JavaScript,
+in applying its mutations and in the tree, without a window.
 
 ## The host
 

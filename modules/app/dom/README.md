@@ -5,6 +5,9 @@ real DOM nodes, or written out as markup. The browser does layout, text, focus a
 
 - `src/dom.silk`: `Dom`, a `Backend`. Each render's mutations are encoded into one buffer
   (`src/wire.silk`) and handed to the page; events come back one record at a time.
+- `src/templates.silk`: repeated subtrees. A subtree like one the page already made (a row of
+  a list) is sent as a copy of it with the texts that differ, and the page makes it with one
+  `cloneNode` in place of a call per node and attribute.
 - `src/page.silk`: `open` and `call`, the two functions a program exports.
 - `src/html.silk`: `Html`, a `Backend` that keeps the document as text, and `render`, which
   renders a program at a path to markup: for a server, or a static build.
