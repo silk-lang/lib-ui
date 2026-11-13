@@ -212,6 +212,30 @@ def unzip(name, member, destination):
             shutil.copyfileobj(data, out)
 
 
+def llvm_ar(clang=None):
+    """Finds llvm-ar beside Clang or on PATH."""
+    clang = clang or os.environ.get("SILK_CLANG") or shutil.which("clang")
+    if clang:
+        tools = Path(clang).parent
+        for tool in (tools / "llvm-ar.exe", tools / "llvm-ar"):
+            if tool.is_file():
+                return str(tool)
+    archiver = shutil.which("llvm-ar")
+    if not archiver:
+        raise SystemExit("ghostty-vt needs llvm-ar on Windows (beside SILK_CLANG or on PATH)")
+    return archiver
+
+
+def without_compiler_rt(library):
+    """Takes Zig's compiler_rt out of the Windows library (see native/windows.c)."""
+    archiver = llvm_ar()
+    members = subprocess.run([archiver, "t", str(library)], check=True, capture_output=True,
+                             text=True).stdout.splitlines()
+    for member in members:
+        if member.replace("\\", "/").rsplit("/", 1)[-1] == "compiler_rt.obj":
+            subprocess.run([archiver, "d", str(library), member], check=True)
+
+
 def bridge():
     """Compiles the C bridge into native/build/lib/ghostty-bridge.lib, for Windows.
 
@@ -221,15 +245,11 @@ def bridge():
     clang = os.environ.get("SILK_CLANG") or shutil.which("clang")
     if not clang:
         raise SystemExit("ghostty-vt needs Clang to compile its bridge on Windows (set SILK_CLANG)")
-    tools = Path(clang).parent
-    archiver = next((str(tool) for tool in (tools / "llvm-ar.exe", tools / "llvm-ar") if tool.is_file()),
-                    shutil.which("llvm-ar") or shutil.which("lib"))
-    if not archiver:
-        raise SystemExit("ghostty-vt needs llvm-ar or lib to archive its bridge on Windows")
+    archiver = llvm_ar(clang)
     output = BUILD / "lib" / "ghostty-bridge.lib"
     output.parent.mkdir(parents=True, exist_ok=True)
     objects = []
-    for name in ("bridge", "input"):
+    for name in ("bridge", "input", "windows"):
         source = PACKAGE / "native" / f"{name}.c"
         target = BUILD / "lib" / f"{name}.obj"
         subprocess.run([clang, "-c", str(source), "-o", str(target), "-std=c11", "-O2", "-Wall",
@@ -237,10 +257,7 @@ def bridge():
         objects.append(str(target))
     if output.exists():
         output.unlink()
-    if Path(archiver).stem.lower() == "lib":
-        subprocess.run([archiver, "/nologo", f"/out:{output}", *objects], check=True)
-    else:
-        subprocess.run([archiver, "rcs", str(output), *objects], check=True)
+    subprocess.run([archiver, "rcs", str(output), *objects], check=True)
     print(f"Prepared: {output}")
 
 
@@ -258,6 +275,8 @@ def prepare(target):
         library = BUILD / "lib" / "libghostty-vt.a"
     stamp = library.parent / "prepared.json"
     identity = {"version": VERSION, "target": target, "os": system, "arch": machine}
+    if system == "Windows" and target == "host":
+        identity["compiler_rt"] = "removed"
     if target == "wasm32":
         # A change to the patch builds again.
         patch = HOST_HEAP + repr(SHARE_HEAP)
@@ -274,6 +293,7 @@ def prepare(target):
         arch = "aarch64" if machine in ("arm64", "aarch64") else "x86_64"
         name = f"ghostty-vt-{VERSION}-{arch}-windows-gnu"
         unzip(f"{name}.zip", f"{name}/lib/ghostty-vt-static.lib", library)
+        without_compiler_rt(library)
     else:
         raise SystemExit(f"ghostty-vt has no libghostty-vt for {system}")
     stamp.write_text(json.dumps(identity, indent=2) + "\n")
