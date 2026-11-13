@@ -33,7 +33,8 @@ mount(createBox({ width: 400, height: 300 }, button));
   its subtree. `mount(node)` makes a node the root.
 - **Style.** `node.style.set({ ... })` sets properties by their camel case names. Numbers are
   CSS pixels, except for unitless properties such as `opacity` and `flexGrow`. `null` takes a
-  property out. `node.look("hover")` (also `active`, `focus`, `focusVisible`) is the look the
+  property out. `fontFamily` takes CSS `font-family` text (`"monospace"`, `"Noto Sans, sans-serif"`),
+  resolved in the host's font collection. `node.look("hover")` (also `active`, `focus`, `focusVisible`) is the look the
   tree lays over the base in that state.
 - **Events.** `addEventListener(type, listener, options)` with `capture` and `once`. An event
   runs the capture phase from the root down, the target, then bubbles, with
@@ -44,8 +45,11 @@ mount(createBox({ width: 400, height: 300 }, button));
   `value`.
 - **Attributes.** `setAttribute(name, value)` for the tree's attributes (`tabIndex`,
   `disabled`, `label`, `testId`, `placeholder`, `multiline`, `readOnly`, `checked`,
-  `selected`, `expanded`, `focusTrap`, `href`, `transition`). A name the tree does not have
-  throws a `TypeError`.
+  `selected`, `expanded`, `focusTrap`, `href`, `cursor`, `transition`). A name the tree does
+  not have throws a `TypeError`. `cursor` takes the CSS keywords (`pointer`, `text`, `grab`,
+  `not-allowed` and the resize ones).
+- **Links.** A node with an `href` is a link, as an `<a>` is: a click on it or inside it that
+  no listener prevented calls `open(href)`, which hands the address to the host.
 - **Errors.** A listener that throws does not stop the dispatch. `setErrorHandler` receives
   the exception. Without a handler the host reports the first one after the input.
 
@@ -89,8 +93,9 @@ createRoot().render(<Counter />);
 - **JSX.** Set the JSX import source to `@silk/ui-react`, or use React's own runtime: both
   work.
 
-[examples/react-counter](examples/react-counter) bundles a counter with Vite into one ES
-module. From `modules/js`, `npm ci && npm run build`, then from the repository root:
+[examples/react-counter](examples/react-counter) is a starter page in React (a logo, a
+counter, a controlled field, a light and dark theme and cards that open the documentation),
+bundled with Vite into one ES module. From `modules/js`, `npm ci && npm run build`, then from the repository root:
 
 ```sh
 silk run --manifest-path modules/js/demo/silk.toml modules/js/examples/react-counter/dist/app.js
@@ -205,7 +210,7 @@ Provide the `RuntimeAllocator` that `memory` observes as the `Allocator` of thes
   after each event it delivers, before the mutations reach the tree.
 - **Nodes.** JavaScript calls native functions on the global `__ui` (`create`, `append`,
   `insertBefore`, `remove`, `destroy`, `root`, `setText`, `listen`, `style`, `clearStyle`,
-  `attribute`, `focus`, `scrollTo`, `select`). Each call appends a mutation to one
+  `attribute`, `focus`, `scrollTo`, `select`, `fontFamily`). Each call appends a mutation to one
   ui-protocol batch and returns. `JsHost.flush` applies the batch to the tree. `style` takes
   CSS text and parses it with css-style, so every property the tree knows is available.
 - **Events.** `JsHost.input` runs one input: the tree queues its event records (`begin`), the
@@ -221,12 +226,15 @@ Provide the `RuntimeAllocator` that `memory` observes as the `Allocator` of thes
 
 Every realm starts with the globals of [src/prelude.js](src/prelude.js) on top of the
 engine's ECMAScript: `setTimeout`, `setInterval`, `requestAnimationFrame`, `queueMicrotask`,
-`performance.now`, `console` and `reportError`. They sit on native timer, clock, frame and
+`performance.now`, `console`, `reportError` and `open`. They sit on native timer, clock, frame and
 log functions, and the host decides what those mean:
 
 - `JsHost.tick(seconds, animation)` moves the clock, runs the timers that are due, and with
   `animation` the frame callbacks. `nextDeadline` and `wantsFrame` tell a loop when to wake.
 - `JsHost.takeLogs` hands over the console lines.
+- `JsHost.takeOpened` hands over the addresses `open(url)` asked for (http, https and mailto
+  only). The window opens them with `xdg-open` on Linux and `open` on macOS, without waiting
+  for it; other systems print that they could not.
 
 `silk task embed-assets` regenerates `src/generated_prelude.silk` after an edit to
 `prelude.js`.
@@ -245,7 +253,7 @@ from [window/dev](window/dev) (`ui-js-window-dev`): `DevTools.watch` for `--watc
 `DevTools.server` for the dev server. Only a client with `DevTools` serves the inspector
 (`WindowClient.servesInspector`).
 
-[demo](demo) is a counter in JavaScript:
+[demo](demo) is the starter page in plain JavaScript, the React example's twin:
 
 ```sh
 silk run --manifest-path modules/js/demo/silk.toml
