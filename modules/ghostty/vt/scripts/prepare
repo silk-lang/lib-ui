@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""Puts libghostty-vt 1.0.1 where ghostty-vt links it, in native/build/ (ignored by git).
+
+    python3 modules/ghostty/vt/scripts/prepare            # for this machine
+    python3 modules/ghostty/vt/scripts/prepare --wasm     # also for wasm32 (browser builds)
+
+macOS and Windows use the official prebuilt static libraries. Linux and wasm32 are built from
+the official source and dependency tarballs with Zig 0.17 (set ZIG to name the executable);
+the build is offline. Every download is checked against the SHA-256 the release publishes.
+"""
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import urllib.request
+import zipfile
+
+VERSION = "1.0.1"
+BASE = f"https://release.files.ghostty.org/libghostty-vt/{VERSION}"
+PACKAGE = Path(__file__).resolve().parents[1]
+BUILD = PACKAGE / "native" / "build"
+CACHE = BUILD / "downloads"
+
+
+# From the release's SHA256SUMS (minisign-signed by the Ghostty release key).
+PINNED = {
+    f"libghostty-vt-{VERSION}.tar.gz": "333dfce97641ef9b536bb9e08907ad86abaaada50e8f7417b70d9284adef37aa",
+    f"libghostty-vt-{VERSION}-deps.tar.gz": "91a4e10960a52bf5bf4b15aa2a2cddaff8a89d6cd903d3055bda4fd17de3356d",
+    f"ghostty-vt-{VERSION}.xcframework.zip": "c0f9631277f726154c8f521954d17cdc41aac4626fc0df8cf925a19ee58e829b",
+    f"ghostty-vt-{VERSION}-x86_64-windows-gnu.zip": "8e2eb9e1822e85d786b456c8beb86f49d09c318c91f0c2913f91e7ffa12cda29",
+    f"ghostty-vt-{VERSION}-aarch64-windows-gnu.zip": "cc61da5f968ea0b08639bdf019c6b7da46bad1d985774fd8a2de57af32862892",
+}
+
+
+def download(name):
+    CACHE.mkdir(parents=True, exist_ok=True)
+    path = CACHE / name
+    expected = PINNED[name]
+    if path.is_file() and digest(path) == expected:
+        return path
+    print(f"Downloading {BASE}/{name}", file=sys.stderr)
+    request = urllib.request.Request(f"{BASE}/{name}", headers={"User-Agent": "ghostty-vt-prepare"})
+    with urllib.request.urlopen(request) as response, open(path, "wb") as out:
+        shutil.copyfileobj(response, out)
+    actual = digest(path)
+    if actual != expected:
+        path.unlink()
+        raise SystemExit(f"SHA-256 mismatch for {name}: {actual}, expected {expected}")
+    return path
+
+
+def digest(path):
+    with open(path, "rb") as data:
+        return hashlib.file_digest(data, "sha256").hexdigest()
+
+
+def zig():
+    executable = os.environ.get("ZIG", "zig")
+    try:
+        version = subprocess.check_output([executable, "version"], text=True).strip()
+    except FileNotFoundError:
+        raise SystemExit("Zig 0.17 is needed to build libghostty-vt here (set ZIG to its path)")
+    if not version.startswith("0.17."):
+        raise SystemExit(f"libghostty-vt {VERSION} needs Zig 0.17; found {version}")
+    return executable
+
+
+def build(target, destination):
+    """Builds the static library from source with Zig, offline, into `destination`."""
+    executable = zig()
+    with tempfile.TemporaryDirectory(prefix="ghostty-vt-") as temporary:
+        work = Path(temporary)
+        for name in (f"libghostty-vt-{VERSION}.tar.gz", f"libghostty-vt-{VERSION}-deps.tar.gz"):
+            with tarfile.open(download(name)) as tar:
+                tar.extractall(work, filter="data")
+        command = [executable, "build", "-Demit-lib-vt", "--prefix", str(work / "out"),
+                   "--system", str(work / f"libghostty-vt-{VERSION}-deps")]
+        if target == "wasm32":
+            command += ["-Dtarget=wasm32-freestanding", "-Doptimize=ReleaseSmall"]
+        else:
+            command += ["-Doptimize=ReleaseFast", "-Dcpu=baseline"]
+        environment = dict(os.environ, ZIG_GLOBAL_CACHE_DIR=str(work / "cache"))
+        subprocess.run(command, cwd=work / f"libghostty-vt-{VERSION}", env=environment, check=True)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(work / "out" / "lib" / "libghostty-vt.a", destination)
+
+
+def unzip(name, member, destination):
+    with zipfile.ZipFile(download(name)) as zipped:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with zipped.open(member) as data, open(destination, "wb") as out:
+            shutil.copyfileobj(data, out)
+
+
+def prepare(target):
+    system = platform.system()
+    machine = platform.machine().lower()
+    if target == "wasm32":
+        library = BUILD / "wasm32" / "libghostty-vt.a"
+    elif system == "Windows":
+        library = BUILD / "lib" / "ghostty-vt-static.lib"
+    else:
+        library = BUILD / "lib" / "libghostty-vt.a"
+    stamp = library.parent / "prepared.json"
+    identity = {"version": VERSION, "target": target, "os": system, "arch": machine}
+    if library.is_file() and stamp.is_file() and json.loads(stamp.read_text()) == identity:
+        print(f"Already prepared: {library}")
+        return
+    if target == "wasm32" or system == "Linux":
+        build(target, library)
+    elif system == "Darwin":
+        unzip(f"ghostty-vt-{VERSION}.xcframework.zip",
+              "ghostty-vt.xcframework/macos-arm64_x86_64/libghostty-vt.a", library)
+    elif system == "Windows":
+        arch = "aarch64" if machine in ("arm64", "aarch64") else "x86_64"
+        name = f"ghostty-vt-{VERSION}-{arch}-windows-gnu"
+        unzip(f"{name}.zip", f"{name}/lib/ghostty-vt-static.lib", library)
+    else:
+        raise SystemExit(f"ghostty-vt has no libghostty-vt for {system}")
+    stamp.write_text(json.dumps(identity, indent=2) + "\n")
+    print(f"Prepared: {library}")
+
+
+def main():
+    targets = ["host"]
+    if "--wasm" in sys.argv[1:]:
+        targets.append("wasm32")
+    if "--wasm-only" in sys.argv[1:]:
+        targets = ["wasm32"]
+    for target in targets:
+        prepare(target)
+
+
+if __name__ == "__main__":
+    main()

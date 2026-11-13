@@ -1,0 +1,267 @@
+//! Integration tests against the prepared libghostty-vt.
+import silk.collections.slice { Slice }
+import terminal { Terminal, Snapshot, Cell, GhosttyError, Geometry, MouseEvent, MouseAction, Span, BOLD, INVERSE }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+type Failure = GhosttyError | AssertionError<'static>
+
+fn at<'a>(snapshot: &'a Snapshot, x: u32, y: u32) -> Cell<'a> {
+  return match snapshot.cell(x, y) {
+    Option<Cell<'a>>.Some { value } => value
+    Option<Cell<'a>>.None => Intrinsic.trap("test coordinate outside frame")
+  }
+}
+
+test effect fn streamingUnicodeAndStyle() -> ()
+  ! Failure {
+  let mut terminal = run Terminal.make(20, 4)
+  terminal.write(b"\x1b[1;38;2;10;")
+  terminal.write(b"20;30m\xc3")
+  terminal.write(b"\xa9\x1b[0me\xcc\x81")
+  terminal.writeText("界")
+  let frame = run terminal.snapshot()
+  let first = at(&frame, 0, 0)
+  run Testing.expect(first.text == "é" && first.foreground == 0x0a141e, "split UTF-8 and RGB SGR")
+  run Testing.expect((first.flags & BOLD) != 0, "bold is retained")
+  run Testing.expect(at(&frame, 1, 0).text == "é", "full combining grapheme")
+  run Testing.expect(
+    at(&frame, 2, 0).width == 2 && at(&frame, 3, 0).width == 0,
+    "wide glyph and spacer",
+  )
+  run Testing.expect(frame.cursor().column == 4, "cursor advances by cell width")
+  run Testing.expect(!terminal.hasProcessingError(), "valid input has no processing error")
+}
+
+test effect fn snapshotsOutliveTerminalAndMutations() -> ()
+  ! Failure {
+  let mut terminal = run Terminal.make(8, 2)
+  terminal.write(b"before")
+  let before = run terminal.snapshot()
+  terminal.write(b"\r\x1b[2Kafter")
+  let after = run terminal.snapshot()
+  drop terminal
+  run Testing.expect(at(&before, 0, 0).text == "b", "previous snapshot survives writes and free")
+  run Testing.expect(at(&after, 0, 0).text == "a", "new snapshot sees replacement")
+  run Testing.expect(
+    before.cell(8, 0).isNone() && before.cell(0, 2).isNone(),
+    "checked coordinates",
+  )
+}
+
+test effect fn alternateScreenResizeAndReset() -> ()
+  ! Failure {
+  let mut terminal = run Terminal.make(10, 3)
+  terminal.write(b"main\x1b[?1049h\x1b[H\x1b[7mALT\x1b[?25l")
+  let alternate = run terminal.snapshot()
+  run Testing.expect(at(&alternate, 0, 0).text == "A", "alternate screen")
+  run Testing.expect((at(&alternate, 0, 0).flags & INVERSE) != 0, "inverse flag")
+  run Testing.expect(!alternate.cursor().visible, "hidden cursor")
+  terminal.write(b"\x1b[?1049l")
+  run terminal.resize(16, 4, 9, 20)
+  let main = run terminal.snapshot()
+  run Testing.expect(main.columns() == 16 && main.rows() == 4, "resize dimensions")
+  run Testing.expect(at(&main, 0, 0).text == "m", "primary contents restored")
+  terminal.reset()
+  let empty = run terminal.snapshot()
+  run Testing.expect(
+    empty.columns() == 16 && at(&empty, 0, 0).text == "",
+    "reset clears and keeps size",
+  )
+}
+
+test effect fn scrollbackAndInvalidSizes() -> ()
+  ! Failure {
+  let invalid = run Effect.result(Terminal.make(0, 2))
+  run Testing.expect(
+    match move invalid {
+      Result<Terminal, GhosttyError>.Failure { error } => error.code == -2
+      Result<Terminal, GhosttyError>.Success { value } => {
+        drop value
+        false
+      }
+    },
+    "zero size rejected",
+  )
+  let mut terminal = run Terminal.make(8, 2)
+  terminal.write(b"one\r\ntwo\r\nthree")
+  run terminal.scroll(-100)
+  let top = run terminal.snapshot()
+  run Testing.expect(at(&top, 0, 0).text == "o", "scrollback viewport")
+  run terminal.scrollToBottom()
+  let bottom = run terminal.snapshot()
+  run Testing.expect(at(&bottom, 0, 0).text == "t", "live viewport")
+  let resized = run Effect.result(terminal.resize(0, 4, 0, 0))
+  run Testing.expect(
+    match move resized {
+      Result<(), GhosttyError>.Failure { error } => error.code == -2
+      Result<(), GhosttyError>.Success { value: _value } => false
+    },
+    "invalid resize rejected",
+  )
+  let unchanged = run terminal.snapshot()
+  run Testing.expect(unchanged.columns() == 8, "failed resize preserves dimensions")
+}
+
+test effect fn plainTextDropsAnsi() -> ()
+  ! Failure | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut terminal = run Terminal.make(20, 3)
+  terminal.write(b"Hello, \x1b[32mworld\x1b[0m!")
+  let text = run terminal.plainText() |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(text.view() == "Hello, world!", "formatter emits plain text without escapes")
+}
+
+fn bytesEqual(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < a.length {
+    if a[i] != b[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+test effect fn inputModesRepliesAndPaste() -> ()
+  ! Failure {
+  let mut terminal = run Terminal.make(80, 24)
+  let mut buffer: [u8; 128] = [0; 128]
+  let ctrl = run terminal.encodeKey("c", 2, &mut buffer)
+  run Testing.expect(ctrl == 1 && buffer[0] == 3, "Ctrl-C is ETX")
+  let enter = run terminal.encodeKey("Enter", 0, &mut buffer)
+  run Testing.expect(enter == 1 && buffer[0] == 13, "Enter is CR")
+  let arrow = run terminal.encodeKey("ArrowUp", 0, &mut buffer)
+  run Testing.expect(arrow == 3 && buffer[1] == 91, "normal cursor key uses CSI")
+  terminal.write(b"\x1b[?1h")
+  let application = run terminal.encodeKey("ArrowUp", 0, &mut buffer)
+  run Testing.expect(application == 3 && buffer[1] == 79, "application cursor key uses SS3")
+  terminal.write(b"\x1b[4;5H\x1b[6n")
+  let reply = run terminal.readReplies(&mut buffer)
+  run Testing.expect(
+    bytesEqual(Slice.view(&buffer, 0, reply), b"\x1b[4;5R"),
+    "DSR response is queued",
+  )
+  run Testing.expect((run terminal.readReplies(&mut buffer)) == 0, "reply queue drains once")
+  terminal.write(b"\x1b[?2004h")
+  let paste = run terminal.encodePaste("a\nb", &mut buffer)
+  run Testing.expect(
+    bytesEqual(Slice.view(&buffer, 0, paste), b"\x1b[200~a\nb\x1b[201~"),
+    "paste respects bracketed mode",
+  )
+}
+
+fn geometry() -> Geometry {
+  return Geometry { columns: 20, rows: 4, cellWidth: 10, cellHeight: 20 }
+}
+
+effect fn selected(terminal: &Terminal) -> String
+  ! Failure | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run terminal.selectedText() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn pointerSelectionByCellWordAndLine() -> ()
+  ! Failure | OutOfMemoryError {
+  let mut terminal = run Terminal.make(20, 4)
+  terminal.write(b"hello world\r\nsecond line")
+  run Testing.expect(!terminal.hasSelection(), "no selection at first")
+
+  // Press on "h" and drag to "o": a cell-wise selection, as a drag on a page selects text.
+  run terminal.selectionPress(0, 0, 2.0, 8.0, 1000000000)
+  run terminal.selectionDrag(4, 0, 46.0, 8.0, geometry(), false)
+  run terminal.selectionRelease()
+  let text = run selected(&terminal)
+  run Testing.expect(text.view() == "hello", "drag selects the cells it crosses")
+  let frame = run terminal.snapshot()
+  let span = frame.selection(0) |> Option<Span>.unwrapOr(Span { first: 99, last: 99 })
+  run Testing.expect(span.first == 0 && span.last == 4, "snapshot reports the row's selection")
+  run Testing.expect(frame.selection(1).isNone(), "rows outside the selection report none")
+
+  // A new single press clears it.
+  run terminal.selectionPress(8, 1, 82.0, 28.0, 3000000000)
+  run terminal.selectionRelease()
+  run Testing.expect(!terminal.hasSelection(), "a press clears the selection")
+
+  // Two quick presses select the word; three, the line.
+  run terminal.selectionPress(7, 0, 72.0, 8.0, 5000000000)
+  run terminal.selectionRelease()
+  run terminal.selectionPress(7, 0, 72.0, 8.0, 5100000000)
+  run terminal.selectionRelease()
+  let word = run selected(&terminal)
+  run Testing.expect(word.view() == "world", "double click selects the word")
+  run terminal.selectionPress(7, 0, 72.0, 8.0, 5200000000)
+  run terminal.selectionRelease()
+  let line = run selected(&terminal)
+  run Testing.expect(line.view() == "hello world", "triple click selects the line")
+
+  run terminal.selectAll()
+  let all = run selected(&terminal)
+  run Testing.expect(all.view() == "hello world\nsecond line", "select all")
+  run terminal.selectWord(0, 1)
+  let second = run selected(&terminal)
+  run Testing.expect(second.view() == "second", "select word")
+  run terminal.clearSelection()
+  let none = run selected(&terminal)
+  run Testing.expect(none.view() == "" && !terminal.hasSelection(), "clear selection")
+}
+
+test effect fn selectionFollowsScrolledContent() -> ()
+  ! Failure | OutOfMemoryError {
+  let mut terminal = run Terminal.make(10, 2)
+  terminal.write(b"alpha\r\nbeta\r\ngamma\r\ndelta")
+  run terminal.selectWord(0, 0)
+  let before = run selected(&terminal)
+  run Testing.expect(before.view() == "gamma", "word on the first viewport row")
+  terminal.write(b"\r\nepsilon")
+  let after = run selected(&terminal)
+  run Testing.expect(after.view() == "gamma", "the selection stays on its text as output scrolls")
+  let bar = terminal.scrollbar()
+  run Testing.expect(bar.total == 5 && bar.length == 2 && bar.offset == 3, "scrollbar at the bottom")
+  run Testing.expect(terminal.followsOutput(), "viewport follows output")
+  run terminal.scroll(-2)
+  run Testing.expect(terminal.scrollbar().offset == 1 && !terminal.followsOutput(), "scrolled up")
+  run terminal.scrollToTop()
+  run Testing.expect(terminal.scrollbar().offset == 0, "top of the scrollback")
+}
+
+test effect fn mouseReportsFocusAndTitle() -> ()
+  ! Failure {
+  let mut terminal = run Terminal.make(20, 4)
+  let mut buffer: [u8; 64] = [0; 64]
+  let press = MouseEvent {
+    action: MouseAction.Press,
+    button: 1,
+    modifiers: 0,
+    pressed: true,
+    x: 35.0,
+    y: 25.0,
+  }
+  run Testing.expect(!terminal.tracksMouse(), "no tracking by default")
+  run Testing.expect((run terminal.encodeMouse(press, geometry(), &mut buffer)) == 0, "no report")
+
+  // Normal tracking with SGR reports: column 4, row 2, one-based.
+  terminal.write(b"\x1b[?1000h\x1b[?1006h")
+  run Testing.expect(terminal.tracksMouse(), "tracking on")
+  let count = run terminal.encodeMouse(press, geometry(), &mut buffer)
+  run Testing.expect(bytesEqual(Slice.view(&buffer, 0, count), b"\x1b[<0;4;2M"), "SGR press")
+
+  run Testing.expect((run terminal.encodeFocus(true, &mut buffer)) == 0, "no focus reports by default")
+  terminal.write(b"\x1b[?1004h")
+  let focus = run terminal.encodeFocus(false, &mut buffer)
+  run Testing.expect(bytesEqual(Slice.view(&buffer, 0, focus), b"\x1b[O"), "focus lost report")
+
+  run Testing.expect(terminal.title() == "", "no title")
+  terminal.write(b"\x1b]2;make test\x07")
+  run Testing.expect(terminal.title() == "make test", "OSC 2 title")
+  run Testing.expect(!terminal.alternateScreen(), "primary screen")
+  terminal.write(b"\x1b[?1049h")
+  run Testing.expect(terminal.alternateScreen(), "alternate screen")
+}
