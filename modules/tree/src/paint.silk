@@ -12,6 +12,7 @@ import node { NONE, NO_INDEX, Node, FaceSlot, FrameStats, PaintCache }
 import resources { Resources, Resource }
 import scrollbar { thumbOf, Thumb, rangeOf, scrolls, usedOverflow }
 import layers
+import transform
 import layers { Sticky }
 import edit
 import ui_text.system { TextSystem }
@@ -48,6 +49,7 @@ import silk.core.option { Option }
 import silk.core.ownership { Copy }
 import silk.geometry.corners { Corners }
 import silk.geometry.insets { Insets }
+import silk.geometry.matrix { Matrix3 }
 import silk.geometry.rect { Rect }
 import silk.geometry.vector { Vector2 }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
@@ -1064,6 +1066,12 @@ pub effect fn inkFragments(
     } else {
       own
     }
+    match layers.flatOf(output, slots, nodes, index) {
+      Option.Some { value } => {
+        total = transform.mapRect(&value, total)
+      }
+      Option.None => {}
+    }
     if sticky {
       if let Option<Sticky>.Some { value } = layers.stickyOf(
         output,
@@ -1155,12 +1163,98 @@ pub effect fn paintFragment(p: &mut Painter<'_, '_>, index: usize, mask: Content
     drop run p.scene.pushScrollGroup(link, everywhere(), ink)
     let saved = p.cull
     p.cull = everywhere()
-    run paintFragmentIn(&mut p, index, mask)
+    run paintTransformed(&mut p, index, mask)
     p.cull = saved
     run p.scene.popScrollGroup()
     return ()
   }
-  run paintFragmentIn(&mut p, index, mask)
+  run paintTransformed(&mut p, index, mask)
+}
+
+/// The ink of fragment `index` and its descendants in its own layout space, before its
+/// transform: `p.ink` holds it mapped.
+fn localInk(p: &Painter<'_, '_>, index: usize) -> Rect<f32> {
+  let values = p.output.fragments.values.asSlice()
+  let mut total = ownInk(p.output, p.slotOfCss, p.css, &p.nodes.*, index)
+  let mut below = Rect<f32>.new(UNBOUNDED_INK, UNBOUNDED_INK, -UNBOUNDED_INK, -UNBOUNDED_INK)
+  let mut child = values[index].firstChild
+  while child != NO_INDEX {
+    if child < p.ink.length() {
+      below = unite(below, p.ink.get(child))
+    }
+    child = values[child].nextSibling
+  }
+  let slot = slotIn(p.slotOfCss, values[index].source)
+  if slot != NONE {
+    let c = &p.nodes.asSlice()[u32.toUsize(slot)].computed
+    if c.clips() {
+      let clip = overflowClip(c, &values[index])
+      below = Rect<f32>.new(
+        f32.max(below.xMin, clip.xMin),
+        f32.max(below.yMin, clip.yMin),
+        f32.min(below.xMax, clip.xMax),
+        f32.min(below.yMax, clip.yMax),
+      )
+    }
+  }
+  if below.xMax > below.xMin && below.yMax > below.yMin {
+    total = unite(total, below)
+  }
+  return total
+}
+
+/// Paints fragment `index` through its transform, if it has one: a plain move is a scroll group
+/// with a fixed offset, anything else a layer drawn through the matrix. Inside, the subtree
+/// paints in its own layout space with an unbounded mask, so its cached paint replays however
+/// the transform moves; `mask` clips where it lands.
+effect fn paintTransformed(p: &mut Painter<'_, '_>, index: usize, mask: ContentMask) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let found = layers.flatOf(p.output, p.slotOfCss, &p.nodes.*, index)
+  if found.isNone() {
+    run paintFragmentIn(&mut p, index, mask)
+    return ()
+  }
+  if layers.hiddenBack(p.output, p.slotOfCss, &p.nodes.*, index) {
+    return ()
+  }
+  let flat = found.unwrapOr(Matrix3<f32>.identity())
+  let s = p.scale
+  let saved = p.cull
+  if transform.translation(&flat) {
+    let dx = flat.values[6] * s
+    let dy = flat.values[7] * s
+    let fixed = ScrollAxis { factor: 0.0, base: 0.0, low: -UNBOUNDED_INK, high: UNBOUNDED_INK }
+    let mut x = fixed
+    x.base = dx
+    let mut y = fixed
+    y.base = dy
+    let ink = if index < p.ink.length() {
+      device(p.ink.get(index), s)
+    } else {
+      everywhere()
+    }
+    drop run p.scene.pushScrollGroup(ScrollLink { node: NONE, x: x, y: y }, mask.bounds, ink)
+    p.cull = Rect<f32>.new(saved.xMin - dx, saved.yMin - dy, saved.xMax - dx, saved.yMax - dy)
+    run paintFragmentIn(&mut p, index, ContentMask.new(everywhere()))
+    p.cull = saved
+    run p.scene.popScrollGroup()
+    return ()
+  }
+  // The matrix in device pixels: scale, map, then scale back.
+  let a = flat.values
+  let onDevice = Matrix3<f32>.new([a[0], a[1], a[2] / s, a[3], a[4], a[5] / s, a[6] * s, a[7] * s, a[8]])
+  let bounds = device(localInk(&p.*, index), s)
+  drop run p.scene.pushTransformLayer(
+    bounds,
+    mask,
+    Isolation { opacity: 1.0, blend: 0 },
+    onDevice,
+  )
+  p.cull = everywhere()
+  run paintFragmentIn(&mut p, index, ContentMask.new(everywhere()))
+  p.cull = saved
+  run p.scene.popLayer()
 }
 
 effect fn paintFragmentIn(p: &mut Painter<'_, '_>, index: usize, mask: ContentMask) -> ()
@@ -1596,6 +1690,7 @@ fn ownHash(
     let node = &nodes.asSlice()[u32.toUsize(slot)]
     h = Hash.combine(h, node.paintHash)
     if f.kind == FragmentKind.Box {
+      h = transform.perspectiveHash(&node.computed.transform, h)
       h = Hash.combine(h, node.content)
       h = Hash.combine(h, u32.toU64(node.resource))
     }
@@ -1625,10 +1720,18 @@ pub effect fn hashFragments(
     let below = out.get(index)
     let combined = Hash.combine(own, below)
     out.set(index, combined)
-    let parent = output.fragments.values.asSlice()[index].parent
+    let f = output.fragments.values.asSlice()[index]
+    let mut placed = combined
+    if f.kind == FragmentKind.Box {
+      let slot = slotIn(slots, f.source)
+      if slot != NONE && nodes.asSlice()[u32.toUsize(slot)].computed.transform.any() {
+        placed = transform.placementHash(&nodes.asSlice()[u32.toUsize(slot)].computed.transform, combined)
+      }
+    }
+    let parent = f.parent
     if parent != NO_INDEX {
       let previous = out.get(parent)
-      out.set(parent, Hash.combine(previous, combined))
+      out.set(parent, Hash.combine(previous, placed))
     }
   }
 }

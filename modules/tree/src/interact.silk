@@ -32,7 +32,10 @@ import paint { styleSlot, borderBox, paddingBox, overflowClip }
 import scrollbar { ScrollRange, rangeOf, scrolls, userScrolls, usedOverflow, thumbOf }
 import layout.lib { FragmentKind, InvalidNode }
 import silk.collections.list { List }
+import silk.core.option { Option }
 import silk.core.ownership { Copy }
+import silk.geometry.point { Point2 }
+import transform
 import silk.geometry.rect { Rect }
 import layers
 import silk.mem.allocator { Allocator, OutOfMemoryError }
@@ -102,6 +105,27 @@ fn inside(rect: Rect<f32>, x: f32, y: f32) -> bool {
 
 // Hit testing.
 
+/// (`x`, `y`), in the layout space around fragment `index`, in the fragment's own layout space:
+/// through the inverse of its transform. None where the fragment cannot be hit there: its
+/// transform flattens it, the point maps behind the viewer, or it shows a hidden back face.
+fn intoLocal(tree: &UiTree<'_>, index: usize, x: f32, y: f32) -> Option<Point2<f32>> {
+  let point = Point2<f32> { x: x, y: y }
+  match layers.transformOf(&tree.output, &tree.slotOfCss, &tree.nodes, index) {
+    Option.Some { value } => {
+      if layers.hiddenBack(&tree.output, &tree.slotOfCss, &tree.nodes, index) {
+        return Option<Point2<f32>>.None
+      }
+      return match transform.flatten(value).inverse() {
+        Option.Some { value: inverse } => transform.map(&inverse, x, y)
+        Option.None => Option<Point2<f32>>.None
+      }
+    }
+    Option.None => {
+      return Option<Point2<f32>>.some(point)
+    }
+  }
+}
+
 /// Whether node `slot` can be the target of pointer input.
 fn targetable(tree: &UiTree<'_>, slot: u32) -> bool {
   let c = &tree.node(slot).computed
@@ -112,10 +136,17 @@ fn targetable(tree: &UiTree<'_>, slot: u32) -> bool {
 /// point is in the fragment's layout coordinates: where it is against the fragment as laid out,
 /// with the scroll and sticky offsets above already taken off. Fragments paint in tree order,
 /// so later siblings and children are on top.
-fn hitFragment(tree: &UiTree<'_>, index: usize, x: f32, y: f32, pruned: bool) -> u32 {
-  if pruned && !inside(tree.fragmentInk.get(index), x, y) {
+fn hitFragment(tree: &UiTree<'_>, index: usize, px: f32, py: f32, pruned: bool) -> u32 {
+  if pruned && !inside(tree.fragmentInk.get(index), px, py) {
     return NONE
   }
+  let local = intoLocal(tree, index, px, py)
+  if local.isNone() {
+    return NONE
+  }
+  let point = local.unwrapOr(Point2<f32> { x: 0.0, y: 0.0 })
+  let x = point.x
+  let y = point.y
   let f = tree.output.fragments.values.asSlice()[index]
   if f.positioningShell || f.kind == FragmentKind.Line {
     return hitChildren(tree, index, x, y, pruned)
@@ -238,16 +269,23 @@ effect fn appendHit(out: &mut List<u32>, slot: u32) -> ()
 effect fn hitsFragment(
   tree: &UiTree<'_>,
   index: usize,
-  x: f32,
-  y: f32,
+  px: f32,
+  py: f32,
   pruned: bool,
   out: &mut List<u32>,
 ) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
-  if pruned && !inside(tree.fragmentInk.get(index), x, y) {
+  if pruned && !inside(tree.fragmentInk.get(index), px, py) {
     return ()
   }
+  let local = intoLocal(tree, index, px, py)
+  if local.isNone() {
+    return ()
+  }
+  let point = local.unwrapOr(Point2<f32> { x: 0.0, y: 0.0 })
+  let x = point.x
+  let y = point.y
   let values = tree.output.fragments.values.asSlice()
   let fragment = values[index]
   if fragment.kind == FragmentKind.Text {

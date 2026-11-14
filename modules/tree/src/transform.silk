@@ -1,0 +1,1713 @@
+//! CSS transforms (CSS Transforms 1 and 2): the `transform`, `translate`, `rotate`, `scale`,
+//! `transform-origin`, `perspective` and `perspective-origin` of a computed style, read from
+//! CSS text, turned into matrices against a node's border box, and interpolated as the spec
+//! says: function by function where the lists match, by matrix decomposition where they do not.
+//!
+//! The tree renders flat (`transform-style: flat`): a node's 4x4 matrix is flattened onto the
+//! plane of its parent before its parent's own matrix applies, so every node maps through a
+//! projective 3x3 matrix of the plane (see [`flatten`]). Matrices are std
+//! `silk.geometry.matrix` values; a point is a column vector, `a * b` applies `b` first.
+import silk.collections.hash { Hash }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.geometry.matrix { Matrix3, Matrix4 }
+import silk.geometry.point { Point2 }
+import silk.geometry.rect { Rect }
+import silk.geometry.vector { Vector3 }
+import silk.num.f32
+import silk.num.u32
+import silk.num.u8
+
+pub const NO_OP: u8 = 0
+pub const TRANSLATE: u8 = 1
+pub const SCALE: u8 = 2
+pub const ROTATE: u8 = 3
+pub const SKEW: u8 = 4
+pub const PERSPECTIVE: u8 = 5
+/// A `matrix()` or `matrix3d()`, or an interpolated matrix: its entries are the list's
+/// `matrix`. A list holds at most one.
+pub const MATRIX: u8 = 6
+
+/// How many functions a `transform` list keeps. A longer list is invalid here.
+pub const CAPACITY: usize = 6
+
+const PI: f32 = 3.14159265358979
+
+/// One transform function, as its primitive (CSS Transforms 2 §"Interpolation primitives"):
+/// - `TRANSLATE`: `x`, `y`, `z` pixels plus `xp`, `yp` fractions of the box width and height;
+/// - `SCALE`: `x`, `y`, `z` factors;
+/// - `ROTATE`: the axis `x`, `y`, `z` and the angle `w` in radians (clockwise on screen);
+/// - `SKEW`: the angles `x` and `y` in radians;
+/// - `PERSPECTIVE`: the distance `x` in pixels, 0 for `perspective(none)`.
+pub struct Op {
+  pub kind: u8,
+  pub x: f32,
+  pub y: f32,
+  pub z: f32,
+  pub w: f32,
+  pub xp: f32,
+  pub yp: f32,
+}
+
+impl Copy for Op {}
+
+impl Op {
+  pub fn none() -> Op {
+    return Op { kind: NO_OP, x: 0.0, y: 0.0, z: 0.0, w: 0.0, xp: 0.0, yp: 0.0 }
+  }
+
+  pub fn translate(x: f32, y: f32, z: f32) -> Op {
+    return Op { kind: TRANSLATE, x: x, y: y, z: z, w: 0.0, xp: 0.0, yp: 0.0 }
+  }
+
+  pub fn scale(x: f32, y: f32, z: f32) -> Op {
+    return Op { kind: SCALE, x: x, y: y, z: z, w: 0.0, xp: 0.0, yp: 0.0 }
+  }
+
+  /// A turn of `angle` radians about the axis (`x`, `y`, `z`).
+  pub fn rotate(x: f32, y: f32, z: f32, angle: f32) -> Op {
+    return Op { kind: ROTATE, x: x, y: y, z: z, w: angle, xp: 0.0, yp: 0.0 }
+  }
+
+  fn of(kind: u8) -> Op {
+    let mut op = Op.none()
+    op.kind = kind
+    return op
+  }
+
+  /// The identity function of the primitive `like` is, what a missing function interpolates as.
+  fn identityLike(like: Op) -> Op {
+    if like.kind == SCALE {
+      return Op.scale(1.0, 1.0, 1.0)
+    }
+    if like.kind == ROTATE {
+      return Op.rotate(like.x, like.y, like.z, 0.0)
+    }
+    return Op.of(like.kind)
+  }
+
+  fn same(self: &Self, other: &Op) -> bool {
+    return self.kind == other.kind && self.x == other.x && self.y == other.y && self.z == other.z
+      && self.w == other.w
+      && self.xp == other.xp
+      && self.yp == other.yp
+  }
+
+  /// Whether the function moves nothing.
+  fn identity(self: &Self) -> bool {
+    if self.kind == NO_OP {
+      return true
+    }
+    if self.kind == TRANSLATE {
+      return self.x == 0.0 && self.y == 0.0 && self.z == 0.0 && self.xp == 0.0 && self.yp == 0.0
+    }
+    if self.kind == SCALE {
+      return self.x == 1.0 && self.y == 1.0 && self.z == 1.0
+    }
+    if self.kind == ROTATE || self.kind == SKEW {
+      return self.w == 0.0 && (self.kind == ROTATE || (self.x == 0.0 && self.y == 0.0))
+    }
+    if self.kind == PERSPECTIVE {
+      return self.x <= 0.0
+    }
+    return false
+  }
+}
+
+/// A `transform` list: `count` functions, `none` when empty.
+pub struct TransformList {
+  pub count: u32,
+  pub ops: [Op; 6],
+  /// The entries of the list's `MATRIX` function, column-major.
+  pub matrix: [f32; 16],
+}
+
+impl Copy for TransformList {}
+
+const IDENTITY16: [f32; 16] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+
+impl TransformList {
+  pub fn none() -> TransformList {
+    return TransformList { count: 0, ops: [Op.none(); 6], matrix: IDENTITY16 }
+  }
+
+  pub fn op(self: &Self, index: u32) -> Op {
+    return self.ops[u32.toUsize(index)]
+  }
+
+  /// Adds `op`; false when the list is full.
+  pub fn push(self: &mut Self, op: Op) -> bool {
+    if u32.toUsize(self.count) >= CAPACITY {
+      return false
+    }
+    self.ops[u32.toUsize(self.count)] = op
+    self.count = self.count + 1
+    return true
+  }
+
+  fn hasMatrix(self: &Self) -> bool {
+    let mut i: u32 = 0
+    while i < self.count {
+      if self.op(i).kind == MATRIX {
+        return true
+      }
+      i = i + 1
+    }
+    return false
+  }
+
+  pub fn same(self: &Self, other: &TransformList) -> bool {
+    if self.count != other.count {
+      return false
+    }
+    let mut i: u32 = 0
+    while i < self.count {
+      if !self.op(i).same(&other.op(i)) {
+        return false
+      }
+      i = i + 1
+    }
+    if self.hasMatrix() {
+      let mut j: usize = 0
+      while j < 16 {
+        if self.matrix[j] != other.matrix[j] {
+          return false
+        }
+        j = j + 1
+      }
+    }
+    return true
+  }
+
+  /// Whether any function moves something.
+  pub fn moves(self: &Self) -> bool {
+    let mut i: u32 = 0
+    while i < self.count {
+      if !self.op(i).identity() {
+        return true
+      }
+      i = i + 1
+    }
+    return false
+  }
+}
+
+/// A position against a box: `x` pixels plus `xp` of its width, and so on.
+pub struct Origin {
+  pub x: f32,
+  pub xp: f32,
+  pub y: f32,
+  pub yp: f32,
+  pub z: f32,
+}
+
+impl Copy for Origin {}
+
+impl Origin {
+  /// `50% 50% 0`, the initial `transform-origin` and `perspective-origin`.
+  pub fn center() -> Origin {
+    return Origin { x: 0.0, xp: 0.5, y: 0.0, yp: 0.5, z: 0.0 }
+  }
+
+  pub fn same(self: &Self, other: &Origin) -> bool {
+    return self.x == other.x && self.xp == other.xp && self.y == other.y && self.yp == other.yp
+      && self.z == other.z
+  }
+
+  fn at(self: &Self, box: Rect<f32>) -> Vector3<f32> {
+    return Vector3<f32> {
+      x: box.xMin + self.x + self.xp * (box.xMax - box.xMin),
+      y: box.yMin + self.y + self.yp * (box.yMax - box.yMin),
+      z: self.z,
+    }
+  }
+}
+
+/// The transform properties of a computed style. None of them inherit.
+pub struct Transform {
+  pub list: TransformList,
+  /// The `translate`, `rotate` and `scale` properties; `NO_OP` for `none`.
+  pub translate: Op,
+  pub rotate: Op,
+  pub scale: Op,
+  pub origin: Origin,
+  /// The `perspective` distance in pixels, 0 for `none`.
+  pub perspective: f32,
+  pub perspectiveOrigin: Origin,
+  /// `backface-visibility: hidden`.
+  pub hideBackface: bool,
+}
+
+impl Copy for Transform {}
+
+impl Transform {
+  pub fn initial() -> Transform {
+    return Transform {
+      list: TransformList.none(),
+      translate: Op.none(),
+      rotate: Op.none(),
+      scale: Op.none(),
+      origin: Origin.center(),
+      perspective: 0.0,
+      perspectiveOrigin: Origin.center(),
+      hideBackface: false,
+    }
+  }
+
+  /// Whether the node has a transform: any of `transform`, `translate`, `rotate`, `scale`
+  /// other than `none` (an identity function still makes one, as in CSS).
+  pub fn any(self: &Self) -> bool {
+    return self.list.count != 0 || self.translate.kind != NO_OP || self.rotate.kind != NO_OP
+      || self.scale.kind != NO_OP
+  }
+
+  /// Whether the node's children see its `perspective`.
+  pub fn deep(self: &Self) -> bool {
+    return self.perspective > 0.0
+  }
+}
+
+// Matrices.
+
+fn op4(op: Op, matrix: &[f32; 16], width: f32, height: f32) -> Matrix4<f32> {
+  if op.kind == TRANSLATE {
+    return Matrix4<f32>.translation(
+      Vector3<f32> { x: op.x + op.xp * width, y: op.y + op.yp * height, z: op.z },
+    )
+  }
+  if op.kind == SCALE {
+    return Matrix4<f32>.scale(op.x, op.y, op.z)
+  }
+  if op.kind == ROTATE {
+    return rotation(op.x, op.y, op.z, op.w)
+  }
+  if op.kind == SKEW {
+    let mut values = IDENTITY16
+    values[4] = f32.tan(op.x)
+    values[1] = f32.tan(op.y)
+    return Matrix4<f32>.new(values)
+  }
+  if op.kind == PERSPECTIVE {
+    if op.x <= 0.0 {
+      return Matrix4<f32>.identity()
+    }
+    return Matrix4<f32>.perspective(f32.max(op.x, 1.0))
+  }
+  if op.kind == MATRIX {
+    return Matrix4<f32>.new(matrix.*)
+  }
+  return Matrix4<f32>.identity()
+}
+
+// `rotate3d(x, y, z, angle)` as CSS Transforms 2 defines it.
+fn rotation(x: f32, y: f32, z: f32, angle: f32) -> Matrix4<f32> {
+  let length = f32.sqrt(x * x + y * y + z * z)
+  if length == 0.0 {
+    return Matrix4<f32>.identity()
+  }
+  let ux = x / length
+  let uy = y / length
+  let uz = z / length
+  let half = angle * 0.5
+  let sc = f32.sin(half) * f32.cos(half)
+  let sq = f32.sin(half) * f32.sin(half)
+  return Matrix4<f32>.new(
+    [
+      1.0 - 2.0 * (uy * uy + uz * uz) * sq,
+      2.0 * (ux * uy * sq + uz * sc),
+      2.0 * (ux * uz * sq - uy * sc),
+      0.0,
+      2.0 * (ux * uy * sq - uz * sc),
+      1.0 - 2.0 * (ux * ux + uz * uz) * sq,
+      2.0 * (uy * uz * sq + ux * sc),
+      0.0,
+      2.0 * (ux * uz * sq + uy * sc),
+      2.0 * (uy * uz * sq - ux * sc),
+      1.0 - 2.0 * (ux * ux + uy * uy) * sq,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      1.0,
+    ],
+  )
+}
+
+/// The matrix of functions `from .. to` of `list`, applied right to left as written.
+fn listMatrix(list: &TransformList, from: u32, to: u32, width: f32, height: f32) -> Matrix4<f32> {
+  let mut m = Matrix4<f32>.identity()
+  let mut i = from
+  while i < to {
+    m = m * op4(list.op(i), &list.matrix, width, height)
+    i = i + 1
+  }
+  return m
+}
+
+/// The node's transform in its own layout space: `box` is its border box, which is also the
+/// reference box percentages and the origin resolve against. `translate`, `rotate`, `scale`
+/// and then `transform` apply about the origin (CSS Transforms 2 §"The current transformation
+/// matrix").
+pub fn matrix(t: &Transform, box: Rect<f32>) -> Matrix4<f32> {
+  let width = box.xMax - box.xMin
+  let height = box.yMax - box.yMin
+  let origin = t.origin.at(box)
+  let mut m = Matrix4<f32>.translation(origin)
+  if t.translate.kind != NO_OP {
+    m = m * op4(t.translate, &t.list.matrix, width, height)
+  }
+  if t.rotate.kind != NO_OP {
+    m = m * op4(t.rotate, &t.list.matrix, width, height)
+  }
+  if t.scale.kind != NO_OP {
+    m = m * op4(t.scale, &t.list.matrix, width, height)
+  }
+  m = m * listMatrix(&t.list, 0, t.list.count, width, height)
+  return m * Matrix4<f32>.translation(Vector3<f32> { x: -origin.x, y: -origin.y, z: -origin.z })
+}
+
+/// What a parent's `perspective` adds in front of its children's transforms: `box` is the
+/// parent's border box, in the children's layout space.
+pub fn perspectiveOf(t: &Transform, box: Rect<f32>) -> Matrix4<f32> {
+  let origin = t.perspectiveOrigin.at(box)
+  return Matrix4<f32>.translation(Vector3<f32> { x: origin.x, y: origin.y, z: 0.0 })
+    * Matrix4<f32>.perspective(f32.max(t.perspective, 1.0))
+    * Matrix4<f32>.translation(Vector3<f32> { x: -origin.x, y: -origin.y, z: 0.0 })
+}
+
+/// The map of the plane `z = 0` through `m`, seen from the front: rows and columns x, y and w.
+pub fn flatten(m: Matrix4<f32>) -> Matrix3<f32> {
+  let a = m.values
+  return Matrix3<f32>.new([a[0], a[1], a[3], a[4], a[5], a[7], a[12], a[13], a[15]])
+}
+
+/// Whether `m` only moves the plane: no scale, turn, skew or perspective.
+pub fn translation(m: &Matrix3<f32>) -> bool {
+  let a = m.values
+  return a[0] == 1.0 && a[1] == 0.0 && a[2] == 0.0 && a[3] == 0.0 && a[4] == 1.0 && a[5] == 0.0
+    && a[8] == 1.0
+}
+
+/// Whether the plane mapped by `m` shows its back to the viewer, as Chromium decides it: the
+/// inverse's entry (2, 2) is negative (a turn past 90 degrees about x or y, not a mirror).
+pub fn backFacing(m: &Matrix4<f32>) -> bool {
+  return match m.inverse() {
+    Option.Some { value } => value.values[10] < 0.0
+    Option.None => false
+  }
+}
+
+/// `point` mapped through `m`, or None where it lands behind the viewer.
+pub fn map(m: &Matrix3<f32>, x: f32, y: f32) -> Option<Point2<f32>> {
+  let h = m.transformHomogeneous(Point2<f32> { x: x, y: y })
+  if !(h.z > 0.000001) {
+    return Option<Point2<f32>>.none()
+  }
+  return Option<Point2<f32>>.some(Point2<f32> { x: h.x / h.z, y: h.y / h.z })
+}
+
+/// The bounding box of `rect` mapped through `m`; everything when a corner lands behind the
+/// viewer.
+pub fn mapRect(m: &Matrix3<f32>, rect: Rect<f32>) -> Rect<f32> {
+  let xs = [rect.xMin, rect.xMax, rect.xMin, rect.xMax]
+  let ys = [rect.yMin, rect.yMin, rect.yMax, rect.yMax]
+  let mut out = Rect<f32>.new(1.0e30, 1.0e30, -1.0e30, -1.0e30)
+  let mut i: usize = 0
+  while i < 4 {
+    match map(m, xs[i], ys[i]) {
+      Option.Some { value } => {
+        out = Rect<f32>.new(
+          f32.min(out.xMin, value.x),
+          f32.min(out.yMin, value.y),
+          f32.max(out.xMax, value.x),
+          f32.max(out.yMax, value.y),
+        )
+      }
+      Option.None => {
+        return Rect<f32>.new(-1.0e30, -1.0e30, 1.0e30, 1.0e30)
+      }
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// Reading CSS text.
+
+fn lower(byte: u8) -> u8 {
+  return if byte >= 65 && byte <= 90 {
+    byte + 32
+  } else {
+    byte
+  }
+}
+
+fn isSpace(byte: u8) -> bool {
+  return byte == 32 || byte == 9 || byte == 10 || byte == 12 || byte == 13
+}
+
+fn isDigit(byte: u8) -> bool {
+  return byte >= 48 && byte <= 57
+}
+
+fn named(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < a.length {
+    if lower(a[i]) != b[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn part(text: &[u8], start: usize, end: usize) -> &[u8] {
+  return Slice.view<u8>(text, start, end - start)
+}
+
+/// How many bytes the number at the start of `text` takes, exponent included (0 when none).
+fn numberLength(text: &[u8]) -> usize {
+  let mut i: usize = 0
+  if i < text.length && (text[i] == 45 || text[i] == 43) {
+    i = i + 1
+  }
+  let mut digits: usize = 0
+  while i < text.length && isDigit(text[i]) {
+    i = i + 1
+    digits = digits + 1
+  }
+  if i < text.length && text[i] == 46 {
+    i = i + 1
+    while i < text.length && isDigit(text[i]) {
+      i = i + 1
+      digits = digits + 1
+    }
+  }
+  if digits == 0 {
+    return 0
+  }
+  if i + 1 < text.length && (text[i] == 101 || text[i] == 69) {
+    let mut j = i + 1
+    if text[j] == 45 || text[j] == 43 {
+      j = j + 1
+    }
+    if j < text.length && isDigit(text[j]) {
+      while j < text.length && isDigit(text[j]) {
+        j = j + 1
+      }
+      return j
+    }
+  }
+  return i
+}
+
+fn numberValue(text: &[u8]) -> f32 {
+  let mut i: usize = 0
+  let mut sign: f32 = 1.0
+  if i < text.length && (text[i] == 45 || text[i] == 43) {
+    if text[i] == 45 {
+      sign = -1.0
+    }
+    i = i + 1
+  }
+  let mut value: f32 = 0.0
+  while i < text.length && isDigit(text[i]) {
+    value = value * 10.0 + u32.toF32(u8.toU32(text[i]) - 48)
+    i = i + 1
+  }
+  if i < text.length && text[i] == 46 {
+    i = i + 1
+    let mut scale: f32 = 0.1
+    while i < text.length && isDigit(text[i]) {
+      value = value + scale * u32.toF32(u8.toU32(text[i]) - 48)
+      scale = scale * 0.1
+      i = i + 1
+    }
+  }
+  if i < text.length && (text[i] == 101 || text[i] == 69) {
+    i = i + 1
+    let mut negative = false
+    if i < text.length && (text[i] == 45 || text[i] == 43) {
+      negative = text[i] == 45
+      i = i + 1
+    }
+    let mut exponent: f32 = 0.0
+    while i < text.length && isDigit(text[i]) {
+      exponent = exponent * 10.0 + u32.toF32(u8.toU32(text[i]) - 48)
+      i = i + 1
+    }
+    value = value * f32.pow(10.0, if negative { -exponent } else { exponent })
+  }
+  return sign * value
+}
+
+/// What lengths resolve against.
+pub struct Units {
+  pub fontSize: f32,
+  pub rootFontSize: f32,
+  pub viewportWidth: f32,
+  pub viewportHeight: f32,
+}
+
+impl Copy for Units {}
+
+/// A number with its unit: `unit` is empty for a bare number.
+struct Dimensioned {
+  value: f32,
+  unitStart: usize,
+}
+
+impl Copy for Dimensioned {}
+
+fn dimensioned(text: &[u8]) -> Option<Dimensioned> {
+  let used = numberLength(text)
+  if used == 0 {
+    return Option<Dimensioned>.None
+  }
+  return Option<Dimensioned>.some(Dimensioned { value: numberValue(part(text, 0, used)), unitStart: used })
+}
+
+/// A plain `<number>`.
+fn number(text: &[u8]) -> Option<f32> {
+  match dimensioned(text) {
+    Option.Some { value } => {
+      if value.unitStart == text.length {
+        return Option<f32>.some(value.value)
+      }
+      return Option<f32>.None
+    }
+    Option.None => {
+      return Option<f32>.None
+    }
+  }
+}
+
+/// A `<number>` or `<percentage>` as a factor: `50%` is 0.5.
+fn factor(text: &[u8]) -> Option<f32> {
+  match dimensioned(text) {
+    Option.Some { value } => {
+      let unit = part(text, value.unitStart, text.length)
+      if unit.length == 0 {
+        return Option<f32>.some(value.value)
+      }
+      if named(unit, b"%") {
+        return Option<f32>.some(value.value / 100.0)
+      }
+      return Option<f32>.None
+    }
+    Option.None => {
+      return Option<f32>.None
+    }
+  }
+}
+
+/// An `<angle>` in radians; a bare 0 too.
+fn angle(text: &[u8]) -> Option<f32> {
+  match dimensioned(text) {
+    Option.Some { value } => {
+      let unit = part(text, value.unitStart, text.length)
+      let v = value.value
+      if named(unit, b"deg") {
+        return Option<f32>.some(v * PI / 180.0)
+      }
+      if named(unit, b"rad") {
+        return Option<f32>.some(v)
+      }
+      if named(unit, b"grad") {
+        return Option<f32>.some(v * PI / 200.0)
+      }
+      if named(unit, b"turn") {
+        return Option<f32>.some(v * 2.0 * PI)
+      }
+      if unit.length == 0 && v == 0.0 {
+        return Option<f32>.some(0.0)
+      }
+      return Option<f32>.None
+    }
+    Option.None => {
+      return Option<f32>.None
+    }
+  }
+}
+
+/// A `<length-percentage>`: pixels and a fraction of the reference size.
+struct Length {
+  pixels: f32,
+  fraction: f32,
+}
+
+impl Copy for Length {}
+
+fn length(text: &[u8], units: &Units, percent: bool) -> Option<Length> {
+  match dimensioned(text) {
+    Option.Some { value } => {
+      let unit = part(text, value.unitStart, text.length)
+      let v = value.value
+      let mut pixels: f32 = -1.0e30
+      if unit.length == 0 {
+        if v == 0.0 {
+          pixels = 0.0
+        }
+      } else if named(unit, b"%") {
+        if percent {
+          return Option<Length>.some(Length { pixels: 0.0, fraction: v / 100.0 })
+        }
+      } else if named(unit, b"px") {
+        pixels = v
+      } else if named(unit, b"em") {
+        pixels = v * units.fontSize
+      } else if named(unit, b"rem") {
+        pixels = v * units.rootFontSize
+      } else if named(unit, b"vw") || named(unit, b"svw") || named(unit, b"lvw") || named(unit, b"dvw") {
+        pixels = v * units.viewportWidth / 100.0
+      } else if named(unit, b"vh") || named(unit, b"svh") || named(unit, b"lvh") || named(unit, b"dvh") {
+        pixels = v * units.viewportHeight / 100.0
+      } else if named(unit, b"vmin") {
+        pixels = v * f32.min(units.viewportWidth, units.viewportHeight) / 100.0
+      } else if named(unit, b"vmax") {
+        pixels = v * f32.max(units.viewportWidth, units.viewportHeight) / 100.0
+      } else if named(unit, b"cm") {
+        pixels = v * 96.0 / 2.54
+      } else if named(unit, b"mm") {
+        pixels = v * 96.0 / 25.4
+      } else if named(unit, b"in") {
+        pixels = v * 96.0
+      } else if named(unit, b"pt") {
+        pixels = v * 96.0 / 72.0
+      } else if named(unit, b"pc") {
+        pixels = v * 16.0
+      }
+      if pixels == -1.0e30 {
+        return Option<Length>.None
+      }
+      return Option<Length>.some(Length { pixels: pixels, fraction: 0.0 })
+    }
+    Option.None => {
+      return Option<Length>.None
+    }
+  }
+}
+
+/// Up to `N` items of `text` split at commas or white space outside parentheses.
+struct Items {
+  count: usize,
+  starts: [usize; 16],
+  ends: [usize; 16],
+}
+
+fn split(text: &[u8], comma: bool) -> Items {
+  let mut items = Items { count: 0, starts: [0; 16], ends: [0; 16] }
+  let mut i: usize = 0
+  while i < text.length {
+    while i < text.length && (isSpace(text[i]) || (comma && text[i] == 44)) {
+      i = i + 1
+    }
+    if i >= text.length {
+      break
+    }
+    let start = i
+    let mut depth: u32 = 0
+    while i < text.length {
+      let byte = text[i]
+      if byte == 40 {
+        depth = depth + 1
+      } else if byte == 41 {
+        if depth > 0 {
+          depth = depth - 1
+        }
+        if depth == 0 && !comma {
+          i = i + 1
+          break
+        }
+      } else if depth == 0 && (isSpace(byte) || (comma && byte == 44)) {
+        break
+      }
+      i = i + 1
+    }
+    if items.count == 16 {
+      items.count = 17
+      return move items
+    }
+    items.starts[items.count] = start
+    items.ends[items.count] = i
+    items.count = items.count + 1
+  }
+  return move items
+}
+
+fn item<'t>(text: &'t [u8], items: &Items, index: usize) -> &'t [u8] {
+  return part(text, items.starts[index], items.ends[index])
+}
+
+// One transform function `name(arguments)`; false when it is not valid.
+fn function(text: &[u8], units: &Units, list: &mut TransformList) -> bool {
+  let mut open: usize = 0
+  while open < text.length && text[open] != 40 {
+    open = open + 1
+  }
+  if open == 0 || open >= text.length || text[text.length - 1] != 41 {
+    return false
+  }
+  let name = part(text, 0, open)
+  let inner = part(text, open + 1, text.length - 1)
+  let args = split(inner, true)
+  let n = args.count
+  if n > 16 {
+    return false
+  }
+  if named(name, b"matrix") || named(name, b"matrix3d") {
+    let three = named(name, b"matrix3d")
+    if (three && n != 16) || (!three && n != 6) || list.hasMatrix() {
+      return false
+    }
+    let mut v: [f32; 16] = [0.0; 16]
+    let mut i: usize = 0
+    while i < n {
+      match number(item(inner, &args, i)) {
+        Option.Some { value } => {
+          v[i] = value
+        }
+        Option.None => {
+          return false
+        }
+      }
+      i = i + 1
+    }
+    if three {
+      list.matrix = v
+    } else {
+      list.matrix = [v[0], v[1], 0.0, 0.0, v[2], v[3], 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, v[4], v[5], 0.0, 1.0]
+    }
+    return list.push(Op.of(MATRIX))
+  }
+  let translateX = named(name, b"translatex")
+  let translateY = named(name, b"translatey")
+  let translateZ = named(name, b"translatez")
+  if named(name, b"translate") || translateX || translateY || translateZ || named(name, b"translate3d") {
+    let three = named(name, b"translate3d")
+    let single = translateX || translateY || translateZ
+    if (three && n != 3) || (single && n != 1) || (!three && !single && (n < 1 || n > 2)) {
+      return false
+    }
+    let mut op = Op.of(TRANSLATE)
+    let mut i: usize = 0
+    while i < n {
+      let z = translateZ || (three && i == 2)
+      match length(item(inner, &args, i), units, !z) {
+        Option.Some { value } => {
+          if z {
+            op.z = value.pixels
+          } else if translateY || i == 1 {
+            op.y = value.pixels
+            op.yp = value.fraction
+          } else {
+            op.x = value.pixels
+            op.xp = value.fraction
+          }
+        }
+        Option.None => {
+          return false
+        }
+      }
+      i = i + 1
+    }
+    return list.push(op)
+  }
+  let scaleX = named(name, b"scalex")
+  let scaleY = named(name, b"scaley")
+  let scaleZ = named(name, b"scalez")
+  if named(name, b"scale") || scaleX || scaleY || scaleZ || named(name, b"scale3d") {
+    let three = named(name, b"scale3d")
+    let single = scaleX || scaleY || scaleZ
+    if (three && n != 3) || (single && n != 1) || (!three && !single && (n < 1 || n > 2)) {
+      return false
+    }
+    let mut values: [f32; 3] = [1.0; 3]
+    let mut i: usize = 0
+    while i < n {
+      match factor(item(inner, &args, i)) {
+        Option.Some { value } => {
+          values[i] = value
+        }
+        Option.None => {
+          return false
+        }
+      }
+      i = i + 1
+    }
+    if scaleX {
+      return list.push(Op.scale(values[0], 1.0, 1.0))
+    }
+    if scaleY {
+      return list.push(Op.scale(1.0, values[0], 1.0))
+    }
+    if scaleZ {
+      return list.push(Op.scale(1.0, 1.0, values[0]))
+    }
+    if !three && n == 1 {
+      values[1] = values[0]
+    }
+    return list.push(Op.scale(values[0], values[1], values[2]))
+  }
+  if named(name, b"rotate3d") {
+    if n != 4 {
+      return false
+    }
+    let x = number(item(inner, &args, 0))
+    let y = number(item(inner, &args, 1))
+    let z = number(item(inner, &args, 2))
+    let a = angle(item(inner, &args, 3))
+    if x.isNone() || y.isNone() || z.isNone() || a.isNone() {
+      return false
+    }
+    return list.push(Op.rotate(x.unwrapOr(0.0), y.unwrapOr(0.0), z.unwrapOr(0.0), a.unwrapOr(0.0)))
+  }
+  if named(name, b"rotate") || named(name, b"rotatex") || named(name, b"rotatey") || named(name, b"rotatez") {
+    if n != 1 {
+      return false
+    }
+    match angle(item(inner, &args, 0)) {
+      Option.Some { value } => {
+        if named(name, b"rotatex") {
+          return list.push(Op.rotate(1.0, 0.0, 0.0, value))
+        }
+        if named(name, b"rotatey") {
+          return list.push(Op.rotate(0.0, 1.0, 0.0, value))
+        }
+        return list.push(Op.rotate(0.0, 0.0, 1.0, value))
+      }
+      Option.None => {
+        return false
+      }
+    }
+  }
+  if named(name, b"skew") || named(name, b"skewx") || named(name, b"skewy") {
+    let pair = named(name, b"skew")
+    if (pair && (n < 1 || n > 2)) || (!pair && n != 1) {
+      return false
+    }
+    let mut op = Op.of(SKEW)
+    let mut i: usize = 0
+    while i < n {
+      match angle(item(inner, &args, i)) {
+        Option.Some { value } => {
+          if named(name, b"skewy") || i == 1 {
+            op.y = value
+          } else {
+            op.x = value
+          }
+        }
+        Option.None => {
+          return false
+        }
+      }
+      i = i + 1
+    }
+    return list.push(op)
+  }
+  if named(name, b"perspective") {
+    if n != 1 {
+      return false
+    }
+    let spelled = item(inner, &args, 0)
+    if named(spelled, b"none") {
+      return list.push(Op.of(PERSPECTIVE))
+    }
+    match length(spelled, units, false) {
+      Option.Some { value } => {
+        if value.pixels < 0.0 {
+          return false
+        }
+        let mut op = Op.of(PERSPECTIVE)
+        op.x = f32.max(value.pixels, 1.0)
+        return list.push(op)
+      }
+      Option.None => {
+        return false
+      }
+    }
+  }
+  return false
+}
+
+/// A `transform` value: `none` or a list of transform functions.
+pub fn parseList(text: &[u8], units: &Units) -> Option<TransformList> {
+  let words = split(text, false)
+  if words.count == 1 && named(item(text, &words, 0), b"none") {
+    return Option<TransformList>.some(TransformList.none())
+  }
+  if words.count == 0 || words.count > CAPACITY {
+    return Option<TransformList>.None
+  }
+  let mut list = TransformList.none()
+  let mut i: usize = 0
+  while i < words.count {
+    if !function(item(text, &words, i), units, &mut list) {
+      return Option<TransformList>.None
+    }
+    i = i + 1
+  }
+  return Option<TransformList>.some(list)
+}
+
+/// A `translate` value: `none` or one to three lengths (the third without a percentage).
+pub fn parseTranslate(text: &[u8], units: &Units) -> Option<Op> {
+  let words = split(text, false)
+  if words.count == 1 && named(item(text, &words, 0), b"none") {
+    return Option<Op>.some(Op.none())
+  }
+  if words.count == 0 || words.count > 3 {
+    return Option<Op>.None
+  }
+  let mut op = Op.of(TRANSLATE)
+  let mut i: usize = 0
+  while i < words.count {
+    match length(item(text, &words, i), units, i < 2) {
+      Option.Some { value } => {
+        if i == 0 {
+          op.x = value.pixels
+          op.xp = value.fraction
+        } else if i == 1 {
+          op.y = value.pixels
+          op.yp = value.fraction
+        } else {
+          op.z = value.pixels
+        }
+      }
+      Option.None => {
+        return Option<Op>.None
+      }
+    }
+    i = i + 1
+  }
+  return Option<Op>.some(op)
+}
+
+/// A `scale` value: `none` or one to three numbers or percentages.
+pub fn parseScale(text: &[u8]) -> Option<Op> {
+  let words = split(text, false)
+  if words.count == 1 && named(item(text, &words, 0), b"none") {
+    return Option<Op>.some(Op.none())
+  }
+  if words.count == 0 || words.count > 3 {
+    return Option<Op>.None
+  }
+  let mut values: [f32; 3] = [1.0; 3]
+  let mut i: usize = 0
+  while i < words.count {
+    match factor(item(text, &words, i)) {
+      Option.Some { value } => {
+        values[i] = value
+      }
+      Option.None => {
+        return Option<Op>.None
+      }
+    }
+    i = i + 1
+  }
+  if words.count == 1 {
+    values[1] = values[0]
+  }
+  return Option<Op>.some(Op.scale(values[0], values[1], values[2]))
+}
+
+/// A `rotate` value: `none`, an angle, or an axis (`x`, `y`, `z` or three numbers) and an
+/// angle in either order.
+pub fn parseRotate(text: &[u8]) -> Option<Op> {
+  let words = split(text, false)
+  if words.count == 1 && named(item(text, &words, 0), b"none") {
+    return Option<Op>.some(Op.none())
+  }
+  if words.count == 0 || words.count > 4 {
+    return Option<Op>.None
+  }
+  let mut axis: [f32; 3] = [0.0, 0.0, 1.0]
+  let mut turned: f32 = 0.0
+  let mut hasAngle = false
+  let mut numbers: [f32; 3] = [0.0; 3]
+  let mut numberCount: usize = 0
+  let mut named3 = false
+  let mut i: usize = 0
+  while i < words.count {
+    let word = item(text, &words, i)
+    let mut used = false
+    if !hasAngle {
+      match angle(word) {
+        Option.Some { value } => {
+          // A bare 0 reads as a number when an axis is still due.
+          if !(number(word).isSome() && words.count == 4 && numberCount < 3) {
+            turned = value
+            hasAngle = true
+            used = true
+          }
+        }
+        Option.None => {}
+      }
+    }
+    if !used {
+      if named(word, b"x") || named(word, b"y") || named(word, b"z") {
+        if named3 || numberCount != 0 {
+          return Option<Op>.None
+        }
+        named3 = true
+        axis = if named(word, b"x") {
+          [1.0, 0.0, 0.0]
+        } else if named(word, b"y") {
+          [0.0, 1.0, 0.0]
+        } else {
+          [0.0, 0.0, 1.0]
+        }
+      } else {
+        match number(word) {
+          Option.Some { value } => {
+            if named3 || numberCount == 3 {
+              return Option<Op>.None
+            }
+            numbers[numberCount] = value
+            numberCount = numberCount + 1
+          }
+          Option.None => {
+            return Option<Op>.None
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  if !hasAngle || (numberCount != 0 && numberCount != 3) {
+    return Option<Op>.None
+  }
+  if numberCount == 3 {
+    axis = numbers
+  }
+  return Option<Op>.some(Op.rotate(axis[0], axis[1], axis[2], turned))
+}
+
+// One coordinate of a position: a keyword's fraction or a length.
+fn originPart(word: &[u8], units: &Units, vertical: bool) -> Option<Length> {
+  if named(word, b"center") {
+    return Option<Length>.some(Length { pixels: 0.0, fraction: 0.5 })
+  }
+  if !vertical && named(word, b"left") || vertical && named(word, b"top") {
+    return Option<Length>.some(Length { pixels: 0.0, fraction: 0.0 })
+  }
+  if !vertical && named(word, b"right") || vertical && named(word, b"bottom") {
+    return Option<Length>.some(Length { pixels: 0.0, fraction: 1.0 })
+  }
+  return length(word, units, true)
+}
+
+fn verticalWord(word: &[u8]) -> bool {
+  return named(word, b"top") || named(word, b"bottom")
+}
+
+fn horizontalWord(word: &[u8]) -> bool {
+  return named(word, b"left") || named(word, b"right")
+}
+
+/// A `transform-origin` (`depth`) or `perspective-origin` value: one to two (three) parts.
+pub fn parseOrigin(text: &[u8], units: &Units, depth: bool) -> Option<Origin> {
+  let words = split(text, false)
+  let most: usize = if depth { 3 } else { 2 }
+  if words.count == 0 || words.count > most {
+    return Option<Origin>.None
+  }
+  let mut origin = Origin.center()
+  let first = item(text, &words, 0)
+  if words.count == 1 {
+    let vertical = verticalWord(first)
+    match originPart(first, units, vertical) {
+      Option.Some { value } => {
+        if vertical {
+          origin.y = value.pixels
+          origin.yp = value.fraction
+        } else {
+          origin.x = value.pixels
+          origin.xp = value.fraction
+        }
+        return Option<Origin>.some(origin)
+      }
+      Option.None => {
+        return Option<Origin>.None
+      }
+    }
+  }
+  let second = item(text, &words, 1)
+  let swapped = verticalWord(first) || horizontalWord(second)
+  let horizontal = if swapped { second } else { first }
+  let vertical = if swapped { first } else { second }
+  if verticalWord(horizontal) || horizontalWord(vertical) {
+    return Option<Origin>.None
+  }
+  let x = originPart(horizontal, units, false)
+  let y = originPart(vertical, units, true)
+  if x.isNone() || y.isNone() {
+    return Option<Origin>.None
+  }
+  let xs = x.unwrapOr(Length { pixels: 0.0, fraction: 0.0 })
+  let ys = y.unwrapOr(Length { pixels: 0.0, fraction: 0.0 })
+  origin.x = xs.pixels
+  origin.xp = xs.fraction
+  origin.y = ys.pixels
+  origin.yp = ys.fraction
+  if words.count == 3 {
+    match length(item(text, &words, 2), units, false) {
+      Option.Some { value } => {
+        origin.z = value.pixels
+      }
+      Option.None => {
+        return Option<Origin>.None
+      }
+    }
+  }
+  return Option<Origin>.some(origin)
+}
+
+/// A `perspective` value: `none` (0) or a non-negative length, at least 1px.
+pub fn parsePerspective(text: &[u8], units: &Units) -> Option<f32> {
+  if named(text, b"none") {
+    return Option<f32>.some(0.0)
+  }
+  match length(text, units, false) {
+    Option.Some { value } => {
+      if value.pixels < 0.0 {
+        return Option<f32>.None
+      }
+      return Option<f32>.some(f32.max(value.pixels, 1.0))
+    }
+    Option.None => {
+      return Option<f32>.None
+    }
+  }
+}
+
+// Interpolation.
+
+fn lerp(a: f32, b: f32, p: f32) -> f32 {
+  return a + (b - a) * p
+}
+
+/// A quaternion (x, y, z, w).
+struct Quaternion {
+  x: f32,
+  y: f32,
+  z: f32,
+  w: f32,
+}
+
+impl Copy for Quaternion {}
+
+fn quaternionOf(op: Op) -> Quaternion {
+  let length = f32.sqrt(op.x * op.x + op.y * op.y + op.z * op.z)
+  if length == 0.0 {
+    return Quaternion { x: 0.0, y: 0.0, z: 0.0, w: 1.0 }
+  }
+  let s = f32.sin(op.w * 0.5) / length
+  return Quaternion { x: op.x * s, y: op.y * s, z: op.z * s, w: f32.cos(op.w * 0.5) }
+}
+
+fn slerp(a: Quaternion, b: Quaternion, p: f32) -> Quaternion {
+  let product = f32.max(-1.0, f32.min(1.0, a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w))
+  if f32.abs(product) >= 0.99999 {
+    return a
+  }
+  let theta = f32.acos(product)
+  let w = f32.sin(p * theta) / f32.sqrt(1.0 - product * product)
+  let k = f32.cos(p * theta) - product * w
+  return Quaternion { x: a.x * k + b.x * w, y: a.y * k + b.y * w, z: a.z * k + b.z * w, w: a.w * k + b.w * w }
+}
+
+fn sameAxis(a: Op, b: Op) -> bool {
+  let la = f32.sqrt(a.x * a.x + a.y * a.y + a.z * a.z)
+  let lb = f32.sqrt(b.x * b.x + b.y * b.y + b.z * b.z)
+  if la == 0.0 || lb == 0.0 {
+    return la == lb
+  }
+  return f32.abs(a.x / la - b.x / lb) < 0.00001 && f32.abs(a.y / la - b.y / lb) < 0.00001
+    && f32.abs(a.z / la - b.z / lb) < 0.00001
+}
+
+fn mixRotate(a: Op, b: Op, p: f32) -> Op {
+  if sameAxis(a, b) || a.w == 0.0 && b.w == 0.0 {
+    return Op.rotate(a.x, a.y, a.z, lerp(a.w, b.w, p))
+  }
+  if a.w == 0.0 {
+    return Op.rotate(b.x, b.y, b.z, lerp(0.0, b.w, p))
+  }
+  if b.w == 0.0 {
+    return Op.rotate(a.x, a.y, a.z, lerp(a.w, 0.0, p))
+  }
+  let q = slerp(quaternionOf(a), quaternionOf(b), p)
+  let half = f32.acos(f32.max(-1.0, f32.min(1.0, q.w)))
+  let s = f32.sin(half)
+  if f32.abs(s) < 0.000001 {
+    return Op.rotate(0.0, 0.0, 1.0, 0.0)
+  }
+  return Op.rotate(q.x / s, q.y / s, q.z / s, 2.0 * half)
+}
+
+/// Function `a` eased toward `b` (the same primitive) by `p`; `NO_OP` takes the identity of the
+/// other side.
+pub fn mixOp(a: Op, b: Op, p: f32) -> Op {
+  if a.kind == NO_OP && b.kind == NO_OP {
+    return a
+  }
+  let from = if a.kind == NO_OP { Op.identityLike(b) } else { a }
+  let to = if b.kind == NO_OP { Op.identityLike(a) } else { b }
+  if from.kind == ROTATE {
+    return mixRotate(from, to, p)
+  }
+  if from.kind == PERSPECTIVE {
+    // Perspective eases by inverse distance, `none` being infinitely far.
+    let ia: f32 = if from.x > 0.0 { 1.0 / from.x } else { 0.0 }
+    let ib: f32 = if to.x > 0.0 { 1.0 / to.x } else { 0.0 }
+    let inverse = lerp(ia, ib, p)
+    let mut op = Op.of(PERSPECTIVE)
+    op.x = if inverse > 0.0 { 1.0 / inverse } else { 0.0 }
+    return op
+  }
+  return Op {
+    kind: from.kind,
+    x: lerp(from.x, to.x, p),
+    y: lerp(from.y, to.y, p),
+    z: lerp(from.z, to.z, p),
+    w: lerp(from.w, to.w, p),
+    xp: lerp(from.xp, to.xp, p),
+    yp: lerp(from.yp, to.yp, p),
+  }
+}
+
+/// Whether two lists ease function by function all the way: pairs of one primitive, the
+/// shorter list padded with identity functions.
+pub fn matched(a: &TransformList, b: &TransformList) -> bool {
+  let count = if a.count > b.count { a.count } else { b.count }
+  let mut i: u32 = 0
+  while i < count {
+    if i < a.count && i < b.count && a.op(i).kind != b.op(i).kind {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+/// The first function from which `a` and `b` stop matching.
+fn mismatchAt(a: &TransformList, b: &TransformList) -> u32 {
+  let count = if a.count > b.count { a.count } else { b.count }
+  let mut i: u32 = 0
+  while i < count {
+    if i < a.count && i < b.count && a.op(i).kind != b.op(i).kind {
+      break
+    }
+    if i < a.count && a.op(i).kind == MATRIX || i < b.count && b.op(i).kind == MATRIX {
+      break
+    }
+    i = i + 1
+  }
+  return i
+}
+
+/// `a` and `b` made to match function by function for an easing over a `width` by `height`
+/// box: from the first pair that does not match, each list's rest becomes one matrix (CSS
+/// Transforms 2 §"Interpolation of Transforms"). Percentages in that rest resolve against the
+/// box now.
+pub fn prepare(a: &TransformList, b: &TransformList, width: f32, height: f32) -> [TransformList; 2] {
+  if matched(a, b) && !a.hasMatrix() && !b.hasMatrix() || a.count == 0 && b.count == 0 {
+    return [a.*, b.*]
+  }
+  let at = mismatchAt(a, b)
+  return [collapse(a, at, width, height), collapse(b, at, width, height)]
+}
+
+fn collapse(list: &TransformList, at: u32, width: f32, height: f32) -> TransformList {
+  let mut out = TransformList.none()
+  let mut i: u32 = 0
+  while i < at && i < list.count {
+    drop out.push(list.op(i))
+    i = i + 1
+  }
+  let rest = if at < list.count {
+    listMatrix(list, at, list.count, width, height)
+  } else {
+    Matrix4<f32>.identity()
+  }
+  out.matrix = rest.values
+  drop out.push(Op.of(MATRIX))
+  return out
+}
+
+/// `a` eased toward `b` by `p`. The lists must match (see [`prepare`]); lists that do not
+/// flip halfway.
+pub fn mixList(a: &TransformList, b: &TransformList, p: f32) -> TransformList {
+  if a.count == 0 && b.count == 0 {
+    return a.*
+  }
+  if !matched(a, b) {
+    return if p < 0.5 { a.* } else { b.* }
+  }
+  let count = if a.count > b.count { a.count } else { b.count }
+  let mut out = TransformList.none()
+  let mut i: u32 = 0
+  while i < count {
+    let from = if i < a.count { a.op(i) } else { Op.none() }
+    let to = if i < b.count { b.op(i) } else { Op.none() }
+    if from.kind == MATRIX || to.kind == MATRIX {
+      let ma = if from.kind == MATRIX { Matrix4<f32>.new(a.matrix) } else { Matrix4<f32>.identity() }
+      let mb = if to.kind == MATRIX { Matrix4<f32>.new(b.matrix) } else { Matrix4<f32>.identity() }
+      out.matrix = mixMatrix(ma, mb, p).values
+      drop out.push(Op.of(MATRIX))
+    } else {
+      drop out.push(mixOp(from, to, p))
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// Matrix interpolation by decomposition (CSS Transforms 2 §"Interpolation of 3D matrices").
+
+struct Decomposed {
+  translate: [f32; 3],
+  scale: [f32; 3],
+  skew: [f32; 3],
+  perspective: [f32; 4],
+  quaternion: Quaternion,
+}
+
+impl Copy for Decomposed {}
+
+fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+  return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn length3(a: [f32; 3]) -> f32 {
+  return f32.sqrt(dot3(a, a))
+}
+
+fn scaled3(a: [f32; 3], s: f32) -> [f32; 3] {
+  return [a[0] * s, a[1] * s, a[2] * s]
+}
+
+fn combine3(a: [f32; 3], b: [f32; 3], sa: f32, sb: f32) -> [f32; 3] {
+  return [a[0] * sa + b[0] * sb, a[1] * sa + b[1] * sb, a[2] * sa + b[2] * sb]
+}
+
+fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+  return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+}
+
+fn decompose(source: Matrix4<f32>) -> Option<Decomposed> {
+  let mut m = source.values
+  if m[15] == 0.0 {
+    return Option<Decomposed>.None
+  }
+  let mut i: usize = 0
+  while i < 16 {
+    m[i] = m[i] / source.values[15]
+    i = i + 1
+  }
+  let mut rest = m
+  rest[3] = 0.0
+  rest[7] = 0.0
+  rest[11] = 0.0
+  rest[15] = 1.0
+  let inverse = match Matrix4<f32>.new(rest).inverse() {
+    Option.Some { value } => value
+    Option.None => {
+      return Option<Decomposed>.None
+    }
+  }
+  let mut perspective: [f32; 4] = [0.0, 0.0, 0.0, 1.0]
+  if m[3] != 0.0 || m[7] != 0.0 || m[11] != 0.0 {
+    let r = [m[3], m[7], m[11], m[15]]
+    let v = inverse.values
+    let mut k: usize = 0
+    while k < 4 {
+      perspective[k] = v[k * 4] * r[0] + v[k * 4 + 1] * r[1] + v[k * 4 + 2] * r[2] + v[k * 4 + 3] * r[3]
+      k = k + 1
+    }
+  }
+  let translate = [m[12], m[13], m[14]]
+  let mut row0 = [m[0], m[1], m[2]]
+  let mut row1 = [m[4], m[5], m[6]]
+  let mut row2 = [m[8], m[9], m[10]]
+  let mut scale: [f32; 3] = [0.0; 3]
+  let mut skew: [f32; 3] = [0.0; 3]
+  scale[0] = length3(row0)
+  if scale[0] == 0.0 {
+    return Option<Decomposed>.None
+  }
+  row0 = scaled3(row0, 1.0 / scale[0])
+  skew[0] = dot3(row0, row1)
+  row1 = combine3(row1, row0, 1.0, -skew[0])
+  scale[1] = length3(row1)
+  if scale[1] == 0.0 {
+    return Option<Decomposed>.None
+  }
+  row1 = scaled3(row1, 1.0 / scale[1])
+  skew[0] = skew[0] / scale[1]
+  skew[1] = dot3(row0, row2)
+  row2 = combine3(row2, row0, 1.0, -skew[1])
+  skew[2] = dot3(row1, row2)
+  row2 = combine3(row2, row1, 1.0, -skew[2])
+  scale[2] = length3(row2)
+  if scale[2] == 0.0 {
+    return Option<Decomposed>.None
+  }
+  row2 = scaled3(row2, 1.0 / scale[2])
+  skew[1] = skew[1] / scale[2]
+  skew[2] = skew[2] / scale[2]
+  if dot3(row0, cross3(row1, row2)) < 0.0 {
+    scale = scaled3(scale, -1.0)
+    row0 = scaled3(row0, -1.0)
+    row1 = scaled3(row1, -1.0)
+    row2 = scaled3(row2, -1.0)
+  }
+  let mut q = Quaternion {
+    x: 0.5 * f32.sqrt(f32.max(1.0 + row0[0] - row1[1] - row2[2], 0.0)),
+    y: 0.5 * f32.sqrt(f32.max(1.0 - row0[0] + row1[1] - row2[2], 0.0)),
+    z: 0.5 * f32.sqrt(f32.max(1.0 - row0[0] - row1[1] + row2[2], 0.0)),
+    w: 0.5 * f32.sqrt(f32.max(1.0 + row0[0] + row1[1] + row2[2], 0.0)),
+  }
+  if row2[1] > row1[2] {
+    q.x = -q.x
+  }
+  if row0[2] > row2[0] {
+    q.y = -q.y
+  }
+  if row1[0] > row0[1] {
+    q.z = -q.z
+  }
+  return Option<Decomposed>.some(
+    Decomposed { translate: translate, scale: scale, skew: skew, perspective: perspective, quaternion: q },
+  )
+}
+
+fn recompose(d: Decomposed) -> Matrix4<f32> {
+  let mut m = IDENTITY16
+  m[3] = d.perspective[0]
+  m[7] = d.perspective[1]
+  m[11] = d.perspective[2]
+  m[15] = d.perspective[3]
+  let mut i: usize = 0
+  while i < 4 {
+    m[12 + i] = m[12 + i] + d.translate[0] * m[i] + d.translate[1] * m[4 + i] + d.translate[2] * m[8 + i]
+    i = i + 1
+  }
+  let x = d.quaternion.x
+  let y = d.quaternion.y
+  let z = d.quaternion.z
+  let w = d.quaternion.w
+  let rotate = Matrix4<f32>.new(
+    [
+      1.0 - 2.0 * (y * y + z * z),
+      2.0 * (x * y + z * w),
+      2.0 * (x * z - y * w),
+      0.0,
+      2.0 * (x * y - z * w),
+      1.0 - 2.0 * (x * x + z * z),
+      2.0 * (y * z + x * w),
+      0.0,
+      2.0 * (x * z + y * w),
+      2.0 * (y * z - x * w),
+      1.0 - 2.0 * (x * x + y * y),
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      1.0,
+    ],
+  )
+  let mut out = Matrix4<f32>.new(m) * rotate
+  if d.skew[2] != 0.0 {
+    let mut t = IDENTITY16
+    t[9] = d.skew[2]
+    out = out * Matrix4<f32>.new(t)
+  }
+  if d.skew[1] != 0.0 {
+    let mut t = IDENTITY16
+    t[8] = d.skew[1]
+    out = out * Matrix4<f32>.new(t)
+  }
+  if d.skew[0] != 0.0 {
+    let mut t = IDENTITY16
+    t[4] = d.skew[0]
+    out = out * Matrix4<f32>.new(t)
+  }
+  let mut values = out.values
+  let mut c: usize = 0
+  while c < 3 {
+    let mut r: usize = 0
+    while r < 4 {
+      values[c * 4 + r] = values[c * 4 + r] * d.scale[c]
+      r = r + 1
+    }
+    c = c + 1
+  }
+  return Matrix4<f32>.new(values)
+}
+
+/// `a` eased toward `b` by `p` through their decompositions; a matrix that has none flips
+/// halfway.
+pub fn mixMatrix(a: Matrix4<f32>, b: Matrix4<f32>, p: f32) -> Matrix4<f32> {
+  let da = decompose(a)
+  let db = decompose(b)
+  if da.isNone() || db.isNone() {
+    return if p < 0.5 { a } else { b }
+  }
+  let x = da.unwrapOr(Decomposed { translate: [0.0; 3], scale: [1.0; 3], skew: [0.0; 3], perspective: [0.0, 0.0, 0.0, 1.0], quaternion: Quaternion { x: 0.0, y: 0.0, z: 0.0, w: 1.0 } })
+  let y = db.unwrapOr(x)
+  let mut out = x
+  let mut i: usize = 0
+  while i < 3 {
+    out.translate[i] = lerp(x.translate[i], y.translate[i], p)
+    out.scale[i] = lerp(x.scale[i], y.scale[i], p)
+    out.skew[i] = lerp(x.skew[i], y.skew[i], p)
+    i = i + 1
+  }
+  i = 0
+  while i < 4 {
+    out.perspective[i] = lerp(x.perspective[i], y.perspective[i], p)
+    i = i + 1
+  }
+  out.quaternion = slerp(x.quaternion, y.quaternion, p)
+  return recompose(out)
+}
+
+// Declarations.
+
+pub const TRANSFORM_LIST: u32 = 0
+pub const TRANSLATE_PROPERTY: u32 = 1
+pub const ROTATE_PROPERTY: u32 = 2
+pub const SCALE_PROPERTY: u32 = 3
+pub const ORIGIN_PROPERTY: u32 = 4
+pub const PERSPECTIVE_PROPERTY: u32 = 5
+pub const PERSPECTIVE_ORIGIN_PROPERTY: u32 = 6
+pub const BACKFACE_PROPERTY: u32 = 7
+
+/// Sets the property `which` (`TRANSFORM_LIST`, ...) declares as CSS `text`. An invalid value
+/// leaves it as it was, as an invalid declaration does.
+pub fn declare(t: &mut Transform, which: u32, text: &[u8], units: &Units) -> () {
+  let start = trimStart(text)
+  let spelled = part(text, start, trimEnd(text, start))
+  if which == TRANSFORM_LIST {
+    match parseList(spelled, units) {
+      Option.Some { value } => {
+        t.list = value
+      }
+      Option.None => {}
+    }
+  } else if which == TRANSLATE_PROPERTY {
+    match parseTranslate(spelled, units) {
+      Option.Some { value } => {
+        t.translate = value
+      }
+      Option.None => {}
+    }
+  } else if which == ROTATE_PROPERTY {
+    match parseRotate(spelled) {
+      Option.Some { value } => {
+        t.rotate = value
+      }
+      Option.None => {}
+    }
+  } else if which == SCALE_PROPERTY {
+    match parseScale(spelled) {
+      Option.Some { value } => {
+        t.scale = value
+      }
+      Option.None => {}
+    }
+  } else if which == ORIGIN_PROPERTY {
+    match parseOrigin(spelled, units, true) {
+      Option.Some { value } => {
+        t.origin = value
+      }
+      Option.None => {}
+    }
+  } else if which == PERSPECTIVE_PROPERTY {
+    match parsePerspective(spelled, units) {
+      Option.Some { value } => {
+        t.perspective = value
+      }
+      Option.None => {}
+    }
+  } else if which == PERSPECTIVE_ORIGIN_PROPERTY {
+    match parseOrigin(spelled, units, false) {
+      Option.Some { value } => {
+        t.perspectiveOrigin = value
+      }
+      Option.None => {}
+    }
+  } else if named(spelled, b"hidden") {
+    t.hideBackface = true
+  } else if named(spelled, b"visible") {
+    t.hideBackface = false
+  }
+}
+
+fn trimStart(text: &[u8]) -> usize {
+  let mut i: usize = 0
+  while i < text.length && isSpace(text[i]) {
+    i = i + 1
+  }
+  return i
+}
+
+fn trimEnd(text: &[u8], start: usize) -> usize {
+  let mut i = text.length
+  while i > start && isSpace(text[i - 1]) {
+    i = i - 1
+  }
+  return i
+}
+
+fn floatHash(h: u64, value: f32) -> u64 {
+  return Hash.combine(h, u32.toU64(f32.toBits(value)))
+}
+
+fn opHash(h: u64, op: Op) -> u64 {
+  let mut out = Hash.combine(h, u8.toU64(op.kind))
+  out = floatHash(floatHash(floatHash(out, op.x), op.y), op.z)
+  return floatHash(floatHash(floatHash(out, op.w), op.xp), op.yp)
+}
+
+fn originHash(h: u64, o: Origin) -> u64 {
+  return floatHash(floatHash(floatHash(floatHash(floatHash(h, o.x), o.xp), o.y), o.yp), o.z)
+}
+
+/// Folds what moves a box's painted subtree into `h`: its parent's cached paint holds the
+/// transform layer, the box's own cache does not.
+pub fn placementHash(t: &Transform, h: u64) -> u64 {
+  let mut out = Hash.combine(h, u32.toU64(t.list.count))
+  let mut i: usize = 0
+  while i < u32.toUsize(t.list.count) {
+    out = opHash(out, t.list.ops[i])
+    if t.list.ops[i].kind == MATRIX {
+      let mut j: usize = 0
+      while j < 16 {
+        out = floatHash(out, t.list.matrix[j])
+        j = j + 1
+      }
+    }
+    i = i + 1
+  }
+  out = opHash(opHash(opHash(out, t.translate), t.rotate), t.scale)
+  out = originHash(out, t.origin)
+  if t.hideBackface {
+    out = Hash.combine(out, 1)
+  }
+  return out
+}
+
+/// Folds a box's `perspective` into `h`: it moves the box's children, inside its own paint.
+pub fn perspectiveHash(t: &Transform, h: u64) -> u64 {
+  if t.perspective == 0.0 {
+    return h
+  }
+  return originHash(floatHash(h, t.perspective), t.perspectiveOrigin)
+}
