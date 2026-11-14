@@ -1,0 +1,477 @@
+//! The UI Automation events a tree update causes.
+//!
+//! Ported from AccessKit (`accesskit_windows/src/adapter.rs`, its `AdapterChangeHandler`, and
+//! `node.rs`, its `enqueue_property_changes`), Copyright 2022 The AccessKit Authors, under the
+//! MIT or Apache-2.0 license.
+import accesskit.lib { Role, Live }
+import accesskit_consumer.lib {
+  NodeRef,
+  TreeState,
+  FullNodeId,
+  IdSet,
+  ChangeHandler,
+  FilterResult,
+  CommonFilter,
+  commonFilter
+}
+import node {
+  Property,
+  PROPERTY_IS_SELECTED,
+  PROPERTY_CONTROLLER_FOR,
+  elementId,
+  name,
+  properties,
+  patterns,
+  findIn,
+  isSelectionItemSupported,
+  isSelected,
+  controlledIds
+}
+import record { Value }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.string { String }
+
+/// `UIA_AutomationFocusChangedEventId`.
+pub fn EVENT_FOCUS_CHANGED() -> i32 {
+  return 20005
+}
+
+/// `UIA_SelectionItem_ElementAddedToSelectionEventId`.
+pub fn EVENT_ADDED_TO_SELECTION() -> i32 {
+  return 20010
+}
+
+/// `UIA_SelectionItem_ElementRemovedFromSelectionEventId`.
+pub fn EVENT_REMOVED_FROM_SELECTION() -> i32 {
+  return 20011
+}
+
+/// `UIA_SelectionItem_ElementSelectedEventId`.
+pub fn EVENT_ELEMENT_SELECTED() -> i32 {
+  return 20012
+}
+
+/// `UIA_Selection_InvalidatedEventId`.
+pub fn EVENT_SELECTION_INVALIDATED() -> i32 {
+  return 20013
+}
+
+/// `UIA_Text_TextSelectionChangedEventId`.
+pub fn EVENT_TEXT_SELECTION_CHANGED() -> i32 {
+  return 20014
+}
+
+/// `UIA_Text_TextChangedEventId`.
+pub fn EVENT_TEXT_CHANGED() -> i32 {
+  return 20015
+}
+
+/// `UIA_Window_WindowOpenedEventId`.
+pub fn EVENT_WINDOW_OPENED() -> i32 {
+  return 20016
+}
+
+/// `UIA_Window_WindowClosedEventId`.
+pub fn EVENT_WINDOW_CLOSED() -> i32 {
+  return 20017
+}
+
+/// `UIA_LiveRegionChangedEventId`.
+pub fn EVENT_LIVE_REGION_CHANGED() -> i32 {
+  return 20024
+}
+
+/// Beyond this many selection changes in one container, UI Automation is told the selection
+/// is invalid instead, as System.Windows.Automation.Provider does.
+fn INVALIDATE_LIMIT() -> usize {
+  return 20
+}
+
+/// One event the adapter raises after an update.
+pub union WinEvent {
+  /// `UiaRaiseAutomationEvent` on element `id`.
+  Simple { pub id: u64, pub event: i32 },
+  /// `UiaRaiseAutomationPropertyChangedEvent` on element `id`.
+  PropertyChanged { pub id: u64, pub property: i32, pub old: Value, pub new: Value },
+}
+
+impl WinEvent {
+  pub fn simple(id: u64, event: i32) -> WinEvent {
+    return WinEvent.Simple { id: id, event: event }
+  }
+
+  fn selected(id: u64, now: bool) -> WinEvent {
+    return WinEvent.PropertyChanged {
+      id: id,
+      property: PROPERTY_IS_SELECTED(),
+      old: Value.Bool { value: !now },
+      new: Value.Bool { value: now },
+    }
+  }
+}
+
+/// The selection changes in one container (or of one node outside any).
+struct SelectionChanges {
+  key: FullNodeId,
+  added: List<FullNodeId>,
+  removed: List<FullNodeId>,
+}
+
+fn has(list: &List<FullNodeId>, id: FullNodeId) -> bool {
+  let mut i: usize = 0
+  while i < list.length() {
+    if list.get(i).toU64() == id.toU64() {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+/// Collects the events of one update, as AccessKit's `AdapterChangeHandler` does.
+pub struct EventGenerator {
+  /// Text changes, which go before the other events, newest first.
+  front: List<WinEvent>,
+  back: List<WinEvent>,
+  textChanged: IdSet,
+  selections: List<SelectionChanges>,
+}
+
+impl EventGenerator {
+  pub fn make() -> EventGenerator {
+    return EventGenerator {
+      front: List<WinEvent>.make(),
+      back: List<WinEvent>.make(),
+      textChanged: IdSet.make(),
+      selections: List<SelectionChanges>.make(),
+    }
+  }
+
+  effect fn push(self: &mut Self, event: WinEvent) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.back.append(move event)
+  }
+
+  effect fn textChangeForParent(self: &mut Self, node: &NodeRef<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !node.supportsTextRanges() || self.textChanged.contains(node.id) {
+      return
+    }
+    // Text changes must come before selection changes; their place among other events does
+    // not matter.
+    run self.front.append(WinEvent.simple(elementId(node), EVENT_TEXT_CHANGED()))
+    drop run self.textChanged.insert(node.id)
+  }
+
+  effect fn textChange(self: &mut Self, node: &NodeRef<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if node.accessRole() != Role.TextRun {
+      return
+    }
+    match node.filteredParent(&CommonFilter {}) {
+      Option.Some { value } => run self.textChangeForParent(&value)
+      Option.None => {}
+    }
+  }
+
+  effect fn selectionChange(self: &mut Self, node: &NodeRef<'_>, selected: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    // Changes are kept by selection container, so that a container with one selected item
+    // gets the cheaper events.
+    let key = match node.selectionContainer(&CommonFilter {}) {
+      Option.Some { value } => value.id
+      Option.None => node.id
+    }
+    let mut at = self.selections.length()
+    let mut i: usize = 0
+    while i < self.selections.length() {
+      if self.selections.asSlice()[i].key.toU64() == key.toU64() {
+        at = i
+        break
+      }
+      i = i + 1
+    }
+    if at == self.selections.length() {
+      run self.selections.append(SelectionChanges {
+        key: key,
+        added: List<FullNodeId>.make(),
+        removed: List<FullNodeId>.make(),
+      })
+    }
+    let changes = &mut self.selections.asMutSlice()[at]
+    if selected {
+      if !has(&changes.added, node.id) {
+        run changes.added.append(node.id)
+      }
+    } else if !has(&changes.removed, node.id) {
+      run changes.removed.append(node.id)
+    }
+  }
+
+  /// The events in the order they are raised, once the tree holds `state`.
+  pub effect fn finish(self: Self, state: &TreeState) -> List<WinEvent>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut generator = move self
+    run generator.selectionEvents(state)
+    let mut front = move generator.front
+    let mut back = move generator.back
+    let mut out = List<WinEvent>.make()
+    while let Option.Some { value } = front.pop() {
+      run out.append(move value)
+    }
+    let mut taken = List<WinEvent>.make()
+    while let Option.Some { value } = back.pop() {
+      run taken.append(move value)
+    }
+    while let Option.Some { value } = taken.pop() {
+      run out.append(move value)
+    }
+    return move out
+  }
+
+  effect fn selectionEvents(self: &mut Self, state: &TreeState) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let filter = CommonFilter {}
+    let mut s: usize = 0
+    while s < self.selections.length() {
+      let key = self.selections.asSlice()[s].key
+      let addedCount = self.selections.asSlice()[s].added.length()
+      let removedCount = self.selections.asSlice()[s].removed.length()
+      let node = match state.nodeById(key) {
+        Option.Some { value } => value
+        Option.None => {
+          s = s + 1
+          continue
+        }
+      }
+      let container = node.isContainerWithSelectableChildren()
+      let mut only: Option<u64> = Option.None
+      if container {
+        let mut count: usize = 0
+        let mut cursor = node.filteredChildren(&filter)
+        while let Option.Some { value: child } = cursor.next(&filter) {
+          if child.isSelected().unwrapOr(false) {
+            count = count + 1
+            only = Option.Some { value: elementId(&child) }
+            if count > 1 {
+              only = Option.None
+              break
+            }
+          }
+        }
+      }
+      match only {
+        Option.Some { value: child } => {
+          run self.push(WinEvent.simple(child, EVENT_ELEMENT_SELECTED()))
+          run self.push(WinEvent.selected(child, true))
+          let mut r: usize = 0
+          while r < removedCount {
+            let id = self.selections.asSlice()[s].removed.get(r).toU64()
+            run self.push(WinEvent.selected(id, false))
+            r = r + 1
+          }
+        }
+        Option.None => {
+          if container && addedCount + removedCount > INVALIDATE_LIMIT() {
+            run self.push(WinEvent.simple(elementId(&node), EVENT_SELECTION_INVALIDATED()))
+          } else {
+            let multiple = container && node.isMultiselectable()
+            let mut a: usize = 0
+            while a < addedCount {
+              let id = self.selections.asSlice()[s].added.get(a).toU64()
+              let event = if multiple {
+                EVENT_ADDED_TO_SELECTION()
+              } else {
+                EVENT_ELEMENT_SELECTED()
+              }
+              run self.push(WinEvent.simple(id, event))
+              run self.push(WinEvent.selected(id, true))
+              a = a + 1
+            }
+            let mut r: usize = 0
+            while r < removedCount {
+              let id = self.selections.asSlice()[s].removed.get(r).toU64()
+              run self.push(WinEvent.simple(id, EVENT_REMOVED_FROM_SELECTION()))
+              run self.push(WinEvent.selected(id, false))
+              r = r + 1
+            }
+          }
+        }
+      }
+      s = s + 1
+    }
+  }
+
+  /// The property changes between `old` and `new`: the element's own properties, and those of
+  /// each control pattern both support.
+  effect fn propertyChanges(self: &mut Self, old: &NodeRef<'_>, new: &NodeRef<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let id = elementId(new)
+    let mut before = List<Property>.make()
+    let mut after = List<Property>.make()
+    run properties(old, &mut before)
+    run properties(new, &mut after)
+    let shared = patterns(old) & patterns(new)
+    let mut i: usize = 0
+    while i < after.length() {
+      let one = &after.asSlice()[i]
+      if one.pattern == 0 || shared & one.pattern != 0 {
+        let previous: Value = match findIn(&before, one.id) {
+          Option.Some { value } => run value.value.copy()
+          Option.None => Value.Empty
+        }
+        if !previous.equals(&one.value) {
+          let now = run one.value.copy()
+          run self.push(WinEvent.PropertyChanged {
+            id: id,
+            property: one.id,
+            old: move previous,
+            new: move now,
+          })
+        }
+      }
+      i = i + 1
+    }
+    let mut oldControls = List<u64>.make()
+    let mut newControls = List<u64>.make()
+    run controlledIds(old, &mut oldControls)
+    run controlledIds(new, &mut newControls)
+    let mut same = oldControls.length() == newControls.length()
+    let mut c: usize = 0
+    while same && c < newControls.length() {
+      same = oldControls.get(c) == newControls.get(c)
+      c = c + 1
+    }
+    if !same {
+      // The native side fills in the controlled elements.
+      run self.push(WinEvent.PropertyChanged {
+        id: id,
+        property: PROPERTY_CONTROLLER_FOR(),
+        old: Value.Empty,
+        new: Value.Empty,
+      })
+    }
+    if old.supportsTextRanges() && new.supportsTextRanges() {
+      let changed = match old.rawTextSelection() {
+        Option.Some { value: mine } => match new.rawTextSelection() {
+          Option.Some { value: theirs } => !mine.equals(theirs)
+          Option.None => true
+        }
+        Option.None => new.rawTextSelection().isSome()
+      }
+      if changed {
+        run self.push(WinEvent.simple(id, EVENT_TEXT_SELECTION_CHANGED()))
+      }
+    }
+  }
+}
+
+fn sameText(left: &Option<String>, right: &Option<String>) -> bool {
+  return match &left.* {
+    Option.Some { value: mine } => match &right.* {
+      Option.Some { value: theirs } => mine.view() == theirs.view()
+      Option.None => false
+    }
+    Option.None => right.isNone()
+  }
+}
+
+impl ChangeHandler for EventGenerator {
+  effect fn nodeAdded(self: &mut Self, node: &NodeRef<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.textChange(node)
+    if commonFilter(node) != FilterResult.Include {
+      return
+    }
+    let id = elementId(node)
+    if node.isDialog() {
+      run self.push(WinEvent.simple(id, EVENT_WINDOW_OPENED()))
+    }
+    if node.live() != Live.Off && (run name(node)).isSome() {
+      run self.push(WinEvent.simple(id, EVENT_LIVE_REGION_CHANGED()))
+    }
+    if isSelectionItemSupported(node) && isSelected(node) {
+      run self.selectionChange(node, true)
+    }
+  }
+
+  effect fn nodeUpdated(self: &mut Self, old: &NodeRef<'_>, new: &NodeRef<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let rawChanged = match old.rawValue() {
+      Option.Some { value: before } => match new.rawValue() {
+        Option.Some { value: after } => before != after
+        Option.None => true
+      }
+      Option.None => new.rawValue().isSome()
+    }
+    if rawChanged {
+      run self.textChange(new)
+    }
+    let wasFilteredOut = commonFilter(old) != FilterResult.Include
+    if commonFilter(new) != FilterResult.Include {
+      if !wasFilteredOut {
+        if old.isDialog() {
+          run self.push(WinEvent.simple(elementId(old), EVENT_WINDOW_CLOSED()))
+        }
+        if isSelectionItemSupported(old) && isSelected(old) {
+          run self.selectionChange(old, false)
+        }
+      }
+      return
+    }
+    let id = elementId(new)
+    run self.propertyChanges(old, new)
+    let newName = run name(new)
+    if newName.isSome() && new.live() != Live.Off {
+      let oldName = run name(old)
+      if new.live() != old.live() || wasFilteredOut || !sameText(&newName, &oldName) {
+        run self.push(WinEvent.simple(id, EVENT_LIVE_REGION_CHANGED()))
+      }
+    }
+    if wasFilteredOut && new.isDialog() {
+      run self.push(WinEvent.simple(id, EVENT_WINDOW_OPENED()))
+    }
+    if isSelectionItemSupported(new) {
+      let now = isSelected(new)
+      if now != isSelected(old) || (wasFilteredOut && now) {
+        run self.selectionChange(new, now)
+      }
+    }
+  }
+
+  effect fn focusMoved(self: &mut Self, old: Option<NodeRef<'_>>, new: Option<NodeRef<'_>>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    drop old
+    match new {
+      Option.Some { value } => run self.push(WinEvent.simple(elementId(&value), EVENT_FOCUS_CHANGED()))
+      Option.None => {}
+    }
+  }
+
+  effect fn nodeRemoved(self: &mut Self, node: &NodeRef<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.textChange(node)
+    if commonFilter(node) != FilterResult.Include {
+      return
+    }
+    if node.isDialog() {
+      run self.push(WinEvent.simple(elementId(node), EVENT_WINDOW_CLOSED()))
+    }
+    if isSelectionItemSupported(node) {
+      run self.selectionChange(node, false)
+    }
+  }
+}

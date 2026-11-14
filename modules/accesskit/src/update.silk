@@ -1,0 +1,167 @@
+//! Tree updates the application sends, action requests assistive technology sends back, and the
+//! handler interfaces an adapter calls.
+//!
+//! Ported from AccessKit 0.25 (`accesskit/src/lib.rs`), Copyright 2023 The AccessKit Authors,
+//! under the MIT or Apache-2.0 license (see LICENSE-MIT and LICENSE-APACHE).
+import geometry { Point }
+import node { Node, NodeId, TreeId, Action, TextSelection }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.string { String }
+
+/// Rarely changing information about a whole tree.
+pub struct TreeInfo {
+  /// The tree's root node.
+  pub root: NodeId,
+  /// The UI toolkit's name, if known.
+  pub toolkitName: Option<String>,
+  /// The UI toolkit's version, if known.
+  pub toolkitVersion: Option<String>,
+}
+
+impl TreeInfo {
+  pub fn make(root: NodeId) -> TreeInfo {
+    return TreeInfo { root: root, toolkitName: Option.None, toolkitVersion: Option.None }
+  }
+
+  pub effect fn copy(self: &Self) -> TreeInfo
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return TreeInfo {
+      root: self.root,
+      toolkitName: run copyText(&self.toolkitName),
+      toolkitVersion: run copyText(&self.toolkitVersion),
+    }
+  }
+
+  pub fn equals(self: &Self, other: &TreeInfo) -> bool {
+    return self.root.value == other.root.value && sameText(&self.toolkitName, &other.toolkitName)
+      && sameText(&self.toolkitVersion, &other.toolkitVersion)
+  }
+}
+
+effect fn copyText(value: &Option<String>) -> Option<String>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match &value.* {
+    Option.Some { value: text } => Option.Some { value: run String.copy(text.view()) }
+    Option.None => Option.None
+  }
+}
+
+fn sameText(a: &Option<String>, b: &Option<String>) -> bool {
+  return match &a.* {
+    Option.Some { value: x } => match &b.* {
+      Option.Some { value: y } => x.view() == y.view()
+      Option.None => false
+    }
+    Option.None => match &b.* {
+      Option.Some { value: _ } => false
+      Option.None => true
+    }
+  }
+}
+
+/// One node of an update, by id.
+pub struct NodeEntry {
+  pub id: NodeId,
+  pub node: Node,
+}
+
+/// An atomic change that brings a tree from one state to the next.
+///
+/// `nodes` holds every node that is new or changed, in any order; each replaces the node with
+/// its id, so a changed node lists all of its properties again. Every node but the root must be
+/// a child of a node in the tree or in the update. To remove a subtree, update its parent
+/// without the child and leave the child and its descendants out.
+pub struct TreeUpdate {
+  pub nodes: List<NodeEntry>,
+  /// Required in the first update of a tree; may be left out after.
+  pub tree: Option<TreeInfo>,
+  /// The tree this update applies to: [`TreeId.root()`] for the main tree.
+  pub treeId: TreeId,
+  /// The node with keyboard focus while the host window has focus, or the root. Every update
+  /// carries it.
+  pub focus: NodeId,
+}
+
+impl TreeUpdate {
+  /// An update of the main tree with no nodes.
+  pub fn make(focus: NodeId) -> TreeUpdate {
+    return TreeUpdate {
+      nodes: List<NodeEntry>.make(),
+      tree: Option.None,
+      treeId: TreeId.root(),
+      focus: focus,
+    }
+  }
+
+  pub effect fn push(self: &mut Self, id: NodeId, node: Node) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.nodes.append(NodeEntry { id: id, node: move node })
+  }
+}
+
+/// How far a `Scroll*` action scrolls.
+pub enum ScrollUnit {
+  /// One item, line or character.
+  Item,
+  /// What fits in the viewport.
+  Page,
+}
+
+/// Where a node scrolled into view should end up in its scroll container.
+pub enum ScrollHint {
+  TopLeft,
+  BottomRight,
+  TopEdge,
+  BottomEdge,
+  LeftEdge,
+  RightEdge,
+}
+
+/// The argument of an action.
+pub union ActionData {
+  CustomAction { pub id: i32 },
+  Value { pub value: String },
+  NumericValue { pub value: f64 },
+  ScrollUnit { pub value: ScrollUnit },
+  /// For `ScrollIntoView`: where the node should land.
+  ScrollHint { pub value: ScrollHint },
+  /// For `ScrollToPoint`, in platform coordinates from the tree's container origin.
+  ScrollToPoint { pub value: Point },
+  /// For `SetScrollOffset`, in the target node's coordinates.
+  SetScrollOffset { pub value: Point },
+  SetTextSelection { pub value: TextSelection },
+}
+
+/// An action assistive technology asked for.
+pub struct ActionRequest {
+  pub action: Action,
+  pub targetTree: TreeId,
+  pub targetNode: NodeId,
+  pub data: Option<ActionData>,
+}
+
+/// Builds the first full tree when an assistive technology starts listening.
+pub interface ActivationHandler {
+  /// A full tree, or `None` when the application sends it later (no later than the next
+  /// frame).
+  effect fn requestInitialTree(self: &mut Self) -> Option<TreeUpdate>
+    ! OutOfMemoryError
+    ? &mut Allocator
+}
+
+/// Performs the actions assistive technology asks for. An unsupported action does nothing.
+pub interface ActionHandler {
+  effect fn doAction(self: &mut Self, request: ActionRequest) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator
+}
+
+/// Lets the application drop its accessibility state when nothing listens any more.
+pub interface DeactivationHandler {
+  fn deactivateAccessibility(self: &mut Self) -> ()
+}
