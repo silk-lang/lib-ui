@@ -1,5 +1,5 @@
 //! Font stylesheets (`Mutation.LoadFontStylesheet`) read or fetched off the UI thread: a
-//! local file, or an HTTP(S) URL fetched as a browser does (`font_web.fetch.stylesheet`, with
+//! local file, or an HTTP(S) URL fetched as a browser does (as `font_web.fetch.stylesheet` does, with
 //! a desktop browser's `User-Agent`, so Google Fonts answers with WOFF2 faces). The loader
 //! declares each `@font-face` rule of a finished sheet into the tree. A WebAssembly host reads
 //! no files or URLs here, so its sheets fail (a page links its stylesheets itself).
@@ -57,7 +57,7 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
   import silk.core.effect { Effect }
   import silk.core.option { Option }
   import silk.core.result { Result }
-  import silk.http.client { Http }
+  import silk.http.client { Http, HttpError, Request }
   import silk.http.client_native { NativeHttp }
   import silk.mem.allocator { Allocator, OutOfMemoryError }
   import silk.system.filesystem { FileSystem, Path }
@@ -198,11 +198,11 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
       }
       Source.Url { url } => {
         let mut http = NativeHttp.make()
-        let fetched = run Effect.result(fetch.stylesheet(String.view(&url)))
+        let fetched = run Effect.result(fetchSheet(String.view(&url)))
           |> Effect.provideMut<Http>(&mut http)
           |> Effect.provideMut<Allocator>(&mut allocator)
         match move fetched {
-          Result.Success { value } => Option<List<FontFaceRule>>.some(move value)
+          Result.Success { value } => move value
           Result.Failure { error } => {
             drop error
             Option<List<FontFaceRule>>.None
@@ -210,6 +210,33 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
         }
       }
     }
+  }
+
+  /// Fetches the stylesheet at HTTP(S) `url` as a desktop browser does, so Google Fonts
+  /// answers with WOFF2 faces; its `src` URLs resolve against the URL the response came from.
+  /// The same request as `font_web.fetch.stylesheet`, written out: calling that one from this
+  /// worker makes silkc dev.74 fail with an internal error on aarch64-apple-darwin.
+  effect fn fetchSheet(url: string) -> Option<List<FontFaceRule>>
+    ! HttpError | OutOfMemoryError
+    ? &mut Http | &mut Allocator {
+    let encoded = run fetch.encode(url)
+    let mut request = Request.get(String.view(&encoded)).timeoutSeconds(15).maxBodyBytes(fetch.MAX_BODY_BYTES)
+    run request.header("User-Agent", fetch.USER_AGENT)
+    run request.header("Accept", "text/css,*/*;q=0.1")
+    let response = run Http.send(move request)
+    if !response.ok() {
+      return Option<List<FontFaceRule>>.None
+    }
+    let mut final = response.url()
+    if final == "" {
+      final = String.view(&encoded)
+    }
+    let base = run Url.parse(final, Option<&'static Url>.None)
+    let rules = match move base {
+      Option<Url>.Some { value } => run parse(response.body(), Option<&Url>.Some { value: &value })
+      Option<Url>.None => run parse(response.body(), Option<&'static Url>.None)
+    }
+    return Option<List<FontFaceRule>>.some(move rules)
   }
 
   /// The rules of the stylesheet file at `path`, or None when it cannot be read.
