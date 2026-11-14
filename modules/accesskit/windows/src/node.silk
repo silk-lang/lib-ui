@@ -1,0 +1,846 @@
+//! How UI Automation sees an AccessKit node: its properties, the control patterns it supports
+//! and the values those patterns report, written as the record the native side answers from.
+//!
+//! Ported from AccessKit (`accesskit_windows/src/node.rs`, `text.rs` and `util.rs`), Copyright
+//! 2022 The AccessKit Authors, under the MIT or Apache-2.0 license. AccessKit's providers ask the
+//! tree on every call; here the Silk side computes the same answers ahead of time and sends them
+//! as a record (see [`record`]), and the text pattern is answered from the record's characters,
+//! words, lines, paragraphs and format runs.
+import accesskit.lib {
+  Action,
+  Role,
+  Toggled,
+  Orientation,
+  Live,
+  AriaCurrent,
+  HasPopup,
+  SortDirection,
+  TextAlign,
+  TextDecorationStyle,
+  VerticalOffset,
+  Color,
+  Rect
+}
+import accesskit_consumer.lib {
+  NodeRef,
+  Position,
+  FilterResult,
+  CommonFilter,
+  CommonFilterWithRootException,
+  commonFilter
+}
+import controls { controlTypeOf, ariaRoleOf }
+import record {
+  Record,
+  Value,
+  TAG_PATTERNS,
+  TAG_BOUNDS,
+  TAG_PARENT,
+  TAG_CHILDREN,
+  TAG_SELECTION_CONTAINER,
+  TAG_SELECTED,
+  TAG_CONTROLS,
+  TAG_FLAGS,
+  TAG_TEXT,
+  PATTERN_TOGGLE,
+  PATTERN_INVOKE,
+  PATTERN_VALUE,
+  PATTERN_RANGE_VALUE,
+  PATTERN_SCROLL_ITEM,
+  PATTERN_SELECTION_ITEM,
+  PATTERN_SELECTION,
+  PATTERN_TEXT,
+  PATTERN_EXPAND_COLLAPSE,
+  PATTERN_WINDOW,
+  FLAG_ROOT,
+  FLAG_HAS_PARENT,
+  FLAG_HAS_BOUNDS,
+  FLAG_DISABLED,
+  FLAG_FOCUSABLE,
+  FLAG_EXPANDED,
+  FLAG_COLLAPSED,
+  FLAG_SELECTED,
+  FLAG_READ_ONLY
+}
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.num.i32
+import silk.num.u8
+import silk.num.usize
+import silk.text.string { String }
+
+/// `UIA_SelectionItemIsSelectedPropertyId`.
+pub fn PROPERTY_IS_SELECTED() -> i32 {
+  return 30079
+}
+
+/// `UIA_ControllerForPropertyId`: the native side fills in the elements.
+pub fn PROPERTY_CONTROLLER_FOR() -> i32 {
+  return 30104
+}
+
+/// `UIA_CulturePropertyId`: carried as a locale name, which the native side turns into an LCID.
+pub fn PROPERTY_CULTURE() -> i32 {
+  return 30015
+}
+
+/// Whether the adapter exposes `node` as an element.
+pub fn included(node: &NodeRef<'_>) -> bool {
+  return commonFilter(node) == FilterResult.Include
+}
+
+/// `node`'s id as the native side knows it.
+pub fn elementId(node: &NodeRef<'_>) -> u64 {
+  return node.id.toU64()
+}
+
+/// One UI Automation property of a node. `pattern` is the `PATTERN_` bit of the control pattern
+/// the property belongs to, or 0 for the element's own properties.
+pub struct Property {
+  pub id: i32,
+  pub pattern: u32,
+  pub value: Value,
+}
+
+effect fn optionalText(value: Option<string>) -> Value ! OutOfMemoryError ? &mut Allocator {
+  return match value {
+    Option.Some { value: text } => Value.Text { value: run String.copy(text) }
+    Option.None => Value.Empty
+  }
+}
+
+fn ownedText(value: Option<String>) -> Value {
+  return match move value {
+    Option.Some { value: text } => Value.Text { value: move text }
+    Option.None => Value.Empty
+  }
+}
+
+fn optionalCount(value: Option<usize>, offset: usize) -> Value {
+  return match value {
+    Option.Some { value: count } => Value.Int { value: usize.wrappingToI32(count + offset) }
+    Option.None => Value.Empty
+  }
+}
+
+/// `UIA_NamePropertyId`: the value for nodes named by their value, else the label.
+pub effect fn name(node: &NodeRef<'_>) -> Option<String>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if node.labelComesFromValue() {
+    return run node.value()
+  }
+  return run node.label()
+}
+
+effect fn appendDecimal(out: &mut String, value: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut digits = List<u8>.make()
+  let mut rest = value
+  while true {
+    run digits.append(usize.wrappingToU8(rest % 10) + 48)
+    rest = rest / 10
+    if rest == 0 {
+      break
+    }
+  }
+  let mut ordered = List<u8>.make()
+  while let Option.Some { value: digit } = digits.pop() {
+    run ordered.append(digit)
+  }
+  run out.append(String.fromUtf8(ordered.asSlice()).unwrapOr("0"))
+}
+
+effect fn ariaProperty(out: &mut String, key: string, value: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if String.byteLength(out.view()) > 0 {
+    run out.append(";")
+  }
+  run out.append(key)
+  run out.append("=")
+  run out.append(value)
+}
+
+/// `UIA_AriaPropertiesPropertyId`: `name=value` pairs joined by `;`.
+pub effect fn ariaProperties(node: &NodeRef<'_>) -> Option<String>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = String.make()
+  if node.isLiveAtomic() {
+    run ariaProperty(&mut out, "atomic", "true")
+  }
+  match node.brailleLabel() {
+    Option.Some { value } => run ariaProperty(&mut out, "braillelabel", value)
+    Option.None => {}
+  }
+  match node.brailleRoleDescription() {
+    Option.Some { value } => run ariaProperty(&mut out, "brailleroledescription", value)
+    Option.None => {}
+  }
+  if node.isBusy() {
+    run ariaProperty(&mut out, "busy", "true")
+  }
+  match node.columnIndexText() {
+    Option.Some { value } => run ariaProperty(&mut out, "colindextext", value)
+    Option.None => {}
+  }
+  match node.ariaCurrent() {
+    Option.Some { value } => {
+      let shown = match value {
+        AriaCurrent.False => ""
+        AriaCurrent.True => "true"
+        AriaCurrent.Page => "page"
+        AriaCurrent.Step => "step"
+        AriaCurrent.Location => "location"
+        AriaCurrent.Date => "date"
+        AriaCurrent.Time => "time"
+      }
+      if value != AriaCurrent.False {
+        run ariaProperty(&mut out, "current", shown)
+      }
+    }
+    Option.None => {}
+  }
+  match node.hasPopup() {
+    Option.Some { value } => {
+      run ariaProperty(
+        &mut out,
+        "haspopup",
+        match value {
+          HasPopup.Menu => "menu"
+          HasPopup.Listbox => "listbox"
+          HasPopup.Tree => "tree"
+          HasPopup.Grid => "grid"
+          HasPopup.Dialog => "dialog"
+        },
+      )
+    }
+    Option.None => {}
+  }
+  match node.level() {
+    Option.Some { value } => {
+      run ariaProperty(&mut out, "level", "")
+      run appendDecimal(&mut out, value)
+    }
+    Option.None => {}
+  }
+  if node.isMultiline() {
+    run ariaProperty(&mut out, "multiline", "true")
+  }
+  match node.rowIndexText() {
+    Option.Some { value } => run ariaProperty(&mut out, "rowindextext", value)
+    Option.None => {}
+  }
+  match node.sortDirection() {
+    Option.Some { value } => {
+      run ariaProperty(
+        &mut out,
+        "sort",
+        match value {
+          SortDirection.Ascending => "ascending"
+          SortDirection.Descending => "descending"
+          SortDirection.Other => "other"
+        },
+      )
+    }
+    Option.None => {}
+  }
+  if String.byteLength(out.view()) == 0 {
+    return Option.None
+  }
+  return Option.Some { value: move out }
+}
+
+/// Whether `node` supports the SelectionItem pattern.
+pub fn isSelectionItemSupported(node: &NodeRef<'_>) -> bool {
+  return match node.accessRole() {
+    // SelectionItem.IsSelected follows aria-checked for radio buttons.
+    Role.RadioButton => match node.toggled() {
+      Option.Some { value } => value != Toggled.Mixed
+      Option.None => false
+    }
+    Role.MenuItemRadio => match node.toggled() {
+      Option.Some { value } => value != Toggled.Mixed
+      Option.None => false
+    }
+    Role.ListBoxOption => node.isSelected().isSome()
+    Role.ListItem => node.isSelected().isSome()
+    Role.MenuListOption => node.isSelected().isSome()
+    Role.Tab => node.isSelected().isSome()
+    Role.TreeItem => node.isSelected().isSome()
+    Role.GridCell => true
+    _ => false
+  }
+}
+
+/// `SelectionItem.IsSelected`.
+pub fn isSelected(node: &NodeRef<'_>) -> bool {
+  return match node.accessRole() {
+    Role.RadioButton => node.toggled().unwrapOr(Toggled.False) == Toggled.True
+    Role.MenuItemRadio => node.toggled().unwrapOr(Toggled.False) == Toggled.True
+    _ => node.isSelected().unwrapOr(false)
+  }
+}
+
+/// The `PATTERN_` bits of the control patterns `node` supports.
+pub fn patterns(node: &NodeRef<'_>) -> u32 {
+  let filter = CommonFilter {}
+  let mut bits: u32 = 0
+  let selectionItem = isSelectionItemSupported(node)
+  if node.toggled().isSome() && !selectionItem {
+    bits = bits | PATTERN_TOGGLE()
+  }
+  if node.isInvocable(&filter) {
+    bits = bits | PATTERN_INVOKE()
+  }
+  if node.supportsUrl() || (node.hasValue() && !node.labelComesFromValue()) {
+    bits = bits | PATTERN_VALUE()
+  }
+  if node.numericValue().isSome() {
+    bits = bits | PATTERN_RANGE_VALUE()
+  }
+  if node.supportsAction(Action.ScrollIntoView, &filter) {
+    bits = bits | PATTERN_SCROLL_ITEM()
+  }
+  if selectionItem {
+    bits = bits | PATTERN_SELECTION_ITEM()
+  }
+  if node.isContainerWithSelectableChildren() {
+    bits = bits | PATTERN_SELECTION()
+  }
+  if node.supportsTextRanges() {
+    bits = bits | PATTERN_TEXT()
+  }
+  if node.supportsExpandCollapse() {
+    bits = bits | PATTERN_EXPAND_COLLAPSE()
+  }
+  if node.isDialog() {
+    bits = bits | PATTERN_WINDOW()
+  }
+  return bits
+}
+
+/// The `FLAG_` bits of `node`.
+pub fn flags(node: &NodeRef<'_>) -> u32 {
+  let filter = CommonFilter {}
+  let mut bits: u32 = 0
+  if node.isRoot() {
+    bits = bits | FLAG_ROOT()
+  }
+  let rootException = CommonFilterWithRootException {}
+  if node.filteredParent(&rootException).isSome() {
+    bits = bits | FLAG_HAS_PARENT()
+  }
+  if node.boundingBox().isSome() {
+    bits = bits | FLAG_HAS_BOUNDS()
+  }
+  if node.isDisabled() {
+    bits = bits | FLAG_DISABLED()
+  }
+  if node.isFocusable(&filter) {
+    bits = bits | FLAG_FOCUSABLE()
+  }
+  match node.data().isExpanded() {
+    Option.Some { value } => {
+      bits = bits
+        | if value {
+          FLAG_EXPANDED()
+        } else {
+          FLAG_COLLAPSED()
+        }
+    }
+    Option.None => {}
+  }
+  if isSelected(node) {
+    bits = bits | FLAG_SELECTED()
+  }
+  if node.isReadOnly() {
+    bits = bits | FLAG_READ_ONLY()
+  }
+  return bits
+}
+
+effect fn add(out: &mut List<Property>, id: i32, pattern: u32, value: Value) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.append(Property { id: id, pattern: pattern, value: move value })
+}
+
+fn flag(value: bool) -> Value {
+  return Value.Bool { value: value }
+}
+
+/// The properties of `node`, in a fixed order: the element's own, then those of each control
+/// pattern it supports. A property with no value is `Value.Empty`.
+pub effect fn properties(node: &NodeRef<'_>, out: &mut List<Property>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let filter = CommonFilter {}
+  let kind = node.accessRole()
+  run add(&mut out, 30003, 0, Value.Int { value: controlTypeOf(kind) })
+  run add(&mut out, 30004, 0, run optionalText(node.roleDescription()))
+  run add(&mut out, 30101, 0, run optionalText(ariaRoleOf(kind)))
+  run add(&mut out, 30005, 0, ownedText(run name(node)))
+  run add(&mut out, 30159, 0, ownedText(run node.description()))
+  run add(&mut out, PROPERTY_CULTURE(), 0, run optionalText(node.language()))
+  run add(&mut out, 30013, 0, run optionalText(node.placeholder()))
+  let content = included(node)
+  run add(&mut out, 30017, 0, flag(content))
+  run add(&mut out, 30016, 0, flag(content))
+  run add(&mut out, 30010, 0, flag(!node.isDisabled()))
+  run add(&mut out, 30009, 0, flag(node.isFocusable(&filter)))
+  run add(&mut out, 30008, 0, flag(node.isFocused()))
+  run add(
+    &mut out,
+    30135,
+    0,
+    Value.Int {
+      value: match node.live() {
+        Live.Off => 0
+        Live.Polite => 1
+        Live.Assertive => 2
+      },
+    },
+  )
+  let automationId = match node.htmlId() {
+    Option.Some { value } => Option.Some { value: value }
+    Option.None => node.authorId()
+  }
+  run add(&mut out, 30011, 0, run optionalText(automationId))
+  run add(&mut out, 30012, 0, run optionalText(node.className()))
+  run add(
+    &mut out,
+    30023,
+    0,
+    Value.Int {
+      value: match node.orientation() {
+        Option.Some { value } => if value == Orientation.Horizontal {
+          1
+        } else {
+          2
+        }
+        Option.None => 0
+      },
+    },
+  )
+  run add(&mut out, 30025, 0, flag(node.isRequired()))
+  run add(&mut out, 30019, 0, flag(node.isPasswordInput()))
+  run add(&mut out, 30154, 0, optionalCount(node.level(), 1))
+  run add(&mut out, 30152, 0, optionalCount(node.positionInSet(), 1))
+  run add(&mut out, 30153, 0, optionalCount(node.sizeOfSetFromContainer(&filter), 0))
+  run add(&mut out, 30102, 0, ownedText(run ariaProperties(node)))
+  run add(&mut out, 30174, 0, flag(node.isDialog()))
+  if node.isRoot() {
+    let toolkit = node.treeState.toolkitName()
+    run add(&mut out, 30024, 0, run optionalText(Option.Some { value: toolkit }))
+    let mut description = run String.copy(toolkit)
+    match node.treeState.toolkitVersion() {
+      Option.Some { value } => {
+        run description.append(" ")
+        run description.append(value)
+      }
+      Option.None => {}
+    }
+    run add(&mut out, 30107, 0, Value.Text { value: move description })
+  }
+
+  let bits = patterns(node)
+  if bits & PATTERN_TOGGLE() != 0 {
+    let state = match node.toggled() {
+      Option.Some { value } => match value {
+        Toggled.False => 0
+        Toggled.True => 1
+        Toggled.Mixed => 2
+      }
+      Option.None => 0
+    }
+    run add(&mut out, 30086, PATTERN_TOGGLE(), Value.Int { value: state })
+  }
+  if bits & PATTERN_VALUE() != 0 {
+    let shown: Option<String> = if node.supportsUrl() && node.url().isSome() {
+      match node.url() {
+        Option.Some { value } => Option.Some { value: run String.copy(value) }
+        Option.None => Option.None
+      }
+    } else {
+      run node.value()
+    }
+    let text = match move shown {
+      Option.Some { value } => move value
+      Option.None => String.make()
+    }
+    run add(&mut out, 30045, PATTERN_VALUE(), Value.Text { value: move text })
+    run add(&mut out, 30046, PATTERN_VALUE(), flag(node.isReadOnly()))
+  }
+  if bits & PATTERN_RANGE_VALUE() != 0 {
+    let step = node.numericValueStep().unwrapOr(0.0)
+    let pattern = PATTERN_RANGE_VALUE()
+    run add(&mut out, 30047, pattern, Value.Number { value: node.numericValue().unwrapOr(0.0) })
+    run add(&mut out, 30048, pattern, flag(node.isReadOnly()))
+    run add(&mut out, 30049, pattern, Value.Number { value: node.minNumericValue().unwrapOr(0.0) })
+    run add(&mut out, 30050, pattern, Value.Number { value: node.maxNumericValue().unwrapOr(0.0) })
+    run add(&mut out, 30052, pattern, Value.Number { value: step })
+    run add(&mut out, 30051, pattern, Value.Number { value: node.numericValueJump().unwrapOr(step) })
+  }
+  if bits & PATTERN_SELECTION() != 0 {
+    run add(&mut out, 30060, PATTERN_SELECTION(), flag(node.isMultiselectable()))
+    run add(&mut out, 30061, PATTERN_SELECTION(), flag(node.isRequired()))
+  }
+  if bits & PATTERN_EXPAND_COLLAPSE() != 0 {
+    let state = match node.data().isExpanded() {
+      Option.Some { value } => if value {
+        1
+      } else {
+        0
+      }
+      Option.None => 3
+    }
+    run add(&mut out, 30070, PATTERN_EXPAND_COLLAPSE(), Value.Int { value: state })
+  }
+  if bits & PATTERN_WINDOW() != 0 {
+    run add(&mut out, 30077, PATTERN_WINDOW(), flag(node.isModal()))
+  }
+}
+
+/// The value of property `id` in `list`, if it is there.
+pub fn findIn<'a>(list: &'a List<Property>, id: i32) -> Option<&'a Property> {
+  let mut i: usize = 0
+  while i < list.length() {
+    let one = &list.asSlice()[i]
+    if one.id == id {
+      return Option.Some { value: one }
+    }
+    i = i + 1
+  }
+  return Option.None
+}
+
+/// The included children of `node`.
+pub effect fn childIds(node: &NodeRef<'_>, out: &mut List<u64>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let filter = CommonFilter {}
+  let mut cursor = node.filteredChildren(&filter)
+  while let Option.Some { value: child } = cursor.next(&filter) {
+    run out.append(elementId(&child))
+  }
+}
+
+/// The included elements that `node` controls.
+pub effect fn controlledIds(node: &NodeRef<'_>, out: &mut List<u64>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut controlled = List<NodeRef<'_>>.make()
+  run node.controls(&mut controlled)
+  let mut c: usize = 0
+  while c < controlled.length() {
+    let one = controlled.get(c)
+    if included(&one) {
+      run out.append(elementId(&one))
+    }
+    c = c + 1
+  }
+}
+
+/// Writes the record of `node` to `out`.
+pub effect fn writeRecord(node: &NodeRef<'_>, out: &mut Record) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let filter = CommonFilter {}
+  let mut list = List<Property>.make()
+  run properties(node, &mut list)
+  let mut i: usize = 0
+  while i < list.length() {
+    let one = &list.asSlice()[i]
+    if !one.value.isEmpty() {
+      run out.property(one.id, &one.value)
+    }
+    i = i + 1
+  }
+  run out.byte(TAG_PATTERNS())
+  run out.uint32(patterns(node))
+  run out.byte(TAG_FLAGS())
+  run out.uint32(flags(node))
+  match node.boundingBox() {
+    Option.Some { value } => {
+      run out.byte(TAG_BOUNDS())
+      run out.rect(value)
+    }
+    Option.None => {}
+  }
+  let rootException = CommonFilterWithRootException {}
+  match node.filteredParent(&rootException) {
+    Option.Some { value } => {
+      run out.byte(TAG_PARENT())
+      run out.uint64(elementId(&value))
+    }
+    Option.None => {}
+  }
+  let mut ids = List<u64>.make()
+  run childIds(node, &mut ids)
+  run out.idsField(TAG_CHILDREN(), &ids)
+  if isSelectionItemSupported(node) {
+    match node.selectionContainer(&filter) {
+      Option.Some { value } => {
+        run out.byte(TAG_SELECTION_CONTAINER())
+        run out.uint64(elementId(&value))
+      }
+      Option.None => {}
+    }
+  }
+  if node.isContainerWithSelectableChildren() {
+    let mut items = List<NodeRef<'_>>.make()
+    run node.items(&filter, &mut items)
+    ids.clear()
+    let mut k: usize = 0
+    while k < items.length() {
+      if items.get(k).isSelected().unwrapOr(false) {
+        run ids.append(elementId(&items.get(k)))
+      }
+      k = k + 1
+    }
+    run out.idsField(TAG_SELECTED(), &ids)
+  }
+  ids.clear()
+  run controlledIds(node, &mut ids)
+  if ids.length() > 0 {
+    run out.idsField(TAG_CONTROLS(), &ids)
+  }
+  if node.supportsTextRanges() {
+    run out.byte(TAG_TEXT())
+    run writeText(node, &mut out)
+  }
+}
+
+/// The most units of each kind a record carries.
+pub fn TEXT_LIMIT() -> usize {
+  return 65536
+}
+
+/// A unit of text: characters, formats, words, lines or paragraphs.
+enum Unit {
+  Character,
+  Format,
+  Word,
+  Line,
+  Paragraph,
+}
+
+fn unitEnd<'a>(pos: Position<'a>, unit: Unit) -> Position<'a> {
+  return match unit {
+    Unit.Character => pos.forwardToCharacterEnd()
+    Unit.Format => pos.forwardToFormatEnd()
+    Unit.Word => pos.forwardToWordEnd()
+    Unit.Line => pos.forwardToLineEnd()
+    Unit.Paragraph => pos.forwardToParagraphEnd()
+  }
+}
+
+fn nextStart<'a>(pos: Position<'a>, unit: Unit) -> Position<'a> {
+  return match unit {
+    Unit.Character => pos.forwardToCharacterStart()
+    Unit.Format => pos.forwardToFormatStart()
+    Unit.Word => pos.forwardToWordStart()
+    Unit.Line => pos.forwardToLineStart()
+    Unit.Paragraph => pos.forwardToParagraphStart()
+  }
+}
+
+/// The union of the boxes between `start` and `end`.
+effect fn spanBounds<'a>(start: &Position<'a>, end: &Position<'a>) -> Rect
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut range = start.toDegenerateRange()
+  range.setEnd(end.*)
+  let mut boxes = List<Rect>.make()
+  run range.boundingBoxes(&mut boxes)
+  if boxes.length() == 0 {
+    return Rect.make(0.0, 0.0, 0.0, 0.0)
+  }
+  let mut out = boxes.get(0)
+  let mut i: usize = 1
+  while i < boxes.length() {
+    let next = boxes.get(i)
+    out = Rect.make(
+      f64.min(out.x0, next.x0),
+      f64.min(out.y0, next.y0),
+      f64.max(out.x1, next.x1),
+      f64.max(out.y1, next.y1),
+    )
+    i = i + 1
+  }
+  return out
+}
+
+/// Writes the spans of `unit` over the document of `node`: a count, then a UTF-16 start and end
+/// each, with the character bounds or the format attributes after each span when `unit` calls
+/// for them.
+effect fn writeUnits(node: &NodeRef<'_>, unit: Unit, out: &mut Record) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut spans = Record.make()
+  let mut count: usize = 0
+  let mut pos = node.documentStart()
+  while count < TEXT_LIMIT() {
+    if unit == Unit.Character && pos.isDocumentEnd() {
+      break
+    }
+    let end = if pos.isDocumentEnd() {
+      pos
+    } else {
+      unitEnd(pos, unit)
+    }
+    run spans.index(pos.toGlobalUtf16Index())
+    run spans.index(end.toGlobalUtf16Index())
+    if unit == Unit.Character {
+      run spans.rect(run spanBounds(&pos, &end))
+    }
+    if unit == Unit.Format {
+      run writeAttributes(&pos.innerNode(), &mut spans)
+    }
+    count = count + 1
+    if pos.isDocumentEnd() {
+      break
+    }
+    let next = nextStart(pos, unit)
+    if next.toGlobalUtf16Index() <= pos.toGlobalUtf16Index() {
+      break
+    }
+    pos = next
+  }
+  run out.index(count)
+  run out.raw(spans.asSlice())
+}
+
+/// Writes the text block of a node that supports text ranges.
+pub effect fn writeText(node: &NodeRef<'_>, out: &mut Record) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let document = node.documentRange()
+  let text = run document.text()
+  run out.text(text.view())
+  run out.index(document.endPosition().toGlobalUtf16Index())
+  match node.textSelectionAnchor() {
+    Option.Some { value: anchor } => {
+      run out.byte(1)
+      run out.index(anchor.toGlobalUtf16Index())
+      let focus = match node.textSelectionFocus() {
+        Option.Some { value } => value.toGlobalUtf16Index()
+        Option.None => anchor.toGlobalUtf16Index()
+      }
+      run out.index(focus)
+    }
+    Option.None => {
+      run out.byte(0)
+      run out.index(0)
+      run out.index(0)
+    }
+  }
+  run writeUnits(node, Unit.Character, &mut out)
+  run writeUnits(node, Unit.Word, &mut out)
+  run writeUnits(node, Unit.Line, &mut out)
+  run writeUnits(node, Unit.Paragraph, &mut out)
+  run writeUnits(node, Unit.Format, &mut out)
+}
+
+/// A color as a Win32 `COLORREF`.
+fn colorRef(value: Color) -> i32 {
+  return u8.toI32(value.red) | i32.shiftLeft(u8.toI32(value.green), 8)
+    | i32.shiftLeft(u8.toI32(value.blue), 16)
+}
+
+fn decorationStyle(value: TextDecorationStyle) -> i32 {
+  return match value {
+    TextDecorationStyle.Solid => 1
+    TextDecorationStyle.Double => 3
+    TextDecorationStyle.Dotted => 4
+    TextDecorationStyle.Dashed => 5
+    TextDecorationStyle.Wavy => 8
+  }
+}
+
+/// Writes the UI Automation text attributes of text run `piece`: a count, then a UIA text
+/// attribute id and a value each.
+effect fn writeAttributes(piece: &NodeRef<'_>, out: &mut Record) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut list = List<Property>.make()
+  match piece.fontFamily() {
+    Option.Some { value } => run add(&mut list, 40005, 0, Value.Text { value: run String.copy(value) })
+    Option.None => {}
+  }
+  match piece.fontSize() {
+    Option.Some { value } => run add(&mut list, 40006, 0, Value.Number { value: f32.toF64(value) })
+    Option.None => {}
+  }
+  match piece.fontWeight() {
+    Option.Some { value } => run add(&mut list, 40007, 0, Value.Int { value: f32.toI32(value) })
+    Option.None => {}
+  }
+  run add(&mut list, 40014, 0, flag(piece.isItalic()))
+  match piece.backgroundColor() {
+    Option.Some { value } => run add(&mut list, 40001, 0, Value.Int { value: colorRef(value) })
+    Option.None => {}
+  }
+  match piece.foregroundColor() {
+    Option.Some { value } => run add(&mut list, 40008, 0, Value.Int { value: colorRef(value) })
+    Option.None => {}
+  }
+  match piece.overline() {
+    Option.Some { value } => {
+      run add(&mut list, 40024, 0, Value.Int { value: decorationStyle(value.style) })
+      run add(&mut list, 40023, 0, Value.Int { value: colorRef(value.color) })
+    }
+    Option.None => {}
+  }
+  match piece.strikethrough() {
+    Option.Some { value } => {
+      run add(&mut list, 40026, 0, Value.Int { value: decorationStyle(value.style) })
+      run add(&mut list, 40025, 0, Value.Int { value: colorRef(value.color) })
+    }
+    Option.None => {}
+  }
+  match piece.underline() {
+    Option.Some { value } => {
+      run add(&mut list, 40030, 0, Value.Int { value: decorationStyle(value.style) })
+      run add(&mut list, 40029, 0, Value.Int { value: colorRef(value.color) })
+    }
+    Option.None => {}
+  }
+  match piece.textAlign() {
+    Option.Some { value } => {
+      let shown = match value {
+        TextAlign.Left => 0
+        TextAlign.Center => 1
+        TextAlign.Right => 2
+        TextAlign.Justify => 3
+      }
+      run add(&mut list, 40009, 0, Value.Int { value: shown })
+    }
+    Option.None => {}
+  }
+  match piece.verticalOffset() {
+    Option.Some { value } => {
+      run add(&mut list, 40016, 0, flag(value == VerticalOffset.Subscript))
+      run add(&mut list, 40017, 0, flag(value == VerticalOffset.Superscript))
+    }
+    Option.None => {}
+  }
+  match piece.language() {
+    Option.Some { value } => run add(&mut list, 40004, 0, Value.Text { value: run String.copy(value) })
+    Option.None => {}
+  }
+  run out.index(list.length())
+  let mut i: usize = 0
+  while i < list.length() {
+    let one = &list.asSlice()[i]
+    run out.uint32(i32.wrappingToU32(one.id))
+    run out.value(&one.value)
+    i = i + 1
+  }
+}

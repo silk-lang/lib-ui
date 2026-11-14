@@ -1,0 +1,1479 @@
+//! Text positions and ranges over the text runs of a text node, with the character, word,
+//! line, paragraph and format boundaries screen readers move by.
+//!
+//! Ported from AccessKit (`accesskit_consumer/src/text.rs`), Copyright 2022 The AccessKit
+//! Authors, under the MIT or Apache-2.0 license (see LICENSE-MIT and LICENSE-APACHE).
+import accesskit.lib {
+  Color,
+  Point,
+  Rect,
+  Role,
+  TextAlign,
+  TextDecoration,
+  TextDirection,
+  TextPosition as WeakPosition,
+  TextSelection,
+  VerticalOffset
+}
+import filters { TextRunFilter }
+import node { NodeRef, FilteredCursor, PASSWORD_MASKING_CHARACTER }
+import tree { TreeState, FullNodeId }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.u8
+import silk.num.usize
+import silk.num.u32
+import silk.text.char
+import silk.text.string { String }
+
+/// The order of two values: -1, 0 or 1.
+pub fn compareUsize(a: usize, b: usize) -> i32 {
+  if a < b {
+    return -1
+  }
+  if a > b {
+    return 1
+  }
+  return 0
+}
+
+fn depthBelow(node: NodeRef<'_>, root: FullNodeId) -> usize {
+  let mut depth: usize = 0
+  let mut current = node
+  while !current.id.equals(root) {
+    current = match current.parent() {
+      Option.Some { value } => value
+      Option.None => {
+        return depth
+      }
+    }
+    depth = depth + 1
+  }
+  return depth
+}
+
+/// The tree order of `a` and `b` under `root`, as comparing their index paths does: an
+/// ancestor comes before its descendants.
+pub fn compareTreeOrder(a: NodeRef<'_>, b: NodeRef<'_>, root: FullNodeId) -> i32 {
+  if a.id.equals(b.id) {
+    return 0
+  }
+  let mut x = a
+  let mut y = b
+  let mut dx = depthBelow(a, root)
+  let mut dy = depthBelow(b, root)
+  while dx > dy {
+    x = x.parent().unwrapOr(x)
+    dx = dx - 1
+    if x.id.equals(y.id) {
+      return 1
+    }
+  }
+  while dy > dx {
+    y = y.parent().unwrapOr(y)
+    dy = dy - 1
+    if x.id.equals(y.id) {
+      return -1
+    }
+  }
+  while true {
+    let px = x.parentId()
+    let py = y.parentId()
+    let same = match px {
+      Option.Some { value: p } => match py {
+        Option.Some { value: q } => p.equals(q)
+        Option.None => true
+      }
+      Option.None => true
+    }
+    if same {
+      return compareUsize(x.indexInParent().unwrapOr(0), y.indexInParent().unwrapOr(0))
+    }
+    x = x.parent().unwrapOr(x)
+    y = y.parent().unwrapOr(y)
+  }
+  return 0
+}
+
+/// A position in a text run: before character `characterIndex`.
+pub struct InnerPosition<'a> {
+  pub node: NodeRef<'a>,
+  pub characterIndex: usize,
+}
+
+impl<'a> Copy for InnerPosition<'a> {}
+
+impl<'a> InnerPosition<'a> {
+  fn upgrade(treeState: &'a TreeState, weak: WeakPosition, nodeId: FullNodeId) -> Option<
+    InnerPosition<'a>
+  > {
+    let node = match treeState.nodeById(nodeId.withSameTree(weak.node)) {
+      Option.Some { value } => value
+      Option.None => {
+        return Option.None
+      }
+    }
+    if node.accessRole() != Role.TextRun {
+      return Option.None
+    }
+    if weak.characterIndex > node.data().characterLengths().length {
+      return Option.None
+    }
+    return Option.Some { value: InnerPosition { node: node, characterIndex: weak.characterIndex } }
+  }
+
+  fn clampedUpgrade(treeState: &'a TreeState, weak: WeakPosition, nodeId: FullNodeId) -> Option<
+    InnerPosition<'a>
+  > {
+    let node = match treeState.nodeById(nodeId.withSameTree(weak.node)) {
+      Option.Some { value } => value
+      Option.None => {
+        return Option.None
+      }
+    }
+    if node.accessRole() != Role.TextRun {
+      return Option.None
+    }
+    let length = node.data().characterLengths().length
+    let index = if weak.characterIndex > length {
+      length
+    } else {
+      weak.characterIndex
+    }
+    return Option.Some { value: InnerPosition { node: node, characterIndex: index } }
+  }
+
+  /// [`clampedUpgrade`] for a selection the application set: it must name a text run.
+  pub fn clampedUpgradePublic(
+    treeState: &'a TreeState,
+    weak: WeakPosition,
+    nodeId: FullNodeId,
+  ) -> InnerPosition<'a> {
+    return match InnerPosition.clampedUpgrade(treeState, weak, nodeId) {
+      Option.Some { value } => value
+      Option.None => Intrinsic.trap(
+        "accesskit: the text selection names a node that is not a text run",
+      )
+    }
+  }
+
+  fn isRunStart(self: &Self) -> bool {
+    return self.characterIndex == 0
+  }
+
+  fn isLineStart(self: &Self) -> bool {
+    return self.isRunStart() && self.node.data().previousOnLine().isNone()
+  }
+
+  fn isRunEnd(self: &Self) -> bool {
+    return self.characterIndex == self.node.data().characterLengths().length
+  }
+
+  fn isLineEnd(self: &Self) -> bool {
+    return self.isRunEnd() && self.node.data().nextOnLine().isNone()
+  }
+
+  fn isParagraphEnd(self: &Self) -> bool {
+    return self.isLineEnd() && String.endsWith(self.node.data().value().unwrapOr(""), "\n")
+  }
+
+  fn isDocumentStart(self: &Self, root: &NodeRef<'_>) -> bool {
+    return self.isRunStart() && precedingTextRun(self.node, root).isNone()
+  }
+
+  fn isDocumentEnd(self: &Self, root: &NodeRef<'_>) -> bool {
+    return self.isRunEnd() && followingTextRun(self.node, root).isNone()
+  }
+
+  fn biasedToStart(self: &Self, root: &NodeRef<'_>) -> InnerPosition<'a> {
+    if self.isRunEnd() {
+      match followingTextRun(self.node, root) {
+        Option.Some { value: node } => {
+          return InnerPosition { node: node, characterIndex: 0 }
+        }
+        Option.None => {}
+      }
+    }
+    return self.*
+  }
+
+  fn biasedToEnd(self: &Self, root: &NodeRef<'_>) -> InnerPosition<'a> {
+    if self.isRunStart() {
+      match precedingTextRun(self.node, root) {
+        Option.Some { value: node } => {
+          return InnerPosition { node: node, characterIndex: node.data().characterLengths().length }
+        }
+        Option.None => {}
+      }
+    }
+    return self.*
+  }
+
+  /// The order of two positions under `root`, after biasing both to the start of a run.
+  fn compare(self: &Self, other: &InnerPosition<'_>, root: &NodeRef<'_>) -> i32 {
+    let a = self.biasedToStart(root)
+    let b = other.biasedToStart(root)
+    let order = compareTreeOrder(a.node, b.node, root.id)
+    if order != 0 {
+      return order
+    }
+    return compareUsize(a.characterIndex, b.characterIndex)
+  }
+
+  fn lineStart(self: &Self) -> InnerPosition<'a> {
+    let mut node = self.node
+    while let Option.Some { value: id } = node.data().previousOnLine() {
+      node = match node.sameTreeNode(id) {
+        Option.Some { value } => value
+        Option.None => Intrinsic.trap("accesskit: previousOnLine names a missing node")
+      }
+    }
+    return InnerPosition { node: node, characterIndex: 0 }
+  }
+
+  fn lineEnd(self: &Self) -> InnerPosition<'a> {
+    let mut node = self.node
+    while let Option.Some { value: id } = node.data().nextOnLine() {
+      node = match node.sameTreeNode(id) {
+        Option.Some { value } => value
+        Option.None => Intrinsic.trap("accesskit: nextOnLine names a missing node")
+      }
+    }
+    return InnerPosition { node: node, characterIndex: node.data().characterLengths().length }
+  }
+
+  pub fn downgrade(self: &Self) -> WeakPosition {
+    return WeakPosition { node: self.node.id.local, characterIndex: self.characterIndex }
+  }
+
+  pub fn equals(self: &Self, other: &InnerPosition<'_>) -> bool {
+    return self.node.id.equals(other.node.id) && self.characterIndex == other.characterIndex
+  }
+}
+
+fn followingTextRun<'a>(node: NodeRef<'a>, root: &NodeRef<'_>) -> Option<NodeRef<'a>> {
+  let filter = TextRunFilter { root: root.id }
+  let mut cursor = node.followingFilteredSiblings(&filter)
+  return cursor.next(&filter)
+}
+
+fn precedingTextRun<'a>(node: NodeRef<'a>, root: &NodeRef<'_>) -> Option<NodeRef<'a>> {
+  let filter = TextRunFilter { root: root.id }
+  let mut cursor = node.precedingFilteredSiblings(&filter)
+  return cursor.next(&filter)
+}
+
+/// A position in the text of a text node.
+pub struct Position<'a> {
+  pub root: NodeRef<'a>,
+  pub inner: InnerPosition<'a>,
+}
+
+impl<'a> Copy for Position<'a> {}
+
+impl<'a> Position<'a> {
+  fn at(self: &Self, inner: InnerPosition<'a>) -> Position<'a> {
+    return Position { root: self.root, inner: inner }
+  }
+
+  pub fn toRaw(self: &Self) -> WeakPosition {
+    return self.inner.downgrade()
+  }
+
+  /// The text run the position is in.
+  pub fn innerNode(self: &Self) -> NodeRef<'a> {
+    return self.inner.node
+  }
+
+  fn wordStarts(self: &Self, node: &NodeRef<'a>) -> &'a [u8] {
+    if self.root.isPasswordInput() {
+      return &[]
+    }
+    return node.data().wordStarts()
+  }
+
+  pub fn isFormatStart(self: &Self) -> bool {
+    if self.isDocumentStart() {
+      return true
+    }
+    if self.inner.characterIndex != 0 {
+      return false
+    }
+    return match precedingTextRun(self.inner.node, &self.root) {
+      Option.Some { value: previous } => self.inner.node.textAttributesDiffer(&previous)
+      Option.None => false
+    }
+  }
+
+  pub fn isWordStart(self: &Self) -> bool {
+    if self.isParagraphStart() {
+      return true
+    }
+    return binarySearch(self.wordStarts(&self.inner.node), self.inner.characterIndex).found
+  }
+
+  pub fn isLineStart(self: &Self) -> bool {
+    return self.inner.isLineStart()
+  }
+
+  pub fn isLineEnd(self: &Self) -> bool {
+    return self.inner.isLineEnd()
+  }
+
+  pub fn isParagraphStart(self: &Self) -> bool {
+    return self.isDocumentStart()
+      || (self.isLineStart() && self.inner.biasedToEnd(&self.root).isParagraphEnd())
+  }
+
+  pub fn isParagraphEnd(self: &Self) -> bool {
+    return self.isDocumentEnd() || self.inner.isParagraphEnd()
+  }
+
+  pub fn isParagraphSeparator(self: &Self) -> bool {
+    if self.isDocumentEnd() {
+      return false
+    }
+    let next = self.forwardToCharacterEnd()
+    return !next.isDocumentEnd() && next.isParagraphEnd()
+  }
+
+  pub fn isPageStart(self: &Self) -> bool {
+    return self.isDocumentStart()
+  }
+
+  pub fn isDocumentStart(self: &Self) -> bool {
+    return self.inner.isDocumentStart(&self.root)
+  }
+
+  pub fn isDocumentEnd(self: &Self) -> bool {
+    return self.inner.isDocumentEnd(&self.root)
+  }
+
+  pub fn toDegenerateRange(self: &Self) -> Range<'a> {
+    return Range.make(self.root, self.inner, self.inner)
+  }
+
+  /// The offset in Unicode scalar values from the start of the text.
+  pub fn toGlobalUsvIndex(self: &Self) -> usize {
+    return self.globalIndex(false)
+  }
+
+  /// The offset in UTF-16 code units from the start of the text.
+  pub fn toGlobalUtf16Index(self: &Self) -> usize {
+    return self.globalIndex(true)
+  }
+
+  fn globalIndex(self: &Self, utf16: bool) -> usize {
+    let masked = self.root.textRunsNeedMasking()
+    let maskUnits: usize = 1
+    let mut total: usize = 0
+    let filter = TextRunFilter { root: self.root.id }
+    let mut runs = self.root.textRuns()
+    while let Option.Some { value: node } = runs.next(&filter) {
+      if masked {
+        if node.id.equals(self.inner.node.id) {
+          return total + self.inner.characterIndex * maskUnits
+        }
+        total = total + node.data().characterLengths().length * maskUnits
+        continue
+      }
+      let text = node.data().value().unwrapOr("")
+      if node.id.equals(self.inner.node.id) {
+        let end = byteOffsetOfCharacter(node.data().characterLengths(), self.inner.characterIndex)
+        return total + unitCount(String.slice(text, 0, end), utf16)
+      }
+      total = total + unitCount(text, utf16)
+    }
+    return Intrinsic.trap("accesskit: invalid position")
+  }
+
+  /// The number of lines before this position's line.
+  pub fn toLineIndex(self: &Self) -> usize {
+    let mut pos = self.*
+    if !pos.isLineStart() {
+      pos = pos.backwardToLineStart()
+    }
+    let mut lines: usize = 0
+    while !pos.isDocumentStart() {
+      pos = pos.backwardToLineStart()
+      lines = lines + 1
+    }
+    return lines
+  }
+
+  pub fn biasedToStart(self: &Self) -> Position<'a> {
+    return self.at(self.inner.biasedToStart(&self.root))
+  }
+
+  pub fn biasedToEnd(self: &Self) -> Position<'a> {
+    return self.at(self.inner.biasedToEnd(&self.root))
+  }
+
+  pub fn forwardToCharacterStart(self: &Self) -> Position<'a> {
+    let pos = self.inner.biasedToStart(&self.root)
+    return self.at(
+      InnerPosition { node: pos.node, characterIndex: pos.characterIndex + 1 }.biasedToStart(
+        &self.root,
+      ),
+    )
+  }
+
+  pub fn forwardToCharacterEnd(self: &Self) -> Position<'a> {
+    let pos = self.inner.biasedToStart(&self.root)
+    return self.at(InnerPosition { node: pos.node, characterIndex: pos.characterIndex + 1 })
+  }
+
+  pub fn backwardToCharacterStart(self: &Self) -> Position<'a> {
+    let pos = self.inner.biasedToEnd(&self.root)
+    return self.at(
+      InnerPosition { node: pos.node, characterIndex: pos.characterIndex - 1 }.biasedToStart(
+        &self.root,
+      ),
+    )
+  }
+
+  pub fn forwardToFormatStart(self: &Self) -> Position<'a> {
+    let filter = TextRunFilter { root: self.root.id }
+    let mut runs = self.inner.node.followingFilteredSiblings(&filter)
+    while let Option.Some { value: node } = runs.next(&filter) {
+      if self.inner.node.textAttributesDiffer(&node) {
+        return self.at(InnerPosition { node: node, characterIndex: 0 })
+      }
+    }
+    return self.documentEnd()
+  }
+
+  pub fn forwardToFormatEnd(self: &Self) -> Position<'a> {
+    return self.forwardToFormatStart().biasedToEnd()
+  }
+
+  pub fn backwardToFormatStart(self: &Self) -> Position<'a> {
+    if self.inner.characterIndex != 0 {
+      let test = self.at(InnerPosition { node: self.inner.node, characterIndex: 0 })
+      if test.isFormatStart() {
+        return test
+      }
+    }
+    let filter = TextRunFilter { root: self.root.id }
+    let mut runs = self.inner.node.precedingFilteredSiblings(&filter)
+    while let Option.Some { value: node } = runs.next(&filter) {
+      let test = self.at(InnerPosition { node: node, characterIndex: 0 })
+      if test.isFormatStart() {
+        return test
+      }
+    }
+    return self.documentStart()
+  }
+
+  pub fn forwardToWordStart(self: &Self) -> Position<'a> {
+    let pos = self.inner.biasedToStart(&self.root)
+    let starts = self.wordStarts(&pos.node)
+    let search = binarySearch(starts, pos.characterIndex)
+    let index = if search.found {
+      search.index + 1
+    } else {
+      search.index
+    }
+    if index < starts.length {
+      return self.at(InnerPosition { node: pos.node, characterIndex: u8.toUsize(starts[index]) })
+    }
+    let filter = TextRunFilter { root: self.root.id }
+    let mut runs = pos.node.followingFilteredSiblings(&filter)
+    while let Option.Some { value: node } = runs.next(&filter) {
+      let start = self.at(InnerPosition { node: node, characterIndex: 0 })
+      if start.isParagraphStart() {
+        return start
+      }
+      let nodeStarts = self.wordStarts(&node)
+      if nodeStarts.length != 0 {
+        return self.at(InnerPosition { node: node, characterIndex: u8.toUsize(nodeStarts[0]) })
+      }
+    }
+    return self.documentEnd()
+  }
+
+  pub fn forwardToWordEnd(self: &Self) -> Position<'a> {
+    return self.forwardToWordStart().biasedToEnd()
+  }
+
+  pub fn backwardToWordStart(self: &Self) -> Position<'a> {
+    let starts = self.wordStarts(&self.inner.node)
+    let search = binarySearch(starts, self.inner.characterIndex)
+    if search.index > 0 {
+      return self.at(
+        InnerPosition {
+          node: self.inner.node,
+          characterIndex: u8.toUsize(starts[search.index - 1]),
+        },
+      )
+    }
+    if self.inner.characterIndex != 0 {
+      let start = self.at(InnerPosition { node: self.inner.node, characterIndex: 0 })
+      if start.isParagraphStart() {
+        return start
+      }
+    }
+    let filter = TextRunFilter { root: self.root.id }
+    let mut runs = self.inner.node.precedingFilteredSiblings(&filter)
+    while let Option.Some { value: node } = runs.next(&filter) {
+      let nodeStarts = self.wordStarts(&node)
+      if nodeStarts.length != 0 {
+        return self.at(
+          InnerPosition {
+            node: node,
+            characterIndex: u8.toUsize(nodeStarts[nodeStarts.length - 1]),
+          },
+        )
+      }
+      let start = self.at(InnerPosition { node: node, characterIndex: 0 })
+      if start.isParagraphStart() {
+        return start
+      }
+    }
+    return self.documentStart()
+  }
+
+  pub fn forwardToLineStart(self: &Self) -> Position<'a> {
+    return self.at(self.inner.lineEnd().biasedToStart(&self.root))
+  }
+
+  pub fn forwardToLineEnd(self: &Self) -> Position<'a> {
+    let pos = self.inner.biasedToStart(&self.root)
+    return self.at(pos.lineEnd())
+  }
+
+  pub fn backwardToLineStart(self: &Self) -> Position<'a> {
+    let pos = self.inner.biasedToEnd(&self.root)
+    return self.at(pos.lineStart().biasedToStart(&self.root))
+  }
+
+  pub fn forwardToParagraphStart(self: &Self) -> Position<'a> {
+    let mut current = self.*
+    while true {
+      current = current.forwardToLineStart()
+      if current.isDocumentEnd() || current.inner.biasedToEnd(&self.root).isParagraphEnd() {
+        break
+      }
+    }
+    return current
+  }
+
+  pub fn forwardToParagraphEnd(self: &Self) -> Position<'a> {
+    let mut current = self.*
+    while true {
+      current = current.forwardToLineEnd()
+      if current.isDocumentEnd() || current.inner.isParagraphEnd() {
+        break
+      }
+    }
+    return current
+  }
+
+  pub fn backwardToParagraphStart(self: &Self) -> Position<'a> {
+    let mut current = self.*
+    while true {
+      current = current.backwardToLineStart()
+      if current.isParagraphStart() {
+        break
+      }
+    }
+    return current
+  }
+
+  pub fn forwardToPageStart(self: &Self) -> Position<'a> {
+    return self.documentEnd()
+  }
+
+  pub fn forwardToPageEnd(self: &Self) -> Position<'a> {
+    return self.documentEnd()
+  }
+
+  pub fn backwardToPageStart(self: &Self) -> Position<'a> {
+    return self.documentStart()
+  }
+
+  pub fn documentEnd(self: &Self) -> Position<'a> {
+    return self.root.documentEnd()
+  }
+
+  pub fn documentStart(self: &Self) -> Position<'a> {
+    return self.root.documentStart()
+  }
+
+  pub fn textDirection(self: &Self) -> Option<TextDirection> {
+    return self.inner.node.textDirection()
+  }
+
+  pub fn fontFamily(self: &Self) -> Option<string<'a>> {
+    return self.inner.node.fontFamily()
+  }
+
+  pub fn language(self: &Self) -> Option<string<'a>> {
+    return self.inner.node.language()
+  }
+
+  pub fn fontSize(self: &Self) -> Option<f32> {
+    return self.inner.node.fontSize()
+  }
+
+  pub fn fontWeight(self: &Self) -> Option<f32> {
+    return self.inner.node.fontWeight()
+  }
+
+  pub fn backgroundColor(self: &Self) -> Option<Color> {
+    return self.inner.node.backgroundColor()
+  }
+
+  pub fn foregroundColor(self: &Self) -> Option<Color> {
+    return self.inner.node.foregroundColor()
+  }
+
+  pub fn overline(self: &Self) -> Option<TextDecoration> {
+    return self.inner.node.overline()
+  }
+
+  pub fn strikethrough(self: &Self) -> Option<TextDecoration> {
+    return self.inner.node.strikethrough()
+  }
+
+  pub fn underline(self: &Self) -> Option<TextDecoration> {
+    return self.inner.node.underline()
+  }
+
+  pub fn textAlign(self: &Self) -> Option<TextAlign> {
+    return self.inner.node.textAlign()
+  }
+
+  pub fn verticalOffset(self: &Self) -> Option<VerticalOffset> {
+    return self.inner.node.verticalOffset()
+  }
+
+  pub fn isItalic(self: &Self) -> bool {
+    return self.inner.node.isItalic()
+  }
+
+  pub fn equals(self: &Self, other: &Position<'_>) -> bool {
+    return self.root.id.equals(other.root.id) && self.inner.equals(&other.inner)
+  }
+
+  /// The order of two positions of the same text node: -1, 0 or 1.
+  pub fn compare(self: &Self, other: &Position<'_>) -> i32 {
+    return self.inner.compare(&other.inner, &self.root)
+  }
+}
+
+/// A property over a range: one value, or several.
+pub union RangeValue<T> {
+  Single { pub value: T },
+  Mixed,
+}
+
+/// A range of the text of a text node.
+pub struct Range<'a> {
+  pub node: NodeRef<'a>,
+  pub start: InnerPosition<'a>,
+  pub end: InnerPosition<'a>,
+}
+
+impl<'a> Copy for Range<'a> {}
+
+impl<'a> Range<'a> {
+  /// The range between two positions, in either order.
+  pub fn make(node: NodeRef<'a>, start: InnerPosition<'a>, end: InnerPosition<'a>) -> Range<'a> {
+    if start.compare(&end, &node) > 0 {
+      return Range { node: node, start: end, end: start }
+    }
+    return Range { node: node, start: start, end: end }
+  }
+
+  pub fn startPosition(self: &Self) -> Position<'a> {
+    return Position { root: self.node, inner: self.start }
+  }
+
+  pub fn endPosition(self: &Self) -> Position<'a> {
+    return Position { root: self.node, inner: self.end }
+  }
+
+  pub fn isDegenerate(self: &Self) -> bool {
+    return self.start.compare(&self.end, &self.node) == 0
+  }
+
+  fn walkBounds(self: &Self) -> WalkBounds<'a> {
+    if self.isDegenerate() {
+      return WalkBounds { first: self.start.node, last: self.start.node }
+    }
+    return WalkBounds {
+      first: self.start.biasedToStart(&self.node).node,
+      last: self.end.biasedToEnd(&self.node).node,
+    }
+  }
+
+  /// Appends the text runs the range touches to `out`, in order.
+  pub effect fn runs(self: &Self, out: &mut List<NodeRef<'a>>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let bounds = self.walkBounds()
+    run out.append(bounds.first)
+    if bounds.first.id.equals(bounds.last.id) {
+      return ()
+    }
+    let filter = TextRunFilter { root: self.node.id }
+    let mut following = bounds.first.followingFilteredSiblings(&filter)
+    while let Option.Some { value: node } = following.next(&filter) {
+      run out.append(node)
+      if node.id.equals(bounds.last.id) {
+        break
+      }
+    }
+  }
+
+  fn startIndexIn(self: &Self, node: &NodeRef<'_>) -> usize {
+    if node.id.equals(self.start.node.id) {
+      return self.start.characterIndex
+    }
+    return 0
+  }
+
+  fn endIndexIn(self: &Self, node: &NodeRef<'_>) -> usize {
+    if node.id.equals(self.end.node.id) {
+      return self.end.characterIndex
+    }
+    return node.data().characterLengths().length
+  }
+
+  /// Appends the range's text to `out`, masked for password inputs.
+  pub effect fn writeText(self: &Self, out: &mut String) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let masked = self.node.textRunsNeedMasking()
+    let mut nodes = List<NodeRef<'a>>.make()
+    run self.runs(&mut nodes)
+    let mut i: usize = 0
+    while i < nodes.length() {
+      let node = nodes.get(i)
+      let lengths = node.data().characterLengths()
+      let startIndex = self.startIndexIn(&node)
+      let endIndex = self.endIndexIn(&node)
+      if masked {
+        let mut c = startIndex
+        while c < endIndex {
+          run out.append(PASSWORD_MASKING_CHARACTER)
+          c = c + 1
+        }
+      } else if startIndex < endIndex {
+        let value = node.data().value().unwrapOr("")
+        let from = byteOffsetOfCharacter(lengths, startIndex)
+        let to = byteOffsetOfCharacter(lengths, endIndex)
+        run out.append(String.slice(value, from, to - from))
+      }
+      i = i + 1
+    }
+  }
+
+  pub effect fn text(self: &Self) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut out = String.make()
+    run self.writeText(&mut out)
+    return move out
+  }
+
+  /// The bounding box of the range on each run, in the tree's coordinates. Empty when a run
+  /// lacks bounds, character metrics or a text direction.
+  pub effect fn boundingBoxes(self: &Self, out: &mut List<Rect>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut nodes = List<NodeRef<'a>>.make()
+    run self.runs(&mut nodes)
+    let mut result = List<Rect>.make()
+    let mut i: usize = 0
+    while i < nodes.length() {
+      let node = nodes.get(i)
+      let mut rect = match node.data().bounds() {
+        Option.Some { value } => value
+        Option.None => {
+          return ()
+        }
+      }
+      let metrics = match CharacterMetrics.make(&node, &self.node) {
+        Option.Some { value } => value
+        Option.None => {
+          return ()
+        }
+      }
+      let direction = match node.textDirection() {
+        Option.Some { value } => value
+        Option.None => {
+          return ()
+        }
+      }
+      let length = node.data().characterLengths().length
+      let startIndex = self.startIndexIn(&node)
+      let endIndex = self.endIndexIn(&node)
+      if startIndex != 0 || endIndex != length {
+        let pixelStart = if startIndex < length {
+          metrics.position(startIndex)
+        } else {
+          metrics.position(startIndex - 1) + metrics.width(startIndex - 1)
+        }
+        let pixelEnd = if endIndex == startIndex {
+          pixelStart
+        } else {
+          metrics.position(endIndex - 1) + metrics.width(endIndex - 1)
+        }
+        let s = f32.toF64(pixelStart)
+        let e = f32.toF64(pixelEnd)
+        match direction {
+          TextDirection.LeftToRight => {
+            let left = rect.x0
+            rect.x0 = left + s
+            rect.x1 = left + e
+          }
+          TextDirection.RightToLeft => {
+            let right = rect.x1
+            rect.x1 = right - s
+            rect.x0 = right - e
+          }
+          TextDirection.TopToBottom => {
+            let top = rect.y0
+            rect.y0 = top + s
+            rect.y1 = top + e
+          }
+          TextDirection.BottomToTop => {
+            let bottom = rect.y1
+            rect.y1 = bottom - s
+            rect.y0 = bottom - e
+          }
+        }
+      }
+      run result.append(node.transform().transformRectBbox(rect))
+      i = i + 1
+    }
+    run out.appendSlice(result.asSlice())
+  }
+
+  fn fixStartBias(self: &mut Self) -> () {
+    if !self.isDegenerate() {
+      self.start = self.start.biasedToStart(&self.node)
+    }
+  }
+
+  pub fn setStart(self: &mut Self, pos: Position<'a>) -> () {
+    if !pos.root.id.equals(self.node.id) {
+      Intrinsic.trap("accesskit: a position of another text node")
+    }
+    self.start = pos.inner
+    if self.start.compare(&self.end, &self.node) >= 0 {
+      self.end = self.start
+    }
+    self.fixStartBias()
+  }
+
+  pub fn setEnd(self: &mut Self, pos: Position<'a>) -> () {
+    if !pos.root.id.equals(self.node.id) {
+      Intrinsic.trap("accesskit: a position of another text node")
+    }
+    self.end = pos.inner
+    if self.start.compare(&self.end, &self.node) >= 0 {
+      self.start = self.end
+    }
+    self.fixStartBias()
+  }
+
+  pub fn toTextSelection(self: &Self) -> TextSelection {
+    return TextSelection { anchor: self.start.downgrade(), focus: self.end.downgrade() }
+  }
+
+  /// A form of the range that outlives the tree state, with its endpoints' index paths for
+  /// ordering.
+  pub effect fn downgrade(self: &Self) -> WeakRange
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut startPath = List<usize>.make()
+    let s = self.start.biasedToStart(&self.node)
+    run s.node.relativeIndexPath(self.node.id, &mut startPath)
+    let mut endPath = List<usize>.make()
+    let e = self.end.biasedToStart(&self.node)
+    run e.node.relativeIndexPath(self.node.id, &mut endPath)
+    return WeakRange {
+      nodeId: self.node.id,
+      start: self.start.downgrade(),
+      end: self.end.downgrade(),
+      startPath: move startPath,
+      startIndex: s.characterIndex,
+      endPath: move endPath,
+      endIndex: e.characterIndex,
+    }
+  }
+
+  pub effect fn textDirection(self: &Self) -> RangeValue<Option<TextDirection>>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut nodes = List<NodeRef<'a>>.make()
+    run self.runs(&mut nodes)
+    let first = nodes.get(0).textDirection()
+    let mut i: usize = 1
+    while i < nodes.length() {
+      let current = nodes.get(i).textDirection()
+      let same = match first {
+        Option.Some { value: x } => match current {
+          Option.Some { value: y } => x == y
+          Option.None => false
+        }
+        Option.None => current.isNone()
+      }
+      if !same {
+        return RangeValue.Mixed
+      }
+      i = i + 1
+    }
+    return RangeValue.Single { value: first }
+  }
+
+  pub effect fn fontFamily(self: &Self) -> RangeValue<Option<string<'a>>>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut nodes = List<NodeRef<'a>>.make()
+    run self.runs(&mut nodes)
+    let first = nodes.get(0).fontFamily()
+    let mut i: usize = 1
+    while i < nodes.length() {
+      let current = nodes.get(i).fontFamily()
+      let same = match first {
+        Option.Some { value: x } => match current {
+          Option.Some { value: y } => x == y
+          Option.None => false
+        }
+        Option.None => current.isNone()
+      }
+      if !same {
+        return RangeValue.Mixed
+      }
+      i = i + 1
+    }
+    return RangeValue.Single { value: first }
+  }
+
+  pub effect fn language(self: &Self) -> RangeValue<Option<string<'a>>>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut nodes = List<NodeRef<'a>>.make()
+    run self.runs(&mut nodes)
+    let first = nodes.get(0).language()
+    let mut i: usize = 1
+    while i < nodes.length() {
+      let current = nodes.get(i).language()
+      let same = match first {
+        Option.Some { value: x } => match current {
+          Option.Some { value: y } => x == y
+          Option.None => false
+        }
+        Option.None => current.isNone()
+      }
+      if !same {
+        return RangeValue.Mixed
+      }
+      i = i + 1
+    }
+    return RangeValue.Single { value: first }
+  }
+
+  pub effect fn fontSize(self: &Self) -> RangeValue<Option<f32>>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut nodes = List<NodeRef<'a>>.make()
+    run self.runs(&mut nodes)
+    let first = nodes.get(0).fontSize()
+    let mut i: usize = 1
+    while i < nodes.length() {
+      let current = nodes.get(i).fontSize()
+      let same = match first {
+        Option.Some { value: x } => match current {
+          Option.Some { value: y } => x == y
+          Option.None => false
+        }
+        Option.None => current.isNone()
+      }
+      if !same {
+        return RangeValue.Mixed
+      }
+      i = i + 1
+    }
+    return RangeValue.Single { value: first }
+  }
+
+  pub effect fn fontWeight(self: &Self) -> RangeValue<Option<f32>>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut nodes = List<NodeRef<'a>>.make()
+    run self.runs(&mut nodes)
+    let first = nodes.get(0).fontWeight()
+    let mut i: usize = 1
+    while i < nodes.length() {
+      let current = nodes.get(i).fontWeight()
+      let same = match first {
+        Option.Some { value: x } => match current {
+          Option.Some { value: y } => x == y
+          Option.None => false
+        }
+        Option.None => current.isNone()
+      }
+      if !same {
+        return RangeValue.Mixed
+      }
+      i = i + 1
+    }
+    return RangeValue.Single { value: first }
+  }
+
+  pub effect fn backgroundColor(self: &Self) -> RangeValue<Option<Color>>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut nodes = List<NodeRef<'a>>.make()
+    run self.runs(&mut nodes)
+    let first = nodes.get(0).backgroundColor()
+    let mut i: usize = 1
+    while i < nodes.length() {
+      let current = nodes.get(i).backgroundColor()
+      let same = match first {
+        Option.Some { value: x } => match current {
+          Option.Some { value: y } => x.equals(y)
+          Option.None => false
+        }
+        Option.None => current.isNone()
+      }
+      if !same {
+        return RangeValue.Mixed
+      }
+      i = i + 1
+    }
+    return RangeValue.Single { value: first }
+  }
+
+  pub effect fn foregroundColor(self: &Self) -> RangeValue<Option<Color>>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut nodes = List<NodeRef<'a>>.make()
+    run self.runs(&mut nodes)
+    let first = nodes.get(0).foregroundColor()
+    let mut i: usize = 1
+    while i < nodes.length() {
+      let current = nodes.get(i).foregroundColor()
+      let same = match first {
+        Option.Some { value: x } => match current {
+          Option.Some { value: y } => x.equals(y)
+          Option.None => false
+        }
+        Option.None => current.isNone()
+      }
+      if !same {
+        return RangeValue.Mixed
+      }
+      i = i + 1
+    }
+    return RangeValue.Single { value: first }
+  }
+
+  pub effect fn overline(self: &Self) -> RangeValue<Option<TextDecoration>>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut nodes = List<NodeRef<'a>>.make()
+    run self.runs(&mut nodes)
+    let first = nodes.get(0).overline()
+    let mut i: usize = 1
+    while i < nodes.length() {
+      let current = nodes.get(i).overline()
+      let same = match first {
+        Option.Some { value: x } => match current {
+          Option.Some { value: y } => x.equals(y)
+          Option.None => false
+        }
+        Option.None => current.isNone()
+      }
+      if !same {
+        return RangeValue.Mixed
+      }
+      i = i + 1
+    }
+    return RangeValue.Single { value: first }
+  }
+
+  pub effect fn strikethrough(self: &Self) -> RangeValue<Option<TextDecoration>>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut nodes = List<NodeRef<'a>>.make()
+    run self.runs(&mut nodes)
+    let first = nodes.get(0).strikethrough()
+    let mut i: usize = 1
+    while i < nodes.length() {
+      let current = nodes.get(i).strikethrough()
+      let same = match first {
+        Option.Some { value: x } => match current {
+          Option.Some { value: y } => x.equals(y)
+          Option.None => false
+        }
+        Option.None => current.isNone()
+      }
+      if !same {
+        return RangeValue.Mixed
+      }
+      i = i + 1
+    }
+    return RangeValue.Single { value: first }
+  }
+
+  pub effect fn underline(self: &Self) -> RangeValue<Option<TextDecoration>>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut nodes = List<NodeRef<'a>>.make()
+    run self.runs(&mut nodes)
+    let first = nodes.get(0).underline()
+    let mut i: usize = 1
+    while i < nodes.length() {
+      let current = nodes.get(i).underline()
+      let same = match first {
+        Option.Some { value: x } => match current {
+          Option.Some { value: y } => x.equals(y)
+          Option.None => false
+        }
+        Option.None => current.isNone()
+      }
+      if !same {
+        return RangeValue.Mixed
+      }
+      i = i + 1
+    }
+    return RangeValue.Single { value: first }
+  }
+
+  pub effect fn textAlign(self: &Self) -> RangeValue<Option<TextAlign>>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut nodes = List<NodeRef<'a>>.make()
+    run self.runs(&mut nodes)
+    let first = nodes.get(0).textAlign()
+    let mut i: usize = 1
+    while i < nodes.length() {
+      let current = nodes.get(i).textAlign()
+      let same = match first {
+        Option.Some { value: x } => match current {
+          Option.Some { value: y } => x == y
+          Option.None => false
+        }
+        Option.None => current.isNone()
+      }
+      if !same {
+        return RangeValue.Mixed
+      }
+      i = i + 1
+    }
+    return RangeValue.Single { value: first }
+  }
+
+  pub effect fn verticalOffset(self: &Self) -> RangeValue<Option<VerticalOffset>>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut nodes = List<NodeRef<'a>>.make()
+    run self.runs(&mut nodes)
+    let first = nodes.get(0).verticalOffset()
+    let mut i: usize = 1
+    while i < nodes.length() {
+      let current = nodes.get(i).verticalOffset()
+      let same = match first {
+        Option.Some { value: x } => match current {
+          Option.Some { value: y } => x == y
+          Option.None => false
+        }
+        Option.None => current.isNone()
+      }
+      if !same {
+        return RangeValue.Mixed
+      }
+      i = i + 1
+    }
+    return RangeValue.Single { value: first }
+  }
+
+  pub effect fn isItalic(self: &Self) -> RangeValue<bool>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut nodes = List<NodeRef<'a>>.make()
+    run self.runs(&mut nodes)
+    let first = nodes.get(0).isItalic()
+    let mut i: usize = 1
+    while i < nodes.length() {
+      if nodes.get(i).isItalic() != first {
+        return RangeValue.Mixed
+      }
+      i = i + 1
+    }
+    return RangeValue.Single { value: first }
+  }
+
+  pub fn equals(self: &Self, other: &Range<'_>) -> bool {
+    return self.node.id.equals(other.node.id) && self.start.equals(&other.start)
+      && self.end.equals(&other.end)
+  }
+}
+
+struct WalkBounds<'a> {
+  first: NodeRef<'a>,
+  last: NodeRef<'a>,
+}
+
+impl<'a> Copy for WalkBounds<'a> {}
+
+/// A range that names its node and endpoints by id, so it outlives a tree state.
+pub struct WeakRange {
+  pub nodeId: FullNodeId,
+  pub start: WeakPosition,
+  pub end: WeakPosition,
+  startPath: List<usize>,
+  startIndex: usize,
+  endPath: List<usize>,
+  endIndex: usize,
+}
+
+impl WeakRange {
+  /// The text node, if it still supports text ranges.
+  pub fn upgradeNode<'a>(self: &Self, treeState: &'a TreeState) -> Option<NodeRef<'a>> {
+    return match treeState.nodeById(self.nodeId) {
+      Option.Some { value } => if value.supportsTextRanges() {
+        Option.Some { value: value }
+      } else {
+        Option.None
+      }
+      Option.None => Option.None
+    }
+  }
+
+  /// The range in `treeState`, if its node and endpoints still exist.
+  pub fn upgrade<'a>(self: &Self, treeState: &'a TreeState) -> Option<Range<'a>> {
+    let node = match self.upgradeNode(treeState) {
+      Option.Some { value } => value
+      Option.None => {
+        return Option.None
+      }
+    }
+    let start = match InnerPosition.upgrade(treeState, self.start, self.nodeId) {
+      Option.Some { value } => value
+      Option.None => {
+        return Option.None
+      }
+    }
+    let end = match InnerPosition.upgrade(treeState, self.end, self.nodeId) {
+      Option.Some { value } => value
+      Option.None => {
+        return Option.None
+      }
+    }
+    return Option.Some { value: Range { node: node, start: start, end: end } }
+  }
+
+  /// The order of this range's start and `other`'s start (`startOfOther`) or end.
+  pub fn compareEndpoints(self: &Self, ownStart: bool, other: &WeakRange, otherStart: bool) -> i32 {
+    let a = if ownStart {
+      self.startPath.asSlice()
+    } else {
+      self.endPath.asSlice()
+    }
+    let ai = if ownStart {
+      self.startIndex
+    } else {
+      self.endIndex
+    }
+    let b = if otherStart {
+      other.startPath.asSlice()
+    } else {
+      other.endPath.asSlice()
+    }
+    let bi = if otherStart {
+      other.startIndex
+    } else {
+      other.endIndex
+    }
+    let mut i: usize = 0
+    while i < a.length && i < b.length {
+      if a[i] != b[i] {
+        return compareUsize(a[i], b[i])
+      }
+      i = i + 1
+    }
+    if a.length != b.length {
+      return compareUsize(a.length, b.length)
+    }
+    return compareUsize(ai, bi)
+  }
+
+  pub effect fn copy(self: &Self) -> WeakRange
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut startPath = List<usize>.make()
+    run startPath.appendSlice(self.startPath.asSlice())
+    let mut endPath = List<usize>.make()
+    run endPath.appendSlice(self.endPath.asSlice())
+    return WeakRange {
+      nodeId: self.nodeId,
+      start: self.start,
+      end: self.end,
+      startPath: move startPath,
+      startIndex: self.startIndex,
+      endPath: move endPath,
+      endIndex: self.endIndex,
+    }
+  }
+}
+
+struct CharacterMetrics<'a> {
+  positions: &'a [f32],
+  widths: &'a [f32],
+  isPassword: bool,
+}
+
+impl<'a> Copy for CharacterMetrics<'a> {}
+
+impl<'a> CharacterMetrics<'a> {
+  fn make(node: &NodeRef<'a>, root: &NodeRef<'_>) -> Option<CharacterMetrics<'a>> {
+    let positions = match node.data().characterPositions() {
+      Option.Some { value } => value
+      Option.None => {
+        return Option.None
+      }
+    }
+    let widths = match node.data().characterWidths() {
+      Option.Some { value } => value
+      Option.None => {
+        return Option.None
+      }
+    }
+    return Option.Some {
+      value: CharacterMetrics {
+        positions: positions,
+        widths: widths,
+        isPassword: root.isPasswordInput(),
+      },
+    }
+  }
+
+  fn length(self: &Self) -> usize {
+    if self.positions.length < self.widths.length {
+      return self.positions.length
+    }
+    return self.widths.length
+  }
+
+  fn position(self: &Self, index: usize) -> f32 {
+    if self.isPassword {
+      let step = if self.positions.length >= 2 {
+        self.positions[1] - self.positions[0]
+      } else {
+        self.widths[0]
+      }
+      return self.positions[0] + usize.toF32(index) * step
+    }
+    return self.positions[index]
+  }
+
+  fn width(self: &Self, index: usize) -> f32 {
+    if self.isPassword {
+      return self.widths[0]
+    }
+    return self.widths[index]
+  }
+}
+
+/// The character of text run `node` at `point` (in its coordinates), or its length past the end.
+pub fn characterIndexAtPoint(node: &NodeRef<'_>, root: &NodeRef<'_>, point: Point) -> usize {
+  let rect = node.data().bounds().unwrapOr(Rect.zero())
+  let length = node.data().characterLengths().length
+  let metrics = match CharacterMetrics.make(node, root) {
+    Option.Some { value } => value
+    Option.None => {
+      return 0
+    }
+  }
+  let direction = match node.textDirection() {
+    Option.Some { value } => value
+    Option.None => {
+      return 0
+    }
+  }
+  let mut i = metrics.length()
+  while i > 0 {
+    i = i - 1
+    let position = f32.toF64(metrics.position(i))
+    let width = f32.toF64(metrics.width(i))
+    let relative = match direction {
+      TextDirection.LeftToRight => point.x - rect.x0
+      TextDirection.RightToLeft => rect.x1 - point.x
+      TextDirection.TopToBottom => point.y - rect.y0
+      TextDirection.BottomToTop => rect.y1 - point.y
+    }
+    if relative >= position && relative < position + width {
+      return i
+    }
+  }
+  return length
+}
+
+/// Where a binary search ended: `index` of the value, or where it would go.
+pub struct SearchResult {
+  pub found: bool,
+  pub index: usize,
+}
+
+impl Copy for SearchResult {}
+
+/// Searches sorted `values` for `target`.
+pub fn binarySearch(values: &[u8], target: usize) -> SearchResult {
+  let mut low: usize = 0
+  let mut high = values.length
+  while low < high {
+    let mid = low + (high - low) / 2
+    let v = u8.toUsize(values[mid])
+    if v == target {
+      return SearchResult { found: true, index: mid }
+    }
+    if v < target {
+      low = mid + 1
+    } else {
+      high = mid
+    }
+  }
+  return SearchResult { found: false, index: low }
+}
+
+/// The UTF-8 offset of character `index` of a run with these character lengths.
+pub fn byteOffsetOfCharacter(lengths: &[u8], index: usize) -> usize {
+  let mut total: usize = 0
+  let mut i: usize = 0
+  while i < index && i < lengths.length {
+    total = total + u8.toUsize(lengths[i])
+    i = i + 1
+  }
+  return total
+}
+
+/// The length of `text` in UTF-16 code units, or in Unicode scalar values.
+pub fn unitCount(text: string, utf16: bool) -> usize {
+  let mut count: usize = 0
+  let mut cursor = String.scalarCursor()
+  while let Option.Some { value: step } = String.nextScalar(text, move cursor) {
+    let c = String.scalarValue(&step)
+    if utf16 && u32.toUsize(char.toU32(c)) >= 65536 {
+      count = count + 2
+    } else {
+      count = count + 1
+    }
+    cursor = String.nextCursor(move step)
+  }
+  return count
+}
+
+/// The text run filter as a cursor over the runs of `root`.
+pub fn textRunsOf<'a>(root: &NodeRef<'a>) -> FilteredCursor<'a> {
+  return root.filteredChildren(&TextRunFilter { root: root.id })
+}

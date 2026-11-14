@@ -1,0 +1,594 @@
+//! Tests of the Windows adapter: control types, the records it sends, the events tree updates
+//! cause (after AccessKit's `accesskit_windows` adapter and its tests), the requests UI
+//! Automation calls become, and, on Windows, what the providers report.
+import accesskit.lib {
+  TextDirection,
+  Node,
+  NodeId,
+  Role,
+  Action,
+  ActionData,
+  Toggled,
+  Live,
+  TreeInfo,
+  TreeUpdate,
+  Rect
+}
+import accesskit_consumer.lib { TreeIndex, FullNodeId }
+import lib {
+  Adapter,
+  RecordingSink,
+  NativeSink,
+  SinkCall,
+  NativeAction,
+  Value,
+  Reader,
+  findProperty,
+  findBits,
+  findIds,
+  controlTypeOf,
+  ariaRoleOf,
+  supported,
+  TAG_PATTERNS,
+  TAG_FLAGS,
+  TAG_CHILDREN,
+  TAG_SELECTED,
+  PATTERN_INVOKE,
+  PATTERN_TOGGLE,
+  PATTERN_VALUE,
+  PATTERN_TEXT,
+  PATTERN_SELECTION,
+  PATTERN_SELECTION_ITEM,
+  FLAG_ROOT,
+  FLAG_FOCUSABLE,
+  FLAG_SELECTED,
+  PROPERTY_IS_SELECTED,
+  EVENT_FOCUS_CHANGED,
+  EVENT_ELEMENT_SELECTED,
+  EVENT_TEXT_CHANGED,
+  EVENT_LIVE_REGION_CHANGED,
+  EVENT_WINDOW_OPENED,
+  ACTION_CLICK,
+  ACTION_EXPAND,
+  ACTION_SET_SELECTION,
+  ACTION_SCROLL_TEXT
+}
+import record { TAG_TEXT }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.usize
+import silk.text.string { String }
+import silk.testing.testing { Testing, AssertionError }
+
+fn eid(value: u64) -> u64 {
+  return FullNodeId.make(NodeId.of(value), TreeIndex { value: 0 }).toU64()
+}
+
+effect fn withChildren(kind: Role, children: &[u64]) -> Node
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut node = Node.make(kind)
+  let mut i: usize = 0
+  while i < children.length {
+    run node.pushChild(NodeId.of(children[i]))
+    i = i + 1
+  }
+  return move node
+}
+
+effect fn textRun(value: string, lengths: &[u8], top: f64) -> Node
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut node = Node.make(Role.TextRun)
+  run node.setBounds(Rect.make(0.0, top, 50.0, top + 10.0))
+  run node.setValue(value)
+  run node.setCharacterLengths(lengths)
+  let mut positions = List<f32>.make()
+  let mut widths = List<f32>.make()
+  let mut i: usize = 0
+  while i < lengths.length {
+    run positions.append(u32.toF32(usize.wrappingToU32(i)) * 10.0)
+    run widths.append(10.0)
+    i = i + 1
+  }
+  run node.setCharacterPositions(positions.asSlice())
+  run node.setCharacterWidths(widths.asSlice())
+  run node.setWordStarts(&[0])
+  run node.setTextDirection(TextDirection.LeftToRight)
+  return move node
+}
+
+effect fn option(label: string, selected: bool) -> Node
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut node = Node.make(Role.ListBoxOption)
+  run node.setLabel(label)
+  run node.setSelected(selected)
+  node.addAction(Action.Click)
+  return move node
+}
+
+/// A window with a button, a checkbox, a text input holding "hello", a live status and a list
+/// box of two options, the first selected.
+effect fn initialTree() -> TreeUpdate
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut update = TreeUpdate.make(NodeId.of(1))
+  update.tree = Option.Some { value: TreeInfo.make(NodeId.of(0)) }
+  run update.push(NodeId.of(0), run withChildren(Role.Window, &[1, 2, 3, 5, 6]))
+  let mut button = Node.make(Role.Button)
+  run button.setLabel("Press me")
+  run button.setBounds(Rect.make(10.0, 10.0, 110.0, 40.0))
+  button.addAction(Action.Click)
+  button.addAction(Action.Focus)
+  run update.push(NodeId.of(1), move button)
+  let mut check = Node.make(Role.CheckBox)
+  run check.setLabel("Ready")
+  run check.setToggled(Toggled.False)
+  check.addAction(Action.Click)
+  run update.push(NodeId.of(2), move check)
+  let mut input = run withChildren(Role.TextInput, &[4])
+  run input.setBounds(Rect.make(0.0, 50.0, 100.0, 70.0))
+  input.addAction(Action.Focus)
+  input.addAction(Action.SetTextSelection)
+  run update.push(NodeId.of(3), move input)
+  run update.push(NodeId.of(4), run textRun("hello", &[1, 1, 1, 1, 1], 50.0))
+  let mut status = Node.make(Role.Status)
+  run status.setLabel("Idle")
+  run status.setLive(Live.Polite)
+  run update.push(NodeId.of(5), move status)
+  let mut list = run withChildren(Role.ListBox, &[7, 8])
+  run list.setLabel("Fruit")
+  run list.setSizeOfSet(2)
+  run update.push(NodeId.of(6), move list)
+  run update.push(NodeId.of(7), run option("Apple", true))
+  run update.push(NodeId.of(8), run option("Pear", false))
+  return move update
+}
+
+fn sentNode(calls: &List<SinkCall>, id: u64) -> bool {
+  let all = calls.asSlice()
+  let mut i: usize = 0
+  while i < all.length {
+    match &all[i] {
+      SinkCall.SetNode { id: given, .. } => {
+        if given == id {
+          return true
+        }
+      }
+      _ => {}
+    }
+    i = i + 1
+  }
+  return false
+}
+
+fn removed(calls: &List<SinkCall>, id: u64) -> bool {
+  let all = calls.asSlice()
+  let mut i: usize = 0
+  while i < all.length {
+    match &all[i] {
+      SinkCall.RemoveNode { id: given } => {
+        if given == id {
+          return true
+        }
+      }
+      _ => {}
+    }
+    i = i + 1
+  }
+  return false
+}
+
+fn raised(calls: &List<SinkCall>, id: u64, event: i32) -> bool {
+  let all = calls.asSlice()
+  let mut i: usize = 0
+  while i < all.length {
+    match &all[i] {
+      SinkCall.RaiseEvent { id: given, event: which } => {
+        if given == id && which == event {
+          return true
+        }
+      }
+      _ => {}
+    }
+    i = i + 1
+  }
+  return false
+}
+
+/// The new value of the last change of `property` raised on `id`.
+effect fn changed(calls: &List<SinkCall>, id: u64, property: i32) -> Option<Value>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let all = calls.asSlice()
+  let mut out: Option<Value> = Option.None
+  let mut i: usize = 0
+  while i < all.length {
+    match &all[i] {
+      SinkCall.RaiseProperty { id: given, property: which, new, .. } => {
+        if given == id && which == property {
+          out = Option.Some { value: run new.copy() }
+        }
+      }
+      _ => {}
+    }
+    i = i + 1
+  }
+  return move out
+}
+
+/// The last record sent for `id`.
+effect fn recordOf(calls: &List<SinkCall>, id: u64) -> List<u8>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let all = calls.asSlice()
+  let mut out = List<u8>.make()
+  let mut i: usize = 0
+  while i < all.length {
+    match &all[i] {
+      SinkCall.SetNode { id: given, record } => {
+        if given == id {
+          out.clear()
+          run out.appendSlice(record.asSlice())
+        }
+      }
+      _ => {}
+    }
+    i = i + 1
+  }
+  return move out
+}
+
+effect fn textOf(record: &[u8], property: i32) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match run findProperty(record, property) {
+    Option.Some { value } => match move value {
+      Value.Text { value: text } => move text
+      _ => String.make()
+    }
+    Option.None => String.make()
+  }
+}
+
+effect fn intOf(record: &[u8], property: i32) -> i32 ! OutOfMemoryError ? &mut Allocator {
+  return match run findProperty(record, property) {
+    Option.Some { value } => match &value {
+      Value.Int { value: number } => number
+      _ => -1
+    }
+    Option.None => -1
+  }
+}
+
+effect fn boolOf(record: &[u8], property: i32) -> bool ! OutOfMemoryError ? &mut Allocator {
+  return match run findProperty(record, property) {
+    Option.Some { value } => match &value {
+      Value.Bool { value: flag } => flag
+      _ => false
+    }
+    Option.None => false
+  }
+}
+
+effect fn controls() -> () ! AssertionError<'static> {
+  run Testing.expect(controlTypeOf(Role.Button) == 50000, "a button is a Button")
+  run Testing.expect(controlTypeOf(Role.CheckBox) == 50002, "a checkbox is a CheckBox")
+  run Testing.expect(controlTypeOf(Role.TextInput) == 50004, "a text input is an Edit")
+  run Testing.expect(controlTypeOf(Role.Window) == 50032, "a window is a Window")
+  run Testing.expect(controlTypeOf(Role.TextRun) == 50025, "a text run is Custom")
+  run Testing.expect(ariaRoleOf(Role.Button).unwrapOr("") == "button", "the ARIA role")
+  run Testing.expect(ariaRoleOf(Role.Abbr).isNone(), "not every role has one")
+}
+
+test effect fn controlTypesFollowAccessKit() -> () ! AssertionError<'static> {
+  run controls()
+}
+
+effect fn records() -> ()
+  ! OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let adapter = run Adapter.make(RecordingSink.make(), run initialTree(), true)
+  let sink = adapter.finish()
+  let calls = &sink.calls
+  run Testing.expect(sentNode(calls, eid(0)), "the root is an element")
+  run Testing.expect(!sentNode(calls, eid(4)), "text runs are not")
+  let window = run recordOf(calls, eid(0))
+  run Testing.expect((findBits(window.asSlice(), TAG_FLAGS()) & FLAG_ROOT()) != 0, "the root")
+  run Testing.expect((run intOf(window.asSlice(), 30003)) == 50032, "a Window")
+  let mut children = List<u64>.make()
+  run Testing.expect(
+    run findIds(window.asSlice(), TAG_CHILDREN(), &mut children),
+    "it lists children",
+  )
+  run Testing.expect(children.length() == 5, "five of them")
+  run Testing.expect(children.get(0) == eid(1), "the button first")
+
+  let button = run recordOf(calls, eid(1))
+  let name = run textOf(button.asSlice(), 30005)
+  run Testing.expect(name.view() == "Press me", "the button's name")
+  run Testing.expect(run boolOf(button.asSlice(), 30008), "it has focus")
+  run Testing.expect(run boolOf(button.asSlice(), 30010), "it is enabled")
+  let aria = run textOf(button.asSlice(), 30101)
+  run Testing.expect(aria.view() == "button", "its ARIA role")
+  let patterns = findBits(button.asSlice(), TAG_PATTERNS())
+  run Testing.expect((patterns & PATTERN_INVOKE()) != 0, "it can be invoked")
+  run Testing.expect((patterns & PATTERN_TOGGLE()) == 0, "but not toggled")
+  run Testing.expect(
+    (findBits(button.asSlice(), TAG_FLAGS()) & FLAG_FOCUSABLE()) != 0,
+    "and takes focus",
+  )
+
+  let check = run recordOf(calls, eid(2))
+  run Testing.expect((findBits(check.asSlice(), TAG_PATTERNS()) & PATTERN_TOGGLE()) != 0, "toggles")
+  run Testing.expect((run intOf(check.asSlice(), 30086)) == 0, "off")
+
+  let input = run recordOf(calls, eid(3))
+  let inputPatterns = findBits(input.asSlice(), TAG_PATTERNS())
+  run Testing.expect((inputPatterns & PATTERN_TEXT()) != 0, "the input has text")
+  run Testing.expect((inputPatterns & PATTERN_VALUE()) != 0, "and a value")
+  let value = run textOf(input.asSlice(), 30045)
+  run Testing.expect(value.view() == "hello", "which is hello")
+
+  let status = run recordOf(calls, eid(5))
+  run Testing.expect((run intOf(status.asSlice(), 30135)) == 1, "the status is polite")
+
+  let list = run recordOf(calls, eid(6))
+  run Testing.expect(
+    (findBits(list.asSlice(), TAG_PATTERNS()) & PATTERN_SELECTION()) != 0,
+    "the list box selects",
+  )
+  let mut selected = List<u64>.make()
+  run Testing.expect(
+    run findIds(list.asSlice(), TAG_SELECTED(), &mut selected),
+    "it lists its selection",
+  )
+  run Testing.expect(selected.length() == 1 && selected.get(0) == eid(7), "the apple")
+  let apple = run recordOf(calls, eid(7))
+  run Testing.expect(
+    (findBits(apple.asSlice(), TAG_PATTERNS()) & PATTERN_SELECTION_ITEM()) != 0,
+    "an option is a selection item",
+  )
+  run Testing.expect((findBits(apple.asSlice(), TAG_FLAGS()) & FLAG_SELECTED()) != 0, "selected")
+  run Testing.expect((run intOf(apple.asSlice(), 30153)) == 2, "one of two options")
+}
+
+test effect fn recordsDescribeElements() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run records() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// Reads the text block of `record`.
+effect fn textBlock(record: &[u8]) -> ()
+  ! OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let mut reader = Reader.make(record)
+  let mut found = false
+  while !reader.atEnd() {
+    let tag = reader.byte()
+    if tag == TAG_TEXT() {
+      found = true
+      run Testing.expect(reader.text() == "hello", "the text")
+      run Testing.expect(reader.uint32() == 5, "five UTF-16 units")
+      run Testing.expect(reader.byte() == 0, "no selection")
+      drop reader.uint32()
+      drop reader.uint32()
+      run Testing.expect(reader.uint32() == 5, "five characters")
+      run Testing.expect(reader.uint32() == 0, "the first from 0")
+      run Testing.expect(reader.uint32() == 1, "to 1")
+      let x0 = reader.double()
+      let y0 = reader.double()
+      let x1 = reader.double()
+      run Testing.expect(x0 == 0.0 && y0 == 50.0 && x1 == 10.0, "with its own box")
+      break
+    }
+    reader.skipField(tag)
+  }
+  run Testing.expect(found, "the input has a text block")
+}
+
+effect fn text() -> ()
+  ! OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let adapter = run Adapter.make(RecordingSink.make(), run initialTree(), true)
+  let sink = adapter.finish()
+  let input = run recordOf(&sink.calls, eid(3))
+  run textBlock(input.asSlice())
+}
+
+test effect fn recordsCarryText() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run text() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn updates() -> ()
+  ! OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let mut adapter = run Adapter.make(RecordingSink.make(), run initialTree(), true)
+  adapter.sink.calls.clear()
+
+  // Rename the button, tick the checkbox, change the status and select the pear.
+  let mut update = TreeUpdate.make(NodeId.of(1))
+  let mut button = Node.make(Role.Button)
+  run button.setLabel("Pressed")
+  run button.setBounds(Rect.make(10.0, 10.0, 110.0, 40.0))
+  button.addAction(Action.Click)
+  button.addAction(Action.Focus)
+  run update.push(NodeId.of(1), move button)
+  let mut check = Node.make(Role.CheckBox)
+  run check.setLabel("Ready")
+  run check.setToggled(Toggled.True)
+  check.addAction(Action.Click)
+  run update.push(NodeId.of(2), move check)
+  let mut status = Node.make(Role.Status)
+  run status.setLabel("Busy")
+  run status.setLive(Live.Polite)
+  run update.push(NodeId.of(5), move status)
+  run update.push(NodeId.of(7), run option("Apple", false))
+  run update.push(NodeId.of(8), run option("Pear", true))
+  run adapter.update(move update)
+  let calls = &adapter.sink.calls
+  run Testing.expect(sentNode(calls, eid(1)) && sentNode(calls, eid(2)), "changed nodes are sent")
+  run Testing.expect(!sentNode(calls, eid(3)), "the others are not")
+  let name = run changed(calls, eid(1), 30005)
+  let renamed = match &name {
+    Option.Some { value } => value.equals(&Value.Text { value: run String.copy("Pressed") })
+    Option.None => false
+  }
+  run Testing.expect(renamed, "the name change")
+  let toggle = run changed(calls, eid(2), 30086)
+  let ticked = match &toggle {
+    Option.Some { value } => value.equals(&Value.Int { value: 1 })
+    Option.None => false
+  }
+  run Testing.expect(ticked, "the toggle state change")
+  run Testing.expect(raised(calls, eid(5), EVENT_LIVE_REGION_CHANGED()), "the live region")
+  run Testing.expect(raised(calls, eid(8), EVENT_ELEMENT_SELECTED()), "the pear is selected")
+  let unselected = run changed(calls, eid(7), PROPERTY_IS_SELECTED())
+  let off = match &unselected {
+    Option.Some { value } => value.equals(&Value.Bool { value: false })
+    Option.None => false
+  }
+  run Testing.expect(off, "and the apple no longer")
+
+  // Remove the checkbox and open a dialog.
+  adapter.sink.calls.clear()
+  let mut removal = TreeUpdate.make(NodeId.of(1))
+  run removal.push(NodeId.of(0), run withChildren(Role.Window, &[1, 3, 5, 6, 9]))
+  let mut dialog = Node.make(Role.Dialog)
+  run dialog.setLabel("Sure?")
+  run removal.push(NodeId.of(9), move dialog)
+  run adapter.update(move removal)
+  let after = &adapter.sink.calls
+  run Testing.expect(removed(after, eid(2)), "the checkbox goes away")
+  run Testing.expect(sentNode(after, eid(0)), "the window's children change")
+  run Testing.expect(raised(after, eid(9), EVENT_WINDOW_OPENED()), "the dialog opens")
+
+  // Edit the text, then move focus.
+  adapter.sink.calls.clear()
+  let mut edit = TreeUpdate.make(NodeId.of(3))
+  run edit.push(NodeId.of(4), run textRun("help", &[1, 1, 1, 1], 50.0))
+  run adapter.update(move edit)
+  run Testing.expect(raised(&adapter.sink.calls, eid(3), EVENT_TEXT_CHANGED()), "text changed")
+  run Testing.expect(raised(&adapter.sink.calls, eid(3), EVENT_FOCUS_CHANGED()), "focus moved")
+}
+
+test effect fn updatesBecomeEvents() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run updates() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+fn plain(kind: u32, id: u64) -> NativeAction {
+  return NativeAction { kind: kind, id: id, number: 0.0, start: 0, end: 0, text: String.make() }
+}
+
+effect fn actions() -> ()
+  ! OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let mut adapter = run Adapter.make(RecordingSink.make(), run initialTree(), true)
+  run adapter.sink.actions.append(plain(ACTION_CLICK(), eid(1)))
+  run adapter.sink.actions.append(plain(ACTION_EXPAND(), eid(1)))
+  run adapter.sink.actions.append(
+    NativeAction {
+      kind: ACTION_SET_SELECTION(),
+      id: eid(3),
+      number: 0.0,
+      start: 1,
+      end: 3,
+      text: String.make(),
+    },
+  )
+  run adapter.sink.actions.append(
+    NativeAction {
+      kind: ACTION_SCROLL_TEXT(),
+      id: eid(3),
+      number: 1.0,
+      start: 2,
+      end: 2,
+      text: String.make(),
+    },
+  )
+  run adapter.pump()
+  let requests = run adapter.takeRequests()
+  run Testing.expect(requests.length() == 3, "the button does not expand")
+  let all = requests.asSlice()
+  run Testing.expect(
+    all[0].action == Action.Click && all[0].targetNode.equals(NodeId.of(1)),
+    "a click on the button",
+  )
+  run Testing.expect(all[1].action == Action.SetTextSelection, "a selection")
+  let selected = match &all[1].data {
+    Option.Some { value } => match &value {
+      ActionData.SetTextSelection { value: selection } => selection.anchor.characterIndex == 1
+        && selection.focus.characterIndex == 3
+      _ => false
+    }
+    Option.None => false
+  }
+  run Testing.expect(selected, "from the second character to the fourth")
+  run Testing.expect(
+    all[2].action == Action.ScrollIntoView && all[2].targetNode.equals(NodeId.of(4)),
+    "scrolling text scrolls its run",
+  )
+}
+
+test effect fn actionsBecomeRequests() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run actions() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+fn has(text: string, part: string) -> bool {
+  return String.contains(text, part)
+}
+
+effect fn automation() -> ()
+  ! OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  if !supported() {
+    return
+  }
+  let sink = match NativeSink.detached() {
+    Option.Some { value } => move value
+    Option.None => {
+      run Testing.expect(false, "Windows gives a window")
+      return
+    }
+  }
+  let mut adapter = run Adapter.make(move sink, run initialTree(), true)
+  let window = run adapter.sink.describe(18446744073709551615)
+  run Testing.expect(has(window.view(), "provider: 1\n"), "the window answers WM_GETOBJECT")
+  let button = run adapter.sink.describe(eid(1))
+  run Testing.expect(has(button.view(), "control type: 50000\n"), "UIA sees a button")
+  run Testing.expect(has(button.view(), "name: Press me\n"), "named Press me")
+  run Testing.expect(has(button.view(), "focused: 1\n"), "with focus")
+  run Testing.expect(has(button.view(), "invoke: 1\n"), "that can be invoked")
+  run Testing.expect(has(button.view(), "parent: 0\n"), "under the window")
+  let input = run adapter.sink.describe(eid(3))
+  run Testing.expect(has(input.view(), "value: hello\n"), "the input's value")
+  run Testing.expect(has(input.view(), "document: hello\n"), "its text")
+  run Testing.expect(has(input.view(), "word 1: hello\n"), "its first word")
+  let root = run adapter.sink.describe(eid(0))
+  run Testing.expect(has(root.view(), "first child: 1\n"), "the window's first child")
+  run Testing.expect(has(root.view(), "focus: 1\n"), "the window knows the focus")
+  run Testing.expect(adapter.sink.perform(eid(1), ACTION_CLICK()), "invoking the button works")
+  run Testing.expect(!adapter.sink.perform(eid(5), ACTION_CLICK()), "invoking the status does not")
+  run adapter.pump()
+  let requests = run adapter.takeRequests()
+  run Testing.expect(requests.length() == 1, "the press reaches the application")
+  let back = adapter.finish()
+  back.detach()
+}
+
+test effect fn automationSeesTheElements() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run automation() |> Effect.provideMut<Allocator>(&mut allocator)
+}
