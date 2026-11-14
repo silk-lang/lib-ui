@@ -9,7 +9,7 @@ import svg_core.structure { Options as StructureOptions }
 import svg_core.resources { Resolver, DataOnly, Limits as ResourceLimits, ProcessingMode }
 import svg_core.url { Url, UrlError }
 import svg_css.media_features { Environment as MediaEnvironment }
-import svg_css.colors { Color, Context as ColorContext }
+import svg_css.colors { Color, Context as ColorContext, SystemColor, systemIndex }
 import svg_css.tokens { Limits }
 import svg_fonts.database { FontDatabase }
 import silk.core.effect { Effect }
@@ -23,6 +23,11 @@ fn still() -> &'static [u8] {
   return b"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='6' fill='#3060c0' fill-opacity='0.75'/><path d='M2 14 L14 2' stroke='black' stroke-width='1.5'/></svg>"
 }
 
+/// Lucide's `check` icon, as lucide-react renders it.
+fn lucide() -> &'static [u8] {
+  return b"<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M20 6 9 17l-5-5'/><circle cx='12' cy='12' r='3' fill='currentColor' fill-opacity='0.5'/></svg>"
+}
+
 fn spinnerSvg() -> &'static [u8] {
   return b"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect x='7' y='1' width='2' height='6' fill='green'><animateTransform attributeName='transform' type='rotate' from='0 8 8' to='360 8 8' dur='1s' repeatCount='indefinite'/></rect></svg>"
 }
@@ -32,13 +37,23 @@ fn pulseSvg() -> &'static [u8] {
 }
 
 fn iconEnvironment<'a>(base: &'a Url, fonts: &'a FontDatabase) -> Environment<'a, 'a> {
-  let black = Color.srgb(0.0, 0.0, 0.0, 1.0)
+  return colored(base, fonts, Color.srgb(0.0, 0.0, 0.0, 1.0))
+}
+
+/// Black system colors but CanvasText, the root's initial `color`, which is `current`.
+fn palette(current: Color) -> ColorContext {
+  let mut system = [Color.srgb(0.0, 0.0, 0.0, 1.0); 19]
+  system[systemIndex(SystemColor.CanvasText)] = current
+  return ColorContext.make(current, system)
+}
+
+fn colored<'a>(base: &'a Url, fonts: &'a FontDatabase, current: Color) -> Environment<'a, 'a> {
   let mut structure = StructureOptions.defaults()
   structure.policy.mode = ProcessingMode.Animated
   return Environment<'a, 'a> {
     base: base,
     media: MediaEnvironment.headless(300.0, 150.0),
-    colors: ColorContext.make(black, [black; 19]),
+    colors: palette(current),
     fontFamily: b"serif",
     systemFonts: [b"16px serif"; 6],
     cssLimits: Limits.make(),
@@ -288,4 +303,59 @@ test effect fn evictedFramesAreRenderedAgainAndPruned() -> ()
     _ => false
   }
   run Testing.expect(refused, "a zero size is refused")
+}
+
+test effect fn currentColorIconsAreMasksOthersAreColorPerTint() -> ()
+  ! AssertionError<'static> | RenderError | AtlasError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let base = run Effect.catch<UrlError>(Url.fromFilePath(b"/icons/icon.svg"), invalidBase)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let fonts = FontDatabase.make()
+  let black = iconEnvironment(&base, &fonts)
+  let white = colored(&base, &fonts, Color.srgb(1.0, 1.0, 1.0, 1.0))
+  let red = colored(&base, &fonts, Color.srgb(1.0, 0.0, 0.0, 1.0))
+  let mut resolver = DataOnly.make(ResourceLimits.defaults())
+  let mut atlas = Atlas.make(AtlasOptions.default())
+  let mut cache = IconCache.make(IconOptions.default())
+  let lined = run cache.register(lucide(), &black)
+    |> Effect.provideMut<Resolver>(&mut resolver)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let painted = run cache.register(still(), &black)
+    |> Effect.provideMut<Resolver>(&mut resolver)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(cache.tinted(painted), "icons are tinted until classified")
+  let a = run cache.classify(lined, 24, &black, &white)
+    |> Effect.provideMut<Resolver>(&mut resolver)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let b = run cache.classify(painted, 24, &black, &white)
+    |> Effect.provideMut<Resolver>(&mut resolver)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(a && cache.tinted(lined), "a currentColor icon is tinted")
+  run Testing.expect(!b && !cache.tinted(painted), "a blue circle with a black line is not")
+
+  // Color tiles are kept per currentColor, and paint with it.
+  drop atlas.beginFrame()
+  let inBlack = run cache.icon(&mut atlas, &black, lined, 24, 24, IconStyle.Color, 0.0)
+    |> Effect.provideMut<Resolver>(&mut resolver)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let inRed = run cache.icon(&mut atlas, &red, lined, 24, 24, IconStyle.Color, 0.0)
+    |> Effect.provideMut<Resolver>(&mut resolver)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(!sameTile(inBlack, inRed), "each currentColor has its own tile")
+  let expected = run reference(lucide(), 24, 24, 0.0, &red)
+    |> Effect.provideMut<Resolver>(&mut resolver)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(lastUploadIs(&cache, &expected, false), "the red tile is svg_render's in red")
+  let rgba = expected.data()
+  let mut reddish = false
+  let mut i: usize = 0
+  while i + 3 < rgba.length {
+    reddish = reddish || (rgba[i] > 200 && rgba[i + 1] == 0 && rgba[i + 3] > 200)
+    i = i + 4
+  }
+  run Testing.expect(reddish, "currentColor reaches the stroke")
+  let again = run cache.icon(&mut atlas, &red, lined, 24, 24, IconStyle.Color, 0.0)
+    |> Effect.provideMut<Resolver>(&mut resolver)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(sameTile(again, inRed), "the same currentColor hits")
 }

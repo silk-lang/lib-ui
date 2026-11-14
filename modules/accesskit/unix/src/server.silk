@@ -1,0 +1,2013 @@
+//! The AT-SPI object server: the application object, one object per included node, and the
+//! cache, answering the method calls and property reads of assistive technology.
+//!
+//! Ported from AccessKit (`accesskit_unix/src/atspi/interfaces` and
+//! `accesskit_atspi_common/src/node.rs`), Copyright 2022 The AccessKit Authors, under the MIT
+//! or Apache-2.0 license.
+import accesskit.lib {
+  Action,
+  ActionData,
+  ActionRequest,
+  NodeId,
+  Point,
+  Rect,
+  ScrollHint,
+  TextSelection
+}
+import accesskit_consumer.lib {
+  Tree,
+  NodeRef,
+  FullNodeId,
+  TreeIndex,
+  CommonFilter,
+  FilterResult,
+  commonFilter
+}
+import atspi { AtspiRole }
+import node {
+  StateSet,
+  WindowBounds,
+  CoordType,
+  Attribute,
+  atspiRole,
+  states,
+  name,
+  interfaces,
+  interfaceNameAt,
+  interfaceBit,
+  actionCount,
+  actionName,
+  attributes,
+  extents,
+  ACCESSIBLE,
+  APPLICATION
+}
+import events { Target, currentValue }
+import text {
+  Granularity,
+  TextAttribute,
+  decimalU64,
+  positionAt,
+  offsetOf,
+  rangeAt,
+  rangeBetween,
+  rangeBounds,
+  attributeIndex,
+  attributeOf,
+  attributeRun,
+  defaultAttributes
+}
+import dbus.lib { Message, Writer, Reader, DBusError, NO_REPLY_EXPECTED }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f64
+import silk.num.i32
+import silk.num.u32
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+import silk.text.string { String }
+
+pub const ROOT_PATH: string<'static> = "/org/a11y/atspi/accessible/root"
+
+pub const ACCESSIBLE_PREFIX: string<'static> = "/org/a11y/atspi/accessible/"
+
+pub const CACHE_PATH: string<'static> = "/org/a11y/atspi/cache"
+
+pub const NULL_PATH: string<'static> = "/org/a11y/atspi/null"
+
+const UNKNOWN_METHOD: string<'static> = "org.freedesktop.DBus.Error.UnknownMethod"
+
+const UNKNOWN_OBJECT: string<'static> = "org.freedesktop.DBus.Error.UnknownObject"
+
+const UNKNOWN_INTERFACE: string<'static> = "org.freedesktop.DBus.Error.UnknownInterface"
+
+const UNKNOWN_PROPERTY: string<'static> = "org.freedesktop.DBus.Error.UnknownProperty"
+
+const INVALID_ARGS: string<'static> = "org.freedesktop.DBus.Error.InvalidArgs"
+
+const READ_ONLY: string<'static> = "org.freedesktop.DBus.Error.PropertyReadOnly"
+
+const FAILED: string<'static> = "org.freedesktop.DBus.Error.Failed"
+
+/// One top-level window: its accessibility tree and where it is on screen.
+pub struct Window {
+  pub id: u32,
+  pub tree: Tree,
+  pub bounds: WindowBounds,
+}
+
+/// An action request for the window with id `window`.
+pub struct WindowRequest {
+  pub window: u32,
+  pub request: ActionRequest,
+}
+
+/// Everything the object server answers from.
+pub struct AppState {
+  pub windows: List<Window>,
+  /// The application's name, the name of its object.
+  pub name: String,
+  pub toolkitName: String,
+  pub toolkitVersion: String,
+  /// The id the registry gives the application, or -1.
+  pub id: i32,
+  /// The desktop object the application is embedded in.
+  pub desktopName: String,
+  pub desktopPath: String,
+  /// Actions assistive technology asked for, for the host to perform.
+  pub requests: List<WindowRequest>,
+}
+
+impl AppState {
+  pub effect fn make(name: string) -> AppState
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return AppState {
+      windows: List<Window>.make(),
+      name: run String.copy(name),
+      toolkitName: String.make(),
+      toolkitVersion: String.make(),
+      id: -1,
+      desktopName: String.make(),
+      desktopPath: run String.copy(NULL_PATH),
+      requests: List<WindowRequest>.make(),
+    }
+  }
+
+  /// The position of the window with id `window`.
+  pub fn windowIndex(self: &Self, window: u32) -> Option<usize> {
+    let all = self.windows.asSlice()
+    let mut i: usize = 0
+    while i < all.length {
+      if all[i].id == window {
+        return Option.Some { value: i }
+      }
+      i = i + 1
+    }
+    return Option.None
+  }
+}
+
+/// What a path names.
+pub union Resolved {
+  App,
+  Cache,
+  Node { pub window: u32, pub id: FullNodeId },
+  Unknown,
+}
+
+fn parseDecimal(text: string) -> Option<u64> {
+  let bytes = String.utf8Bytes(text)
+  if bytes.length == 0 || bytes.length > 20 {
+    return Option.None
+  }
+  let mut value: u64 = 0
+  let mut i: usize = 0
+  while i < bytes.length {
+    let c = bytes[i]
+    if c < 48 || c > 57 {
+      return Option.None
+    }
+    value = value * 10 + u8.toU64(c - 48)
+    i = i + 1
+  }
+  return Option.Some { value: value }
+}
+
+/// The node id a path segment names: the tree index in the top 16 bits, the local id below.
+pub fn nodeIdOf(value: u64) -> FullNodeId {
+  return FullNodeId.make(
+    NodeId.of(u64.bitAnd(value, 281474976710655)),
+    TreeIndex { value: u64.wrappingToU32(u64.shiftRight(value, 48)) },
+  )
+}
+
+/// What object `path` names.
+pub fn resolvePath(path: string) -> Resolved {
+  if path == ROOT_PATH {
+    return Resolved.App
+  }
+  if path == CACHE_PATH {
+    return Resolved.Cache
+  }
+  if !String.startsWith(path, ACCESSIBLE_PREFIX) {
+    return Resolved.Unknown
+  }
+  let start = String.byteLength(ACCESSIBLE_PREFIX)
+  let rest = String.slice(path, start, String.byteLength(path) - start)
+  return match String.find(rest, "/") {
+    Option.Some { value: slash } => {
+      let window = parseDecimal(String.slice(rest, 0, slash))
+      let id = parseDecimal(String.slice(rest, slash + 1, String.byteLength(rest) - slash - 1))
+      match window {
+        Option.Some { value: w } => match id {
+          Option.Some { value: n } => Resolved.Node {
+            window: u64.wrappingToU32(w),
+            id: nodeIdOf(n),
+          }
+          Option.None => Resolved.Unknown
+        }
+        Option.None => Resolved.Unknown
+      }
+    }
+    Option.None => Resolved.Unknown
+  }
+}
+
+/// The object path of node `id` of window `window`.
+pub effect fn nodePath(window: u32, id: FullNodeId) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut path = run String.copy(ACCESSIBLE_PREFIX)
+  let first = run decimalU64(u32.toU64(window))
+  run path.append(first.view())
+  run path.append("/")
+  let second = run decimalU64(id.toU64())
+  run path.append(second.view())
+  return move path
+}
+
+/// The object path of `target`.
+pub effect fn targetPath(target: Target) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match target {
+    Target.App => run String.copy(ROOT_PATH)
+    Target.Node { window, id } => run nodePath(window, id)
+  }
+}
+
+/// Writes an object reference `(so)`.
+pub effect fn writeAddress(w: &mut Writer, bus: string, path: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run w.beginStruct()
+  run w.string(bus)
+  run w.objectPath(path)
+}
+
+/// Writes the reference `(so)` to `target` on `bus`.
+pub effect fn writeTarget(w: &mut Writer, bus: string, target: Target) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let path = run targetPath(target)
+  run writeAddress(&mut w, bus, path.view())
+}
+
+/// Writes the null reference, for no object.
+pub effect fn writeNull(w: &mut Writer) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run writeAddress(&mut w, "", NULL_PATH)
+}
+
+/// Writes an `(iiii)` rectangle, or the invalid one (-1 everywhere).
+effect fn writeRect(w: &mut Writer, rect: Option<Rect>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run w.beginStruct()
+  run writeRectFields(&mut w, rect)
+}
+
+effect fn writeRectFields(w: &mut Writer, rect: Option<Rect>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match rect {
+    Option.Some { value } => {
+      run w.int32(toInt(value.x0))
+      run w.int32(toInt(value.y0))
+      run w.int32(toInt(value.width()))
+      run w.int32(toInt(value.height()))
+    }
+    Option.None => {
+      run w.int32(-1)
+      run w.int32(-1)
+      run w.int32(-1)
+      run w.int32(-1)
+    }
+  }
+}
+
+fn toInt(value: f64) -> i32 {
+  return match f64.checkedToI32(f64.round(value)) {
+    Option.Some { value: v } => v
+    Option.None => if value < 0.0 {
+      i32.MIN
+    } else {
+      i32.MAX
+    }
+  }
+}
+
+/// Writes `as`: the names of the interfaces in `set`.
+effect fn writeInterfaces(w: &mut Writer, set: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mark = run w.beginArray(4)
+  let mut i: u32 = 0
+  while i <= 10 {
+    if u32.bitAnd(set, u32.shiftLeft(1, i)) != 0 {
+      run w.string(interfaceNameAt(i))
+    }
+    i = i + 1
+  }
+  w.endArray(mark)
+}
+
+/// Writes `au`: a state set as two words.
+effect fn writeStates(w: &mut Writer, set: StateSet) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mark = run w.beginArray(4)
+  run w.uint32(set.low())
+  run w.uint32(set.high())
+  w.endArray(mark)
+}
+
+/// The answer to a call.
+pub union Answer {
+  Reply { pub signature: string<'static>, pub body: Writer },
+  Failure { pub name: string<'static>, pub text: string<'static> },
+}
+
+fn reply(signature: string<'static>, body: Writer) -> Answer {
+  return Answer.Reply { signature: signature, body: move body }
+}
+
+fn empty() -> Answer {
+  return Answer.Reply { signature: "", body: Writer.make() }
+}
+
+fn failure(name: string<'static>, text: string<'static>) -> Answer {
+  return Answer.Failure { name: name, text: text }
+}
+
+effect fn boolean(value: bool) -> Answer
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut w = Writer.make()
+  run w.boolean(value)
+  return reply("b", move w)
+}
+
+effect fn integer(value: i32) -> Answer
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut w = Writer.make()
+  run w.int32(value)
+  return reply("i", move w)
+}
+
+effect fn text(value: string) -> Answer
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut w = Writer.make()
+  run w.string(value)
+  return reply("s", move w)
+}
+
+effect fn address(bus: string, target: Option<Target>) -> Answer
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut w = Writer.make()
+  match target {
+    Option.Some { value } => run writeTarget(&mut w, bus, value)
+    Option.None => run writeNull(&mut w)
+  }
+  return reply("(so)", move w)
+}
+
+/// Where a node sits: its window and that window's place among the application's children.
+pub struct Place {
+  pub window: u32,
+  pub index: u32,
+  pub bounds: WindowBounds,
+}
+
+impl Copy for Place {}
+
+fn nodeTarget(place: Place, node: &NodeRef<'_>) -> Target {
+  return Target.Node { window: place.window, id: node.id }
+}
+
+fn parentOf(place: Place, node: &NodeRef<'_>) -> Target {
+  return match node.filteredParent(&CommonFilter {}) {
+    Option.Some { value } => Target.Node { window: place.window, id: value.id }
+    Option.None => Target.App
+  }
+}
+
+fn childCount(node: &NodeRef<'_>) -> i32 {
+  let filter = CommonFilter {}
+  let mut cursor = node.filteredChildren(&filter)
+  let mut count: i32 = 0
+  while let Option.Some { value: _ } = cursor.next(&filter) {
+    count = count + 1
+  }
+  return count
+}
+
+fn childAt<'a>(node: &NodeRef<'a>, index: i32) -> Option<NodeRef<'a>> {
+  if index < 0 {
+    return Option.None
+  }
+  let filter = CommonFilter {}
+  let mut cursor = node.filteredChildren(&filter)
+  let mut i: i32 = 0
+  while let Option.Some { value: child } = cursor.next(&filter) {
+    if i == index {
+      return Option.Some { value: child }
+    }
+    i = i + 1
+  }
+  return Option.None
+}
+
+/// The index of `node` among its parent's included children, or its window's index for a root.
+pub fn indexInParent(place: Place, node: &NodeRef<'_>) -> i32 {
+  let filter = CommonFilter {}
+  if node.filteredParent(&filter).isNone() {
+    return u32.wrappingToI32(place.index)
+  }
+  let mut cursor = node.precedingFilteredSiblings(&filter)
+  let mut count: i32 = 0
+  while let Option.Some { value: _ } = cursor.next(&filter) {
+    count = count + 1
+  }
+  return count
+}
+
+/// The request for `action` on `node`, for the host.
+fn requestFor(place: Place, node: &NodeRef<'_>, action: Action, data: Option<ActionData>) -> Option<
+  WindowRequest
+> {
+  return match node.treeState.locateNode(node.id) {
+    Option.Some { value } => Option.Some {
+      value: WindowRequest {
+        window: place.window,
+        request: ActionRequest {
+          action: action,
+          targetTree: value.tree,
+          targetNode: value.local,
+          data: move data,
+        },
+      },
+    }
+    Option.None => Option.None
+  }
+}
+
+fn nowhere() -> Option<Target> {
+  return Option.None
+}
+
+fn noData() -> Option<ActionData> {
+  return Option.None
+}
+
+effect fn ask(out: &mut List<WindowRequest>, request: Option<WindowRequest>) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match move request {
+    Option.Some { value } => {
+      run out.append(move value)
+      true
+    }
+    Option.None => false
+  }
+}
+
+fn scrollHintOf(scrollType: u32) -> Option<ActionData> {
+  return match scrollType {
+    0 => Option.Some { value: ActionData.ScrollHint { value: ScrollHint.TopLeft } }
+    1 => Option.Some { value: ActionData.ScrollHint { value: ScrollHint.BottomRight } }
+    2 => Option.Some { value: ActionData.ScrollHint { value: ScrollHint.TopEdge } }
+    3 => Option.Some { value: ActionData.ScrollHint { value: ScrollHint.BottomEdge } }
+    4 => Option.Some { value: ActionData.ScrollHint { value: ScrollHint.LeftEdge } }
+    5 => Option.Some { value: ActionData.ScrollHint { value: ScrollHint.RightEdge } }
+    _ => Option.None
+  }
+}
+
+/// `point` in the AT-SPI coordinates of `coordType`, inside `node`.
+fn localPoint(place: Place, node: &NodeRef<'_>, x: i32, y: i32, coordType: CoordType) -> Point {
+  let point = place.bounds.toAccessKit(
+    Point.make(i32.toF64(x), i32.toF64(y)),
+    Option.Some { value: node.* },
+    coordType,
+  )
+  return node.transform().inverse().apply(point)
+}
+
+/// `rect`, in `node`'s coordinates, moved into the AT-SPI coordinates of `coordType`.
+fn atspiRect(place: Place, node: &NodeRef<'_>, rect: Rect, coordType: CoordType) -> Rect {
+  let origin = place.bounds.toAtspi(
+    Point.make(rect.x0, rect.y0),
+    Option.Some { value: node.* },
+    coordType,
+  )
+  return Rect.make(origin.x, origin.y, origin.x + rect.width(), origin.y + rect.height())
+}
+
+// Properties -----------------------------------------------------------------------------------
+
+/// The name of property `index` of interface `iface`, for `GetAll`.
+fn propertyAt(iface: string, index: usize) -> Option<string<'static>> {
+  let names: [string<'static>; 6] = if iface == "org.a11y.atspi.Accessible" {
+    ["Name", "Description", "Parent", "ChildCount", "Locale", "AccessibleId"]
+  } else if iface == "org.a11y.atspi.Action" {
+    ["NActions", "", "", "", "", ""]
+  } else if iface == "org.a11y.atspi.Text" {
+    ["CharacterCount", "CaretOffset", "", "", "", ""]
+  } else if iface == "org.a11y.atspi.Value" {
+    ["MinimumValue", "MaximumValue", "MinimumIncrement", "CurrentValue", "", ""]
+  } else if iface == "org.a11y.atspi.Selection" {
+    ["NSelectedChildren", "", "", "", "", ""]
+  } else if iface == "org.a11y.atspi.Image" {
+    ["ImageDescription", "ImageLocale", "", "", "", ""]
+  } else if iface == "org.a11y.atspi.Hyperlink" {
+    ["NAnchors", "StartIndex", "EndIndex", "", "", ""]
+  } else if iface == "org.a11y.atspi.Application" {
+    ["ToolkitName", "Version", "AtspiVersion", "Id", "", ""]
+  } else {
+    ["", "", "", "", "", ""]
+  }
+  if index >= names.length || names[index] == "" {
+    return Option.None
+  }
+  return Option.Some { value: names[index] }
+}
+
+/// What writing a property did.
+pub enum Written {
+  Done,
+  Unknown,
+  Unsupported,
+}
+
+effect fn variantText(w: &mut Writer, value: string) -> Written
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run w.variant("s")
+  run w.string(value)
+  return Written.Done
+}
+
+effect fn variantInt(w: &mut Writer, value: i32) -> Written
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run w.variant("i")
+  run w.int32(value)
+  return Written.Done
+}
+
+effect fn variantDouble(w: &mut Writer, value: f64) -> Written
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run w.variant("d")
+  run w.double(value)
+  return Written.Done
+}
+
+/// Writes property `property` of `iface` of `node` as a variant.
+effect fn nodeProperty(
+  w: &mut Writer,
+  bus: string,
+  place: Place,
+  node: &NodeRef<'_>,
+  iface: string,
+  property: string,
+) -> Written
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if iface == "org.a11y.atspi.Accessible" {
+    if property == "Name" {
+      let value = run name(node)
+      return match &value {
+        Option.Some { value: given } => run variantText(&mut w, given.view())
+        Option.None => run variantText(&mut w, "")
+      }
+    }
+    if property == "Description" {
+      let value = run node.description()
+      return match &value {
+        Option.Some { value: given } => run variantText(&mut w, given.view())
+        Option.None => run variantText(&mut w, "")
+      }
+    }
+    if property == "Parent" {
+      run w.variant("(so)")
+      run writeTarget(&mut w, bus, parentOf(place, node))
+      return Written.Done
+    }
+    if property == "ChildCount" {
+      return run variantInt(&mut w, childCount(node))
+    }
+    if property == "Locale" {
+      return run variantText(&mut w, "")
+    }
+    if property == "AccessibleId" {
+      return run variantText(
+        &mut w,
+        match node.authorId() {
+          Option.Some { value } => value
+          Option.None => ""
+        },
+      )
+    }
+    return Written.Unknown
+  }
+  if iface == "org.a11y.atspi.Action" {
+    if property == "NActions" {
+      return run variantInt(&mut w, actionCount(node))
+    }
+    return Written.Unknown
+  }
+  if iface == "org.a11y.atspi.Text" {
+    if property == "CharacterCount" {
+      return run variantInt(&mut w, offsetOf(&node.documentRange().endPosition()))
+    }
+    if property == "CaretOffset" {
+      return run variantInt(
+        &mut w,
+        match node.textSelectionFocus() {
+          Option.Some { value } => offsetOf(&value)
+          Option.None => -1
+        },
+      )
+    }
+    return Written.Unknown
+  }
+  if iface == "org.a11y.atspi.Value" {
+    if property == "MinimumValue" {
+      return run variantDouble(
+        &mut w,
+        match node.minNumericValue() {
+          Option.Some { value } => value
+          Option.None => f64.MIN
+        },
+      )
+    }
+    if property == "MaximumValue" {
+      return run variantDouble(
+        &mut w,
+        match node.maxNumericValue() {
+          Option.Some { value } => value
+          Option.None => f64.MAX
+        },
+      )
+    }
+    if property == "MinimumIncrement" {
+      return run variantDouble(
+        &mut w,
+        match node.numericValueStep() {
+          Option.Some { value } => value
+          Option.None => 0.0
+        },
+      )
+    }
+    if property == "CurrentValue" {
+      return run variantDouble(
+        &mut w,
+        match currentValue(node) {
+          Option.Some { value } => value
+          Option.None => 0.0
+        },
+      )
+    }
+    return Written.Unknown
+  }
+  if iface == "org.a11y.atspi.Selection" {
+    if property == "NSelectedChildren" {
+      let mut items = List<NodeRef<'_>>.make()
+      run node.items(&CommonFilter {}, &mut items)
+      let mut count: i32 = 0
+      let mut i: usize = 0
+      while i < items.length() {
+        if selected(&items.get(i)) {
+          count = count + 1
+        }
+        i = i + 1
+      }
+      return run variantInt(&mut w, count)
+    }
+    return Written.Unknown
+  }
+  if iface == "org.a11y.atspi.Image" {
+    if property == "ImageDescription" {
+      let value = run node.description()
+      return match &value {
+        Option.Some { value: given } => run variantText(&mut w, given.view())
+        Option.None => run variantText(&mut w, "")
+      }
+    }
+    if property == "ImageLocale" {
+      return run variantText(
+        &mut w,
+        match node.language() {
+          Option.Some { value } => value
+          Option.None => ""
+        },
+      )
+    }
+    return Written.Unknown
+  }
+  if iface == "org.a11y.atspi.Hyperlink" {
+    if property == "NAnchors" {
+      return run variantInt(
+        &mut w,
+        if node.url().isSome() {
+          1
+        } else {
+          0
+        },
+      )
+    }
+    if property == "StartIndex" || property == "EndIndex" {
+      return run variantInt(&mut w, -1)
+    }
+    return Written.Unknown
+  }
+  if iface == "org.a11y.atspi.Document" {
+    if property == "CurrentPageNumber" || property == "PageCount" {
+      return Written.Unsupported
+    }
+    return Written.Unknown
+  }
+  return Written.Unknown
+}
+
+fn selected(node: &NodeRef<'_>) -> bool {
+  return match node.isSelected() {
+    Option.Some { value } => value
+    Option.None => false
+  }
+}
+
+/// Writes property `property` of `iface` of the application object as a variant.
+effect fn appProperty(
+  w: &mut Writer,
+  app: &AppState,
+  bus: string,
+  iface: string,
+  property: string,
+) -> Written
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if iface == "org.a11y.atspi.Accessible" {
+    if property == "Name" {
+      return run variantText(&mut w, app.name.view())
+    }
+    if property == "Description" || property == "Locale" || property == "AccessibleId" {
+      return run variantText(&mut w, "")
+    }
+    if property == "Parent" {
+      run w.variant("(so)")
+      run writeAddress(&mut w, app.desktopName.view(), app.desktopPath.view())
+      return Written.Done
+    }
+    if property == "ChildCount" {
+      return run variantInt(&mut w, usize.wrappingToI32(app.windows.length()))
+    }
+    return Written.Unknown
+  }
+  if iface == "org.a11y.atspi.Application" {
+    if property == "ToolkitName" {
+      return run variantText(&mut w, app.toolkitName.view())
+    }
+    if property == "Version" {
+      return run variantText(&mut w, app.toolkitVersion.view())
+    }
+    if property == "AtspiVersion" {
+      return run variantText(&mut w, "2.1")
+    }
+    if property == "Id" {
+      return run variantInt(&mut w, app.id)
+    }
+    return Written.Unknown
+  }
+  return Written.Unknown
+}
+
+// Method calls ---------------------------------------------------------------------------------
+
+/// Answers `call` on the application object.
+effect fn appCall(app: &mut AppState, call: &Message, bus: string) -> Answer
+  ! DBusError | OutOfMemoryError
+  ? &mut Allocator {
+  let iface = call.interfaceName.view()
+  let member = call.member.view()
+  let mut args = call.reader()
+  if iface == "org.freedesktop.DBus.Properties" {
+    let target = run args.string()
+    if interfaceBit(target) == 0
+      || (target != "org.a11y.atspi.Accessible" && target != "org.a11y.atspi.Application") {
+      return failure(UNKNOWN_INTERFACE, "the application has no such interface")
+    }
+    if member == "Get" {
+      let property = run args.string()
+      let mut w = Writer.make()
+      return match run appProperty(&mut w, &app.*, bus, target, property) {
+        Written.Done => reply("v", move w)
+        _ => failure(UNKNOWN_PROPERTY, "no such property")
+      }
+    }
+    if member == "GetAll" {
+      let mut w = Writer.make()
+      let mark = run w.beginArray(8)
+      let mut i: usize = 0
+      while let Option.Some { value: property } = propertyAt(target, i) {
+        run w.beginStruct()
+        run w.string(property)
+        drop run appProperty(&mut w, &app.*, bus, target, property)
+        i = i + 1
+      }
+      w.endArray(mark)
+      return reply("a{sv}", move w)
+    }
+    if member == "Set" {
+      let property = run args.string()
+      if target == "org.a11y.atspi.Application" && property == "Id" {
+        let signature = run args.signature()
+        if signature != "i" {
+          return failure(INVALID_ARGS, "Id is an int32")
+        }
+        app.id = run args.int32()
+        return empty()
+      }
+      return failure(READ_ONLY, "the property cannot be set")
+    }
+    return failure(UNKNOWN_METHOD, "no such method")
+  }
+  if iface == "org.a11y.atspi.Application" {
+    if member == "GetLocale" {
+      return run text("")
+    }
+    return failure(UNKNOWN_METHOD, "no such method")
+  }
+  if iface != "org.a11y.atspi.Accessible" {
+    return failure(UNKNOWN_INTERFACE, "the application has no such interface")
+  }
+  if member == "GetChildAtIndex" {
+    let index = run args.int32()
+    if index < 0 {
+      return failure(INVALID_ARGS, "the index cannot be negative")
+    }
+    if i32.wrappingToUsize(index) >= app.windows.length() {
+      return run address(bus, nowhere())
+    }
+    let window = &app.windows.asSlice()[i32.wrappingToUsize(index)]
+    return run address(
+      bus,
+      Option.Some { value: Target.Node { window: window.id, id: window.tree.state().rootId() } },
+    )
+  }
+  if member == "GetChildren" {
+    let mut w = Writer.make()
+    let mark = run w.beginArray(8)
+    let all = app.windows.asSlice()
+    let mut i: usize = 0
+    while i < all.length {
+      run writeTarget(
+        &mut w,
+        bus,
+        Target.Node { window: all[i].id, id: all[i].tree.state().rootId() },
+      )
+      i = i + 1
+    }
+    w.endArray(mark)
+    return reply("a(so)", move w)
+  }
+  if member == "GetIndexInParent" {
+    return run integer(-1)
+  }
+  if member == "GetRelationSet" {
+    let mut w = Writer.make()
+    let mark = run w.beginArray(8)
+    w.endArray(mark)
+    return reply("a(ua(so))", move w)
+  }
+  if member == "GetRole" {
+    let mut w = Writer.make()
+    run w.uint32(AtspiRole.Application.number())
+    return reply("u", move w)
+  }
+  if member == "GetRoleName" || member == "GetLocalizedRoleName" {
+    return run text(AtspiRole.Application.roleName())
+  }
+  if member == "GetState" {
+    let mut w = Writer.make()
+    run writeStates(&mut w, StateSet.empty())
+    return reply("au", move w)
+  }
+  if member == "GetAttributes" {
+    let mut w = Writer.make()
+    let mark = run w.beginArray(8)
+    w.endArray(mark)
+    return reply("a{ss}", move w)
+  }
+  if member == "GetApplication" {
+    return run address(bus, Option.Some { value: Target.App })
+  }
+  if member == "GetInterfaces" {
+    let mut w = Writer.make()
+    run writeInterfaces(&mut w, u32.bitOr(ACCESSIBLE(), APPLICATION()))
+    return reply("as", move w)
+  }
+  return failure(UNKNOWN_METHOD, "no such method")
+}
+
+/// Answers `call` on `node`, adding any action it asks for to `out`.
+effect fn nodeCall(
+  call: &Message,
+  bus: string,
+  place: Place,
+  node: &NodeRef<'_>,
+  out: &mut List<WindowRequest>,
+) -> Answer
+  ! DBusError | OutOfMemoryError
+  ? &mut Allocator {
+  let iface = call.interfaceName.view()
+  let member = call.member.view()
+  let mut args = call.reader()
+  let supported = interfaces(node)
+  if iface == "org.freedesktop.DBus.Properties" {
+    let target = run args.string()
+    if u32.bitAnd(supported, interfaceBit(target)) == 0 {
+      return failure(UNKNOWN_INTERFACE, "the object has no such interface")
+    }
+    if member == "Get" {
+      let property = run args.string()
+      let mut w = Writer.make()
+      return match run nodeProperty(&mut w, bus, place, node, target, property) {
+        Written.Done => reply("v", move w)
+        Written.Unsupported => failure(FAILED, "not supported")
+        Written.Unknown => failure(UNKNOWN_PROPERTY, "no such property")
+      }
+    }
+    if member == "GetAll" {
+      let mut w = Writer.make()
+      let mark = run w.beginArray(8)
+      let mut i: usize = 0
+      while let Option.Some { value: property } = propertyAt(target, i) {
+        run w.beginStruct()
+        run w.string(property)
+        drop run nodeProperty(&mut w, bus, place, node, target, property)
+        i = i + 1
+      }
+      w.endArray(mark)
+      return reply("a{sv}", move w)
+    }
+    if member == "Set" {
+      let property = run args.string()
+      if target == "org.a11y.atspi.Value" && property == "CurrentValue" {
+        let signature = run args.signature()
+        if signature != "d" {
+          return failure(INVALID_ARGS, "CurrentValue is a double")
+        }
+        let value = run args.double()
+        drop run ask(
+          &mut out,
+          requestFor(
+            place,
+            node,
+            Action.SetValue,
+            Option.Some { value: ActionData.NumericValue { value: value } },
+          ),
+        )
+        return empty()
+      }
+      return failure(READ_ONLY, "the property cannot be set")
+    }
+    return failure(UNKNOWN_METHOD, "no such method")
+  }
+  if u32.bitAnd(supported, interfaceBit(iface)) == 0 {
+    return failure(UNKNOWN_INTERFACE, "the object has no such interface")
+  }
+  if iface == "org.a11y.atspi.Accessible" {
+    return run accessibleCall(member, &mut args, bus, place, node)
+  }
+  if iface == "org.a11y.atspi.Action" {
+    if member == "GetDescription" || member == "GetKeyBinding" {
+      drop run args.int32()
+      return run text("")
+    }
+    if member == "GetName" || member == "GetLocalizedName" {
+      let index = run args.int32()
+      return run text(actionName(node, index))
+    }
+    if member == "GetActions" {
+      let mut w = Writer.make()
+      let mark = run w.beginArray(8)
+      let count = actionCount(node)
+      let mut i: i32 = 0
+      while i < count {
+        run w.beginStruct()
+        run w.string(actionName(node, i))
+        run w.string("")
+        run w.string("")
+        i = i + 1
+      }
+      w.endArray(mark)
+      return reply("a(sss)", move w)
+    }
+    if member == "DoAction" {
+      let index = run args.int32()
+      if index != 0 {
+        return run boolean(false)
+      }
+      return run boolean(run ask(&mut out, requestFor(place, node, Action.Click, noData())))
+    }
+    return failure(UNKNOWN_METHOD, "no such method")
+  }
+  if iface == "org.a11y.atspi.Component" {
+    return run componentCall(member, &mut args, bus, place, node, &mut out)
+  }
+  if iface == "org.a11y.atspi.Text" {
+    return run textCall(member, &mut args, place, node, &mut out)
+  }
+  if iface == "org.a11y.atspi.EditableText" {
+    if member == "SetTextContents" {
+      let value = run args.string()
+      if node.isReadOnly() {
+        return run boolean(false)
+      }
+      let data = ActionData.Value { value: run String.copy(value) }
+      return run boolean(
+        run ask(
+          &mut out,
+          requestFor(place, node, Action.SetValue, Option.Some { value: move data }),
+        ),
+      )
+    }
+    return failure(FAILED, "not supported")
+  }
+  if iface == "org.a11y.atspi.Selection" {
+    return run selectionCall(member, &mut args, bus, place, node, &mut out)
+  }
+  if iface == "org.a11y.atspi.Image" {
+    if member == "GetImageExtents" {
+      let coordType = CoordType.of(run args.uint32())
+      let mut w = Writer.make()
+      run writeRect(&mut w, extents(node, &place.bounds, coordType))
+      return reply("(iiii)", move w)
+    }
+    if member == "GetImagePosition" {
+      let coordType = CoordType.of(run args.uint32())
+      let mut w = Writer.make()
+      let box = extents(node, &place.bounds, coordType)
+      run w.int32(
+        match box {
+          Option.Some { value } => toInt(value.x0)
+          Option.None => -1
+        },
+      )
+      run w.int32(
+        match box {
+          Option.Some { value } => toInt(value.y0)
+          Option.None => -1
+        },
+      )
+      return reply("ii", move w)
+    }
+    if member == "GetImageSize" {
+      let mut w = Writer.make()
+      let box = extents(node, &place.bounds, CoordType.Window)
+      run w.int32(
+        match box {
+          Option.Some { value } => toInt(value.width())
+          Option.None => -1
+        },
+      )
+      run w.int32(
+        match box {
+          Option.Some { value } => toInt(value.height())
+          Option.None => -1
+        },
+      )
+      return reply("ii", move w)
+    }
+    return failure(UNKNOWN_METHOD, "no such method")
+  }
+  if iface == "org.a11y.atspi.Hyperlink" {
+    if member == "GetObject" {
+      let index = run args.int32()
+      return run address(
+        bus,
+        if index == 0 {
+          Option.Some { value: nodeTarget(place, node) }
+        } else {
+          nowhere()
+        },
+      )
+    }
+    if member == "GetURI" {
+      let index = run args.int32()
+      return run text(
+        if index == 0 {
+          match node.url() {
+            Option.Some { value } => value
+            Option.None => ""
+          }
+        } else {
+          ""
+        },
+      )
+    }
+    if member == "IsValid" {
+      return run boolean(node.url().isSome())
+    }
+    return failure(UNKNOWN_METHOD, "no such method")
+  }
+  if iface == "org.a11y.atspi.Document" {
+    if member == "GetLocale" {
+      return run text(
+        match node.language() {
+          Option.Some { value } => value
+          Option.None => ""
+        },
+      )
+    }
+    if member == "GetAttributeValue" {
+      let wanted = run args.string()
+      if equalsIgnoringCase(wanted, "Title") {
+        let label = run node.label()
+        return match &label {
+          Option.Some { value } => run text(value.view())
+          Option.None => run text("")
+        }
+      }
+      if equalsIgnoringCase(wanted, "URI") {
+        return run text(
+          match node.url() {
+            Option.Some { value } => value
+            Option.None => ""
+          },
+        )
+      }
+      return run text("")
+    }
+    if member == "GetAttributes" {
+      let mut w = Writer.make()
+      let mark = run w.beginArray(8)
+      let label = run node.label()
+      match &label {
+        Option.Some { value } => {
+          run w.beginStruct()
+          run w.string("Title")
+          run w.string(value.view())
+        }
+        Option.None => {}
+      }
+      match node.url() {
+        Option.Some { value } => {
+          run w.beginStruct()
+          run w.string("URI")
+          run w.string(value)
+        }
+        Option.None => {}
+      }
+      w.endArray(mark)
+      return reply("a{ss}", move w)
+    }
+    return failure(FAILED, "not supported")
+  }
+  if iface == "org.a11y.atspi.Value" {
+    return failure(UNKNOWN_METHOD, "no such method")
+  }
+  return failure(UNKNOWN_INTERFACE, "the object has no such interface")
+}
+
+fn lower(c: u8) -> u8 {
+  return if c >= 65 && c <= 90 {
+    c + 32
+  } else {
+    c
+  }
+}
+
+fn equalsIgnoringCase(a: string, b: string) -> bool {
+  let x = String.utf8Bytes(a)
+  let y = String.utf8Bytes(b)
+  if x.length != y.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < x.length {
+    if lower(x[i]) != lower(y[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+effect fn accessibleCall(
+  member: string,
+  args: &mut Reader<'_>,
+  bus: string,
+  place: Place,
+  node: &NodeRef<'_>,
+) -> Answer
+  ! DBusError | OutOfMemoryError
+  ? &mut Allocator {
+  if member == "GetChildAtIndex" {
+    let index = run args.int32()
+    if index < 0 {
+      return failure(INVALID_ARGS, "the index cannot be negative")
+    }
+    return run address(
+      bus,
+      match childAt(node, index) {
+        Option.Some { value } => Option.Some { value: nodeTarget(place, &value) }
+        Option.None => Option.None
+      },
+    )
+  }
+  if member == "GetChildren" {
+    let mut w = Writer.make()
+    let mark = run w.beginArray(8)
+    let filter = CommonFilter {}
+    let mut cursor = node.filteredChildren(&filter)
+    while let Option.Some { value: child } = cursor.next(&filter) {
+      run writeTarget(&mut w, bus, nodeTarget(place, &child))
+    }
+    w.endArray(mark)
+    return reply("a(so)", move w)
+  }
+  if member == "GetIndexInParent" {
+    return run integer(indexInParent(place, node))
+  }
+  if member == "GetRelationSet" {
+    let mut w = Writer.make()
+    let mark = run w.beginArray(8)
+    let mut controlled = List<NodeRef<'_>>.make()
+    run node.controls(&mut controlled)
+    let mut count: usize = 0
+    let mut i: usize = 0
+    while i < controlled.length() {
+      if commonFilter(&controlled.get(i)) == FilterResult.Include {
+        count = count + 1
+      }
+      i = i + 1
+    }
+    if count > 0 {
+      run w.beginStruct()
+      run w.uint32(3)
+      let targets = run w.beginArray(8)
+      i = 0
+      while i < controlled.length() {
+        let one = controlled.get(i)
+        if commonFilter(&one) == FilterResult.Include {
+          run writeTarget(&mut w, bus, nodeTarget(place, &one))
+        }
+        i = i + 1
+      }
+      w.endArray(targets)
+    }
+    w.endArray(mark)
+    return reply("a(ua(so))", move w)
+  }
+  if member == "GetRole" {
+    let mut w = Writer.make()
+    run w.uint32(atspiRole(node).number())
+    return reply("u", move w)
+  }
+  if member == "GetRoleName" {
+    return run text(atspiRole(node).roleName())
+  }
+  if member == "GetLocalizedRoleName" {
+    return run text(
+      match node.roleDescription() {
+        Option.Some { value } => value
+        Option.None => ""
+      },
+    )
+  }
+  if member == "GetState" {
+    let mut w = Writer.make()
+    run writeStates(&mut w, states(node, node.treeState.focusId().isSome()))
+    return reply("au", move w)
+  }
+  if member == "GetAttributes" {
+    let mut list = List<Attribute>.make()
+    run attributes(node, &mut list)
+    let mut w = Writer.make()
+    let mark = run w.beginArray(8)
+    let all = list.asSlice()
+    let mut i: usize = 0
+    while i < all.length {
+      run w.beginStruct()
+      run w.string(all[i].key)
+      run w.string(all[i].value.view())
+      i = i + 1
+    }
+    w.endArray(mark)
+    return reply("a{ss}", move w)
+  }
+  if member == "GetApplication" {
+    return run address(bus, Option.Some { value: Target.App })
+  }
+  if member == "GetInterfaces" {
+    let mut w = Writer.make()
+    run writeInterfaces(&mut w, interfaces(node))
+    return reply("as", move w)
+  }
+  return failure(UNKNOWN_METHOD, "no such method")
+}
+
+effect fn componentCall(
+  member: string,
+  args: &mut Reader<'_>,
+  bus: string,
+  place: Place,
+  node: &NodeRef<'_>,
+  out: &mut List<WindowRequest>,
+) -> Answer
+  ! DBusError | OutOfMemoryError
+  ? &mut Allocator {
+  if member == "Contains" {
+    let x = run args.int32()
+    let y = run args.int32()
+    let coordType = CoordType.of(run args.uint32())
+    return run boolean(
+      match extents(node, &place.bounds, coordType) {
+        Option.Some { value } => value.contains(Point.make(i32.toF64(x), i32.toF64(y)))
+        Option.None => false
+      },
+    )
+  }
+  if member == "GetAccessibleAtPoint" {
+    let x = run args.int32()
+    let y = run args.int32()
+    let coordType = CoordType.of(run args.uint32())
+    let point = localPoint(place, node, x, y, coordType)
+    return run address(
+      bus,
+      match node.nodeAtPoint(point, &CommonFilter {}) {
+        Option.Some { value } => Option.Some { value: nodeTarget(place, &value) }
+        Option.None => Option.None
+      },
+    )
+  }
+  if member == "GetExtents" {
+    let coordType = CoordType.of(run args.uint32())
+    let mut w = Writer.make()
+    run writeRect(&mut w, extents(node, &place.bounds, coordType))
+    return reply("(iiii)", move w)
+  }
+  if member == "GetPosition" {
+    let coordType = CoordType.of(run args.uint32())
+    let box = extents(node, &place.bounds, coordType)
+    let mut w = Writer.make()
+    run w.int32(
+      match box {
+        Option.Some { value } => toInt(value.x0)
+        Option.None => -1
+      },
+    )
+    run w.int32(
+      match box {
+        Option.Some { value } => toInt(value.y0)
+        Option.None => -1
+      },
+    )
+    return reply("ii", move w)
+  }
+  if member == "GetSize" {
+    let box = extents(node, &place.bounds, CoordType.Window)
+    let mut w = Writer.make()
+    run w.int32(
+      match box {
+        Option.Some { value } => toInt(value.width())
+        Option.None => -1
+      },
+    )
+    run w.int32(
+      match box {
+        Option.Some { value } => toInt(value.height())
+        Option.None => -1
+      },
+    )
+    return reply("ii", move w)
+  }
+  if member == "GetLayer" {
+    let mut w = Writer.make()
+    run w.uint32(
+      if atspiRole(node) == AtspiRole.Window {
+        7
+      } else {
+        3
+      },
+    )
+    return reply("u", move w)
+  }
+  if member == "GetMDIZOrder" {
+    let mut w = Writer.make()
+    run w.int16(-1)
+    return reply("n", move w)
+  }
+  if member == "GetAlpha" {
+    let mut w = Writer.make()
+    run w.double(1.0)
+    return reply("d", move w)
+  }
+  if member == "GrabFocus" {
+    return run boolean(run ask(&mut out, requestFor(place, node, Action.Focus, noData())))
+  }
+  if member == "ScrollTo" {
+    let scrollType = run args.uint32()
+    return run boolean(
+      run ask(&mut out, requestFor(place, node, Action.ScrollIntoView, scrollHintOf(scrollType))),
+    )
+  }
+  if member == "ScrollToPoint" {
+    let coordType = CoordType.of(run args.uint32())
+    let x = run args.int32()
+    let y = run args.int32()
+    let point = place.bounds.toAccessKit(
+      Point.make(i32.toF64(x), i32.toF64(y)),
+      node.filteredParent(&CommonFilter {}),
+      coordType,
+    )
+    let data = Option.Some { value: ActionData.ScrollToPoint { value: point } }
+    return run boolean(run ask(&mut out, requestFor(place, node, Action.ScrollToPoint, move data)))
+  }
+  return failure(UNKNOWN_METHOD, "no such method")
+}
+
+effect fn selectionData(range: TextSelection) -> Option<ActionData> {
+  return Option.Some { value: ActionData.SetTextSelection { value: range } }
+}
+
+effect fn textCall(
+  member: string,
+  args: &mut Reader<'_>,
+  place: Place,
+  node: &NodeRef<'_>,
+  out: &mut List<WindowRequest>,
+) -> Answer
+  ! DBusError | OutOfMemoryError
+  ? &mut Allocator {
+  if member == "GetStringAtOffset" {
+    let offset = run args.int32()
+    let granularity = match Granularity.of(run args.uint32()) {
+      Option.Some { value } => value
+      Option.None => {
+        return failure(INVALID_ARGS, "unknown granularity")
+      }
+    }
+    let range = match rangeAt(node, offset, granularity) {
+      Option.Some { value } => value
+      Option.None => {
+        return failure(FAILED, "the offset is out of range or the granularity is not supported")
+      }
+    }
+    let content = run range.text()
+    let mut w = Writer.make()
+    run w.string(content.view())
+    run w.int32(offsetOf(&range.startPosition()))
+    run w.int32(offsetOf(&range.endPosition()))
+    return reply("sii", move w)
+  }
+  if member == "GetText" {
+    let start = run args.int32()
+    let end = run args.int32()
+    return match rangeBetween(node, start, end) {
+      Option.Some { value } => {
+        let content = run value.text()
+        run text(content.view())
+      }
+      Option.None => failure(FAILED, "the offsets are out of range")
+    }
+  }
+  if member == "SetCaretOffset" {
+    let offset = run args.int32()
+    return match positionAt(node, offset) {
+      Option.Some { value } => {
+        let selection = value.toDegenerateRange().toTextSelection()
+        run boolean(
+          run ask(
+            &mut out,
+            requestFor(place, node, Action.SetTextSelection, run selectionData(selection)),
+          ),
+        )
+      }
+      Option.None => failure(FAILED, "the offset is out of range")
+    }
+  }
+  if member == "GetAttributeValue" {
+    let offset = run args.int32()
+    let wanted = run args.string()
+    let at = match positionAt(node, offset) {
+      Option.Some { value } => value
+      Option.None => {
+        return failure(FAILED, "the offset is out of range")
+      }
+    }
+    let value: Option<String> = match attributeIndex(wanted) {
+      Option.Some { value: index } => run attributeOf(&at.innerNode(), index)
+      Option.None => Option.None
+    }
+    return match &value {
+      Option.Some { value: given } => run text(given.view())
+      Option.None => run text("")
+    }
+  }
+  if member == "GetAttributes" || member == "GetAttributeRun" {
+    let offset = run args.int32()
+    let includeDefaults = if member == "GetAttributeRun" {
+      run args.boolean()
+    } else {
+      false
+    }
+    let mut list = List<TextAttribute>.make()
+    let span = match run attributeRun(node, offset, includeDefaults, &mut list) {
+      Option.Some { value } => value
+      Option.None => {
+        return failure(FAILED, "the offset is out of range")
+      }
+    }
+    let mut w = Writer.make()
+    let mark = run w.beginArray(8)
+    let all = list.asSlice()
+    let mut i: usize = 0
+    while i < all.length {
+      run w.beginStruct()
+      run w.string(all[i].name)
+      run w.string(all[i].value.view())
+      i = i + 1
+    }
+    w.endArray(mark)
+    run w.int32(span[0])
+    run w.int32(span[1])
+    return reply("a{ss}ii", move w)
+  }
+  if member == "GetDefaultAttributes" || member == "GetDefaultAttributeSet" {
+    let mut list = List<TextAttribute>.make()
+    run defaultAttributes(node, &mut list)
+    let mut w = Writer.make()
+    let mark = run w.beginArray(8)
+    let all = list.asSlice()
+    let mut i: usize = 0
+    while i < all.length {
+      run w.beginStruct()
+      run w.string(all[i].name)
+      run w.string(all[i].value.view())
+      i = i + 1
+    }
+    w.endArray(mark)
+    return reply("a{ss}", move w)
+  }
+  if member == "GetCharacterExtents" {
+    let offset = run args.int32()
+    let coordType = CoordType.of(run args.uint32())
+    let mut w = Writer.make()
+    let box: Option<Rect> = match rangeAt(node, offset, Granularity.Char) {
+      Option.Some { value } => {
+        let mut boxes = List<Rect>.make()
+        run value.boundingBoxes(&mut boxes)
+        if boxes.length() > 0 {
+          Option.Some { value: atspiRect(place, node, boxes.get(0), coordType) }
+        } else {
+          Option.None
+        }
+      }
+      Option.None => {
+        return failure(FAILED, "the offset is out of range")
+      }
+    }
+    run writeRectFields(&mut w, box)
+    return reply("iiii", move w)
+  }
+  if member == "GetRangeExtents" {
+    let start = run args.int32()
+    let end = run args.int32()
+    let coordType = CoordType.of(run args.uint32())
+    let bounds: Option<Rect> = match rangeBetween(node, start, end) {
+      Option.Some { value } => match run rangeBounds(&value) {
+        Option.Some { value: rect } => Option.Some {
+          value: atspiRect(place, node, rect, coordType),
+        }
+        Option.None => Option.None
+      }
+      Option.None => Option.None
+    }
+    let mut w = Writer.make()
+    run writeRectFields(&mut w, bounds)
+    return reply("iiii", move w)
+  }
+  if member == "GetOffsetAtPoint" {
+    let x = run args.int32()
+    let y = run args.int32()
+    let coordType = CoordType.of(run args.uint32())
+    let point = localPoint(place, node, x, y, coordType)
+    return run integer(offsetOf(&node.textPositionAtPoint(point)))
+  }
+  if member == "GetNSelections" {
+    return run integer(
+      match node.textSelection() {
+        Option.Some { value } => if value.isDegenerate() {
+          0
+        } else {
+          1
+        }
+        Option.None => 0
+      },
+    )
+  }
+  if member == "GetSelection" {
+    let index = run args.int32()
+    let mut w = Writer.make()
+    let mut start: i32 = -1
+    let mut end: i32 = -1
+    if index == 0 {
+      match node.textSelection() {
+        Option.Some { value } => {
+          if !value.isDegenerate() {
+            start = offsetOf(&value.startPosition())
+            end = offsetOf(&value.endPosition())
+          }
+        }
+        Option.None => {}
+      }
+    }
+    run w.int32(start)
+    run w.int32(end)
+    return reply("ii", move w)
+  }
+  if member == "AddSelection" || member == "SetSelection" {
+    let index = if member == "SetSelection" {
+      run args.int32()
+    } else {
+      0
+    }
+    let start = run args.int32()
+    let end = run args.int32()
+    if index != 0 {
+      return run boolean(false)
+    }
+    return match rangeBetween(node, start, end) {
+      Option.Some { value } => run boolean(
+        run ask(
+          &mut out,
+          requestFor(
+            place,
+            node,
+            Action.SetTextSelection,
+            run selectionData(value.toTextSelection()),
+          ),
+        ),
+      )
+      Option.None => failure(FAILED, "the offsets are out of range")
+    }
+  }
+  if member == "RemoveSelection" {
+    let index = run args.int32()
+    if index != 0 {
+      return run boolean(false)
+    }
+    let caret = match node.textSelectionFocus() {
+      Option.Some { value } => value
+      Option.None => node.documentRange().startPosition()
+    }
+    let selection = caret.toDegenerateRange().toTextSelection()
+    return run boolean(
+      run ask(
+        &mut out,
+        requestFor(place, node, Action.SetTextSelection, run selectionData(selection)),
+      ),
+    )
+  }
+  if member == "ScrollSubstringTo" {
+    let start = run args.int32()
+    let end = run args.int32()
+    let scrollType = run args.uint32()
+    return match rangeBetween(node, start, end) {
+      Option.Some { value } => {
+        let toEnd = scrollType == 1 || scrollType == 3 || scrollType == 5
+        let position = if toEnd {
+          value.endPosition()
+        } else {
+          value.startPosition()
+        }
+        let target = position.innerNode()
+        run boolean(
+          run ask(
+            &mut out,
+            requestFor(place, &target, Action.ScrollIntoView, scrollHintOf(scrollType)),
+          ),
+        )
+      }
+      Option.None => run boolean(false)
+    }
+  }
+  if member == "ScrollSubstringToPoint" {
+    let start = run args.int32()
+    let end = run args.int32()
+    let coordType = CoordType.of(run args.uint32())
+    let x = run args.int32()
+    let y = run args.int32()
+    let target = place.bounds.toAccessKit(
+      Point.make(i32.toF64(x), i32.toF64(y)),
+      Option.Some { value: node.* },
+      coordType,
+    )
+    let bounds: Option<Rect> = match rangeBetween(node, start, end) {
+      Option.Some { value } => run rangeBounds(&value)
+      Option.None => Option.None
+    }
+    return match bounds {
+      Option.Some { value } => {
+        let data = Option.Some {
+          value: ActionData.ScrollToPoint {
+            value: Point.make(target.x - value.x0, target.y - value.y0),
+          },
+        }
+        run boolean(run ask(&mut out, requestFor(place, node, Action.ScrollToPoint, move data)))
+      }
+      Option.None => run boolean(false)
+    }
+  }
+  return failure(UNKNOWN_METHOD, "no such method")
+}
+
+fn selectedItem<'a>(node: &NodeRef<'a>, items: &List<NodeRef<'a>>, index: i32) -> Option<
+  NodeRef<'a>
+> {
+  let mut seen: i32 = 0
+  let mut i: usize = 0
+  while i < items.length() {
+    let item = items.get(i)
+    if selected(&item) {
+      if seen == index {
+        return Option.Some { value: item }
+      }
+      seen = seen + 1
+    }
+    i = i + 1
+  }
+  return Option.None
+}
+
+effect fn selectionCall(
+  member: string,
+  args: &mut Reader<'_>,
+  bus: string,
+  place: Place,
+  node: &NodeRef<'_>,
+  out: &mut List<WindowRequest>,
+) -> Answer
+  ! DBusError | OutOfMemoryError
+  ? &mut Allocator {
+  let filter = CommonFilter {}
+  if member == "SelectAll" || member == "ClearSelection" {
+    return run boolean(false)
+  }
+  let index = run args.int32()
+  if index < 0 {
+    return failure(INVALID_ARGS, "the index cannot be negative")
+  }
+  if member == "GetSelectedChild" || member == "DeselectSelectedChild" {
+    let mut items = List<NodeRef<'_>>.make()
+    run node.items(&filter, &mut items)
+    let found = selectedItem(node, &items, index)
+    if member == "GetSelectedChild" {
+      return run address(
+        bus,
+        match found {
+          Option.Some { value } => Option.Some { value: nodeTarget(place, &value) }
+          Option.None => Option.None
+        },
+      )
+    }
+    return match found {
+      Option.Some { value } => {
+        if value.isClickable(&filter) {
+          run boolean(run ask(&mut out, requestFor(place, &value, Action.Click, noData())))
+        } else {
+          run boolean(false)
+        }
+      }
+      Option.None => failure(UNKNOWN_OBJECT, "no such selected child")
+    }
+  }
+  let child = match childAt(node, index) {
+    Option.Some { value } => value
+    Option.None => {
+      return failure(UNKNOWN_OBJECT, "no such child")
+    }
+  }
+  if member == "IsChildSelected" {
+    return run boolean(child.isItemLike() && selected(&child))
+  }
+  if member == "SelectChild" || member == "DeselectChild" {
+    let want = member == "SelectChild"
+    let already = match child.isSelected() {
+      Option.Some { value } => value == want
+      Option.None => false
+    }
+    if already {
+      return run boolean(true)
+    }
+    if child.isSelectable() && child.isClickable(&filter) {
+      return run boolean(run ask(&mut out, requestFor(place, &child, Action.Click, noData())))
+    }
+    return run boolean(false)
+  }
+  return failure(UNKNOWN_METHOD, "no such method")
+}
+
+// The cache ------------------------------------------------------------------------------------
+
+/// Writes the cache item `((so)(so)(so)iiassusau)` of `node`.
+pub effect fn writeCacheItem(w: &mut Writer, bus: string, place: Place, node: &NodeRef<'_>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run w.beginStruct()
+  run writeTarget(&mut w, bus, nodeTarget(place, node))
+  run writeTarget(&mut w, bus, Target.App)
+  run writeTarget(&mut w, bus, parentOf(place, node))
+  run w.int32(indexInParent(place, node))
+  run w.int32(childCount(node))
+  run writeInterfaces(&mut w, interfaces(node))
+  let label = run name(node)
+  run w.string(
+    match &label {
+      Option.Some { value } => value.view()
+      Option.None => ""
+    },
+  )
+  run w.uint32(atspiRole(node).number())
+  let description = run node.description()
+  run w.string(
+    match &description {
+      Option.Some { value } => value.view()
+      Option.None => ""
+    },
+  )
+  run writeStates(&mut w, states(node, node.treeState.focusId().isSome()))
+}
+
+effect fn writeCacheSubtree(w: &mut Writer, bus: string, place: Place, node: &NodeRef<'_>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run writeCacheItem(&mut w, bus, place, node)
+  let filter = CommonFilter {}
+  let mut cursor = node.filteredChildren(&filter)
+  while let Option.Some { value: child } = cursor.next(&filter) {
+    run writeCacheSubtree(&mut w, bus, place, &child)
+  }
+}
+
+/// The place of window `index` of `app`.
+pub fn placeOf(app: &AppState, index: usize) -> Place {
+  let window = &app.windows.asSlice()[index]
+  return Place { window: window.id, index: usize.wrappingToU32(index), bounds: window.bounds }
+}
+
+effect fn cacheCall(app: &AppState, call: &Message, bus: string) -> Answer
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if call.interfaceName.view() != "org.a11y.atspi.Cache" || call.member.view() != "GetItems" {
+    return failure(UNKNOWN_METHOD, "no such method")
+  }
+  let mut w = Writer.make()
+  let mark = run w.beginArray(8)
+  run w.beginStruct()
+  run writeTarget(&mut w, bus, Target.App)
+  run writeTarget(&mut w, bus, Target.App)
+  run writeAddress(&mut w, app.desktopName.view(), app.desktopPath.view())
+  run w.int32(-1)
+  run w.int32(usize.wrappingToI32(app.windows.length()))
+  run writeInterfaces(&mut w, u32.bitOr(ACCESSIBLE(), APPLICATION()))
+  run w.string(app.name.view())
+  run w.uint32(AtspiRole.Application.number())
+  run w.string("")
+  run writeStates(&mut w, StateSet.empty())
+  let mut i: usize = 0
+  while i < app.windows.length() {
+    let place = placeOf(app, i)
+    let root = app.windows.asSlice()[i].tree.state().rootNode()
+    run writeCacheSubtree(&mut w, bus, place, &root)
+    i = i + 1
+  }
+  w.endArray(mark)
+  return reply("a((so)(so)(so)iiassusau)", move w)
+}
+
+// Introspection --------------------------------------------------------------------------------
+
+effect fn introspection(set: u32, node: bool) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut xml = run String.copy(
+    "<!DOCTYPE node PUBLIC \"-//freedesktop//DTD D-BUS Object Introspection 1.0//EN\" \"http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd\">\n<node>\n",
+  )
+  run xml.append("  <interface name=\"org.freedesktop.DBus.Introspectable\"/>\n")
+  run xml.append("  <interface name=\"org.freedesktop.DBus.Peer\"/>\n")
+  if node {
+    run xml.append("  <interface name=\"org.freedesktop.DBus.Properties\"/>\n")
+  }
+  let mut i: u32 = 0
+  while i <= 10 {
+    if u32.bitAnd(set, u32.shiftLeft(1, i)) != 0 {
+      run xml.append("  <interface name=\"")
+      run xml.append(interfaceNameAt(i))
+      run xml.append("\"/>\n")
+    }
+    i = i + 1
+  }
+  run xml.append("</node>\n")
+  return move xml
+}
+
+// Dispatch -------------------------------------------------------------------------------------
+
+effect fn badArguments(error: DBusError) -> Answer {
+  drop error
+  return failure(INVALID_ARGS, "the arguments do not match the method")
+}
+
+effect fn serve(app: &mut AppState, call: &Message, bus: string) -> Answer
+  ! DBusError | OutOfMemoryError
+  ? &mut Allocator {
+  let iface = call.interfaceName.view()
+  let member = call.member.view()
+  let resolved = resolvePath(call.path.view())
+  if iface == "org.freedesktop.DBus.Peer" {
+    if member == "Ping" {
+      return empty()
+    }
+    return failure(UNKNOWN_METHOD, "no such method")
+  }
+  return match move resolved {
+    Resolved.App => {
+      if iface == "org.freedesktop.DBus.Introspectable" && member == "Introspect" {
+        let xml = run introspection(u32.bitOr(ACCESSIBLE(), APPLICATION()), true)
+        run text(xml.view())
+      } else {
+        run appCall(&mut app, call, bus)
+      }
+    }
+    Resolved.Cache => {
+      if iface == "org.freedesktop.DBus.Introspectable" && member == "Introspect" {
+        let xml = run introspection(0, false)
+        run text(xml.view())
+      } else {
+        run cacheCall(&app.*, call, bus)
+      }
+    }
+    Resolved.Node { window, id } => {
+      let index = match app.windowIndex(window) {
+        Option.Some { value } => value
+        Option.None => {
+          return failure(UNKNOWN_OBJECT, "no such window")
+        }
+      }
+      let place = placeOf(&app.*, index)
+      let mut asked = List<WindowRequest>.make()
+      let answer = match app.windows.asSlice()[index].tree.state().nodeById(id) {
+        Option.Some { value: node } => {
+          if commonFilter(&node) != FilterResult.Include {
+            failure(UNKNOWN_OBJECT, "the node is not exposed")
+          } else if iface == "org.freedesktop.DBus.Introspectable" && member == "Introspect" {
+            let xml = run introspection(interfaces(&node), true)
+            run text(xml.view())
+          } else {
+            run nodeCall(call, bus, place, &node, &mut asked)
+          }
+        }
+        Option.None => failure(UNKNOWN_OBJECT, "the node is gone")
+      }
+      while asked.length() > 0 {
+        run app.requests.append(asked.remove(0))
+      }
+      move answer
+    }
+    Resolved.Unknown => failure(UNKNOWN_OBJECT, "no such object")
+  }
+}
+
+/// The reply to `call`, a method call to this application's unique name `bus`, or none when
+/// the caller asked for no reply. Actions the call asks for go to `app.requests`.
+pub effect fn handle(app: &mut AppState, call: &Message, bus: string) -> Option<Message>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let answer = run Effect.catch<DBusError>(serve(&mut app, call, bus), badArguments)
+  if u8.bitAnd(call.flags, NO_REPLY_EXPECTED()) != 0 {
+    return Option.None
+  }
+  return match move answer {
+    Answer.Reply { signature, body } => {
+      let mut message = run Message.methodReturn(call)
+      run message.setBody(signature, move body)
+      Option.Some { value: move message }
+    }
+    Answer.Failure { name, text } => Option.Some { value: run Message.errorReply(call, name, text) }
+  }
+}
