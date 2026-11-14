@@ -4,7 +4,8 @@
 // Strings in children become text nodes. Props:
 //
 // - `style`, and `hoverStyle`, `activeStyle`, `focusStyle`, `focusVisibleStyle` for the
-//   looks the tree lays over it in those states.
+//   looks the tree lays over it in those states. `startingStyle` is what transitions start
+//   from when the node first shows, as CSS `@starting-style`.
 // - `onClick`, `onPointerDown`, `onKeyDown`, `onInput` and so on for every event of the
 //   tree, with a `Capture` suffix for the capture phase. Listeners receive the @silk/ui
 //   event, which has the DOM members.
@@ -21,11 +22,11 @@ import {
   DiscreteEventPriority,
 } from "react-reconciler/constants.js";
 import { createContext } from "react";
-import { createNode, createText, mount, root as mountedRoot } from "@silk/ui";
+import { RichInput, createNode, createText, mount, root as mountedRoot } from "@silk/ui";
 
-const LOOKS = { style: "base", hoverStyle: "hover", activeStyle: "active", focusStyle: "focus", focusVisibleStyle: "focusVisible" };
+const LOOKS = { style: "base", hoverStyle: "hover", activeStyle: "active", focusStyle: "focus", focusVisibleStyle: "focusVisible", startingStyle: "starting" };
 const CONTINUOUS = new Set(["pointermove", "pointerenter", "pointerleave", "wheel", "scroll", "layout"]);
-const SKIP = new Set(["children", "key", "ref", "value", "defaultValue", "svg"]);
+const SKIP = new Set(["children", "key", "ref", "value", "defaultValue", "svg", "document", "defaultDocument", "marks", "atoms"]);
 
 let updatePriority = 0;
 let eventPriority = 0;
@@ -73,7 +74,39 @@ function listen(node, name, type, capture) {
 // listener put it into state.
 function restoreControlled(node) {
   const props = bindings.get(node)?.props;
-  if (props && props.value !== undefined && String(props.value) !== node.value) node.value = props.value;
+  if (!props) return;
+  if (node instanceof RichInput) {
+    if (props.document !== undefined && !sameDocument(props.document, node.document)) node.document = props.document;
+  } else if (props.value !== undefined && String(props.value) !== node.value) node.value = props.value;
+}
+
+function sameDocument(a, b) {
+  if (a === b) return true;
+  if (String(a?.text ?? "") !== b.text) return false;
+  const marks = a?.marks ?? [];
+  const atoms = a?.atoms ?? [];
+  if (marks.length !== b.marks.length || atoms.length !== b.atoms.length) return false;
+  for (let i = 0; i < marks.length; i++) {
+    const x = marks[i];
+    const y = b.marks[i];
+    if (x.start !== y.start || x.end !== y.end || x.marks.length !== y.marks.length) return false;
+    for (let j = 0; j < x.marks.length; j++) if (x.marks[j] !== y.marks[j]) return false;
+  }
+  for (let i = 0; i < atoms.length; i++) {
+    const x = atoms[i];
+    const y = b.atoms[i];
+    if (x.kind !== y.kind || String(x.label ?? "") !== y.label || String(x.data ?? "") !== y.data) return false;
+  }
+  return true;
+}
+
+// `marks` and `atoms` map a mark name or atom kind to its style; a changed entry is
+// defined again.
+function defineLooks(previous, next, define) {
+  if (!next || previous === next) return;
+  for (const name of Object.keys(next)) {
+    if (!previous || previous[name] !== next[name]) define(name, next[name]);
+  }
 }
 
 function diffStyle(look, previous, next) {
@@ -125,7 +158,16 @@ function applyProps(node, previous, next) {
     else if (!eventOf(name)) node.setAttribute(name, name === "tabIndex" ? -2147483648 : typeof previous[name] === "boolean" ? false : "");
   }
   if (node.kind === "icon" && next.svg !== previous.svg) node.svg = next.svg;
-  if (node.kind === "input") {
+  if (node instanceof RichInput) {
+    defineLooks(previous.marks, next.marks, (name, style) => node.defineMark(name, style));
+    defineLooks(previous.atoms, next.atoms, (kind, style) => node.defineAtom(kind, style));
+    if (next.document !== undefined) {
+      if (!sameDocument(next.document, node.document)) node.document = next.document;
+      listen(node, "onInput", "input", false);
+    } else if (previous === EMPTY && next.defaultDocument !== undefined) {
+      node.document = next.defaultDocument;
+    }
+  } else if (node.kind === "input") {
     if (next.value !== undefined) {
       if (String(next.value) !== node.value) node.value = next.value;
       // Typing reaches the tree first, so a controlled input needs the input event to put
@@ -137,7 +179,7 @@ function applyProps(node, previous, next) {
   }
   let bound = bindings.get(node);
   if (bound) bound.props = next;
-  else if (next.value !== undefined) bindings.set(node, { props: next, names: new Set() });
+  else if (next.value !== undefined || next.document !== undefined) bindings.set(node, { props: next, names: new Set() });
 }
 
 const EMPTY = {};

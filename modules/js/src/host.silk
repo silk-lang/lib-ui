@@ -2,10 +2,10 @@
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
-import silk.text.string { String }
+import silk.text.string { String, InvalidUtf8 }
 import silk.num.u32
 import silk.num.f32
-import ui_tree.lib { Tree, ProtocolError, Input, EventKind, EventRecord, Event }
+import ui_tree.lib { Tree, ProtocolError, Input, EventKind, EventRecord, Event, Motion }
 import ui_tree.legacy { UiTree, TreeError }
 import ui_tree.node { Event as RawEvent }
 import silkjs.js_engine { Engine }
@@ -37,7 +37,9 @@ import silkjs.js_promise as promise
 import silkjs.native_stack as stack
 import bridge
 import bridge { Timer }
-import bridge { Bridge, ModuleSource, LogEntry }
+import bridge { Bridge, ModuleSource, LogEntry, Rejected }
+import silkjs.js_core_types { HostHook }
+import silkjs.js_proxy_core as core
 import generated_prelude { prelude }
 
 /// How much native stack JavaScript may use below the frame that opened the host.
@@ -79,8 +81,31 @@ pub fn kindCode(kind: EventKind) -> u32 {
   if kind == EventKind.PointerCancel { return 14 }
   if kind == EventKind.GotPointerCapture { return 15 }
   if kind == EventKind.Load { return 17 }
+  if kind == EventKind.LostPointerCapture { return 16 }
   if kind == EventKind.Error { return 18 }
-  return 16
+  if kind == EventKind.TransitionRun { return 19 }
+  if kind == EventKind.TransitionStart { return 20 }
+  if kind == EventKind.TransitionEnd { return 21 }
+  if kind == EventKind.TransitionCancel { return 22 }
+  if kind == EventKind.AnimationStart { return 23 }
+  if kind == EventKind.AnimationIteration { return 24 }
+  if kind == EventKind.AnimationEnd { return 25 }
+  return 26
+}
+
+/// The property or `@keyframes` name and elapsed time of a transition or animation event.
+fn motionOf(event: &Event) -> Option<&Motion> {
+  return match &event.* {
+    Event.TransitionRun { motion } => Option<&Motion>.some(&motion)
+    Event.TransitionStart { motion } => Option<&Motion>.some(&motion)
+    Event.TransitionEnd { motion } => Option<&Motion>.some(&motion)
+    Event.TransitionCancel { motion } => Option<&Motion>.some(&motion)
+    Event.AnimationStart { motion } => Option<&Motion>.some(&motion)
+    Event.AnimationIteration { motion } => Option<&Motion>.some(&motion)
+    Event.AnimationEnd { motion } => Option<&Motion>.some(&motion)
+    Event.AnimationCancel { motion } => Option<&Motion>.some(&motion)
+    _ => Option<&Motion>.None
+  }
 }
 
 /// The numbers of an event, in the order `__ui.dispatch` receives them after the target:
@@ -92,7 +117,11 @@ pub fn kindCode(kind: EventKind) -> u32 {
 /// - input: selection anchor, selection focus
 /// - scroll: x, y
 /// - layout: left, top, 0, width, height
+/// - transition and animation events: elapsed seconds
 pub fn numbersOf(event: &Event) -> [f64; 5] {
+  if let Option<&Motion>.Some { value: motion } = motionOf(event) {
+    return [f32.toF64(motion.elapsedTime), 0.0, 0.0, 0.0, 0.0]
+  }
   return match &event.* {
     Event.PointerDown { pointer, button, count } => [f32.toF64(pointer.x), f32.toF64(pointer.y), u32.toF64(pointer.modifiers.toBits()), u32.toF64(button.toNumber()), u32.toF64(count)]
     Event.PointerUp { pointer, button } => [f32.toF64(pointer.x), f32.toF64(pointer.y), u32.toF64(pointer.modifiers.toBits()), u32.toF64(button.toNumber()), 0.0]
@@ -104,7 +133,7 @@ pub fn numbersOf(event: &Event) -> [f64; 5] {
     Event.Wheel { pointer, deltaX, deltaY } => [f32.toF64(pointer.x), f32.toF64(pointer.y), u32.toF64(pointer.modifiers.toBits()), f32.toF64(deltaX), f32.toF64(deltaY)]
     Event.KeyDown { key, repeat } => [0.0, 0.0, u32.toF64(key.modifiers.toBits()), if repeat { 1.0 } else { 0.0 }, 0.0]
     Event.KeyUp { key } => [0.0, 0.0, u32.toF64(key.modifiers.toBits()), 0.0, 0.0]
-    Event.Input { change } => [usize.toF64(change.selection.anchor), usize.toF64(change.selection.focus), 0.0, 0.0, 0.0]
+    Event.Input { change } => [usize.toF64(change.selection.anchor), usize.toF64(change.selection.focus), 0.0, u32.toF64(change.activeMarks), 0.0]
     Event.Scroll { x, y } => [f32.toF64(x), f32.toF64(y), 0.0, 0.0, 0.0]
     Event.Layout { bounds } => [f32.toF64(bounds.xMin), f32.toF64(bounds.yMin), 0.0, f32.toF64(bounds.xMax - bounds.xMin), f32.toF64(bounds.yMax - bounds.yMin)]
     _ => [0.0, 0.0, 0.0, 0.0, 0.0]
@@ -130,7 +159,10 @@ pub effect fn firstString(event: &Event) -> Value ! OutOfMemoryError ? &mut Allo
     Event.KeyDown { key, .. } => run jsString(String.view(&key.key))
     Event.KeyUp { key } => run jsString(String.view(&key.key))
     Event.Input { change } => run jsString(String.view(&change.value))
-    _ => Value.immediate(ValueBits.Undefined)
+    _ => match motionOf(event) {
+      Option<&Motion>.Some { value: motion } => run jsString(String.view(&motion.name))
+      Option<&Motion>.None => Value.immediate(ValueBits.Undefined)
+    }
   }
 }
 
@@ -140,6 +172,73 @@ pub effect fn secondString(event: &Event) -> Value ! OutOfMemoryError ? &mut All
     Event.KeyUp { key } => run jsString(String.view(&key.code))
     Event.Input { change } => run jsString(change.inputType.name())
     _ => Value.immediate(ValueBits.Undefined)
+  }
+}
+
+/// The third and fourth strings of an event: a rich input's marks and atoms, packed as
+/// `__ui.richText` takes them (empty for every other record).
+pub effect fn thirdString(event: &Event) -> Value ! OutOfMemoryError ? &mut Allocator {
+  let packed = run richStrings(event)
+  return run jsString(String.view(&packed[0]))
+}
+
+pub effect fn fourthString(event: &Event) -> Value ! OutOfMemoryError ? &mut Allocator {
+  let packed = run richStrings(event)
+  return run jsString(String.view(&packed[1]))
+}
+
+effect fn richStrings(event: &Event) -> [String; 2] ! OutOfMemoryError ? &mut Allocator {
+  let mut marks = String.make()
+  let mut atoms = String.make()
+  match &event.* {
+    Event.Input { change } => {
+      let spans = change.marks.asSlice()
+      let mut i: usize = 0
+      while i < spans.length {
+        run appendNumber(&mut marks, spans[i].start)
+        run marks.append(",")
+        run appendNumber(&mut marks, spans[i].end)
+        run marks.append(",")
+        run appendNumber(&mut marks, u32.toUsize(spans[i].marks))
+        run marks.append(";")
+        i = i + 1
+      }
+      let list = change.atoms.asSlice()
+      i = 0
+      while i < list.length {
+        run appendNumber(&mut atoms, u32.toUsize(list[i].kind))
+        run atoms.append("\u{0}")
+        run atoms.append(String.view(&list[i].label))
+        run atoms.append("\u{0}")
+        run atoms.append(String.view(&list[i].data))
+        run atoms.append("\u{0}")
+        i = i + 1
+      }
+    }
+    _ => ()
+  }
+  return [move marks, move atoms]
+}
+
+effect fn appendNumber(out: &mut String, value: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut digits: [u8; 20] = [0; 20]
+  let mut count: usize = 0
+  let mut rest = value
+  while true {
+    digits[count] = usize.toU8(rest % 10) + 48
+    count = count + 1
+    rest = rest / 10
+    if rest == 0 {
+      break
+    }
+  }
+  while count > 0 {
+    count = count - 1
+    let one: [u8; 1] = [digits[count]]
+    match String.fromUtf8(&one) {
+      Result<string, InvalidUtf8>.Success { value: text } => { run out.append(text) }
+      Result<string, InvalidUtf8>.Failure { .. } => ()
+    }
   }
 }
 
@@ -188,10 +287,46 @@ effect fn thrown<'a, 'm>(engine: &mut Engine<'m, Bridge>, realm: Realm<'a>) -> J
 /// Runs promise jobs until none is queued, as the microtask checkpoint after a script or a
 /// callback. A job that throws fails with what it threw.
 effect fn drainIn<'a, 'm>(engine: &mut Engine<'m, Bridge>, realm: Realm<'a>) -> () ! OutOfMemoryError | JsError ? &mut Allocator {
+  run runJobs(&mut engine, realm)
+  run reportRejections(&mut engine, realm)
+}
+
+/// The promise jobs alone, for a caller that reports one of the rejections itself.
+effect fn runJobs<'a, 'm>(engine: &mut Engine<'m, Bridge>, realm: Realm<'a>) -> () ! OutOfMemoryError | JsError ? &mut Allocator {
   let rt = realm.runtime()
   while unsafe jobs.isJobPending(rt) {
     let job = run unsafe jobs.executePendingJob(&mut engine, rt)
     if job.status < 0 { fail run thrown(&mut engine, realm) }
+  }
+}
+
+/// Takes `promise` out of the unhandled rejections: its caller reports the failure.
+fn forget<'a, 'v, 'm>(engine: &mut Engine<'m, Bridge>, realm: Realm<'a>, promise: ValueRef<'v>) -> () {
+  let items = engine.services.rejections.asSlice()
+  let mut i: usize = 0
+  while i < items.length {
+    if unsafe core.sameValue(items[i].promise.view(), promise.view()) {
+      let Rejected { promise: kept, reason } = engine.services.rejections.remove(i)
+      realm.release(&mut engine, move kept)
+      realm.release(&mut engine, move reason)
+      return
+    }
+    i = i + 1
+  }
+}
+
+/// Writes a console error for each promise that is still rejected with no handler now that
+/// the promise jobs ran, and forgets them: a handler added later is too late, as on the web.
+effect fn reportRejections<'a, 'm>(engine: &mut Engine<'m, Bridge>, realm: Realm<'a>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let rejections = Intrinsic.replace(engine.services.rejections, List<Rejected>.make())
+  let mut rest = move rejections
+  while rest.length() > 0 {
+    let Rejected { promise: rejected, reason } = rest.remove(0)
+    realm.release(&mut engine, move rejected)
+    let JsError { message } = run describe(&mut engine, realm, move reason)
+    let mut line = run String.copy("Uncaught (in promise) ")
+    run line.append(String.view(&message))
+    run engine.services.logs.append(LogEntry { level: 3, text: move line })
   }
 }
 
@@ -200,7 +335,8 @@ effect fn evaluateIn<'a, 'm>(engine: &mut Engine<'m, Bridge>, realm: Realm<'a>, 
   return run evaluation.evaluate(&mut engine, memory, realm, source, name, mode)
 }
 
-/// Calls `__ui.dispatch(kind, target, a, b, modifiers, d, e, first, second)` when the
+/// Calls `__ui.dispatch(kind, target, a, b, modifiers, d, e, first, second, third, fourth)`
+/// (the last two are a rich input's packed marks and atoms) when the
 /// application installed one (see `numbersOf` for the numbers and `firstString` for the
 /// strings), and says whether it returned true, which means a handler prevented the default.
 effect fn dispatchIn<'a, 'm>(engine: &mut Engine<'m, Bridge>, realm: Realm<'a>, record: &EventRecord) -> bool ! OutOfMemoryError | JsException ? &mut Allocator {
@@ -211,6 +347,8 @@ effect fn dispatchIn<'a, 'm>(engine: &mut Engine<'m, Bridge>, realm: Realm<'a>, 
     let numbers = numbersOf(&record.event)
     let first = run firstString(&record.event)
     let second = run secondString(&record.event)
+    let third = run thirdString(&record.event)
+    let fourth = run fourthString(&record.event)
     let arguments = [
       ValueBits.number(u32.toF64(kindCode(record.event.kind()))),
       ValueBits.number(u32.toF64(record.target.raw())),
@@ -221,6 +359,8 @@ effect fn dispatchIn<'a, 'm>(engine: &mut Engine<'m, Bridge>, realm: Realm<'a>, 
       ValueBits.number(numbers[4]),
       first.borrow().view(),
       second.borrow().view(),
+      third.borrow().view(),
+      fourth.borrow().view(),
     ]
     let called = run Effect.result(promise.call(&mut engine, realm, function.borrow(), ui.borrow(), &arguments))
     match move called {
@@ -290,6 +430,7 @@ impl<'m> JsHost<'m> {
         fail JsError { message: run String.copy("the JavaScript realm could not be created") }
       }
     }
+    unsafe runtime.setPromiseRejectionTracker(rt, HostHook { callback: Option<NativeFunctionId>.some(NativeFunctionId.Host { id: bridge.REJECTION }), opaque: Pointer.null<u8>() })
     unsafe loader.setLoader(rt, Option<NativeFunctionId>.none(), Option<NativeFunctionId>.some(NativeFunctionId.Host { id: bridge.MODULE_LOAD }), Pointer.null<u8>())
     let mut host = JsHost { engine: move engine, runtime: rt, context: context, closed: false }
     let installed = run Effect.result(install(&mut host.engine, unsafe lendRealm(&context, context)))
@@ -357,7 +498,10 @@ impl<'m> JsHost<'m> {
       Result<Value, JsException>.Success { value } => move value
       Result<Value, JsException>.Failure { .. } => { fail run thrown(&mut self.engine, realm) }
     }
-    let drained = run Effect.result(drainIn(&mut self.engine, realm))
+    let drained = run Effect.result(runJobs(&mut self.engine, realm))
+    // The module's own failure is this call's failure, not an unhandled rejection.
+    forget(&mut self.engine, realm, completion.borrow())
+    run reportRejections(&mut self.engine, realm)
     let rejected = promise.stateOf(completion.borrow()) == promise.REJECTED
     let reason = promise.resultOf(completion.borrow())
     realm.release(&mut self.engine, move completion)
@@ -619,6 +763,14 @@ impl<'m> JsHost<'m> {
   /// Frees the realm and the runtime. Safe to call twice.
   pub effect fn close(self: &mut Self) -> () ? &mut Allocator {
     if self.closed { return }
+    let context = self.context
+    let realm = unsafe lendRealm(&context, context)
+    let mut rest = Intrinsic.replace(self.engine.services.rejections, List<Rejected>.make())
+    while rest.length() > 0 {
+      let Rejected { promise: rejected, reason } = rest.remove(0)
+      realm.release(&mut self.engine, move rejected)
+      realm.release(&mut self.engine, move reason)
+    }
     unsafe gc.releaseHeader(&mut self.engine, self.runtime, self.context)
     run unsafe gc.destroyRuntime(&mut self.engine, self.runtime)
     self.closed = true

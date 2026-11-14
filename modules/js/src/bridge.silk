@@ -12,8 +12,10 @@ import silk.core.ownership { Copy }
 import silk.collections.slice { Slice }
 import silk.num.i32
 import silk.num.f64
+import silk.num.u8
+import silk.num.usize
 import ui_tree.css { Declaration }
-import ui_tree.legacy { Batch, NodeKind, Attribute, Mutation, StyleState, Cursor, Role }
+import ui_tree.legacy { Batch, NodeKind, Attribute, Mutation, StyleState, Cursor, Keyframe, Role, MarkSpan, Atom }
 import ui_tree.mutation { ariaAttribute }
 import css_style.tokens { CssError }
 import css_style.written as written
@@ -21,7 +23,8 @@ import silkjs.js_engine { Engine }
 import silkjs.js_engine_host { EngineServices }
 import silkjs.js_value { ValueBits }
 import silkjs.js_realm { Realm, Arguments }
-import silkjs.js_owned_value { ValueRef }
+import silkjs.js_owned_value { Value, ValueRef }
+import silkjs.js_proxy_core as core
 import silkjs.js_exceptions { JsException }
 import silkjs.js_strings { Strings }
 import silkjs.js_core_types { NativeFunctionId, NativeErrorKind, ModuleDef }
@@ -29,6 +32,8 @@ import silkjs.js_heap { CellRef }
 import silkjs.js_coercion_host { CoercionHooks }
 import silkjs.js_eval as evaluation
 import silkjs.js_eval_compile as flags
+import silkjs.js_string_types { StringLengthError }
+import markdown
 
 /// `__ui.create(id, kind)`: kind 0 is a box, 1 text, 2 an input, 3 an image, 4 an icon,
 /// 5 a canvas.
@@ -91,8 +96,34 @@ pub const DEFINE_ICON: u32 = 24
 pub const SOURCE: u32 = 25
 /// `__ui.release(resource)`: forgets a resource no node shows any more.
 pub const RELEASE: u32 = 26
+/// `__ui.markdown(text, flags)`: the mdast JSON of `text`, with the extensions of the
+/// [`markdown`] option bits in `flags`.
+pub const MARKDOWN: u32 = 27
+/// `__ui.keyframe(offset, css)`: adds a frame (offset 0 to 1, CSS declarations) to the
+/// `@keyframes` rule that the next `__ui.keyframes` defines.
+pub const KEYFRAME: u32 = 28
+/// `__ui.keyframes(name)`: defines `@keyframes name` from the frames added since the last
+/// one; none removes it.
+pub const KEYFRAMES: u32 = 29
+/// `__ui.richText(id, value, marks, atoms)`: sets a rich input's value. `marks` packs the
+/// mark spans as `"start,end,bits;..."` and `atoms` packs each atom as `kind\0label\0data\0`,
+/// with UTF-8 byte offsets.
+pub const RICH_TEXT: u32 = 30
+/// `__ui.mark(id, mark, css)`: what mark `mark` (0 to 31) of a rich input looks like.
+pub const MARK: u32 = 31
+/// `__ui.atomStyle(id, kind, css)`: what atoms of `kind` in a rich input look like.
+pub const ATOM_STYLE: u32 = 32
+/// `__ui.format(id, mark, on)`: turns a mark on or off over the selection.
+pub const FORMAT: u32 = 33
+/// `__ui.insertAtom(id, start, end, atom)`: replaces value bytes [start, end) with an atom
+/// packed as for `richText`.
+pub const INSERT_ATOM: u32 = 34
 /// The number of native functions, for the installer.
-pub const LAST: u32 = 26
+pub const LAST: u32 = 34
+
+/// The runtime's promise rejection tracker callback: [`Bridge`] keeps the promises that
+/// were rejected with no handler until one is added.
+pub const REJECTION: u32 = 101
 
 /// The runtime's module loader callback: [`Bridge`] answers it from the defined modules.
 pub const MODULE_LOAD: u32 = 100
@@ -129,12 +160,23 @@ pub struct Bridge {
   /// Whether JavaScript asked for an animation frame callback.
   pub frame: bool,
   pub logs: List<LogEntry>,
+  /// Promises rejected with no handler so far, with what they were rejected with. The
+  /// host reports the ones still here after the promise jobs ran, as a browser does.
+  pub rejections: List<Rejected>,
   /// Lines JavaScript sent to the development server, oldest first.
   pub outbox: List<String>,
   /// Whether JavaScript asked for a new realm.
   pub reload: bool,
   /// Addresses JavaScript asked the host to open, oldest first.
   pub opened: List<String>,
+  /// The frames `__ui.keyframe` added for the next `__ui.keyframes`.
+  pub frames: List<Keyframe>,
+}
+
+/// A rejected promise nothing handles yet. Both values are owned.
+pub struct Rejected {
+  pub promise: Value,
+  pub reason: Value,
 }
 
 impl Bridge {
@@ -146,9 +188,11 @@ impl Bridge {
       timers: List<Timer>.make(),
       frame: false,
       logs: List<LogEntry>.make(),
+      rejections: List<Rejected>.make(),
       outbox: List<String>.make(),
       reload: false,
       opened: List<String>.make(),
+      frames: List<Keyframe>.make(),
     }
   }
 
@@ -214,15 +258,25 @@ pub fn name(id: u32) -> &'static [u8] {
   if id == DEFINE_ICON { return b"defineIcon" }
   if id == SOURCE { return b"source" }
   if id == RELEASE { return b"release" }
+  if id == MARKDOWN { return b"markdown" }
+  if id == KEYFRAME { return b"keyframe" }
+  if id == KEYFRAMES { return b"keyframes" }
+  if id == RICH_TEXT { return b"richText" }
+  if id == MARK { return b"mark" }
+  if id == ATOM_STYLE { return b"atomStyle" }
+  if id == FORMAT { return b"format" }
+  if id == INSERT_ATOM { return b"insertAtom" }
   return b"requestFrame"
 }
 
 /// The declared argument count of native function `id`.
 pub fn arity(id: u32) -> i32 {
   if id == NOW || id == REQUEST_FRAME || id == DEV_RELOAD { return 0 }
-  if id == DEV_SEND || id == OPEN { return 1 }
+  if id == DEV_SEND || id == OPEN || id == KEYFRAMES { return 1 }
   if id == ROOT || id == FOCUS || id == REMOVE || id == DESTROY || id == CANCEL_TIMER || id == RELEASE { return 1 }
   if id == INSERT_BEFORE || id == STYLE || id == ATTRIBUTE || id == SCROLL_TO || id == SELECT { return 3 }
+  if id == MARK || id == ATOM_STYLE || id == FORMAT { return 3 }
+  if id == RICH_TEXT || id == INSERT_ATOM { return 4 }
   return 2
 }
 
@@ -253,6 +307,59 @@ fn truthy(value: ValueBits) -> bool {
   }
 }
 
+/// The number at the start of `bytes[at..]`, and where it ends.
+fn digits(bytes: &[u8], at: usize) -> [usize; 2] {
+  let mut value: usize = 0
+  let mut i = at
+  while i < bytes.length && bytes[i] >= 48 && bytes[i] <= 57 {
+    value = value * 10 + u8.toUsize(bytes[i] - 48)
+    i = i + 1
+  }
+  return [value, i]
+}
+
+/// Mark spans packed as `"start,end,bits;..."`.
+pub effect fn unpackMarks(packed: string) -> List<MarkSpan> ! OutOfMemoryError ? &mut Allocator {
+  let bytes = String.utf8Bytes(packed)
+  let mut out = List<MarkSpan>.make()
+  let mut at: usize = 0
+  while at < bytes.length {
+    let start = digits(bytes, at)
+    let end = digits(bytes, start[1] + 1)
+    let marks = digits(bytes, end[1] + 1)
+    run out.append(MarkSpan { start: start[0], end: end[0], marks: usize.toU32(marks[0]) })
+    at = marks[1] + 1
+  }
+  return move out
+}
+
+/// Atoms packed as `kind\0label\0data\0` each.
+pub effect fn unpackAtoms(packed: string) -> List<Atom> ! OutOfMemoryError ? &mut Allocator {
+  let bytes = String.utf8Bytes(packed)
+  let mut out = List<Atom>.make()
+  let mut fields = List<usize>.make()
+  let mut at: usize = 0
+  let mut start: usize = 0
+  while at < bytes.length {
+    if bytes[at] == 0 {
+      run fields.append(start)
+      run fields.append(at)
+      start = at + 1
+      if fields.length() == 6 {
+        let kind = digits(bytes, fields.get(0))
+        run out.append(Atom {
+          kind: usize.toU32(kind[0]),
+          label: run String.copy(String.slice(packed, fields.get(2), fields.get(3) - fields.get(2))),
+          data: run String.copy(String.slice(packed, fields.get(4), fields.get(5) - fields.get(4))),
+        })
+        fields.clear()
+      }
+    }
+    at = at + 1
+  }
+  return move out
+}
+
 fn kind(code: u32) -> NodeKind {
   if code == 1 { return NodeKind.Text }
   if code == 2 { return NodeKind.Input }
@@ -267,6 +374,7 @@ fn state(code: u32) -> StyleState {
   if code == 2 { return StyleState.Active }
   if code == 3 { return StyleState.Focus }
   if code == 4 { return StyleState.FocusVisible }
+  if code == 5 { return StyleState.Starting }
   return StyleState.Base
 }
 
@@ -532,6 +640,57 @@ pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) 
     run bridge.batch.source(first, id(argv.get(1).view()))
   } else if function == RELEASE {
     run bridge.batch.releaseResource(first)
+  } else if function == MARKDOWN {
+    let source = run text(argv.get(0))
+    let json = run markdown.json(String.view(&source), id(argv.get(1).view()))
+    let made = run Effect.result(Strings.fromUtf8(json.asSlice()))
+    return match move made {
+      Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value } => Outcome.Returned { value: value }
+      Result<ValueBits, OutOfMemoryError | StringLengthError>.Failure { error } => match move error {
+        OutOfMemoryError allocation => { fail move allocation }
+        StringLengthError _ => {
+          let mut message = List<u8>.make()
+          run message.appendSlice(b"the markdown tree is too long for a string")
+          Outcome.TypeError { message: move message }
+        }
+      }
+    }
+  } else if function == KEYFRAME {
+    let css = run text(argv.get(1))
+    let declarations = run declarationsOf(&css)
+    let offset = f64.toF32(number(argv.get(0).view()))
+    run bridge.frames.append(Keyframe { offset: offset, declarations: move declarations })
+  } else if function == KEYFRAMES {
+    let name = run text(argv.get(0))
+    let frames = Intrinsic.replace(bridge.frames, List<Keyframe>.make())
+    run bridge.batch.keyframes(String.view(&name), move frames)
+  } else if function == RICH_TEXT {
+    let value = run text(argv.get(1))
+    let packedMarks = run text(argv.get(2))
+    let packedAtoms = run text(argv.get(3))
+    let marks = run unpackMarks(String.view(&packedMarks))
+    let atoms = run unpackAtoms(String.view(&packedAtoms))
+    run bridge.batch.push(Mutation.SetRichText { id: first, value: move value, marks: move marks, atoms: move atoms })
+  } else if function == MARK || function == ATOM_STYLE {
+    let css = run text(argv.get(2))
+    let declarations = run declarationsOf(&css)
+    let key = id(argv.get(1).view())
+    if function == MARK {
+      run bridge.batch.push(Mutation.DefineMark { id: first, mark: key, declarations: move declarations })
+    } else {
+      run bridge.batch.push(Mutation.DefineAtom { id: first, kind: key, declarations: move declarations })
+    }
+  } else if function == FORMAT {
+    run bridge.batch.format(first, id(argv.get(1).view()), truthy(argv.get(2).view()))
+  } else if function == INSERT_ATOM {
+    let packed = run text(argv.get(3))
+    let mut atoms = run unpackAtoms(String.view(&packed))
+    match atoms.pop() {
+      Option<Atom>.Some { value: atom } => {
+        run bridge.batch.insertAtom(first, f64.toUsize(number(argv.get(1).view())), f64.toUsize(number(argv.get(2).view())), move atom)
+      }
+      Option<Atom>.None => ()
+    }
   } else if function == SELECT {
     run bridge.batch.select(first, f64.toUsize(number(argv.get(1).view())), f64.toUsize(number(argv.get(2).view())))
   }
@@ -557,6 +716,31 @@ impl EngineServices for Bridge {
       Outcome.Returned { value } => value
       Outcome.TypeError { message } => run engine.throwError(realm, NativeErrorKind.Type, message.asSlice())
     }
+  }
+
+  /// Keeps a promise rejected with no handler, and lets go of it when a handler is added.
+  unsafe effect fn promiseRejection<'r, 'v, 'w, 'm>(engine: &mut Engine<'m, Self>, realm: Realm<'r>,
+    callback: NativeFunctionId, promise: ValueRef<'v>, reason: ValueRef<'w>, event: u32, opaque: ?*mut u8) -> () ? &mut Allocator {
+    // 0: rejected with no handler, 1: handler added later; later codes are double settles.
+    if event > 1 { return () }
+    let handled = event == 1
+    let items = engine.services.rejections.asSlice()
+    let mut i: usize = 0
+    while i < items.length {
+      if unsafe core.sameValue(items[i].promise.view(), promise.view()) {
+        if handled {
+          let Rejected { promise: kept, reason: why } = engine.services.rejections.remove(i)
+          realm.release(&mut engine, move kept)
+          realm.release(&mut engine, move why)
+        }
+        return
+      }
+      i = i + 1
+    }
+    if handled { return }
+    // Without memory for the entry the rejection goes unreported.
+    let entry = Rejected { promise: promise.dup(), reason: reason.dup() }
+    drop run Effect.result(engine.services.rejections.append(move entry))
   }
 
   /// A module the application defined, compiled when something first imports it.

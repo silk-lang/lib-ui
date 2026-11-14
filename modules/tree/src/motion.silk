@@ -1,0 +1,1274 @@
+//! CSS transitions (CSS Transitions 1 and 2): when a node's computed style changes, the
+//! fields its `transition-*` lists name ease from the old value to the new one over the frame
+//! clock, with `transitionrun`, `transitionstart`, `transitionend` and `transitioncancel`
+//! records.
+//!
+//! The node's stored computed style is what shows, transitions included, so it is the
+//! before-change style of the next style change. `resolve` hands each new style to
+//! [`transition`], which starts, keeps, reverses or cancels transitions and writes the
+//! values of the running ones over it. While any run, [`tick`] restyles their nodes each
+//! frame, which also carries an eased inherited value (a color) down to the children.
+import engine { UiTree }
+import style { Computed }
+import timing { EasingStops, Easing, TransitionLists, TransitionSpec, Span, LIST, ALL }
+import timing
+import node { NONE, Event, EventKind }
+import mutation {
+  LISTEN_TRANSITION_RUN,
+  LISTEN_TRANSITION_START,
+  LISTEN_TRANSITION_END,
+  LISTEN_TRANSITION_CANCEL
+}
+import transform
+import transform { TransformList, Op, Origin }
+import properties.computed { Fill, BoxShadow, Visibility, Dimension, DimensionKind, Display }
+import silk.collections.list { List }
+import silk.color.rgba { Rgba }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.num.u32
+import silk.num.u64
+import silk.text.string { String }
+
+// Fields: what the tree transitions, one longhand each.
+
+pub const OPACITY: u32 = 0
+pub const COLOR: u32 = 1
+pub const BACKGROUND_COLOR: u32 = 2
+pub const BORDER_TOP_COLOR: u32 = 3
+pub const BORDER_RADIUS: u32 = 7
+pub const BOX_SHADOW: u32 = 11
+pub const BACKDROP: u32 = 12
+pub const WIDTH: u32 = 13
+pub const MARGIN: u32 = 20
+pub const PADDING: u32 = 24
+pub const INSET: u32 = 28
+pub const BORDER_WIDTH: u32 = 32
+pub const ROW_GAP: u32 = 36
+pub const COLUMN_GAP: u32 = 37
+pub const FONT_SIZE: u32 = 38
+pub const DECORATION_COLOR: u32 = 39
+pub const FLEX_GROW: u32 = 40
+pub const FLEX_SHRINK: u32 = 41
+pub const VISIBILITY: u32 = 42
+pub const DISPLAY: u32 = 43
+pub const TRANSFORM: u32 = 44
+pub const TRANSLATE: u32 = 45
+pub const ROTATE: u32 = 46
+pub const SCALE: u32 = 47
+pub const TRANSFORM_ORIGIN: u32 = 48
+pub const PERSPECTIVE: u32 = 49
+pub const PERSPECTIVE_ORIGIN: u32 = 50
+pub const FIELDS: u32 = 51
+
+
+/// The CSS longhand of field `field`, as transition records name it.
+pub fn fieldName(field: u32) -> &'static [u8] {
+  return match field {
+    0 => b"opacity"
+    1 => b"color"
+    2 => b"background-color"
+    3 => b"border-top-color"
+    4 => b"border-right-color"
+    5 => b"border-bottom-color"
+    6 => b"border-left-color"
+    7 => b"border-top-left-radius"
+    8 => b"border-top-right-radius"
+    9 => b"border-bottom-right-radius"
+    10 => b"border-bottom-left-radius"
+    11 => b"box-shadow"
+    12 => b"backdrop-filter"
+    13 => b"width"
+    14 => b"height"
+    15 => b"min-width"
+    16 => b"min-height"
+    17 => b"max-width"
+    18 => b"max-height"
+    19 => b"flex-basis"
+    20 => b"margin-top"
+    21 => b"margin-right"
+    22 => b"margin-bottom"
+    23 => b"margin-left"
+    24 => b"padding-top"
+    25 => b"padding-right"
+    26 => b"padding-bottom"
+    27 => b"padding-left"
+    28 => b"top"
+    29 => b"right"
+    30 => b"bottom"
+    31 => b"left"
+    32 => b"border-top-width"
+    33 => b"border-right-width"
+    34 => b"border-bottom-width"
+    35 => b"border-left-width"
+    36 => b"row-gap"
+    37 => b"column-gap"
+    38 => b"font-size"
+    39 => b"text-decoration-color"
+    40 => b"flex-grow"
+    41 => b"flex-shrink"
+    42 => b"visibility"
+    43 => b"display"
+    44 => b"transform"
+    45 => b"translate"
+    46 => b"rotate"
+    47 => b"scale"
+    48 => b"transform-origin"
+    49 => b"perspective"
+    _ => b"perspective-origin"
+  }
+}
+
+fn bits(first: u32, count: u32) -> u64 {
+  return u64.shiftLeft(u64.shiftLeft(1, u32.toU64(count)) - 1, u32.toU64(first))
+}
+
+fn bit(field: u32) -> u64 {
+  return u64.shiftLeft(1, u32.toU64(field))
+}
+
+/// The fields `transition-property` name `name` covers: a longhand, a shorthand of them, or
+/// `all`. Zero for a property the tree does not transition.
+pub fn propertyMask(name: &[u8]) -> u64 {
+  if timing.named(name, b"all") {
+    return ALL
+  }
+  let mut field: u32 = 0
+  while field < FIELDS {
+    if timing.named(name, fieldName(field)) {
+      return bit(field)
+    }
+    field = field + 1
+  }
+  if timing.named(name, b"border-color") {
+    return bits(BORDER_TOP_COLOR, 4)
+  }
+  if timing.named(name, b"border-radius") {
+    return bits(BORDER_RADIUS, 4)
+  }
+  if timing.named(name, b"margin") {
+    return bits(MARGIN, 4)
+  }
+  if timing.named(name, b"padding") {
+    return bits(PADDING, 4)
+  }
+  if timing.named(name, b"inset") {
+    return bits(INSET, 4)
+  }
+  if timing.named(name, b"border-width") {
+    return bits(BORDER_WIDTH, 4)
+  }
+  if timing.named(name, b"border") {
+    return bits(BORDER_TOP_COLOR, 4) | bits(BORDER_WIDTH, 4)
+  }
+  if timing.named(name, b"border-top") {
+    return bit(BORDER_TOP_COLOR) | bit(BORDER_WIDTH)
+  }
+  if timing.named(name, b"border-right") {
+    return bit(BORDER_TOP_COLOR + 1) | bit(BORDER_WIDTH + 1)
+  }
+  if timing.named(name, b"border-bottom") {
+    return bit(BORDER_TOP_COLOR + 2) | bit(BORDER_WIDTH + 2)
+  }
+  if timing.named(name, b"border-left") {
+    return bit(BORDER_TOP_COLOR + 3) | bit(BORDER_WIDTH + 3)
+  }
+  if timing.named(name, b"gap") {
+    return bits(ROW_GAP, 2)
+  }
+  if timing.named(name, b"flex") {
+    return bit(WIDTH + 6) | bits(FLEX_GROW, 2)
+  }
+  if timing.named(name, b"background") {
+    return bit(BACKGROUND_COLOR)
+  }
+  if timing.named(name, b"font") {
+    return bit(FONT_SIZE)
+  }
+  if timing.named(name, b"text-decoration") {
+    return bit(DECORATION_COLOR)
+  }
+  return 0
+}
+
+// Reading `transition-*` declarations.
+
+pub const SHORTHAND: u32 = 0
+pub const PROPERTY: u32 = 1
+pub const DURATION: u32 = 2
+pub const TIMING: u32 = 3
+pub const DELAY: u32 = 4
+pub const BEHAVIOR: u32 = 5
+
+/// Sets the lists that `which` (`SHORTHAND`, `PROPERTY`, ...) declares as CSS `text`. An
+/// invalid value leaves them as they were, as an invalid declaration does.
+pub fn declare(lists: &mut TransitionLists, which: u32, text: &[u8]) -> () {
+  let mut spans = [Span { start: 0, end: 0 }; 8]
+  let count = timing.items(text, &mut spans)
+  let mut next = lists.*
+  let mut i: usize = 0
+  while i < count {
+    let item = timing.part(text, spans[i].start, spans[i].end)
+    if item.length == 0 {
+      return ()
+    }
+    if which == SHORTHAND {
+      if !shorthandItem(&mut next, i, item, count == 1) {
+        return ()
+      }
+    } else if which == PROPERTY {
+      if timing.named(item, b"none") {
+        if count != 1 {
+          return ()
+        }
+        next.none = true
+      } else {
+        next.none = false
+        next.properties[i] = propertyMask(item)
+      }
+    } else if which == DURATION {
+      match timing.time(item) {
+        Option<f32>.Some { value } => {
+          if value < 0.0 {
+            return ()
+          }
+          next.durations[i] = value
+        }
+        Option<f32>.None => {
+          return ()
+        }
+      }
+    } else if which == DELAY {
+      match timing.time(item) {
+        Option<f32>.Some { value } => {
+          next.delays[i] = value
+        }
+        Option<f32>.None => {
+          return ()
+        }
+      }
+    } else if which == TIMING {
+      match timing.easing(item) {
+        Option<Easing>.Some { value } => {
+          next.easings[i] = value
+        }
+        Option<Easing>.None => {
+          return ()
+        }
+      }
+    } else {
+      if timing.named(item, b"allow-discrete") {
+        next.discrete[i] = true
+      } else if timing.named(item, b"normal") {
+        next.discrete[i] = false
+      } else {
+        return ()
+      }
+    }
+    i = i + 1
+  }
+  if which == SHORTHAND {
+    next.propertyCount = count
+    next.durationCount = count
+    next.delayCount = count
+    next.easingCount = count
+    next.discreteCount = count
+  } else if which == PROPERTY {
+    next.propertyCount = if next.none {
+      0
+    } else {
+      count
+    }
+  } else if which == DURATION {
+    next.durationCount = count
+  } else if which == DELAY {
+    next.delayCount = count
+  } else if which == TIMING {
+    next.easingCount = count
+  } else {
+    next.discreteCount = count
+  }
+  lists.* = next
+}
+
+// One item of the `transition` shorthand: a property, up to two times, an easing and a
+// behavior, in any order. `none` is valid only alone.
+fn shorthandItem(lists: &mut TransitionLists, index: usize, item: &[u8], single: bool) -> bool {
+  let mut spans = [Span { start: 0, end: 0 }; 8]
+  let count = timing.words(item, &mut spans)
+  let mut property: u64 = ALL
+  let mut named = false
+  let mut none = false
+  let mut times: u32 = 0
+  let mut eased = false
+  let mut behaved = false
+  lists.durations[index] = 0.0
+  lists.delays[index] = 0.0
+  lists.easings[index] = Easing.ease()
+  lists.discrete[index] = false
+  let mut i: usize = 0
+  while i < count {
+    let word = timing.part(item, spans[i].start, spans[i].end)
+    let mut done = false
+    if times < 2 {
+      match timing.time(word) {
+        Option<f32>.Some { value } => {
+          if times == 0 {
+            if value < 0.0 {
+              return false
+            }
+            lists.durations[index] = value
+          } else {
+            lists.delays[index] = value
+          }
+          times = times + 1
+          done = true
+        }
+        Option<f32>.None => {}
+      }
+    }
+    if !done && !eased {
+      match timing.easing(word) {
+        Option<Easing>.Some { value } => {
+          lists.easings[index] = value
+          eased = true
+          done = true
+        }
+        Option<Easing>.None => {}
+      }
+    }
+    if !done && !behaved && (timing.named(word, b"allow-discrete") || timing.named(word, b"normal")) {
+      lists.discrete[index] = timing.named(word, b"allow-discrete")
+      behaved = true
+      done = true
+    }
+    if !done {
+      if named {
+        return false
+      }
+      named = true
+      if timing.named(word, b"none") {
+        none = true
+        property = 0
+      } else {
+        property = propertyMask(word)
+      }
+    }
+    i = i + 1
+  }
+  if none && !single {
+    return false
+  }
+  lists.properties[index] = property
+  lists.none = none
+  return true
+}
+
+// Samples: the value of one field.
+
+pub union Sample {
+  Number { pub value: f32 },
+  Color { pub value: Rgba<f32> },
+  Length { pub value: Dimension },
+  Background { pub value: Fill },
+  Shadow { pub value: BoxShadow, pub present: bool },
+  Seen { pub value: Visibility },
+  Shown { pub value: Display },
+  List { pub value: TransformList },
+  Function { pub value: Op },
+  Place { pub value: Origin },
+  /// A `perspective` distance, 0 for `none`.
+  Distance { pub value: f32 },
+}
+
+impl Copy for Sample {}
+
+/// The value of `field` in `computed`.
+pub fn sample(computed: &Computed, field: u32) -> Sample {
+  let paint = &computed.paint
+  let layout = &computed.layout
+  return match field {
+    0 => Sample.Number { value: paint.opacity }
+    1 => Sample.Color { value: computed.text.color }
+    2 => Sample.Background { value: paint.background }
+    3 => Sample.Color { value: paint.borderColor }
+    4 => Sample.Color { value: paint.borderColor }
+    5 => Sample.Color { value: paint.borderColor }
+    6 => Sample.Color { value: paint.borderColor }
+    7 => Sample.Number { value: paint.radii.topLeft }
+    8 => Sample.Number { value: paint.radii.topRight }
+    9 => Sample.Number { value: paint.radii.bottomRight }
+    10 => Sample.Number { value: paint.radii.bottomLeft }
+    11 => Sample.Shadow { value: paint.shadow, present: paint.hasShadow }
+    12 => Sample.Number { value: paint.backdropBlur }
+    13 => Sample.Length { value: layout.width }
+    14 => Sample.Length { value: layout.height }
+    15 => Sample.Length { value: layout.minWidth }
+    16 => Sample.Length { value: layout.minHeight }
+    17 => Sample.Length { value: layout.maxWidth }
+    18 => Sample.Length { value: layout.maxHeight }
+    19 => Sample.Length { value: layout.flexBasis }
+    20 => Sample.Length { value: layout.margin.top }
+    21 => Sample.Length { value: layout.margin.right }
+    22 => Sample.Length { value: layout.margin.bottom }
+    23 => Sample.Length { value: layout.margin.left }
+    24 => Sample.Length { value: layout.padding.top }
+    25 => Sample.Length { value: layout.padding.right }
+    26 => Sample.Length { value: layout.padding.bottom }
+    27 => Sample.Length { value: layout.padding.left }
+    28 => Sample.Length { value: layout.inset.top }
+    29 => Sample.Length { value: layout.inset.right }
+    30 => Sample.Length { value: layout.inset.bottom }
+    31 => Sample.Length { value: layout.inset.left }
+    32 => Sample.Number { value: paint.border.top }
+    33 => Sample.Number { value: paint.border.right }
+    34 => Sample.Number { value: paint.border.bottom }
+    35 => Sample.Number { value: paint.border.left }
+    36 => Sample.Length { value: layout.rowGap }
+    37 => Sample.Length { value: layout.columnGap }
+    38 => Sample.Number { value: computed.text.size }
+    39 => Sample.Color {
+      value: if computed.text.hasDecorationColor {
+        computed.text.decorationColor
+      } else {
+        computed.text.color
+      },
+    }
+    40 => Sample.Number { value: layout.flexGrow }
+    41 => Sample.Number { value: layout.flexShrink }
+    42 => Sample.Seen { value: computed.text.visibility }
+    43 => Sample.Shown { value: layout.display }
+    44 => Sample.List { value: computed.transform.list }
+    45 => Sample.Function { value: computed.transform.translate }
+    46 => Sample.Function { value: computed.transform.rotate }
+    47 => Sample.Function { value: computed.transform.scale }
+    48 => Sample.Place { value: computed.transform.origin }
+    49 => Sample.Distance { value: computed.transform.perspective }
+    _ => Sample.Place { value: computed.transform.perspectiveOrigin }
+  }
+}
+
+fn numberOf(of: Sample) -> f32 {
+  return match of {
+    Sample.Number { value } => value
+    Sample.Distance { value } => value
+    _ => 0.0
+  }
+}
+
+fn colorOf(of: Sample) -> Rgba<f32> {
+  return match of {
+    Sample.Color { value } => value
+    _ => Rgba<f32> { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }
+  }
+}
+
+fn lengthOf(of: Sample) -> Dimension {
+  return match of {
+    Sample.Length { value } => value
+    _ => Dimension.auto()
+  }
+}
+
+/// Writes `value` as field `field` of `computed`.
+pub fn write(computed: &mut Computed, field: u32, value: Sample) -> () {
+  if field == 0 {
+    computed.paint.opacity = numberOf(value)
+  } else if field == 1 {
+    computed.text.color = colorOf(value)
+  } else if field == 2 {
+    match value {
+      Sample.Background { value: fill } => {
+        computed.paint.background = fill
+      }
+      _ => {}
+    }
+  } else if field >= 3 && field <= 6 {
+    computed.paint.borderColor = colorOf(value)
+  } else if field == 7 {
+    computed.paint.radii.topLeft = numberOf(value)
+  } else if field == 8 {
+    computed.paint.radii.topRight = numberOf(value)
+  } else if field == 9 {
+    computed.paint.radii.bottomRight = numberOf(value)
+  } else if field == 10 {
+    computed.paint.radii.bottomLeft = numberOf(value)
+  } else if field == 11 {
+    match value {
+      Sample.Shadow { value: shadow, present } => {
+        computed.paint.shadow = shadow
+        computed.paint.hasShadow = present
+      }
+      _ => {}
+    }
+  } else if field == 12 {
+    computed.paint.backdropBlur = numberOf(value)
+  } else if field == 13 {
+    computed.layout.width = lengthOf(value)
+  } else if field == 14 {
+    computed.layout.height = lengthOf(value)
+  } else if field == 15 {
+    computed.layout.minWidth = lengthOf(value)
+  } else if field == 16 {
+    computed.layout.minHeight = lengthOf(value)
+  } else if field == 17 {
+    computed.layout.maxWidth = lengthOf(value)
+  } else if field == 18 {
+    computed.layout.maxHeight = lengthOf(value)
+  } else if field == 19 {
+    computed.layout.flexBasis = lengthOf(value)
+  } else if field == 20 {
+    computed.layout.margin.top = lengthOf(value)
+  } else if field == 21 {
+    computed.layout.margin.right = lengthOf(value)
+  } else if field == 22 {
+    computed.layout.margin.bottom = lengthOf(value)
+  } else if field == 23 {
+    computed.layout.margin.left = lengthOf(value)
+  } else if field == 24 {
+    computed.layout.padding.top = lengthOf(value)
+  } else if field == 25 {
+    computed.layout.padding.right = lengthOf(value)
+  } else if field == 26 {
+    computed.layout.padding.bottom = lengthOf(value)
+  } else if field == 27 {
+    computed.layout.padding.left = lengthOf(value)
+  } else if field == 28 {
+    computed.layout.inset.top = lengthOf(value)
+  } else if field == 29 {
+    computed.layout.inset.right = lengthOf(value)
+  } else if field == 30 {
+    computed.layout.inset.bottom = lengthOf(value)
+  } else if field == 31 {
+    computed.layout.inset.left = lengthOf(value)
+  } else if field == 32 {
+    computed.paint.border.top = numberOf(value)
+  } else if field == 33 {
+    computed.paint.border.right = numberOf(value)
+  } else if field == 34 {
+    computed.paint.border.bottom = numberOf(value)
+  } else if field == 35 {
+    computed.paint.border.left = numberOf(value)
+  } else if field == 36 {
+    computed.layout.rowGap = lengthOf(value)
+  } else if field == 37 {
+    computed.layout.columnGap = lengthOf(value)
+  } else if field == 38 {
+    computed.text.size = numberOf(value)
+  } else if field == 39 {
+    computed.text.decorationColor = colorOf(value)
+    computed.text.hasDecorationColor = true
+  } else if field == 40 {
+    computed.layout.flexGrow = numberOf(value)
+  } else if field == 41 {
+    computed.layout.flexShrink = numberOf(value)
+  } else if field == 42 {
+    match value {
+      Sample.Seen { value: seen } => {
+        computed.text.visibility = seen
+        computed.text.visible = seen == Visibility.Visible
+      }
+      _ => {}
+    }
+  } else {
+    match value {
+      Sample.Shown { value: shown } => {
+        computed.layout.display = shown
+      }
+      Sample.List { value: list } => {
+        computed.transform.list = list
+      }
+      Sample.Function { value: op } => {
+        if field == TRANSLATE {
+          computed.transform.translate = op
+        } else if field == ROTATE {
+          computed.transform.rotate = op
+        } else {
+          computed.transform.scale = op
+        }
+      }
+      Sample.Place { value: origin } => {
+        if field == TRANSFORM_ORIGIN {
+          computed.transform.origin = origin
+        } else {
+          computed.transform.perspectiveOrigin = origin
+        }
+      }
+      Sample.Distance { value: distance } => {
+        computed.transform.perspective = distance
+      }
+      _ => {}
+    }
+  }
+}
+
+fn sameColor(a: Rgba<f32>, b: Rgba<f32>) -> bool {
+  return a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a
+}
+
+fn sameFill(a: Fill, b: Fill) -> bool {
+  return match a {
+    Fill.None => match b {
+      Fill.None => true
+      _ => false
+    }
+    Fill.Solid { color } => match b {
+      Fill.Solid { color: other } => sameColor(color, other)
+      _ => false
+    }
+    Fill.Gradient { angle, from, to } => match b {
+      Fill.Gradient { angle: otherAngle, from: otherFrom, to: otherTo } => angle == otherAngle
+        && sameColor(from, otherFrom)
+        && sameColor(to, otherTo)
+      _ => false
+    }
+  }
+}
+
+fn sameShadow(a: BoxShadow, b: BoxShadow) -> bool {
+  return a.offsetX == b.offsetX && a.offsetY == b.offsetY && a.blur == b.blur && a.spread == b.spread
+    && a.inset == b.inset
+    && sameColor(a.color, b.color)
+}
+
+/// Whether two samples of one field are the same value.
+pub fn same(a: Sample, b: Sample) -> bool {
+  return match a {
+    Sample.Number { value } => numberOf(b) == value
+    Sample.Color { value } => sameColor(value, colorOf(b))
+    Sample.Length { value } => &value == &lengthOf(b)
+    Sample.Background { value } => match b {
+      Sample.Background { value: other } => sameFill(value, other)
+      _ => false
+    }
+    Sample.Shadow { value, present } => match b {
+      Sample.Shadow { value: other, present: otherPresent } => present == otherPresent
+        && (!present || sameShadow(value, other))
+      _ => false
+    }
+    Sample.Seen { value } => match b {
+      Sample.Seen { value: other } => value == other
+      _ => false
+    }
+    Sample.Shown { value } => match b {
+      Sample.Shown { value: other } => &value == &other
+      _ => false
+    }
+    Sample.List { value } => match b {
+      Sample.List { value: other } => value.same(&other)
+      _ => false
+    }
+    Sample.Function { value } => match b {
+      Sample.Function { value: other } => value.same(&other)
+      _ => false
+    }
+    Sample.Place { value } => match b {
+      Sample.Place { value: other } => value.same(&other)
+      _ => false
+    }
+    Sample.Distance { value } => match b {
+      Sample.Distance { value: other } => value == other
+      _ => false
+    }
+  }
+}
+
+fn numeric(kind: DimensionKind) -> bool {
+  return kind == DimensionKind.Length || kind == DimensionKind.Percent || kind == DimensionKind.Calc
+}
+
+fn transparentLike(color: Rgba<f32>) -> Rgba<f32> {
+  return Rgba<f32> { r: color.r, g: color.g, b: color.b, a: 0.0 }
+}
+
+fn noShadow(like: BoxShadow) -> BoxShadow {
+  return BoxShadow {
+    offsetX: 0.0,
+    offsetY: 0.0,
+    blur: 0.0,
+    spread: 0.0,
+    color: transparentLike(like.color),
+    inset: like.inset,
+  }
+}
+
+/// Whether the field can ease smoothly from `a` to `b`. A pair that cannot transitions only
+/// with `transition-behavior: allow-discrete`, flipping halfway.
+pub fn interpolable(a: Sample, b: Sample) -> bool {
+  return match a {
+    Sample.Length { value } => numeric(value.kind) && numeric(lengthOf(b).kind)
+    Sample.Background { value } => match value {
+      Fill.Gradient { .. } => match b {
+        Sample.Background { value: Fill.Gradient { .. } } => true
+        _ => false
+      }
+      _ => match b {
+        Sample.Background { value: Fill.Gradient { .. } } => false
+        _ => true
+      }
+    }
+    Sample.Shadow { value, present } => match b {
+      Sample.Shadow { value: other, present: otherPresent } => !present || !otherPresent
+        || value.inset == other.inset
+      _ => false
+    }
+    Sample.Shown { .. } => false
+    Sample.Distance { value } => match b {
+      Sample.Distance { value: other } => value > 0.0 && other > 0.0
+      _ => false
+    }
+    _ => true
+  }
+}
+
+fn lerp(a: f32, b: f32, p: f32) -> f32 {
+  return a + (b - a) * p
+}
+
+// Colors ease premultiplied, as CSS Color 4 interpolates in sRGB.
+fn mixColor(a: Rgba<f32>, b: Rgba<f32>, p: f32) -> Rgba<f32> {
+  let alpha = lerp(a.a, b.a, p)
+  if alpha <= 0.0 {
+    return Rgba<f32> { r: lerp(a.r, b.r, p), g: lerp(a.g, b.g, p), b: lerp(a.b, b.b, p), a: 0.0 }
+  }
+  let clamped = f32.min(1.0, alpha)
+  return Rgba<f32> {
+    r: lerp(a.r * a.a, b.r * b.a, p) / alpha,
+    g: lerp(a.g * a.a, b.g * b.a, p) / alpha,
+    b: lerp(a.b * a.a, b.b * b.a, p) / alpha,
+    a: clamped,
+  }
+}
+
+fn solidOf(fill: Fill, other: Fill) -> Rgba<f32> {
+  return match fill {
+    Fill.Solid { color } => color
+    _ => match other {
+      Fill.Solid { color } => transparentLike(color)
+      _ => Rgba<f32> { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }
+    }
+  }
+}
+
+fn nonNegative(field: u32) -> bool {
+  return (field >= 7 && field <= 10) || field == BACKDROP || (field >= 32 && field <= 35)
+    || field == FONT_SIZE || field == FLEX_GROW || field == FLEX_SHRINK
+}
+
+fn shown(of: Sample) -> bool {
+  return match of {
+    Sample.Shown { value } => !value.isNone()
+    _ => true
+  }
+}
+
+fn shadowOf(of: Sample) -> BoxShadow {
+  return match of {
+    Sample.Shadow { value, .. } => value
+    _ => noShadow(BoxShadow { offsetX: 0.0, offsetY: 0.0, blur: 0.0, spread: 0.0, color: Rgba<f32> { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }, inset: false })
+  }
+}
+
+fn presentOf(of: Sample) -> bool {
+  return match of {
+    Sample.Shadow { present, .. } => present
+    _ => false
+  }
+}
+
+fn fillOf(of: Sample) -> Fill {
+  return match of {
+    Sample.Background { value } => value
+    _ => Fill.None
+  }
+}
+
+fn seenOf(of: Sample) -> Visibility {
+  return match of {
+    Sample.Seen { value } => value
+    _ => Visibility.Visible
+  }
+}
+
+fn mixNumber(field: u32, a: f32, b: f32, p: f32) -> f32 {
+  let mixed = lerp(a, b, p)
+  if nonNegative(field) {
+    return f32.max(0.0, mixed)
+  }
+  if field == OPACITY {
+    return f32.max(0.0, f32.min(1.0, mixed))
+  }
+  return mixed
+}
+
+fn mixLength(value: Dimension, other: Dimension, p: f32) -> Dimension {
+  let length = lerp(value.value, other.value, p)
+  let percent = lerp(value.percent, other.percent, p)
+  if value.kind == DimensionKind.Length && other.kind == DimensionKind.Length {
+    return Dimension.px(length)
+  }
+  if value.kind == DimensionKind.Percent && other.kind == DimensionKind.Percent {
+    return Dimension.pct(percent)
+  }
+  return Dimension.calc(length, percent)
+}
+
+fn mixFill(value: Fill, other: Fill, p: f32) -> Fill {
+  match value {
+    Fill.Gradient { angle, from, to } => {
+      match other {
+        Fill.Gradient { angle: otherAngle, from: otherFrom, to: otherTo } => {
+          return Fill.Gradient {
+            angle: lerp(angle, otherAngle, p),
+            from: mixColor(from, otherFrom, p),
+            to: mixColor(to, otherTo, p),
+          }
+        }
+        _ => {
+          return value
+        }
+      }
+    }
+    _ => {}
+  }
+  return Fill.Solid { color: mixColor(solidOf(value, other), solidOf(other, value), p) }
+}
+
+// A missing shadow eases as a transparent one with no offsets.
+fn mixShadow(a: Sample, b: Sample, p: f32) -> Sample {
+  let presentA = presentOf(a)
+  let presentB = presentOf(b)
+  if !presentA && !presentB {
+    return a
+  }
+  let from = if presentA {
+    shadowOf(a)
+  } else {
+    noShadow(shadowOf(b))
+  }
+  let to = if presentB {
+    shadowOf(b)
+  } else {
+    noShadow(shadowOf(a))
+  }
+  if p >= 1.0 && !presentB {
+    return b
+  }
+  if p <= 0.0 && !presentA {
+    return a
+  }
+  return Sample.Shadow {
+    value: BoxShadow {
+      offsetX: lerp(from.offsetX, to.offsetX, p),
+      offsetY: lerp(from.offsetY, to.offsetY, p),
+      blur: f32.max(0.0, lerp(from.blur, to.blur, p)),
+      spread: lerp(from.spread, to.spread, p),
+      color: mixColor(from.color, to.color, p),
+      inset: from.inset,
+    },
+    present: true,
+  }
+}
+
+// Visible for the whole transition when either end is visible.
+fn mixSeen(a: Visibility, b: Visibility, p: f32) -> Visibility {
+  if p <= 0.0 {
+    return a
+  }
+  if p >= 1.0 {
+    return b
+  }
+  if a == Visibility.Visible || b == Visibility.Visible {
+    return Visibility.Visible
+  }
+  if p < 0.5 {
+    return a
+  }
+  return b
+}
+
+/// The value of field `field` at eased progress `p` from `a` to `b`, on a `width` by `height`
+/// border box (what transform lists that ease through matrices resolve percentages against).
+pub fn mix(field: u32, a: Sample, b: Sample, p: f32, width: f32, height: f32) -> Sample {
+  if !interpolable(a, b) {
+    // `display` shows for the whole transition when either end is shown.
+    if field == DISPLAY && !shown(a) {
+      if p > 0.0 {
+        return b
+      }
+      return a
+    }
+    if field == DISPLAY && !shown(b) {
+      if p < 1.0 {
+        return a
+      }
+      return b
+    }
+    if p < 0.5 {
+      return a
+    }
+    return b
+  }
+  match a {
+    Sample.Number { value } => {
+      return Sample.Number { value: mixNumber(field, value, numberOf(b), p) }
+    }
+    Sample.Color { value } => {
+      return Sample.Color { value: mixColor(value, colorOf(b), p) }
+    }
+    Sample.Length { value } => {
+      return Sample.Length { value: mixLength(value, lengthOf(b), p) }
+    }
+    Sample.Background { value } => {
+      return Sample.Background { value: mixFill(value, fillOf(b), p) }
+    }
+    Sample.Shadow { .. } => {
+      return mixShadow(a, b, p)
+    }
+    Sample.Seen { value } => {
+      return Sample.Seen { value: mixSeen(value, seenOf(b), p) }
+    }
+    Sample.Shown { .. } => {
+      return b
+    }
+    Sample.List { value } => {
+      return match b {
+        Sample.List { value: other } => Sample.List { value: transform.mixLists(&value, &other, p, width, height) }
+        _ => b
+      }
+    }
+    Sample.Function { value } => {
+      return match b {
+        Sample.Function { value: other } => Sample.Function { value: transform.mixOp(value, other, p) }
+        _ => b
+      }
+    }
+    Sample.Place { value } => {
+      return match b {
+        Sample.Place { value: other } => Sample.Place { value: transform.mixOrigin(value, other, p) }
+        _ => b
+      }
+    }
+    Sample.Distance { value } => {
+      return Sample.Distance { value: lerp(value, numberOf(b), p) }
+    }
+  }
+}
+
+// Running transitions.
+
+/// One transition of one field of one node.
+pub struct Running {
+  pub slot: u32,
+  pub id: u32,
+  pub field: u32,
+  pub from: Sample,
+  pub to: Sample,
+  /// The reversing-adjusted start value and shortening factor (CSS Transitions 1 §3).
+  pub reversingFrom: Sample,
+  pub factor: f32,
+  /// Frame clock seconds when the active phase starts, and how long it lasts.
+  pub start: f64,
+  pub duration: f64,
+  pub easing: Easing,
+  /// The border box size a `transform` list eases over.
+  pub width: f32,
+  pub height: f32,
+  /// Whether its `transitionstart` was queued.
+  pub started: bool,
+}
+
+impl Copy for Running {}
+
+impl Running {
+  /// The input progress at `now`, 0 before the start.
+  pub fn progress(self: &Self, now: f64) -> f32 {
+    if now <= self.start {
+      return 0.0
+    }
+    if self.duration <= 0.0 || now >= self.start + self.duration {
+      return 1.0
+    }
+    return f64.toF32((now - self.start) / self.duration)
+  }
+
+  /// The value at `now`, with `linear()` easings from `stops`.
+  pub fn at(self: &Self, now: f64, stops: &EasingStops) -> Sample {
+    return mix(self.field, self.from, self.to, self.easing.at(self.progress(now), stops), self.width, self.height)
+  }
+
+  /// Seconds of the active phase run by `now`, as `elapsedTime`.
+  fn elapsed(self: &Self, now: f64) -> f32 {
+    return f64.toF32(f64.max(0.0, f64.min(now - self.start, self.duration)))
+  }
+}
+
+fn find(tree: &UiTree<'_>, slot: u32, id: u32, field: u32) -> usize {
+  let list = tree.transitions.asSlice()
+  let mut i: usize = 0
+  while i < list.length {
+    if list[i].slot == slot && list[i].id == id && list[i].field == field {
+      return i
+    }
+    i = i + 1
+  }
+  return LIST * 1000
+}
+
+/// Whether the node at `slot` has a running transition.
+pub fn running(tree: &UiTree<'_>, slot: u32) -> bool {
+  let list = tree.transitions.asSlice()
+  let mut i: usize = 0
+  while i < list.length {
+    if list[i].slot == slot {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+fn listenFlag(kind: EventKind) -> u32 {
+  return match kind {
+    EventKind.TransitionRun => LISTEN_TRANSITION_RUN
+    EventKind.TransitionStart => LISTEN_TRANSITION_START
+    EventKind.TransitionEnd => LISTEN_TRANSITION_END
+    _ => LISTEN_TRANSITION_CANCEL
+  }
+}
+
+/// Queues a transition record for `slot` when it or a node above it listens.
+effect fn record(tree: &mut UiTree<'_>, kind: EventKind, slot: u32, field: u32, elapsed: f32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let flag = listenFlag(kind)
+  let mut at = slot
+  let mut heard = false
+  while at != NONE {
+    if u32.bitAnd(tree.node(at).listeners, flag) != 0 {
+      heard = true
+      break
+    }
+    at = tree.node(at).parent
+  }
+  if !heard {
+    return ()
+  }
+  let mut path = List<u32>.make()
+  run tree.pathTo(slot, &mut path)
+  let mut event = Event.make(kind, tree.node(slot).id, move path)
+  event.name = run String.copy(unsafe String.fromUtf8Unchecked(fieldName(field)))
+  event.elapsedTime = elapsed
+  run tree.queueEvent(move event)
+}
+
+/// Removes running transition `index`, queuing `transitioncancel`.
+effect fn cancel(tree: &mut UiTree<'_>, index: usize, now: f64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let gone = tree.transitions.remove(index)
+  run record(&mut tree, EventKind.TransitionCancel, gone.slot, gone.field, gone.elapsed(now))
+}
+
+/// Cancels every transition of the node at `slot`.
+pub effect fn cancelAll(tree: &mut UiTree<'_>, slot: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let now = tree.input.time
+  let mut i: usize = 0
+  while i < tree.transitions.length() {
+    if tree.transitions.asSlice()[i].slot == slot {
+      run cancel(&mut tree, i, now)
+    } else {
+      i = i + 1
+    }
+  }
+}
+
+/// Starts, keeps, reverses or cancels the transitions of the node at `slot` for its new
+/// style `computed` (CSS Transitions 1 §3, "Starting of transitions"), and writes the values
+/// of the running ones over it. `before` is the before-change style; `hasBefore` is false
+/// when the node had none (it is new, or it or an ancestor was `display: none`).
+pub effect fn transition(
+  tree: &mut UiTree<'_>,
+  slot: u32,
+  before: &Computed,
+  hasBefore: bool,
+  computed: &mut Computed,
+  animated: u64,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let lists = computed.transition
+  let mine = tree.transitions.length() != 0 && running(&tree.*, slot)
+  if !mine && (!hasBefore || !lists.any()) {
+    return ()
+  }
+  let now = tree.input.time
+  let id = tree.node(slot).id
+  let mut field: u32 = 0
+  while field < FIELDS {
+    if u64.bitAnd(animated, u64.shiftLeft(1, u32.toU64(field))) != 0 {
+      // An animation sets the field: its value wins over any transition.
+      field = field + 1
+      continue
+    }
+    let after = sample(&computed.*, field)
+    let spec = lists.spec(field)
+    let at = find(&tree.*, slot, id, field)
+    if at != LIST * 1000 {
+      let old = tree.transitions.asSlice()[at]
+      if same(old.to, after) {
+        // Still heading where it was.
+        write(&mut computed, field, old.at(now, &tree.easingStops))
+        field = field + 1
+        continue
+      }
+      let current = old.at(now, &tree.easingStops)
+      run cancel(&mut tree, at, now)
+      if hasBefore && spec.duration + spec.delay > 0.0 && !same(current, after)
+        && (spec.allowDiscrete || interpolable(current, after)) {
+        let mut next = startOf(&tree.*, slot, id, field, current, after, &spec, now)
+        if same(old.reversingFrom, after) {
+          // Reversing a transition part way takes as long as the part it undoes.
+          let output = old.easing.at(old.progress(now), &tree.easingStops)
+          let factor = f32.max(0.0, f32.min(1.0, f32.abs(output * old.factor + 1.0 - old.factor)))
+          next.reversingFrom = old.to
+          next.factor = factor
+          next.duration = next.duration * f32.toF64(factor)
+          if spec.delay < 0.0 {
+            next.start = now + f32.toF64(spec.delay * factor)
+          }
+        }
+        run begin(&mut tree, next, now, &mut computed)
+      }
+      field = field + 1
+      continue
+    }
+    if hasBefore && spec.duration + spec.delay > 0.0 {
+      let previous = sample(before, field)
+      if !same(previous, after) && (spec.allowDiscrete || interpolable(previous, after)) {
+        let next = startOf(&tree.*, slot, id, field, previous, after, &spec, now)
+        run begin(&mut tree, next, now, &mut computed)
+      }
+    }
+    field = field + 1
+  }
+  if computed.layout.display.isNone() {
+    run cancelAll(&mut tree, slot)
+  }
+}
+
+/// The border box size of the node at `slot` in the last layout, zero before its first.
+pub fn boxSize(tree: &UiTree<'_>, slot: u32) -> [f32; 2] {
+  let source = tree.node(slot).css
+  if source >= tree.fragmentOf.length() {
+    return [0.0, 0.0]
+  }
+  let index = tree.fragmentOf.get(source)
+  if index >= tree.output.fragments.values.length() {
+    return [0.0, 0.0]
+  }
+  let f = tree.output.fragments.values.asSlice()[index]
+  return [f.size.width, f.size.height]
+}
+
+fn startOf(
+  tree: &UiTree<'_>,
+  slot: u32,
+  id: u32,
+  field: u32,
+  from: Sample,
+  to: Sample,
+  spec: &TransitionSpec,
+  now: f64,
+) -> Running {
+  let size: [f32; 2] = if field == TRANSFORM { boxSize(tree, slot) } else { [0.0, 0.0] }
+  return Running {
+    slot: slot,
+    id: id,
+    field: field,
+    from: from,
+    to: to,
+    reversingFrom: from,
+    factor: 1.0,
+    start: now + f32.toF64(spec.delay),
+    duration: f32.toF64(spec.duration),
+    easing: spec.easing,
+    width: size[0],
+    height: size[1],
+    started: false,
+  }
+}
+
+// Adds `next`, queues its `transitionrun` (and `transitionstart` when it has no delay left)
+// and writes its value now.
+effect fn begin(tree: &mut UiTree<'_>, next: Running, now: f64, computed: &mut Computed) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut added = next
+  run record(&mut tree, EventKind.TransitionRun, added.slot, added.field, added.elapsed(now))
+  if now >= added.start {
+    added.started = true
+    run record(&mut tree, EventKind.TransitionStart, added.slot, added.field, added.elapsed(now))
+  }
+  write(&mut computed, added.field, added.at(now, &tree.easingStops))
+  run tree.transitions.append(added)
+}
+
+/// Advances the transitions of the current root to the frame clock: queues the records of
+/// the ones that started or ended, and restyles their nodes so the next style resolve
+/// writes their new values (and the final value of the ones that ended).
+pub effect fn tick(tree: &mut UiTree<'_>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if tree.transitions.length() == 0 {
+    return ()
+  }
+  let now = tree.input.time
+  let mut i: usize = 0
+  while i < tree.transitions.length() {
+    let item = tree.transitions.asSlice()[i]
+    let slot = item.slot
+    if u32.toUsize(slot) >= tree.nodes.length() || !tree.node(slot).live || tree.node(slot).id != item.id {
+      drop tree.transitions.remove(i)
+      continue
+    }
+    if !tree.holdsCurrent(slot) {
+      i = i + 1
+      continue
+    }
+    if !item.started && now >= item.start {
+      let mut marked = item
+      marked.started = true
+      tree.transitions.set(i, marked)
+      run record(&mut tree, EventKind.TransitionStart, slot, item.field, item.elapsed(now))
+    }
+    if now >= item.start + item.duration {
+      // Ended: the style shows its final value, and the next resolve starts from it.
+      write(&mut tree.nodeMut(slot).computed, item.field, item.to)
+      drop tree.transitions.remove(i)
+      run record(&mut tree, EventKind.TransitionEnd, slot, item.field, f64.toF32(item.duration))
+      tree.restyle(slot)
+      continue
+    }
+    tree.restyle(slot)
+    i = i + 1
+  }
+}
+
+/// Whether the current root has transitions to draw.
+pub fn animating(tree: &UiTree<'_>) -> bool {
+  let list = tree.transitions.asSlice()
+  let mut i: usize = 0
+  while i < list.length {
+    if tree.holdsCurrent(list[i].slot) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}

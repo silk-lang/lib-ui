@@ -1,0 +1,198 @@
+//! Fonts as a page has them: a [`Font`] names a family list the way CSS `font-family` does,
+//! and a program says where the faces of its families come from in `Program.fonts`, the way a
+//! page has `@font-face` rules and stylesheet links.
+//!
+//! ```silk,ignore
+//! const GEIST: Font = Font.of("Geist, system-ui, sans-serif")
+//! const MONO: Font = Font.of("ui-monospace, monospace")
+//!
+//! impl Program<Message, NoCommand> for Model {
+//!   fn fonts(model: &Model, fonts: &mut Fonts) -> () {
+//!     fonts.face(GEIST, "fonts/Geist.ttf", Face.weights(100.0, 900.0))
+//!     fonts.family(MONO)
+//!   }
+//!   fn view(model: &Model, h: &Document<Message>) -> Node {
+//!     return h.box([h.style([css.fontFamily(GEIST)])], [h.text("Hello")])
+//!   }
+//!   // init, update
+//! }
+//! ```
+//!
+//! A family no face is declared for uses the fonts installed where the program runs; the
+//! generic names (`system-ui`, `sans-serif`, `serif`, `monospace`) are always there. A
+//! declared face loads when text first needs it, and the text draws with the next family in
+//! the list until then (`font-display: swap`).
+import heap { Heap }
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.num.u8
+import silk.num.u32
+import silk.text.string { String }
+import ui_protocol.mutation { FACE_NORMAL, FACE_ITALIC }
+
+/// A font family list, as CSS `font-family` text: `"Geist, system-ui, sans-serif"`. Make one
+/// constant per list and pass it to `css.fontFamily`. Every font a view uses goes in
+/// `Program.fonts`, with `Fonts.family` or `Fonts.face`.
+pub struct Font {
+  /// The `font-family` text.
+  pub names: string<'static>,
+}
+
+impl Copy for Font {}
+
+impl Font {
+  /// The font family list `names`, as CSS `font-family` text.
+  pub fn of(names: string<'static>) -> Font {
+    return Font { names: names }
+  }
+
+  /// The number the tree knows the list by, made from its text.
+  pub fn family(self: &Self) -> u32 {
+    return familyNumber(String.utf8Bytes(self.names))
+  }
+
+  /// The first family of the list, without quotes: the name its faces are declared under.
+  pub fn first(self: &Self) -> string<'static> {
+    let bytes = String.utf8Bytes(self.names)
+    let mut start: usize = 0
+    while start < bytes.length && (bytes[start] == 32 || bytes[start] == 9) {
+      start = start + 1
+    }
+    let mut end = start
+    while end < bytes.length && bytes[end] != 44 {
+      end = end + 1
+    }
+    while end > start && (bytes[end - 1] == 32 || bytes[end - 1] == 9) {
+      end = end - 1
+    }
+    if end - start >= 2 && (bytes[start] == 34 || bytes[start] == 39) && bytes[end - 1] == bytes[start] {
+      start = start + 1
+      end = end - 1
+    }
+    return String.slice(self.names, start, end - start)
+  }
+}
+
+/// The tree's number for family list `names`: FNV-1a over the text, kept between 2^23 and
+/// 2^24 so it is exact in a 32-bit float style value and clear of the small numbers hosts and
+/// the lists JavaScript apps define use.
+fn familyNumber(names: &[u8]) -> u32 {
+  let mut hash: u32 = 2166136261
+  let mut i: usize = 0
+  while i < names.length {
+    hash = u32.wrappingMultiply(u32.bitXor(hash, u8.toU32(names[i])), 16777619)
+    i = i + 1
+  }
+  return u32.bitOr(0x800000, u32.bitAnd(hash, 0x7FFFFF))
+}
+
+/// What a face covers, as the descriptors of an `@font-face` rule: its weights, widths and
+/// style. `Face.normal()` is an upright face of weight 400 at normal width.
+pub struct Face {
+  pub weightMin: f32,
+  pub weightMax: f32,
+  pub widthMin: f32,
+  pub widthMax: f32,
+  pub style: u8,
+}
+
+impl Copy for Face {}
+
+impl Face {
+  /// An upright face of weight 400 at normal width (`font-weight: 400`).
+  pub fn normal() -> Face {
+    return Face { weightMin: 400.0, weightMax: 400.0, widthMin: 100.0, widthMax: 100.0, style: FACE_NORMAL }
+  }
+
+  /// An upright face of weight `weight`: `Face.weight(700.0)` for a bold file.
+  pub fn weight(weight: f32) -> Face {
+    return Face { weightMin: weight, weightMax: weight, widthMin: 100.0, widthMax: 100.0, style: FACE_NORMAL }
+  }
+
+  /// A variable face covering weights `min` to `max` (`font-weight: 100 900`).
+  pub fn weights(min: f32, max: f32) -> Face {
+    return Face { weightMin: min, weightMax: max, widthMin: 100.0, widthMax: 100.0, style: FACE_NORMAL }
+  }
+
+  /// This face, italic (`font-style: italic`).
+  pub fn italic(self: Self) -> Face {
+    return Face {
+      weightMin: self.weightMin,
+      weightMax: self.weightMax,
+      widthMin: self.widthMin,
+      widthMax: self.widthMax,
+      style: FACE_ITALIC,
+    }
+  }
+
+  /// This face, covering widths `min` to `max` in percent (`font-stretch: 75% 125%`).
+  pub fn widths(self: Self, min: f32, max: f32) -> Face {
+    return Face {
+      weightMin: self.weightMin,
+      weightMax: self.weightMax,
+      widthMin: min,
+      widthMax: max,
+      style: self.style,
+    }
+  }
+}
+
+/// A face `Program.fonts` declared.
+pub struct DeclaredFace {
+  pub font: Font,
+  pub url: String,
+  pub face: Face,
+}
+
+/// What `Program.fonts` declares: the families views use, the faces they are made of, and
+/// stylesheets of `@font-face` rules. The runtime asks once, before a window's first render.
+pub struct Fonts {
+  heap: Heap,
+  pub families: List<Font>,
+  pub faces: List<DeclaredFace>,
+  pub stylesheets: List<String>,
+}
+
+impl Fonts {
+  pub fn make() -> Fonts {
+    return Fonts {
+      heap: Heap.make(),
+      families: List<Font>.make(),
+      faces: List<DeclaredFace>.make(),
+      stylesheets: List<String>.make(),
+    }
+  }
+
+  /// Font `font` is used by views. Its families are installed fonts, or have faces declared
+  /// with `face` or in a `stylesheet`.
+  pub fn family(self: &mut Self, font: Font) -> () {
+    let known = self.families.asSlice()
+    let mut i: usize = 0
+    while i < known.length {
+      if known[i].names == font.names {
+        return ()
+      }
+      i = i + 1
+    }
+    drop known
+    self.heap.alloc(self.families.append(font))
+  }
+
+  /// A face of the first family of `font` (`Geist` in `"Geist, sans-serif"`) whose file is at
+  /// `url`, read as an image URL is: a path relative to the app, `https:`, `file:`, `data:` or
+  /// a scheme the host has a loader for. `face` says which weights and style it covers. As an
+  /// `@font-face` rule; `font` is used by views, as with `family`.
+  pub fn face(self: &mut Self, font: Font, url: string, face: Face) -> () {
+    self.family(font)
+    let copied = self.heap.alloc(String.copy(url))
+    self.heap.alloc(self.faces.append(DeclaredFace { font: font, url: move copied, face: face }))
+  }
+
+  /// Loads the stylesheet at `url` for its `@font-face` rules, as `<link rel="stylesheet">`
+  /// does for a font service: `"https://fonts.googleapis.com/css2?family=Inter"`. The families
+  /// it declares still go in `family`.
+  pub fn stylesheet(self: &mut Self, url: string) -> () {
+    let copied = self.heap.alloc(String.copy(url))
+    self.heap.alloc(self.stylesheets.append(move copied))
+  }
+}

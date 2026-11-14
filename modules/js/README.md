@@ -38,7 +38,9 @@ mount(createBox({ width: 400, height: 300 }, button));
   (`gridTemplateColumns: "auto 1fr"`, `repeat()`, `minmax()`, named lines and
   `gridTemplateAreas`, `gridArea`, `gridColumn: "span 2"`); numbers for the placement
   properties are line numbers. Grid properties apply from the base look only. `node.look("hover")` (also `active`, `focus`, `focusVisible`) is the look the
-  tree lays over the base in that state.
+  tree lays over the base in that state; `node.look("starting")` is what transitions start
+  from when the node first shows. `defineKeyframes(name, { from: {...}, to: {...} })` defines
+  `@keyframes` for `animation` styles.
 - **Events.** `addEventListener(type, listener, options)` with `capture` and `once`. An event
   runs the capture phase from the root down, the target, then bubbles, with
   `stopPropagation`, `stopImmediatePropagation` and `preventDefault`. Listeners run before
@@ -46,6 +48,16 @@ mount(createBox({ width: 400, height: 300 }, button));
   is, as on the web. Events carry the DOM members of their kind (`clientX`, `button`,
   `detail`, `shiftKey`, `key`, `code`, `deltaY`, `inputType`). An `input` event has the new
   `value`.
+- **Rich inputs.** `createRichInput(style)` (or `createNode("richinput")`) edits a document
+  of styled text and inline atoms: `{ text, marks: [{ start, end, marks: ["bold"] }], atoms:
+  [{ kind, label, data }] }`. An atom (a mention, a chip) sits in `text` as one `OBJECT`
+  character, so the caret steps over it and Backspace deletes it whole. `defineMark(name,
+  style)` and `defineAtom(kind, style)` say what they look like; `document` reads and replaces
+  the document; `format(name, on)` and `toggleMark(name)` mark the selection, or the text typed
+  next at a caret; `insertAtom(start, end, atom)` replaces a range with an atom (a `@` trigger
+  turning into a mention). Offsets are string indices. An `input` event also has `document`,
+  and `activeMarks` holds the marks typed text gets. Typing takes the marks before the caret;
+  undo, IME and copy (which writes atom labels) work as in a plain input.
 - **Attributes.** `setAttribute(name, value)` for the tree's attributes (`tabIndex`,
   `disabled`, `label`, `testId`, `placeholder`, `multiline`, `readOnly`, `checked`,
   `selected`, `expanded`, `focusTrap`, `href`, `cursor`, `transition`). A name the tree does
@@ -59,6 +71,15 @@ mount(createBox({ width: 400, height: 300 }, button));
   on). Other roles and ARIA names are ignored with one console warning each.
 - **Links.** A node with an `href` is a link, as an `<a>` is: a click on it or inside it that
   no listener prevented calls `open(href)`, which hands the address to the host.
+- **Markdown.** `parseMarkdown(text, options)` returns the syntax tree of the text in
+  the shape of [mdast](https://github.com/syntax-tree/mdast), the tree remark gives, so
+  renderers written for remark's tree work on it, and an application needs no Markdown
+  parser in its bundle. The parser is the Silk standard library's (`silk.markdown`):
+  CommonMark with GitHub's tables, strikethrough, task lists and autolinks. `gfm: false`
+  turns those four off, each can be set alone (`tables`, `strikethrough`, `taskLists`,
+  `autolinkLiterals`), and `footnotes`, `frontmatter` (a `yaml` or `toml` node) and
+  `alerts` (`> [!NOTE]`, a node of type `alert` with a `kind`) turn on more. Nodes have no
+  `position`.
 - **Errors.** A listener that throws does not stop the dispatch. `setErrorHandler` receives
   the exception. Without a handler the host reports the first one after the input.
 
@@ -89,12 +110,15 @@ createRoot().render(<Counter />);
 ```
 
 - **Props.** `style`, and `hoverStyle`, `activeStyle`, `focusStyle` and `focusVisibleStyle`
-  for the looks of those states. `onClick`, `onPointerDown`, `onKeyDown`, `onInput` and so
+  for the looks of those states. `startingStyle` is what transitions start from when the node
+  first shows (CSS `@starting-style`). `onClick`, `onPointerDown`, `onKeyDown`, `onInput` and so
   on for every event of the tree, with a `Capture` suffix for the capture phase. Listeners
   receive the `@silk/ui` event. Every other prop is a tree attribute (`tabIndex`, `testId`,
   `label`, `disabled`, `placeholder`), and `role` and `aria-*` work as in React DOM.
 - **Inputs.** `value` on `<input>` is controlled as in React DOM: the field shows what the
-  component keeps, whatever was typed.
+  component keeps, whatever was typed. `<richinput>` takes `marks` and `atoms` (name to
+  style), and `document` controlled the same way (`defaultDocument` for an uncontrolled one):
+  keep `event.document` from `onInput`.
 - **Timing.** `root.render` commits before it returns, so the first frame of a window has
   the content. A state change in a click, key or input listener commits before the host
   applies the mutations, so the next frame shows it. Other updates go through React's
@@ -254,6 +278,9 @@ log functions, and the host decides what those mean:
 - `JsHost.tick(seconds, animation)` moves the clock, runs the timers that are due, and with
   `animation` the frame callbacks. `nextDeadline` and `wantsFrame` tell a loop when to wake.
 - `JsHost.takeLogs` hands over the console lines.
+- A promise that is still rejected with no handler once the promise jobs ran becomes a
+  console error, `Uncaught (in promise) …`, as in a browser. A handler added later is too
+  late. A module that fails is reported by `JsHost.module` alone.
 - `JsHost.takeOpened` hands over the addresses `open(url)` asked for (http, https and mailto
   only). The window opens them with `xdg-open` on Linux and `open` on macOS, without waiting
   for it; other systems print that they could not.
@@ -317,7 +344,7 @@ the engine here (it lives in the SilkJS runtime, which ui-js does not link).
   against a stand-in for the native functions, and
   `silk test --manifest-path modules/js/examples/tests/silk.toml --root src/tests.silk` for
   the bundled examples on the engine (build them first).
-- Not here yet: unhandled rejection reports, images and canvas commands from JavaScript,
+- Not here yet: images and canvas commands from JavaScript,
   source maps for errors under the dev server, and choosing engine features beyond Intl and
   Temporal for each build.
 - Memory, release builds on Linux x86-64 under Xvfb with a software GPU, resident after six

@@ -13,6 +13,8 @@ import silk.core.result { Result }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.testing.testing { Testing, AssertionError }
 import silk.text.string { String }
+import silk.io.writer_native { StderrWriter }
+import silk.io.writer { Writer }
 
 fn viewport() -> Viewport {
   return Viewport { width: 400.0, height: 300.0, scale: 1.0 }
@@ -155,6 +157,15 @@ effect fn library(host: &mut JsHost<'_>, tree: &mut Tree<'_>) -> ()
   run host.input(&mut tree, run Input.key("Escape"))
   run host.evaluate(b"if (lastKey !== 'Escape') throw new Error('key was ' + lastKey)", b"test")
 
+  // Transforms from a style object: pointers find a turned box where it shows, and
+  // transitions and linear() easings read from the same text.
+  run host.evaluate(b"const turned = app.createBox({ position: 'absolute', left: 300, top: 200, width: 40, height: 20, transform: 'rotate(90deg)', transformOrigin: '50% 50%', transition: 'transform 1s linear(0, 0.5 25%, 1)' }); turned.addEventListener('click', () => { globalThis.turnedHit = true }); app.root.append(turned); globalThis.turned = turned", b"test")
+  run host.flush(&mut tree)
+  drop run tree.frame(viewport(), 0.5)
+  run click(&mut host, &mut tree, 320.0, 195.0)
+  run host.evaluate(b"if (!turnedHit) throw new Error('the turned box missed its click'); turned.remove()", b"test")
+  run host.flush(&mut tree)
+
   // A listener that throws does not stop the others, and the host reports it afterwards.
   run host.evaluate(b"log.length = 0; app.root.addEventListener('click', () => { throw new Error('boom') }, true)", b"test")
   let failed = run Effect.result(click(&mut host, &mut tree, 10.0, 50.0))
@@ -231,6 +242,15 @@ effect fn globals(host: &mut JsHost<'_>) -> ()
   run Testing.expect(lines[0].level == 1 && String.view(&lines[0].text) == "hello { a: [1, \"x\"] } 2", "console.log formats its values")
   run Testing.expect(lines[1].level == 3 && String.view(&lines[1].text) == "bad", "console.error has the error level")
 
+  // A rejection nothing handles by the end of the promise jobs is a console error; one
+  // that gets a handler in the same turn is not.
+  run host.evaluate(b"Promise.reject(new Error('lost')); const kept = Promise.reject(1); kept.catch(() => {}); (async () => { throw new TypeError('async') })()", b"test")
+  let rejected = host.takeLogs()
+  let reports = rejected.asSlice()
+  run Testing.expect(reports.length == 2, "two rejections went unhandled")
+  run Testing.expect(reports[0].level == 3 && String.view(&reports[0].text) == "Uncaught (in promise) Error: lost", "the report carries the reason")
+  run Testing.expect(String.view(&reports[1].text) == "Uncaught (in promise) TypeError: async", "an async function that throws is reported")
+
   // The development server's lines reach JavaScript, and what it sends and asks comes back.
   run host.evaluate(b"__ui.devMessage = (line) => { __ui.devSend('echo ' + line); Promise.resolve().then(() => __ui.devReload()) }", b"test")
   run Testing.expect(!host.takeReload(), "nothing asked for a reload yet")
@@ -238,6 +258,14 @@ effect fn globals(host: &mut JsHost<'_>) -> ()
   let sent = host.takeOutbox()
   run Testing.expect(sent.length() == 1 && String.view(&sent.asSlice()[0]) == "echo hi", "devSend queued one line for the server")
   run Testing.expect(host.takeReload() && !host.takeReload(), "devReload asked once, from a promise job")
+}
+
+/// `__ui.markdown` gives the tree remark gives for a sample with every construct of GFM.
+effect fn markdown(host: &mut JsHost<'_>) -> ()
+  ! OutOfMemoryError | JsError | platform.PlatformError
+  ? &mut Allocator {
+  let source = run platform.readFile(b"modules/js/tests/fixtures/markdown.js")
+  run host.evaluate(source.asSlice(), b"markdown.js")
 }
 
 effect fn withHost(scenario: u32) -> ()
@@ -259,7 +287,22 @@ effect fn withHost(scenario: u32) -> ()
   } else {
     run Effect.result(errors(&mut host)) |> Effect.provideMut<Allocator>(&mut allocator)
   }
+  let parsed = if scenario == 2 {
+    run Effect.result(markdown(&mut host)) |> Effect.provideMut<Allocator>(&mut allocator)
+  } else {
+    Result<(), OutOfMemoryError | JsError | platform.PlatformError>.Success { value: () }
+  }
   run host.close() |> Effect.provideMut<Allocator>(&mut allocator)
+  match move parsed {
+    Result<(), OutOfMemoryError | JsError | platform.PlatformError>.Success { .. } => ()
+    Result<(), OutOfMemoryError | JsError | platform.PlatformError>.Failure { error } => {
+      match &error { JsError { message } => {
+        let mut writer = StderrWriter.make()
+        drop run Effect.result(Writer.writeString(String.view(&message))) |> Effect.provideMut<Writer>(&mut writer)
+      } _ => () }
+      fail move error
+    }
+  }
   match move ran {
     Result<(), TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>>.Success { .. } => ()
     Result<(), TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>>.Failure { error } => { fail move error }
@@ -282,7 +325,7 @@ test effect fn libraryModuleRunsDomStyleEvents() -> ()
   run withHost(1) |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
-test effect fn timersFramesAndConsoleReachTheHost() -> ()
+test effect fn timersFramesConsoleAndMarkdownReachTheHost() -> ()
   ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run withHost(2) |> Effect.provideMut<Allocator>(&mut allocator)

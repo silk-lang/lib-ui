@@ -35,8 +35,12 @@ import layout.lib { FragmentKind, InvalidNode }
 import silk.collections.list { List }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
+import silk.geometry.point { Point2 }
+import transform
 import silk.geometry.rect { Rect }
 import layers
+import stacking { IN_FLOW }
+import silk.geometry.vector { Vector2 }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.f32
 import silk.num.i32
@@ -104,6 +108,27 @@ fn inside(rect: Rect<f32>, x: f32, y: f32) -> bool {
 
 // Hit testing.
 
+/// (`x`, `y`), in the layout space around fragment `index`, in the fragment's own layout space:
+/// through the inverse of its transform. None where the fragment cannot be hit there: its
+/// transform flattens it, the point maps behind the viewer, or it shows a hidden back face.
+fn intoLocal(tree: &UiTree<'_>, index: usize, x: f32, y: f32) -> Option<Point2<f32>> {
+  let point = Point2<f32> { x: x, y: y }
+  match layers.transformOf(&tree.output, &tree.slotOfCss, &tree.nodes, index) {
+    Option.Some { value } => {
+      if layers.hiddenBack(&tree.output, &tree.slotOfCss, &tree.nodes, index) {
+        return Option<Point2<f32>>.None
+      }
+      return match transform.flatten(value).inverse() {
+        Option.Some { value: inverse } => transform.map(&inverse, x, y)
+        Option.None => Option<Point2<f32>>.None
+      }
+    }
+    Option.None => {
+      return Option<Point2<f32>>.some(point)
+    }
+  }
+}
+
 /// Whether node `slot` can be the target of pointer input.
 fn targetable(tree: &UiTree<'_>, slot: u32) -> bool {
   let c = &tree.node(slot).computed
@@ -112,15 +137,22 @@ fn targetable(tree: &UiTree<'_>, slot: u32) -> bool {
 
 /// The topmost target under (`x`, `y`) in fragment `index` and its descendants, or NONE. The
 /// point is in the fragment's layout coordinates: where it is against the fragment as laid out,
-/// with the scroll and sticky offsets above already taken off. Fragments paint in tree order,
-/// so later siblings and children are on top.
-fn hitFragment(tree: &UiTree<'_>, index: usize, x: f32, y: f32, pruned: bool) -> u32 {
-  if pruned && !inside(tree.fragmentInk.get(index), x, y) {
+/// with the scroll and sticky offsets above already taken off. The walk is paint order
+/// reversed (see `stacking`): what paints last is on top.
+fn hitFragment(tree: &UiTree<'_>, index: usize, px: f32, py: f32, pruned: bool) -> u32 {
+  if pruned && !inside(tree.fragmentInk.get(index), px, py) {
     return NONE
   }
+  let local = intoLocal(tree, index, px, py)
+  if local.isNone() {
+    return NONE
+  }
+  let point = local.unwrapOr(Point2<f32> { x: 0.0, y: 0.0 })
+  let x = point.x
+  let y = point.y
   let f = tree.output.fragments.values.asSlice()[index]
   if f.positioningShell || f.kind == FragmentKind.Line {
-    return hitChildren(tree, index, x, y, pruned)
+    return hitInside(tree, index, x, y, pruned)
   }
   if f.kind == FragmentKind.Text {
     if !inside(borderBox(&f), x, y) {
@@ -136,11 +168,11 @@ fn hitFragment(tree: &UiTree<'_>, index: usize, x: f32, y: f32, pruned: bool) ->
   }
   let slot = slotIn(&tree.slotOfCss, f.source)
   if slot == NONE {
-    return hitChildren(tree, index, x, y, pruned)
+    return hitInside(tree, index, x, y, pruned)
   }
   let clips = f.kind == FragmentKind.Box && tree.node(slot).computed.clips()
   if !clips || inside(overflowClip(&tree.node(slot).computed, &f), x, y) {
-    let below = hitChildren(tree, index, x, y, pruned)
+    let below = hitInside(tree, index, x, y, pruned)
     if below != NONE {
       return below
     }
@@ -151,22 +183,121 @@ fn hitFragment(tree: &UiTree<'_>, index: usize, x: f32, y: f32, pruned: bool) ->
   return NONE
 }
 
-fn hitChildren(tree: &UiTree<'_>, index: usize, x: f32, y: f32, pruned: bool) -> u32 {
-  let values = tree.output.fragments.values.asSlice()
-  let mut child = values[index].lastChild
-  while child != NO_INDEX {
-    let own = layers.ownShift(
-      &tree.output,
-      &tree.slotOfCss,
-      &tree.layout,
-      &tree.nodes,
-      child,
-      tree.input.width,
-      tree.input.height,
-    )
-    let found = hitFragment(tree, child, x - own.x, y - own.y, pruned)
+/// Whether the stacking flags describe the last layout.
+fn layered(tree: &UiTree<'_>) -> bool {
+  return tree.fragmentStacking.covers(tree.output.fragments.values.length())
+}
+
+fn ownShiftOf(tree: &UiTree<'_>, index: usize) -> Vector2<f32> {
+  return layers.ownShift(
+    &tree.output,
+    &tree.slotOfCss,
+    &tree.layout,
+    &tree.nodes,
+    index,
+    tree.input.width,
+    tree.input.height,
+  )
+}
+
+/// What is inside fragment `index`, topmost first: a stacking context's lists in reverse paint
+/// order, else its children. A root element's box is hit where it sits in flow, as the body's
+/// is in a browser, though its background paints first (see `stacking.ROOT`).
+fn hitInside(tree: &UiTree<'_>, index: usize, x: f32, y: f32, pruned: bool) -> u32 {
+  if !layered(tree) || !tree.fragmentStacking.stacks(index) {
+    return hitChildren(tree, index, x, y, pruned)
+  }
+  let steps = tree.fragmentStacking.steps(index)
+  let mut k: usize = 0
+  while k < steps {
+    let step = tree.fragmentStacking.step(index, k, true)
+    k = k + 1
+    let found = if step == IN_FLOW {
+      hitChildren(tree, index, x, y, pruned)
+    } else {
+      hitHoisted(tree, index, step, x, y, pruned)
+    }
     if found != NONE {
       return found
+    }
+  }
+  return NONE
+}
+
+/// Whether box fragment `at` clips what is below it.
+fn clipsAt(tree: &UiTree<'_>, at: usize) -> bool {
+  let f = &tree.output.fragments.values.asSlice()[at]
+  if f.kind != FragmentKind.Box || f.positioningShell {
+    return false
+  }
+  let slot = slotIn(&tree.slotOfCss, f.source)
+  return slot != NONE && tree.node(slot).kind != NodeKind.Text && tree.node(slot).computed.clips()
+}
+
+/// How far the boxes between stacking context `root` and its entry `entry` move it.
+fn shiftBetween(tree: &UiTree<'_>, root: usize, entry: usize) -> Vector2<f32> {
+  let values = tree.output.fragments.values.asSlice()
+  let mut total = Vector2<f32> { x: 0.0, y: 0.0 }
+  let mut at = values[entry].parent
+  while at != root && at != NO_INDEX {
+    let own = ownShiftOf(tree, at)
+    total = Vector2<f32> { x: total.x + own.x, y: total.y + own.y }
+    at = values[at].parent
+  }
+  return total
+}
+
+/// Whether (`x`, `y`) in `root`'s coordinates is inside the clips between stacking context
+/// `root` and its entry `entry`. `total` is [`shiftBetween`].
+fn insideBetween(
+  tree: &UiTree<'_>,
+  root: usize,
+  entry: usize,
+  x: f32,
+  y: f32,
+  total: Vector2<f32>,
+) -> bool {
+  let values = tree.output.fragments.values.asSlice()
+  // The shift of the boxes below the one at hand: the point there is `total` less that.
+  let mut below = Vector2<f32> { x: 0.0, y: 0.0 }
+  let mut at = values[entry].parent
+  while at != root && at != NO_INDEX {
+    let own = ownShiftOf(tree, at)
+    if clipsAt(tree, at) {
+      let f = values[at]
+      let slot = slotIn(&tree.slotOfCss, f.source)
+      let clip = overflowClip(&tree.node(slot).computed, &f)
+      if !inside(clip, x - (total.x - below.x), y - (total.y - below.y)) {
+        return false
+      }
+    }
+    below = Vector2<f32> { x: below.x + own.x, y: below.y + own.y }
+    at = values[at].parent
+  }
+  return true
+}
+
+/// Hit tests `entry` of stacking context `root`'s lists, where it sits in the tree.
+fn hitHoisted(tree: &UiTree<'_>, root: usize, entry: usize, x: f32, y: f32, pruned: bool) -> u32 {
+  let total = shiftBetween(tree, root, entry)
+  if !insideBetween(tree, root, entry, x, y, total) {
+    return NONE
+  }
+  let own = ownShiftOf(tree, entry)
+  return hitFragment(tree, entry, x - total.x - own.x, y - total.y - own.y, pruned)
+}
+
+fn hitChildren(tree: &UiTree<'_>, index: usize, x: f32, y: f32, pruned: bool) -> u32 {
+  let values = tree.output.fragments.values.asSlice()
+  let skips = layered(tree)
+  let mut child = values[index].lastChild
+  while child != NO_INDEX {
+    if !skips || !tree.fragmentStacking.hoisted(child) {
+      let own = ownShiftOf(tree, child)
+      let found = hitFragment(tree, child, x - own.x, y - own.y, pruned)
+      if found != NONE {
+        return found
+      }
     }
     child = values[child].previousSibling
   }
@@ -179,7 +310,7 @@ pub fn hitSlot(tree: &UiTree<'_>, x: f32, y: f32) -> u32 {
   let mut index = values.length
   while index > 0 {
     index = index - 1
-    if values[index].parent == NO_INDEX {
+    if values[index].parent == NO_INDEX && !(layered(tree) && tree.fragmentStacking.hoisted(index)) {
       let own = layers.ownShift(
         &tree.output,
         &tree.slotOfCss,
@@ -209,7 +340,7 @@ pub effect fn hitSlots(tree: &UiTree<'_>, x: f32, y: f32, out: &mut List<u32>) -
   let mut index = values.length
   while index > 0 {
     index = index - 1
-    if values[index].parent == NO_INDEX {
+    if values[index].parent == NO_INDEX && !(layered(tree) && tree.fragmentStacking.hoisted(index)) {
       let own = layers.ownShift(
         &tree.output,
         &tree.slotOfCss,
@@ -240,16 +371,23 @@ effect fn appendHit(out: &mut List<u32>, slot: u32) -> ()
 effect fn hitsFragment(
   tree: &UiTree<'_>,
   index: usize,
-  x: f32,
-  y: f32,
+  px: f32,
+  py: f32,
   pruned: bool,
   out: &mut List<u32>,
 ) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
-  if pruned && !inside(tree.fragmentInk.get(index), x, y) {
+  if pruned && !inside(tree.fragmentInk.get(index), px, py) {
     return ()
   }
+  let local = intoLocal(tree, index, px, py)
+  if local.isNone() {
+    return ()
+  }
+  let point = local.unwrapOr(Point2<f32> { x: 0.0, y: 0.0 })
+  let x = point.x
+  let y = point.y
   let values = tree.output.fragments.values.asSlice()
   let fragment = values[index]
   if fragment.kind == FragmentKind.Text {
@@ -267,23 +405,63 @@ effect fn hitsFragment(
   }
   let clips = slot != NONE && fragment.kind == FragmentKind.Box && tree.node(slot).computed.clips()
   if !clips || inside(overflowClip(&tree.node(slot).computed, &fragment), x, y) {
-    let mut child = fragment.lastChild
-    while child != NO_INDEX {
-      let own = layers.ownShift(
-        &tree.output,
-        &tree.slotOfCss,
-        &tree.layout,
-        &tree.nodes,
-        child,
-        tree.input.width,
-        tree.input.height,
-      )
-      run hitsFragment(tree, child, x - own.x, y - own.y, pruned, &mut out.*)
-      child = values[child].previousSibling
-    }
+    run hitsInside(tree, index, x, y, pruned, &mut out.*)
   }
   if slot != NONE && targetable(tree, slot) && inside(borderBox(&fragment), x, y) {
     run appendHit(&mut out.*, slot)
+  }
+}
+
+effect fn hitsInside(
+  tree: &UiTree<'_>,
+  index: usize,
+  x: f32,
+  y: f32,
+  pruned: bool,
+  out: &mut List<u32>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !layered(tree) || !tree.fragmentStacking.stacks(index) {
+    run hitsChildren(tree, index, x, y, pruned, &mut out.*)
+    return ()
+  }
+  let steps = tree.fragmentStacking.steps(index)
+  let mut k: usize = 0
+  while k < steps {
+    let step = tree.fragmentStacking.step(index, k, true)
+    k = k + 1
+    if step == IN_FLOW {
+      run hitsChildren(tree, index, x, y, pruned, &mut out.*)
+    } else {
+      let total = shiftBetween(tree, index, step)
+      if insideBetween(tree, index, step, x, y, total) {
+        let own = ownShiftOf(tree, step)
+        run hitsFragment(tree, step, x - total.x - own.x, y - total.y - own.y, pruned, &mut out.*)
+      }
+    }
+  }
+}
+
+effect fn hitsChildren(
+  tree: &UiTree<'_>,
+  index: usize,
+  x: f32,
+  y: f32,
+  pruned: bool,
+  out: &mut List<u32>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let values = tree.output.fragments.values.asSlice()
+  let skips = layered(tree)
+  let mut child = values[index].lastChild
+  while child != NO_INDEX {
+    if !skips || !tree.fragmentStacking.hoisted(child) {
+      let own = ownShiftOf(tree, child)
+      run hitsFragment(tree, child, x - own.x, y - own.y, pruned, &mut out.*)
+    }
+    child = values[child].previousSibling
   }
 }
 

@@ -1,0 +1,666 @@
+//! Rich inputs: marks and atoms over an input's value, and the styled runs css-layout lays out
+//! for them.
+//!
+//! The value is the input's text with each atom as one `OBJECT` character. Marks are spans of
+//! value bytes. A rich input's display text is not one css-layout text node but runs under the
+//! input's box: an inline span with a text node for each stretch of one set of marks, and an
+//! inline block with the label for each atom. The runs have no slot: they take their look from
+//! the input's computed style with the mark or atom declarations laid over it, kept on the run
+//! for paint. Every offset is still a display offset, so the caret code reads them as pieces
+//! of one text.
+pub import ui_protocol.rich { MarkSpan, Atom, OBJECT }
+import engine { UiTree, applyAll }
+import timing { EasingStops }
+import style { Computed }
+import mutation { Declaration }
+import node { NO_INDEX }
+import layout.lib { NodeId, Style as CssStyle }
+import properties.computed { Display as CssDisplay, DisplayOutside, DisplayInside }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.text.string { String }
+
+/// The declarations of one mark or atom kind of an input.
+pub struct Styled {
+  pub key: u32,
+  pub declarations: List<Declaration>,
+}
+
+/// One run css-layout lays out for a rich input: display bytes [`start`, `end`).
+pub struct Run {
+  /// The span (or the atom's inline block) and its text node (the atom's label).
+  pub css: usize,
+  pub text: usize,
+  pub start: usize,
+  pub end: usize,
+  pub atom: bool,
+  /// The marks of a text run, the kind of an atom.
+  pub key: u32,
+  /// Whether the text ends with the filler that holds an empty last line.
+  pub filler: bool,
+  pub computed: Computed,
+}
+
+impl Copy for Run {}
+
+fn minimum(a: usize, b: usize) -> usize {
+  if a < b {
+    return a
+  }
+  return b
+}
+
+fn maximum(a: usize, b: usize) -> usize {
+  if a > b {
+    return a
+  }
+  return b
+}
+
+/// Whether an object character starts at byte `at` of `text`.
+pub fn objectAt(text: string, at: usize) -> bool {
+  let bytes = String.utf8Bytes(text)
+  return at + 3 <= bytes.length && bytes[at] == 239 && bytes[at + 1] == 191 && bytes[at + 2] == 188
+}
+
+/// The object characters in bytes [`from`, `to`) of `text`.
+pub fn objectsIn(text: string, from: usize, to: usize) -> usize {
+  let mut count: usize = 0
+  let mut at = from
+  while at < to {
+    if objectAt(text, at) {
+      count = count + 1
+      at = at + 3
+    } else {
+      at = at + 1
+    }
+  }
+  return count
+}
+
+/// `text` without object characters, for typed and pasted text: atoms come only from
+/// `InsertAtom` and `SetRichText`.
+pub effect fn withoutObjects(text: string) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = String.make()
+  let length = String.byteLength(text)
+  let mut start: usize = 0
+  let mut at: usize = 0
+  while at < length {
+    if objectAt(text, at) {
+      run out.append(String.slice(text, start, at - start))
+      at = at + 3
+      start = at
+    } else {
+      at = at + 1
+    }
+  }
+  run out.append(String.slice(text, start, length - start))
+  return move out
+}
+
+// Marks.
+
+/// The marks of value byte `at`.
+pub fn marksAt(spans: &List<MarkSpan>, at: usize) -> u32 {
+  let list = spans.asSlice()
+  let mut i: usize = 0
+  while i < list.length {
+    if list[i].start <= at && at < list[i].end {
+      return list[i].marks
+    }
+    if list[i].start > at {
+      return 0
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+/// The marks text typed at `at` takes: those of the character before it, or at the start of
+/// a line, those of the character after it, as editors do.
+pub fn marksBefore(spans: &List<MarkSpan>, value: string, at: usize) -> u32 {
+  let bytes = String.utf8Bytes(value)
+  if at > 0 && at <= bytes.length && bytes[at - 1] != 10 {
+    return marksAt(spans, at - 1)
+  }
+  if at < bytes.length && bytes[at] != 10 {
+    return marksAt(spans, at)
+  }
+  return 0
+}
+
+effect fn push(out: &mut List<MarkSpan>, start: usize, end: usize, marks: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if start >= end || marks == 0 {
+    return ()
+  }
+  let length = out.length()
+  if length != 0 {
+    let last = out.get(length - 1)
+    if last.end == start && last.marks == marks {
+      out.set(length - 1, MarkSpan { start: last.start, end: end, marks: marks })
+      return ()
+    }
+  }
+  run out.append(MarkSpan { start: start, end: end, marks: marks })
+}
+
+/// The spans after value bytes [`lo`, `hi`) are replaced by `inserted` bytes with `marks`.
+pub effect fn spliceMarks(
+  spans: &List<MarkSpan>,
+  lo: usize,
+  hi: usize,
+  inserted: usize,
+  marks: u32,
+) -> List<MarkSpan>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let list = spans.asSlice()
+  let mut out = List<MarkSpan>.make()
+  let mut i: usize = 0
+  while i < list.length {
+    if list[i].start < lo {
+      run push(&mut out, list[i].start, minimum(list[i].end, lo), list[i].marks)
+    }
+    i = i + 1
+  }
+  run push(&mut out, lo, lo + inserted, marks)
+  i = 0
+  while i < list.length {
+    if list[i].end > hi {
+      let start = maximum(list[i].start, hi) - hi + lo + inserted
+      run push(&mut out, start, list[i].end - hi + lo + inserted, list[i].marks)
+    }
+    i = i + 1
+  }
+  return move out
+}
+
+/// The spans with mark bit `bit` turned on or off over value bytes [`lo`, `hi`).
+pub effect fn formatMarks(spans: &List<MarkSpan>, lo: usize, hi: usize, bit: u32, on: bool) -> List<MarkSpan>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let list = spans.asSlice()
+  let mut out = List<MarkSpan>.make()
+  let mut i: usize = 0
+  while i < list.length {
+    if list[i].start < lo {
+      run push(&mut out, list[i].start, minimum(list[i].end, lo), list[i].marks)
+    }
+    i = i + 1
+  }
+  let mut at = lo
+  i = 0
+  while i < list.length {
+    if list[i].end > lo && list[i].start < hi {
+      let start = maximum(list[i].start, lo)
+      let end = minimum(list[i].end, hi)
+      if at < start {
+        run push(&mut out, at, start, toggled(0, bit, on))
+      }
+      run push(&mut out, start, end, toggled(list[i].marks, bit, on))
+      at = end
+    }
+    i = i + 1
+  }
+  if at < hi {
+    run push(&mut out, at, hi, toggled(0, bit, on))
+  }
+  i = 0
+  while i < list.length {
+    if list[i].end > hi {
+      run push(&mut out, maximum(list[i].start, hi), list[i].end, list[i].marks)
+    }
+    i = i + 1
+  }
+  return move out
+}
+
+fn toggled(marks: u32, bit: u32, on: bool) -> u32 {
+  if on {
+    return u32.bitOr(marks, bit)
+  }
+  return u32.bitAnd(marks, u32.bitNot(bit))
+}
+
+/// Whether every byte of [`lo`, `hi`) carries mark bit `bit`.
+pub fn allMarked(spans: &List<MarkSpan>, lo: usize, hi: usize, bit: u32) -> bool {
+  let list = spans.asSlice()
+  let mut at = lo
+  let mut i: usize = 0
+  while at < hi {
+    while i < list.length && list[i].end <= at {
+      i = i + 1
+    }
+    if i >= list.length || list[i].start > at || u32.bitAnd(list[i].marks, bit) == 0 {
+      return false
+    }
+    at = list[i].end
+  }
+  return true
+}
+
+/// Client spans made fit for `value`: sorted, clamped, without overlaps or empty marks.
+pub effect fn cleanMarks(spans: List<MarkSpan>, value: string) -> List<MarkSpan>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut sorted = move spans
+  let items = sorted.asMutSlice()
+  let mut i: usize = 1
+  while i < items.length {
+    let mut j = i
+    while j > 0 && items[j - 1].start > items[j].start {
+      let swap = items[j - 1]
+      items[j - 1] = items[j]
+      items[j] = swap
+      j = j - 1
+    }
+    i = i + 1
+  }
+  let length = String.byteLength(value)
+  let mut out = List<MarkSpan>.make()
+  let mut floor: usize = 0
+  i = 0
+  while i < items.length {
+    let start = maximum(minimum(items[i].start, length), floor)
+    let end = minimum(items[i].end, length)
+    if start < end {
+      run push(&mut out, start, end, items[i].marks)
+      floor = end
+    }
+    i = i + 1
+  }
+  return move out
+}
+
+// Atoms.
+
+/// The atoms after value bytes [`lo`, `hi`) of `value` are replaced by text with `atom` (or
+/// no atom) at its start.
+pub effect fn spliceAtoms(atoms: &mut List<Atom>, value: string, lo: usize, hi: usize, atom: Option<Atom>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let first = objectsIn(value, 0, lo)
+  let mut gone = objectsIn(value, lo, hi)
+  while gone > 0 && first < atoms.length() {
+    drop atoms.remove(first)
+    gone = gone - 1
+  }
+  match move atom {
+    Option<Atom>.Some { value: added } => {
+      let at = minimum(first, atoms.length())
+      run atoms.insert(at, move added)
+    }
+    Option<Atom>.None => ()
+  }
+}
+
+/// `atoms` made one per object character of `value`.
+pub effect fn fitAtoms(atoms: &mut List<Atom>, value: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let count = objectsIn(value, 0, String.byteLength(value))
+  while atoms.length() > count {
+    drop atoms.pop()
+  }
+  while atoms.length() < count {
+    run atoms.append(Atom { kind: 0, label: String.make(), data: String.make() })
+  }
+}
+
+pub effect fn copyAtoms(atoms: &List<Atom>) -> List<Atom>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = List<Atom>.make()
+  let list = atoms.asSlice()
+  let mut i: usize = 0
+  while i < list.length {
+    run out.append(run list[i].copy())
+    i = i + 1
+  }
+  return move out
+}
+
+pub effect fn copySpans(spans: &List<MarkSpan>) -> List<MarkSpan>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = List<MarkSpan>.make()
+  run out.appendSlice(spans.asSlice())
+  return move out
+}
+
+pub fn sameSpans(a: &List<MarkSpan>, b: &List<MarkSpan>) -> bool {
+  let x = a.asSlice()
+  let y = b.asSlice()
+  if x.length != y.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < x.length {
+    if x[i].start != y[i].start || x[i].end != y[i].end || x[i].marks != y[i].marks {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+pub fn sameAtoms(a: &List<Atom>, b: &List<Atom>) -> bool {
+  let x = a.asSlice()
+  let y = b.asSlice()
+  if x.length != y.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < x.length {
+    if x[i].kind != y[i].kind || String.view(&x[i].label) != String.view(&y[i].label)
+      || String.view(&x[i].data) != String.view(&y[i].data) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+/// Sets the declarations of `key` in `list`.
+pub effect fn define(list: &mut List<Styled>, key: u32, declarations: List<Declaration>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let items = list.asMutSlice()
+  let mut i: usize = 0
+  while i < items.length {
+    if items[i].key == key {
+      items[i].declarations = move declarations
+      return ()
+    }
+    i = i + 1
+  }
+  run list.append(Styled { key: key, declarations: move declarations })
+}
+
+// Runs.
+
+/// A stretch of display text one run lays out.
+struct Segment {
+  start: usize,
+  end: usize,
+  atom: bool,
+  key: u32,
+}
+
+impl Copy for Segment {}
+
+effect fn ignoreAny<E>(error: E) -> () {
+  drop error
+}
+
+effect fn addCut(cuts: &mut List<usize>, at: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run cuts.append(at)
+}
+
+/// The segments of input `slot`'s display text.
+effect fn segments(tree: &UiTree<'_>, slot: u32, out: &mut List<Segment>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let node = tree.node(slot)
+  let e = node.edit()
+  let display = String.view(&e.display)
+  let value = String.view(&node.text)
+  let length = String.byteLength(display)
+  let preeditLength = if e.composing {
+    String.byteLength(String.view(&e.preedit))
+  } else {
+    0
+  }
+  let preeditStart = e.preeditAt
+  let preeditEnd = e.preeditAt + preeditLength
+  let mut cuts = List<usize>.make()
+  run cuts.append(0)
+  run cuts.append(length)
+  let spans = e.marks.asSlice()
+  let mut i: usize = 0
+  while i < spans.length {
+    run cuts.append(minimum(e.toDisplay(spans[i].start), length))
+    run cuts.append(minimum(e.toDisplay(spans[i].end), length))
+    i = i + 1
+  }
+  if preeditLength != 0 {
+    run cuts.append(preeditStart)
+    run cuts.append(preeditEnd)
+  }
+  let mut at: usize = 0
+  while at < String.byteLength(value) {
+    if objectAt(value, at) {
+      run cuts.append(e.toDisplay(at))
+      run cuts.append(e.toDisplay(at) + 3)
+      at = at + 3
+    } else {
+      at = at + 1
+    }
+  }
+
+  // Sorted, without repeats.
+  let items = cuts.asMutSlice()
+  let mut a: usize = 1
+  while a < items.length {
+    let mut b = a
+    while b > 0 && items[b - 1] > items[b] {
+      let swap = items[b - 1]
+      items[b - 1] = items[b]
+      items[b] = swap
+      b = b - 1
+    }
+    a = a + 1
+  }
+  let typed = e.activeMarks(value)
+  let mut atomIndex: u32 = 0
+  let mut k: usize = 0
+  while k + 1 < items.length {
+    let start = items[k]
+    let end = items[k + 1]
+    k = k + 1
+    if start >= end {
+      continue
+    }
+    let inPreedit = preeditLength != 0 && start >= preeditStart && end <= preeditEnd
+    if !inPreedit && end - start == 3 && objectAt(display, start) {
+      run out.append(Segment { start: start, end: end, atom: true, key: atomIndex })
+      atomIndex = atomIndex + 1
+      continue
+    }
+    let marks = if inPreedit {
+      typed
+    } else {
+      marksAt(&e.marks, e.toValue(start, String.byteLength(value)))
+    }
+    run out.append(Segment { start: start, end: end, atom: false, key: marks })
+  }
+}
+
+/// Destroys the runs of input `slot` in css-layout.
+pub effect fn dropRuns(tree: &mut UiTree<'_>, slot: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut runs = run tree.nodes.asMutSlice()[u32.toUsize(slot)].editMut().runs.splitOff(0)
+  let list = runs.asSlice()
+  let mut i: usize = 0
+  while i < list.length {
+    let id = NodeId { index: list[i].css }
+    if tree.layout.contains(id) {
+      run Effect.catchAll(tree.layout.destroy(id), ignoreAny)
+    }
+    i = i + 1
+  }
+  runs.clear()
+}
+
+/// Lays the display text of rich input `slot` out as runs, reusing the runs it has where the
+/// segment is of the same kind, and restyles the input when a run's look may have changed.
+pub effect fn syncRuns(tree: &mut UiTree<'_>, slot: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut parts = List<Segment>.make()
+  run segments(&tree.*, slot, &mut parts)
+  let parent = NodeId { index: tree.node(slot).css }
+  let filler = tree.node(slot).edit().filler
+  let displayLength = String.byteLength(String.view(&tree.node(slot).edit().display))
+  let mut old = run tree.nodes.asMutSlice()[u32.toUsize(slot)].editMut().runs.splitOff(0)
+  let mut runs = List<Run>.make()
+  let mut restyle = false
+  let segs = parts.asSlice()
+  let mut i: usize = 0
+  while i < segs.length {
+    let seg = segs[i]
+    let label = if seg.atom {
+      let atoms = tree.node(slot).edit().atoms.asSlice()
+      if u32.toUsize(seg.key) < atoms.length {
+        run String.copy(String.view(&atoms[u32.toUsize(seg.key)].label))
+      } else {
+        String.make()
+      }
+    } else {
+      run String.copy(String.slice(String.view(&tree.node(slot).edit().display), seg.start, seg.end - seg.start))
+    }
+    let key = if seg.atom {
+      let atoms = tree.node(slot).edit().atoms.asSlice()
+      if u32.toUsize(seg.key) < atoms.length {
+        atoms[u32.toUsize(seg.key)].kind
+      } else {
+        0
+      }
+    } else {
+      seg.key
+    }
+    let mut made = Run {
+      css: NO_INDEX,
+      text: NO_INDEX,
+      start: seg.start,
+      end: seg.end,
+      atom: seg.atom,
+      key: key,
+      filler: filler && !seg.atom && seg.end == displayLength,
+      computed: tree.node(slot).computed,
+    }
+    if i < old.length() && old.get(i).atom == seg.atom && tree.layout.contains(NodeId { index: old.get(i).css }) {
+      let previous = old.get(i)
+      made.css = previous.css
+      made.text = previous.text
+      made.computed = previous.computed
+      if previous.key != key {
+        restyle = true
+      }
+      run Effect.catchAll(tree.layout.setText(NodeId { index: previous.text }, move label), ignoreAny)
+    } else {
+      let span = run tree.layout.create(CssStyle.make())
+      let text = run tree.layout.createText(move label)
+      run Effect.catchAll(tree.layout.insertBefore(span, text, Option<NodeId>.None), ignoreAny)
+      run Effect.catchAll(tree.layout.insertBefore(parent, span, Option<NodeId>.None), ignoreAny)
+      run tree.forgetCss(span.index)
+      run tree.forgetCss(text.index)
+      made.css = span.index
+      made.text = text.index
+      restyle = true
+    }
+    run runs.append(made)
+    i = i + 1
+  }
+
+  // Runs past the segments go.
+  let extra = old.asSlice()
+  let mut j = segs.length
+  while j < extra.length {
+    let id = NodeId { index: extra[j].css }
+    if tree.layout.contains(id) {
+      run Effect.catchAll(tree.layout.destroy(id), ignoreAny)
+    }
+    j = j + 1
+  }
+  old.clear()
+  let node = &mut tree.nodes.asMutSlice()[u32.toUsize(slot)]
+  let edited = node.editMut()
+  edited.runs = move runs
+  if restyle {
+    run styleRuns(&mut tree, slot)
+  }
+}
+
+fn inline(outside: DisplayOutside, inside: DisplayInside) -> CssDisplay {
+  return CssDisplay.Box { outside: outside, inside: inside }
+}
+
+/// Resolves the look of every run of rich input `slot` from the input's computed style and
+/// hands it to css-layout. Runs after the input's own style is resolved.
+pub effect fn styleRuns(tree: &mut UiTree<'_>, slot: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let count = tree.node(slot).edit().runs.length()
+  let base = tree.node(slot).computed.text
+  let mut i: usize = 0
+  while i < count {
+    let r = tree.node(slot).edit().runs.get(i)
+    let mut computed = Computed.inheriting(base)
+    let mut stops = EasingStops.make()
+    computed.layout.display = if r.atom {
+      inline(DisplayOutside.Inline, DisplayInside.FlowRoot)
+    } else {
+      inline(DisplayOutside.Inline, DisplayInside.Flow)
+    }
+    if r.atom {
+      let styles = tree.node(slot).edit().atomStyles.asSlice()
+      let mut s: usize = 0
+      while s < styles.length {
+        if styles[s].key == r.key {
+          run applyAll(&mut computed, &styles[s].declarations, &mut stops)
+        }
+        s = s + 1
+      }
+    } else {
+      let styles = tree.node(slot).edit().markStyles.asSlice()
+      let mut bit: u32 = 0
+      while bit < 32 {
+        if u32.bitAnd(r.key, u32.shiftLeft(1, bit)) != 0 {
+          let mut s: usize = 0
+          while s < styles.length {
+            if styles[s].key == bit {
+              run applyAll(&mut computed, &styles[s].declarations, &mut stops)
+            }
+            s = s + 1
+          }
+        }
+        bit = bit + 1
+      }
+    }
+    let fontKey = run tree.fontKeyOf(computed.text)
+    computed.finish(fontKey)
+    run Effect.catchAll(tree.layout.setStyle(NodeId { index: r.css }, computed.layout), ignoreAny)
+    let runs = tree.nodes.asMutSlice()[u32.toUsize(slot)].editMut().runs.asMutSlice()
+    runs[i].computed = computed
+    i = i + 1
+  }
+  let node = &mut tree.nodes.asMutSlice()[u32.toUsize(slot)]
+  node.content = node.content + 1
+  tree.paintDirty = true
+}
+
+/// The run of a rich input whose span, inline block or text node is css-layout node `css`, or
+/// `NO_INDEX`.
+pub fn runOf(runs: &List<Run>, css: usize) -> usize {
+  let list = runs.asSlice()
+  let mut i: usize = 0
+  while i < list.length {
+    if list[i].css == css || list[i].text == css {
+      return i
+    }
+    i = i + 1
+  }
+  return NO_INDEX
+}

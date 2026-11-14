@@ -13,9 +13,15 @@ export function installMock() {
     "create", "append", "insertBefore", "root", "setText", "listen", "style", "clearStyle",
     "attribute", "focus", "remove", "destroy", "scrollTo", "select", "fontFamily", "open",
     "defineIcon", "source", "release",
+    "keyframe", "keyframes",
+    "richText", "mark", "atomStyle", "format", "insertAtom",
   ]) {
     native[name] = record(name);
   }
+  native.markdown = (text, flags) => {
+    calls.push(["markdown", text, flags]);
+    return '{"type":"root","children":[]}';
+  };
   globalThis.__ui = native;
   return {
     calls,
