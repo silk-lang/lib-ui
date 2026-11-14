@@ -1,5 +1,7 @@
 //! Accessibility attributes in the document backend's markup, by their ARIA names.
 import ui_app_dom.html { Html }
+import ui_app.lib { Document, drain, NoCommand, Node, NoOutput, Program, Update }
+import ui_app.program as program
 import ui_app.backend { Backend, TreeError }
 import ui_protocol.mutation { Mutation, Attribute, NodeKind, Role, TriState, Live, FIRST_ROOT }
 import ui_protocol.options { RootOptions }
@@ -65,4 +67,65 @@ effect fn markupBody() -> ()
   let after = Bytes.asSlice(&cleared)
   run Testing.expect(!has(after, "aria-level") && !has(after, "aria-live"), "defaults leave the attribute out")
   run Testing.expect(has(after, "aria-checked=\"true\""), "checked again without indeterminate")
+}
+
+struct Toggle {
+  on: bool,
+}
+
+union Flip {
+  Flip,
+}
+
+type FlipNext = Update<Toggle, NoCommand, NoOutput>
+
+impl Program<Flip, NoCommand> for Toggle {
+  effect fn init() -> FlipNext ! OutOfMemoryError ? &mut Allocator {
+    return FlipNext.of(Toggle { on: false })
+  }
+
+  effect fn update(mut model: Toggle, message: Flip) -> FlipNext ! OutOfMemoryError ? &mut Allocator {
+    match move message {
+      Flip.Flip => { model.on = !model.on }
+    }
+    return FlipNext.of(move model)
+  }
+
+  fn view(model: &Toggle, h: &Document<Flip>) -> Node {
+    return h.column(
+      &[
+        h.accessRole(Role.Button),
+        h.pressed(if model.on { TriState.True } else { TriState.False }),
+        h.level(if model.on { 3 } else { 0 }),
+        h.live(Live.Polite),
+        h.description(if model.on { "On now" } else { "" }),
+      ],
+      &[h.text("Bold")],
+    )
+  }
+}
+
+effect fn builderBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut page = Html.make()
+  let mut app = run program.make<Toggle, Flip, NoCommand>()
+  run app.start(&mut page, 0.0)
+  run drain(&mut app, &mut page)
+  let first = run page.markup()
+  let before = Bytes.asSlice(&first)
+  run Testing.expect(has(before, "aria-pressed=\"false\"") && has(before, "aria-live=\"polite\""), "builders reach the backend")
+  run Testing.expect(!has(before, "aria-level") && !has(before, "aria-description"), "defaults set nothing")
+  app.send(Flip.Flip)
+  run drain(&mut app, &mut page)
+  let second = run page.markup()
+  let after = Bytes.asSlice(&second)
+  run Testing.expect(has(after, "aria-pressed=\"true\"") && has(after, "aria-level=\"3\""), "changes are diffed")
+  run Testing.expect(has(after, "aria-description=\"On now\""), "text attributes too")
+}
+
+test effect fn documentBuildersSetAriaAttributes() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run builderBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }
