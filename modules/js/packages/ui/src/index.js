@@ -10,14 +10,16 @@ const native = globalThis.__ui;
 if (!native) throw new Error("@silk/ui needs the __ui functions of a ui-js host");
 
 const KINDS = { box: 0, text: 1, input: 2, image: 3, icon: 4, canvas: 5 };
-const STATES = { base: 0, hover: 1, active: 2, focus: 3, focusVisible: 4 };
+const STATES = { base: 0, hover: 1, active: 2, focus: 3, focusVisible: 4, starting: 5 };
 
 // Event types in the order of the tree's LISTEN_* flags: the index is the kind number the
 // host dispatches and the bit a node listens with.
 const TYPES = [
   "pointerdown", "pointerup", "click", "pointermove", "pointerenter", "pointerleave", "wheel",
   "keydown", "keyup", "focus", "blur", "input", "scroll", "layout", "pointercancel",
-  "gotpointercapture", "lostpointercapture", "load", "error",
+  "gotpointercapture", "lostpointercapture", "load", "error", "transitionrun", "transitionstart",
+  "transitionend", "transitioncancel", "animationstart", "animationiteration", "animationend",
+  "animationcancel",
 ];
 const KIND_OF = new Map(TYPES.map((type, kind) => [type, kind]));
 const CLICK = KIND_OF.get("click");
@@ -29,8 +31,8 @@ const CANCELABLE = new Set(["pointerdown", "pointerup", "click", "wheel", "keydo
 // Properties whose numbers are not lengths. Every other number is CSS pixels.
 const UNITLESS = new Set([
   "opacity", "flexGrow", "flexShrink", "flex", "order", "zIndex", "fontWeight", "lineHeight",
-  "aspectRatio", "tabSize", "scale", "gridRow", "gridRowStart", "gridRowEnd", "gridColumn",
-  "gridColumnStart", "gridColumnEnd", "gridArea",
+  "aspectRatio", "tabSize", "scale", "animationIterationCount", "gridRow", "gridRowStart", "gridRowEnd",
+  "gridColumn", "gridColumnStart", "gridColumnEnd", "gridArea",
 ]);
 
 const nodes = new Map();
@@ -258,7 +260,8 @@ export class Node {
     this.look("base").replace(properties);
   }
 
-  /** The look the tree lays over the base in `state`: hover, active, focus or focusVisible. */
+  /** The look the tree lays over the base in `state`: hover, active, focus, focusVisible, or
+   * starting (what transitions start from when the node first shows, as `@starting-style`). */
   look(state) {
     if (state === "base") return (this.#base ??= new Look(this, 0));
     if (!(state in STATES)) throw new TypeError("the tree has no look '" + state + "'");
@@ -540,6 +543,30 @@ export function createInput(style) {
 let rootNode = null;
 
 /** Makes `node` the root of the window's tree. */
+/**
+ * Defines `@keyframes name` as CSS would: `{ from: { opacity: 0 }, "50%": {...}, to: {...} }`,
+ * with selectors such as `"0%, 100%"` too. Style objects name it in `animation` or
+ * `animationName`. Defining a name again replaces its rule; `null` removes it.
+ */
+export function defineKeyframes(name, frames) {
+  for (const selector of Object.keys(frames ?? {})) {
+    let css = "";
+    const declarations = frames[selector];
+    for (const property of Object.keys(declarations)) {
+      const value = declarations[property];
+      if (value === null || value === undefined || value === "") continue;
+      css += cssName(property) + ":" + cssValue(property, value) + ";";
+    }
+    for (const part of selector.split(",")) {
+      const text = part.trim().toLowerCase();
+      const offset = text === "from" ? 0 : text === "to" ? 1 : parseFloat(text) / 100;
+      if (!(offset >= 0 && offset <= 1)) throw new Error(`@silk/ui: bad keyframe selector '${part}'`);
+      native.keyframe(offset, css);
+    }
+  }
+  native.keyframes(String(name));
+}
+
 export function mount(node) {
   rootNode = node;
   native.root(node.id);
@@ -655,6 +682,14 @@ function fill(event, kind, a, b, modifiers, d, e, first, second) {
     event.scrollTop = b;
   } else if (kind === 13) {
     event.bounds = { x: a, y: b, width: d, height: e };
+  } else if (kind >= 19 && kind <= 22) {
+    event.propertyName = first;
+    event.elapsedTime = a;
+    event.pseudoElement = "";
+  } else if (kind >= 23) {
+    event.animationName = first;
+    event.elapsedTime = a;
+    event.pseudoElement = "";
   }
 }
 

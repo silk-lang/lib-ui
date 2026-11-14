@@ -38,6 +38,14 @@ const EVENT = {
   lostPointerCapture: 16,
   load: 17,
   error: 18,
+  transitionRun: 19,
+  transitionStart: 20,
+  transitionEnd: 21,
+  transitionCancel: 22,
+  animationStart: 23,
+  animationIteration: 24,
+  animationEnd: 25,
+  animationCancel: 26,
 };
 
 // The listener flag of event kind `k` is `1 << k`.
@@ -46,8 +54,10 @@ const PREVENT_SCROLL = 2;
 const PREVENT_KEYS = 4;
 
 // Later sheets win: a pressed node shows its active look over its hover look.
-const STATES = [null, ":hover", ":active", ":focus", ":focus-visible"];
-const STATE_ORDER = [1, 3, 4, 2];
+// The starting look (5) is an `@starting-style` block holding the node's rule.
+const STATES = [null, ":hover", ":active", ":focus", ":focus-visible", ""];
+const STATE_ORDER = [5, 1, 3, 4, 2];
+const STARTING = 5;
 
 // The same rules as `RESET` in `src/html.silk`, which a server render carries. `:where` gives
 // them no specificity, so the page's own stylesheets win. A pseudo-element rule that matches
@@ -306,6 +316,9 @@ class Page {
       document.head.append(style);
       this.sheets[state] = { sheet: style.sheet, rules: new Map() };
     }
+    const keyframes = document.createElement("style");
+    document.head.append(keyframes);
+    this.keyframes = { sheet: keyframes.sheet, rules: new Map() };
     this.layout = new ResizeObserver((entries) => {
       for (const entry of entries) {
         const id = this.idOf(entry.target);
@@ -716,6 +729,19 @@ class Page {
         case 35:
           this.linkFonts(r.text());
           break;
+        case 36: {
+          // `@keyframes`, in a sheet of their own, one rule per name.
+          const name = r.text();
+          const frames = [];
+          for (let count = r.u32(); count > 0; count--) {
+            const offset = r.f32();
+            const declarations = [];
+            for (let n = r.u32(); n > 0; n--) declarations.push(r.text());
+            frames.push(`${+(offset * 100).toFixed(4)}% { ${declarations.join("; ")} }`);
+          }
+          this.defineKeyframes(name, frames);
+          break;
+        }
         case 27: {
           // The first root closes: the mounted element shows nothing.
           if (r.u32() !== 0) break;
@@ -974,6 +1000,18 @@ class Page {
   // document order, as the program handed them out; then come the texts that differ. Only the
   // top node goes in the tables now: most rows of a long list are never named again, so the
   // others wait until one of them is (`fill`, `reveal`).
+  defineKeyframes(name, frames) {
+    const { sheet, rules } = this.keyframes;
+    const old = rules.get(name);
+    if (old) {
+      sheet.deleteRule(Array.prototype.indexOf.call(sheet.cssRules, old));
+      rules.delete(name);
+    }
+    if (!frames.length) return;
+    const at = sheet.insertRule(`@keyframes ${CSS.escape(name)} { ${frames.join(" ")} }`, sheet.cssRules.length);
+    rules.set(name, sheet.cssRules[at]);
+  }
+
   clone(r) {
     const template = this.templates[r.u32()];
     const top = r.u32();
@@ -1113,11 +1151,12 @@ class Page {
         attribute = "data-silk-html";
         node.setAttribute(attribute, id);
       }
-      const at = sheet.insertRule(`[${attribute}="${id}"]${STATES[state]} {}`, sheet.cssRules.length);
+      const selector = `[${attribute}="${id}"]${STATES[state]} {}`;
+      const at = sheet.insertRule(state === STARTING ? `@starting-style { ${selector} }` : selector, sheet.cssRules.length);
       rule = sheet.cssRules[at];
       rules.set(id, rule);
     }
-    return rule?.style;
+    return state === STARTING ? rule?.cssRules[0]?.style : rule?.style;
   }
 
   dropRule(id, state) {
@@ -1374,19 +1413,20 @@ class Page {
     w.u32(editable ? target.selectionEnd : 0);
     w.text(event.key ?? "");
     w.text(event.code ?? "");
-    w.text("value" in target && typeof target.value === "string" ? target.value : "");
+    // Transition and animation records carry their property or @keyframes name here.
+    w.text(extra.text ?? ("value" in target && typeof target.value === "string" ? target.value : ""));
     w.text(event.inputType ?? "");
     return w;
   }
 
   // Sends `event` as a record of `kind` when a node on its path listens for it.
-  forward(kind, event, target = event.target) {
+  forward(kind, event, target = event.target, extra = {}) {
     const path = this.pathTo(target);
     if (!path.length || !(this.hears(path, kind) || (kind === EVENT.click && this.links(path)))) {
       return { path, prevented: false };
     }
     const element = path[path.length - 1];
-    const prevented = this.send(this.record(kind, element, path, event));
+    const prevented = this.send(this.record(kind, element, path, event, extra));
     if (prevented && event.cancelable) event.preventDefault();
     return { path, prevented };
   }
@@ -1422,6 +1462,17 @@ class Page {
     // An image's load and error do not bubble; the root hears them while capturing.
     on("load", (event) => event.target instanceof HTMLImageElement && this.direct(EVENT.load, event.target, event), true);
     on("error", (event) => event.target instanceof HTMLImageElement && this.direct(EVENT.error, event.target, event), true);
+    // The elapsed time travels as x and the property or animation name as the value.
+    const motion = (kind, name) => (event) =>
+      this.forward(kind, event, event.target, { x: event.elapsedTime, y: 0, text: event[name] });
+    on("transitionrun", motion(EVENT.transitionRun, "propertyName"));
+    on("transitionstart", motion(EVENT.transitionStart, "propertyName"));
+    on("transitionend", motion(EVENT.transitionEnd, "propertyName"));
+    on("transitioncancel", motion(EVENT.transitionCancel, "propertyName"));
+    on("animationstart", motion(EVENT.animationStart, "animationName"));
+    on("animationiteration", motion(EVENT.animationIteration, "animationName"));
+    on("animationend", motion(EVENT.animationEnd, "animationName"));
+    on("animationcancel", motion(EVENT.animationCancel, "animationName"));
     on("input", (event) => this.forward(EVENT.input, event));
     on(
       "wheel",

@@ -324,7 +324,7 @@ input against the last frame's layout, and the changes show at the next frame
   uses a 250 ms ease-out. Wheel, pointer-down, and key-down input interrupt pending motion.
 
 Call geometry APIs after current layout has been produced. This adapter does not add a CSS
-parser-to-`Style` bridge, browser browsing contexts, general element transforms, or
+parser-to-`Style` bridge, browser browsing contexts, or
 `content-visibility` to the renderer. Unsupported host features are not represented by
 fabricated geometry.
 
@@ -500,7 +500,10 @@ the wasm build draw the same bytes.
 - Scrollbars are overlays that take no space; the arrow keys, Page Up and Page Down do not
   scroll yet, and the root does not scroll the viewport (give it `overflow: auto`).
 - Hit testing uses rectangles: rounded corners and clip radii are not hit shapes.
-- No style transitions yet.
+- Transforms flatten into their parent's plane (no `transform-style: preserve-3d`), and a
+  transformed box that is not a pure translation is resampled from its own layer, so magnified
+  content is softer than content painted at that size. Caret and range rectangles ignore
+  transforms.
 - Editing moves logically: in right-to-left text the arrows follow the text order, not the
   screen, and a caret at a direction boundary is drawn on one side only. No password masking,
   no drag and drop of text, no maximum length, and text outside inputs is not selectable.

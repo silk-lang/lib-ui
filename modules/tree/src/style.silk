@@ -16,6 +16,9 @@ pub import properties.computed { Text as TextStyle, Paint, Fill, DisplayOutside,
 import properties.computed { BorderStyle, DecorationLine, WhiteSpace, ObjectFit, Position }
 import properties.computed { WritingMode, Direction }
 import properties.convert { Context }
+import timing { TransitionLists, AnimationLists }
+import transform { Transform }
+import timing
 import properties.values { Unit }
 import properties.convert
 import properties.keyword_enums
@@ -43,6 +46,17 @@ pub struct Computed {
   /// lays out as zero.
   pub paint: Paint,
   pub text: TextStyle,
+  /// The viewport that `vw`, `vh` and the other viewport units resolve against.
+  pub viewportWidth: f32,
+  pub viewportHeight: f32,
+  /// A declaration used a viewport unit, so the style changes when the viewport does.
+  pub usesViewport: bool,
+  /// The `transition-*` lists.
+  pub transition: TransitionLists,
+  /// The `animation-*` lists.
+  pub animation: AnimationLists,
+  /// `transform`, `translate`, `rotate`, `scale`, their origin, `perspective` and its origin.
+  pub transform: Transform,
   /// `z-index`: `zIndex` counts only when `zAuto` is false. It applies to positioned boxes and
   /// to flex and grid items (see `stacking`).
   pub zIndex: i32,
@@ -55,6 +69,71 @@ pub struct Computed {
 }
 
 impl Copy for Computed {}
+
+fn viewportUnit(unit: Unit) -> bool {
+  return unit == Unit.Vw || unit == Unit.Vh || unit == Unit.Vi || unit == Unit.Vb
+    || unit == Unit.Vmin || unit == Unit.Vmax
+    || unit == Unit.Svw || unit == Unit.Svh || unit == Unit.Svi || unit == Unit.Svb
+    || unit == Unit.Svmin || unit == Unit.Svmax
+    || unit == Unit.Lvw || unit == Unit.Lvh || unit == Unit.Lvi || unit == Unit.Lvb
+    || unit == Unit.Lvmin || unit == Unit.Lvmax
+    || unit == Unit.Dvw || unit == Unit.Dvh || unit == Unit.Dvi || unit == Unit.Dvb
+    || unit == Unit.Dvmin || unit == Unit.Dvmax
+}
+
+/// Whether `value` has a viewport unit anywhere in it.
+fn hasViewportUnit(value: &Value) -> bool {
+  match &value.* {
+    Value.Unit { value: _, unit } => {
+      return viewportUnit(unit)
+    }
+    Value.Math { operator: _, values } => {
+      return anyViewportUnit(values.asSlice())
+    }
+    Value.Function { name: _, values } => {
+      return anyViewportUnit(values.asSlice())
+    }
+    Value.Sequence { separator: _, values } => {
+      return anyViewportUnit(values.asSlice())
+    }
+    Value.Text { css } => {
+      // A number followed by `v`, `sv`, `lv` or `dv` starts a viewport unit.
+      let bytes = css.asSlice()
+      let mut i: usize = 1
+      while i < bytes.length {
+        if (bytes[i] | 32) == 118 {
+          let before = bytes[i - 1] | 32
+          if isDigit(bytes[i - 1]) {
+            return true
+          }
+          if i >= 2 && (before == 115 || before == 108 || before == 100) && isDigit(bytes[i - 2]) {
+            return true
+          }
+        }
+        i = i + 1
+      }
+      return false
+    }
+    _ => {
+      return false
+    }
+  }
+}
+
+fn isDigit(byte: u8) -> bool {
+  return byte >= 48 && byte <= 57
+}
+
+fn anyViewportUnit(items: &[Value]) -> bool {
+  let mut i: usize = 0
+  while i < items.length {
+    if hasViewportUnit(&items[i]) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
 
 /// `outline`: a ring `offset` outside the border box, drawn over the content.
 pub struct Outline {
@@ -281,13 +360,29 @@ fn setColor(target: &mut Rgba<f32>, value: &Value) -> bool {
   }
 }
 
+/// Whether `declaration` uses a viewport unit.
+pub fn viewportDependent(declaration: &Declaration) -> bool {
+  return hasViewportUnit(&declaration.value)
+}
+
 impl Computed {
   /// The initial style of an element whose parent's text style is `text`.
   pub fn inheriting(text: TextStyle) -> Computed {
+    return Computed.inViewport(text, 0.0, 0.0)
+  }
+
+  /// `inheriting`, with viewport units resolving against a `width` by `height` viewport.
+  pub fn inViewport(text: TextStyle, width: f32, height: f32) -> Computed {
     return Computed {
       layout: CssStyle.make(),
       paint: Paint.initial(),
       text: text,
+      viewportWidth: width,
+      viewportHeight: height,
+      usesViewport: false,
+      transition: TransitionLists.initial(timing.ALL),
+      animation: AnimationLists.initial(),
+      transform: Transform.initial(),
       zIndex: 0,
       zAuto: true,
       outline: Outline.initial(),
@@ -299,6 +394,9 @@ impl Computed {
   /// Applies one declaration. A value that does not fit its property is ignored, as an
   /// invalid declaration is in CSS.
   pub fn apply(self: &mut Self, declaration: &Declaration) -> () {
+    if !self.usesViewport && hasViewportUnit(&declaration.value) {
+      self.usesViewport = true
+    }
     self.set(declaration.property, &declaration.value)
   }
 
@@ -380,8 +478,8 @@ impl Computed {
     let context = Context {
       fontSize: self.text.size,
       rootFontSize: 16.0,
-      viewportWidth: 0.0,
-      viewportHeight: 0.0,
+      viewportWidth: self.viewportWidth,
+      viewportHeight: self.viewportHeight,
     }
     match property {
       // Shorthands.

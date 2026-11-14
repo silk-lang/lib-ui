@@ -123,6 +123,10 @@ pub const OP_LOAD_FONT_FACE: u8 = 34
 /// Load a stylesheet of `@font-face` rules from a URL: the page links it.
 pub const OP_FONT_STYLESHEET: u8 = 35
 
+/// Defines `@keyframes`: its name, a count of frames, and for each its offset (0 to 1), a
+/// count of declarations and those declarations as text. No frames removes the rule.
+pub const OP_KEYFRAMES: u8 = 36
+
 pub effect fn byte(out: &mut Bytes, value: u8) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
@@ -191,6 +195,7 @@ fn stateCode(state: StyleState) -> u8 {
     StyleState.Active => 2
     StyleState.Focus => 3
     StyleState.FocusVisible => 4
+    StyleState.Starting => 5
   }
 }
 
@@ -714,6 +719,27 @@ pub effect fn writeMutation(out: &mut Bytes, mutation: &Mutation) -> bool
       run byte(&mut out, OP_FONT_STYLESHEET)
       run text(&mut out, url.ownedUtf8Bytes())
     }
+    Mutation.DefineKeyframes { name, frames } => {
+      run byte(&mut out, OP_KEYFRAMES)
+      run text(&mut out, name.ownedUtf8Bytes())
+      let items = frames.asSlice()
+      run word(&mut out, usize.toU32(items.length))
+      let mut line = Bytes.make()
+      let mut i: usize = 0
+      while i < items.length {
+        run float(&mut out, items[i].offset)
+        let list = items[i].declarations.asSlice()
+        run word(&mut out, usize.toU32(list.length))
+        let mut k: usize = 0
+        while k < list.length {
+          line.clear()
+          run writeDeclaration(&mut line, &list[k])
+          run text(&mut out, line.asSlice())
+          k = k + 1
+        }
+        i = i + 1
+      }
+    }
     _ => {
       return false
     }
@@ -772,9 +798,17 @@ fn eventKind(code: u8) -> EventKind {
     13 => EventKind.Layout
     14 => EventKind.PointerCancel
     15 => EventKind.GotPointerCapture
+    16 => EventKind.LostPointerCapture
     17 => EventKind.Load
     18 => EventKind.Error
-    _ => EventKind.LostPointerCapture
+    19 => EventKind.TransitionRun
+    20 => EventKind.TransitionStart
+    21 => EventKind.TransitionEnd
+    22 => EventKind.TransitionCancel
+    23 => EventKind.AnimationStart
+    24 => EventKind.AnimationIteration
+    25 => EventKind.AnimationEnd
+    _ => EventKind.AnimationCancel
   }
 }
 
@@ -783,7 +817,8 @@ pub effect fn readEvent(bytes: &[u8]) -> Event
   ! OutOfMemoryError
   ? &mut Allocator {
   let mut at: usize = 0
-  let kind = eventKind(readByte(bytes, &mut at))
+  let kindCode = readByte(bytes, &mut at)
+  let kind = eventKind(kindCode)
   let target = readWord(bytes, &mut at)
   let count = readWord(bytes, &mut at)
   let mut path = List<u32>.make()
@@ -813,5 +848,12 @@ pub effect fn readEvent(bytes: &[u8]) -> Event
   event.code = run readText(bytes, &mut at)
   event.value = run readText(bytes, &mut at)
   event.inputType = run readText(bytes, &mut at)
+  if u8.toU32(kindCode) >= 19 {
+    // Transition and animation records: the name travels as the value, the elapsed time as x.
+    event.name = move event.value
+    event.value = String.make()
+    event.elapsedTime = event.x
+    event.x = 0.0
+  }
   return move event
 }

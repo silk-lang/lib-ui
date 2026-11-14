@@ -13,6 +13,7 @@ export function installMock() {
     "create", "append", "insertBefore", "root", "setText", "listen", "style", "clearStyle",
     "attribute", "focus", "remove", "destroy", "scrollTo", "select", "fontFamily", "open",
     "defineIcon", "source", "release",
+    "keyframe", "keyframes",
   ]) {
     native[name] = record(name);
   }

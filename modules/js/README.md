@@ -38,7 +38,9 @@ mount(createBox({ width: 400, height: 300 }, button));
   (`gridTemplateColumns: "auto 1fr"`, `repeat()`, `minmax()`, named lines and
   `gridTemplateAreas`, `gridArea`, `gridColumn: "span 2"`); numbers for the placement
   properties are line numbers. Grid properties apply from the base look only. `node.look("hover")` (also `active`, `focus`, `focusVisible`) is the look the
-  tree lays over the base in that state.
+  tree lays over the base in that state; `node.look("starting")` is what transitions start
+  from when the node first shows. `defineKeyframes(name, { from: {...}, to: {...} })` defines
+  `@keyframes` for `animation` styles.
 - **Events.** `addEventListener(type, listener, options)` with `capture` and `once`. An event
   runs the capture phase from the root down, the target, then bubbles, with
   `stopPropagation`, `stopImmediatePropagation` and `preventDefault`. Listeners run before
@@ -98,7 +100,8 @@ createRoot().render(<Counter />);
 ```
 
 - **Props.** `style`, and `hoverStyle`, `activeStyle`, `focusStyle` and `focusVisibleStyle`
-  for the looks of those states. `onClick`, `onPointerDown`, `onKeyDown`, `onInput` and so
+  for the looks of those states. `startingStyle` is what transitions start from when the node
+  first shows (CSS `@starting-style`). `onClick`, `onPointerDown`, `onKeyDown`, `onInput` and so
   on for every event of the tree, with a `Capture` suffix for the capture phase. Listeners
   receive the `@silk/ui` event. Every other prop is a tree attribute (`tabIndex`, `testId`,
   `label`, `disabled`, `placeholder`), and `role` and `aria-*` work as in React DOM.
