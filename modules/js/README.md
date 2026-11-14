@@ -34,7 +34,10 @@ mount(createBox({ width: 400, height: 300 }, button));
 - **Style.** `node.style.set({ ... })` sets properties by their camel case names. Numbers are
   CSS pixels, except for unitless properties such as `opacity` and `flexGrow`. `null` takes a
   property out. `fontFamily` takes CSS `font-family` text (`"monospace"`, `"Noto Sans, sans-serif"`),
-  resolved in the host's font collection. `node.look("hover")` (also `active`, `focus`, `focusVisible`) is the look the
+  resolved in the host's font collection. Grid layouts take the CSS grid properties
+  (`gridTemplateColumns: "auto 1fr"`, `repeat()`, `minmax()`, named lines and
+  `gridTemplateAreas`, `gridArea`, `gridColumn: "span 2"`); numbers for the placement
+  properties are line numbers. Grid properties apply from the base look only. `node.look("hover")` (also `active`, `focus`, `focusVisible`) is the look the
   tree lays over the base in that state.
 - **Events.** `addEventListener(type, listener, options)` with `capture` and `once`. An event
   runs the capture phase from the root down, the target, then bubbles, with
@@ -47,7 +50,13 @@ mount(createBox({ width: 400, height: 300 }, button));
   `disabled`, `label`, `testId`, `placeholder`, `multiline`, `readOnly`, `checked`,
   `selected`, `expanded`, `focusTrap`, `href`, `cursor`, `transition`). A name the tree does
   not have throws a `TypeError`. `cursor` takes the CSS keywords (`pointer`, `text`, `grab`,
-  `not-allowed` and the resize ones).
+  `not-allowed` and the resize ones); the `cursor` style property does the same, and a node
+  without one shows its nearest ancestor's.
+- **Accessibility.** `role` and `aria-*` work as in the DOM, as `aria-label` or `ariaLabel`.
+  `role` takes the first word that names a role the tree has (`"switch checkbox"`), and
+  `aria-label`, `aria-checked`, `aria-selected`, `aria-expanded` and `aria-valuemin`,
+  `aria-valuemax`, `aria-valuenow` set the tree's attributes. Other roles and ARIA names are
+  ignored with one console warning each, until the tree has them.
 - **Links.** A node with an `href` is a link, as an `<a>` is: a click on it or inside it that
   no listener prevented calls `open(href)`, which hands the address to the host.
 - **Errors.** A listener that throws does not stop the dispatch. `setErrorHandler` receives
@@ -83,7 +92,7 @@ createRoot().render(<Counter />);
   for the looks of those states. `onClick`, `onPointerDown`, `onKeyDown`, `onInput` and so
   on for every event of the tree, with a `Capture` suffix for the capture phase. Listeners
   receive the `@silk/ui` event. Every other prop is a tree attribute (`tabIndex`, `testId`,
-  `label`, `disabled`, `placeholder`).
+  `label`, `disabled`, `placeholder`), and `role` and `aria-*` work as in React DOM.
 - **Inputs.** `value` on `<input>` is controlled as in React DOM: the field shows what the
   component keeps, whatever was typed.
 - **Timing.** `root.render` commits before it returns, so the first frame of a window has
@@ -102,6 +111,10 @@ ref. It is bundled with Vite into one ES module. From `modules/js`, `npm ci && n
 ```sh
 silk run --manifest-path modules/js/demo/silk.toml modules/js/examples/react-counter/dist/app.js
 ```
+
+[examples/text-showcase](examples/text-showcase) is a magazine in five spreads that shows the
+tree's text layout (scripts, bidi, vertical writing modes, floats), each feature labelled, and
+runs in a browser from the same files for comparison.
 
 React 19.3 with react-reconciler 0.34 runs on the engine as it is: the bundle needs only
 the web globals below.

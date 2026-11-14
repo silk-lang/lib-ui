@@ -12,7 +12,7 @@
 // - `svg` on <icon>: SVG markup, drawn at the icon's CSS size with its `color` as
 //   `currentColor`.
 // - Everything else is a tree attribute: `tabIndex`, `testId`, `label`, `disabled`,
-//   `placeholder` and so on.
+//   `placeholder` and so on, and `role` and `aria-*` as in React DOM.
 import Reconciler from "react-reconciler";
 import {
   ConcurrentRoot,

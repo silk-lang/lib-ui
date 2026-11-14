@@ -11,6 +11,8 @@ import cssom_view { ScrollAnimation }
 import svg_css.cssom_view_window { ScrollState, ViewTarget, ViewTargetKind }
 import svg_css.cssom_error { CssomError }
 import ui_protocol.grid { Grid }
+import grid_css
+import expand
 import ui_protocol.options { RootOptions }
 import ui_protocol.root { RootEvent, RootEventKind, RootSupport, ExtraRoot }
 import mutation {
@@ -753,6 +755,17 @@ impl<'a> UiTree<'a> {
   /// parent, its hover, press or focus state): the next resolve restyles it, and its
   /// descendants as far as what they inherit changed. Its ancestors are marked so the resolve
   /// finds it from the root.
+  /// Installs the grid the base look's grid properties describe, replacing any earlier
+  /// template, as `Mutation.SetGrid` does.
+  effect fn styleGrid(self: &mut Self, slot: u32) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let grid = run grid_css.gridOf(self.node(slot).base.asSlice())
+    let css = self.node(slot).css
+    run Effect.catchAll(grid.install(&mut self.layout, NodeId { index: css }), layoutFailed)
+    self.paintDirty = true
+  }
+
   pub fn restyle(self: &mut Self, slot: u32) -> () {
     self.stylesPending = true
     let nodes = self.nodes.asMutSlice()
@@ -941,7 +954,11 @@ impl<'a> UiTree<'a> {
       }
       Mutation.SetStyle { id, state, declarations } => {
         let slot = run self.require(index, id)
-        let values = declarations.asSlice()
+        let prepared = run expand.prepared(declarations.asSlice())
+        let values = match &prepared {
+          Option.Some { value } => value.asSlice()
+          Option.None => declarations.asSlice()
+        }
         let node = self.nodeMut(slot)
         let mut i: usize = 0
         while i < values.length {
@@ -965,10 +982,14 @@ impl<'a> UiTree<'a> {
           i = i + 1
         }
         self.restyle(slot)
+        if state == StyleState.Base && grid_css.mentionsGrid(values) {
+          run self.styleGrid(slot)
+        }
       }
       Mutation.ClearStyle { id, state } => {
         let slot = run self.require(index, id)
         let node = self.nodeMut(slot)
+        let hadGrid = state == StyleState.Base && grid_css.mentionsGrid(node.base.asSlice())
         match state {
           StyleState.Base => {
             node.base.clear()
@@ -987,6 +1008,9 @@ impl<'a> UiTree<'a> {
           }
         }
         self.restyle(slot)
+        if hadGrid {
+          run self.styleGrid(slot)
+        }
       }
       Mutation.SetText { id, value } => {
         let slot = run self.require(index, id)

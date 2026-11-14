@@ -6,7 +6,9 @@ import ui_tree.legacy { TreeError, Mutation }
 import ui_tree_window.host { RunOptions, runWindow, StartedGpu, startGpu }
 import ui_tree_window.platform_thread { Launched }
 import ui_tree_window.console { StderrWriter }
-import font_collection.lib { Generic }
+import font_collection.lib { Generic, FontCollection }
+import font_collection.system as systemFonts
+import font_collection.system { Options as FontOptions, Report as FontReport }
 import ui_fixtures.fixtures as fixtures
 import ui_inspect_server.lib { Inspector }
 import silkjs.js_atomics_native { WaiterDomain, SynchronizationError }
@@ -23,10 +25,13 @@ import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.core.result { Result }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.filesystem { FileSystem, FileError, Path }
+import silk.system.filesystem_machine { MachineFileSystem }
 import silk.system.host_input { HostInput }
 
-/// Runs the entry at `entry` (the demo counter when empty) in a window with `tools`.
-pub effect fn program<T: JsTools>(check: bool, entry: &[u8], tools: T, inspector: Inspector, launched: Option<Launched>) -> i32
+/// Runs the entry at `entry` (the demo counter when empty) in a window with `tools`. The font
+/// files under `fontDirectory`, when it is not empty, join the bundled fonts.
+pub effect fn program<T: JsTools>(check: bool, entry: &[u8], fontDirectory: &[u8], tools: T, inspector: Inspector, launched: Option<Launched>) -> i32
   ! TreeError | WindowError | GpuError | AtlasError | GeometryError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError
   ? &mut Allocator {
   // The GPU first: it takes longer than the fonts, the script and the realm together.
@@ -36,6 +41,12 @@ pub effect fn program<T: JsTools>(check: bool, entry: &[u8], tools: T, inspector
   run fonts.addGeneric(Generic.SansSerif, b"Noto Sans")
   run fonts.addGeneric(Generic.SystemUi, b"Noto Sans")
   run fonts.addGeneric(Generic.Monospace, b"Geist Mono")
+  if fontDirectory.length != 0 {
+    if let Result.Failure { error } = run Effect.result(addFonts(&mut fonts, fontDirectory)) {
+      drop error
+      StderrWriter.print("The --fonts directory could not be read\n", &())
+    }
+  }
   // `@silk/ui` and the starter page are part of the binary, so it runs from any directory.
   let domain = run WaiterDomain.make()
   let allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
@@ -68,6 +79,18 @@ pub effect fn program<T: JsTools>(check: bool, entry: &[u8], tools: T, inspector
   return match move status {
     Result<i32, WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError>.Success { value } => value
     Result<i32, WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError>.Failure { error } => { fail move error }
+  }
+}
+
+effect fn addFonts(fonts: &mut FontCollection, directory: &[u8]) -> () ! FileError | OutOfMemoryError ? &mut Allocator {
+  let mut files = run MachineFileSystem.make()
+  let path = run Path.fromBytes(directory)
+  let options = FontOptions { maxFiles: 256, maxBytes: 268435456, maxDepth: 4 }
+  let mut report = FontReport.empty()
+  run systemFonts.directory(&mut fonts, &path, &options, &mut report, 0)
+    |> Effect.provideMut<FileSystem>(&mut files)
+  if report.files == 0 {
+    StderrWriter.print("No font files were found in the --fonts directory\n", &())
   }
 }
 
