@@ -347,9 +347,6 @@ the engine here (it lives in the SilkJS runtime, which ui-js does not link).
   against a stand-in for the native functions, and
   `silk test --manifest-path modules/js/examples/tests/silk.toml --root src/tests.silk` for
   the bundled examples on the engine (build them first).
-- Not here yet: images and canvas commands from JavaScript,
-  source maps for errors under the dev server, and choosing engine features beyond Intl and
-  Temporal for each build.
 - Memory, release builds on Linux x86-64 under Xvfb with a software GPU, resident after six
   seconds: the Silk window demo 155 MB, the JavaScript counter 169 MB, the React counter
   174 MB. The GPU stack is most of each; the engine with `@silk/ui` adds about 14 MB and
