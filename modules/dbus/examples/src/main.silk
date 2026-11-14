@@ -1,0 +1,79 @@
+//! Lists the names on the session bus: connects, authenticates, says Hello and calls
+//! `ListNames`. Exits 0 when the bus answers with at least this connection's own name.
+import dbus.lib { Bus, Message, DBusError, sessionBusAddress }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
+import silk.text.string { String }
+
+effect fn listNames() -> i32
+  ! DBusError | OutOfMemoryError | HostInputError
+  ? &mut Allocator | &mut HostInput | &mut MonotonicClock {
+  let address = match run sessionBusAddress() {
+    Option.Some { value } => move value
+    Option.None => {
+      return 2
+    }
+  }
+  let mut bus = run Bus.connect(String.view(&address), Option.None)
+  let call = run Message.methodCall(
+    "org.freedesktop.DBus",
+    "/org/freedesktop/DBus",
+    "org.freedesktop.DBus",
+    "ListNames",
+  )
+  let reply = run bus.call(move call, Option.None)
+  let mut reader = reply.reader()
+  let end = run reader.beginArray(4)
+  let mut found = false
+  let mut count: i32 = 0
+  while reader.position < end {
+    let name = run reader.string()
+    if name == String.view(&bus.uniqueName) {
+      found = true
+    }
+    count = count + 1
+  }
+  run bus.close()
+  if found && count > 0 {
+    return 0
+  }
+  return 1
+}
+
+effect fn failed(error: DBusError) -> i32 {
+  return match error {
+    DBusError.Malformed { .. } => 10
+    DBusError.AuthFailed => 11
+    DBusError.Closed => 12
+    DBusError.Socket => 13
+    DBusError.NoAddress => 14
+    DBusError.Remote => 15
+    DBusError.Timeout => 16
+  }
+}
+
+effect fn outOfMemory(error: OutOfMemoryError) -> i32 {
+  drop error
+  return 4
+}
+
+effect fn inputFailed(error: HostInputError) -> i32 {
+  drop error
+  return 3
+}
+
+pub effect fn main() -> i32
+  ? &mut HostInput {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut clock = OsMonotonicClock.make()
+  return run Effect.catch<OutOfMemoryError>(
+    Effect.catch<HostInputError>(Effect.catch<DBusError>(listNames(), failed), inputFailed),
+    outOfMemory,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+    |> Effect.provideMut<MonotonicClock>(&mut clock)
+}

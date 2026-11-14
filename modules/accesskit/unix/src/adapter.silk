@@ -1,0 +1,428 @@
+//! The Linux adapter: an application's windows exposed to assistive technology over AT-SPI.
+//!
+//! An [`App`] connects to the accessibility bus, embeds itself under the desktop, serves the
+//! AT-SPI interfaces of every window it is given, and sends the events each tree update causes.
+//! The host calls [`App.pump`] when the bus socket is readable (or once a frame), and performs the
+//! actions [`App.takeRequests`] hands back.
+//!
+//! Ported from AccessKit (`accesskit_unix/src/adapter.rs` and `atspi/bus.rs`), Copyright 2022
+//! The AccessKit Authors, under the MIT or Apache-2.0 license.
+import accesskit.lib { TreeUpdate }
+import accesskit_consumer.lib { Tree, FilterResult, commonFilter }
+import atspi { AtspiState }
+import node { WindowBounds }
+import events { Event, EventKind, EventData, EventCollector, Target }
+import server {
+  AppState,
+  Window,
+  WindowRequest,
+  ROOT_PATH,
+  CACHE_PATH,
+  handle,
+  targetPath,
+  writeTarget,
+  writeCacheItem,
+  placeOf
+}
+import dbus.lib { Bus, Message, MessageType, Writer, DBusError, sessionBusAddress }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.collections.bytes { Bytes }
+import silk.num.f64
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.net.socket_native { RawSocket }
+import silk.num.i32
+import silk.num.u32
+import silk.num.usize
+import silk.system.host_input { HostInput, HostInputError }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.system_clock { Instant, SystemClock }
+import silk.text.string { String }
+
+fn again(deadline: &Option<Instant>) -> Option<Instant> {
+  return match &deadline.* {
+    Option.Some { value } => Option.Some {
+      value: SystemClock.make(SystemClock.seconds(&value), SystemClock.nanoseconds(&value)),
+    }
+    Option.None => Option.None
+  }
+}
+
+effect fn hostInputFailed(error: HostInputError) -> never
+  ! DBusError {
+  drop error
+  fail DBusError.NoAddress
+}
+
+effect fn variableText(name: string) -> Option<String>
+  ! OutOfMemoryError
+  ? &mut HostInput | &mut Allocator {
+  let found = run Effect.catch<HostInputError>(HostInput.variableNamed(name), absentVariable)
+  return match &found {
+    Option.Some { value } => match String.fromUtf8(value.asSlice()) {
+      Result.Success { value: text } => Option.Some { value: run String.copy(text) }
+      Result.Failure { .. } => Option.None
+    }
+    Option.None => Option.None
+  }
+}
+
+effect fn absentVariable(error: HostInputError) -> Option<Bytes> {
+  drop error
+  return Option.None
+}
+
+/// The address of the accessibility bus: `AT_SPI_BUS_ADDRESS` when it is set, otherwise what
+/// `org.a11y.Bus` on the session bus says.
+pub effect fn accessibilityBusAddress(deadline: Option<Instant>) -> String
+  ! DBusError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator | &mut MonotonicClock {
+  match run variableText("AT_SPI_BUS_ADDRESS") {
+    Option.Some { value } => {
+      if String.byteLength(value.view()) > 0 {
+        return move value
+      }
+    }
+    Option.None => {}
+  }
+  let session = match run Effect.catch<HostInputError>(sessionBusAddress(), noSessionBus) {
+    Option.Some { value } => move value
+    Option.None => {
+      fail DBusError.NoAddress
+    }
+  }
+  let mut bus = run Bus.connect(session.view(), again(&deadline))
+  let call = run Message.methodCall("org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus", "GetAddress")
+  let answer = run bus.call(move call, again(&deadline))
+  run bus.close()
+  let mut reader = answer.reader()
+  return run String.copy(run reader.string())
+}
+
+effect fn noSessionBus(error: HostInputError) -> Option<String> {
+  drop error
+  return Option.None
+}
+
+/// Whether the desktop asks applications to be accessible: `org.a11y.Status.IsEnabled` or
+/// `ScreenReaderEnabled` on the session bus.
+pub effect fn accessibilityEnabled(deadline: Option<Instant>) -> bool
+  ! DBusError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator | &mut MonotonicClock {
+  let session = match run Effect.catch<HostInputError>(sessionBusAddress(), noSessionBus) {
+    Option.Some { value } => move value
+    Option.None => {
+      return false
+    }
+  }
+  let mut bus = run Bus.connect(session.view(), again(&deadline))
+  let mut enabled = false
+  let names = ["IsEnabled", "ScreenReaderEnabled"]
+  let mut i: usize = 0
+  while i < names.length && !enabled {
+    let mut call = run Message.methodCall(
+      "org.a11y.Bus",
+      "/org/a11y/bus",
+      "org.freedesktop.DBus.Properties",
+      "Get",
+    )
+    let mut body = Writer.make()
+    run body.string("org.a11y.Status")
+    run body.string(names[i])
+    run call.setBody("ss", move body)
+    let answer = run bus.call(move call, again(&deadline))
+    let mut reader = answer.reader()
+    if (run reader.signature()) == "b" {
+      enabled = run reader.boolean()
+    }
+    i = i + 1
+  }
+  run bus.close()
+  return enabled
+}
+
+/// An application on the accessibility bus.
+pub struct App {
+  pub bus: Bus,
+  pub state: AppState,
+}
+
+impl App {
+  /// Connects to the accessibility bus at `address` and embeds the application, named `name`,
+  /// under the desktop.
+  pub effect fn connect(name: string, address: string, deadline: Option<Instant>) -> App
+    ! DBusError | OutOfMemoryError
+    ? &mut Allocator | &mut MonotonicClock {
+    let mut bus = run Bus.connect(address, again(&deadline))
+    let mut state = run AppState.make(name)
+    let mut call = run Message.methodCall(
+      "org.a11y.atspi.Registry",
+      ROOT_PATH,
+      "org.a11y.atspi.Socket",
+      "Embed",
+    )
+    let mut body = Writer.make()
+    run body.beginStruct()
+    run body.string(bus.uniqueName.view())
+    run body.objectPath(ROOT_PATH)
+    run call.setBody("(so)", move body)
+    let answer = run bus.call(move call, again(&deadline))
+    let mut reader = answer.reader()
+    run reader.beginStruct()
+    state.desktopName = run String.copy(run reader.string())
+    state.desktopPath = run String.copy(run reader.objectPath())
+    return App { bus: move bus, state: move state }
+  }
+
+  /// The bus socket, to wait on for readability.
+  pub fn descriptor(self: &Self) -> RawSocket {
+    return self.bus.rawDescriptor()
+  }
+
+  /// Sets the toolkit name and version the application reports.
+  pub effect fn setToolkit(self: &mut Self, name: string, version: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.state.toolkitName = run String.copy(name)
+    self.state.toolkitVersion = run String.copy(version)
+  }
+
+  /// Adds window `id`, described by `initial` (which must carry tree info).
+  pub effect fn addWindow(
+    self: &mut Self,
+    id: u32,
+    initial: TreeUpdate,
+    focused: bool,
+    bounds: WindowBounds,
+  ) -> ()
+    ! DBusError | OutOfMemoryError
+    ? &mut Allocator {
+    let tree = run Tree.make(move initial, focused)
+    let index = self.state.windows.length()
+    run self.state.windows.append(Window { id: id, tree: move tree, bounds: bounds })
+    let mut collector = EventCollector.make(id, usize.wrappingToU32(index), bounds)
+    let state = self.state.windows.asSlice()[index].tree.state()
+    let root = state.rootNode()
+    run collector.windowCreated(&root)
+    match state.focusNode() {
+      Option.Some { value: node } => {
+        let event = Event.object(
+          Target.Node { window: id, id: node.id },
+          "StateChanged",
+          AtspiState.Focused.eventName(),
+          1,
+          EventData.Nothing,
+        )
+        run collector.events.append(move event)
+      }
+      Option.None => {}
+    }
+    run self.send(&collector.events)
+  }
+
+  /// Applies `update` to window `id` and sends the events it causes.
+  pub effect fn updateWindow(self: &mut Self, id: u32, update: TreeUpdate) -> ()
+    ! DBusError | OutOfMemoryError
+    ? &mut Allocator {
+    let index = match self.state.windowIndex(id) {
+      Option.Some { value } => value
+      Option.None => {
+        return ()
+      }
+    }
+    let bounds = self.state.windows.asSlice()[index].bounds
+    let mut collector = EventCollector.make(id, usize.wrappingToU32(index), bounds)
+    run self.state.windows.asMutSlice()[index].tree.update(move update, &mut collector)
+    run collector.finish()
+    run self.send(&collector.events)
+  }
+
+  /// Records whether window `id` has focus and sends the events that causes.
+  pub effect fn setWindowFocused(self: &mut Self, id: u32, focused: bool) -> ()
+    ! DBusError | OutOfMemoryError
+    ? &mut Allocator {
+    let index = match self.state.windowIndex(id) {
+      Option.Some { value } => value
+      Option.None => {
+        return ()
+      }
+    }
+    let bounds = self.state.windows.asSlice()[index].bounds
+    let mut collector = EventCollector.make(id, usize.wrappingToU32(index), bounds)
+    run self.state.windows.asMutSlice()[index].tree.updateHostFocusState(focused, &mut collector)
+    run self.send(&collector.events)
+  }
+
+  /// Records where window `id` is on screen.
+  pub fn setWindowBounds(self: &mut Self, id: u32, bounds: WindowBounds) -> () {
+    match self.state.windowIndex(id) {
+      Option.Some { value } => {
+        let windows = self.state.windows.asMutSlice()
+        windows[value].bounds = bounds
+      }
+      Option.None => {}
+    }
+  }
+
+  /// Removes window `id`.
+  pub effect fn removeWindow(self: &mut Self, id: u32) -> ()
+    ! DBusError | OutOfMemoryError
+    ? &mut Allocator {
+    let index = match self.state.windowIndex(id) {
+      Option.Some { value } => value
+      Option.None => {
+        return ()
+      }
+    }
+    let bounds = self.state.windows.asSlice()[index].bounds
+    let mut collector = EventCollector.make(id, usize.wrappingToU32(index), bounds)
+    let root = self.state.windows.asSlice()[index].tree.state().rootNode()
+    run collector.windowDestroyed(&root)
+    run self.send(&collector.events)
+    drop self.state.windows.remove(index)
+  }
+
+  /// Reads what the bus sent, answers method calls, and writes what is waiting.
+  pub effect fn pump(self: &mut Self) -> ()
+    ! DBusError | OutOfMemoryError
+    ? &mut Allocator {
+    run self.bus.pump()
+    while let Option.Some { value: message } = self.bus.take() {
+      if message.kind == MessageType.MethodCall {
+        let bus = run String.copy(self.bus.uniqueName.view())
+        match run handle(&mut self.state, &message, bus.view()) {
+          Option.Some { value: answer } => {
+            drop run self.bus.send(&answer)
+          }
+          Option.None => {}
+        }
+      }
+    }
+    run self.bus.flush()
+  }
+
+  /// The actions assistive technology asked for since the last call.
+  pub effect fn takeRequests(self: &mut Self) -> List<WindowRequest>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run self.state.requests.splitOff(0)
+  }
+
+  effect fn send(self: &mut Self, events: &List<Event>) -> ()
+    ! DBusError | OutOfMemoryError
+    ? &mut Allocator {
+    let all = events.asSlice()
+    let mut i: usize = 0
+    while i < all.length {
+      match run signalOf(&self.state, self.bus.uniqueName.view(), &all[i]) {
+        Option.Some { value: message } => {
+          drop run self.bus.send(&message)
+        }
+        Option.None => {}
+      }
+      i = i + 1
+    }
+    run self.bus.flush()
+  }
+}
+
+/// Writes the `any_data` of an event as a variant.
+effect fn writeData(w: &mut Writer, bus: string, data: &EventData) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match &data.* {
+    EventData.Nothing => {
+      run w.variant("u")
+      run w.uint32(0)
+    }
+    EventData.Text { value } => {
+      run w.variant("s")
+      run w.string(value.view())
+    }
+    EventData.Object { target } => {
+      run w.variant("(so)")
+      run writeTarget(&mut w, bus, target)
+    }
+    EventData.Number { value } => {
+      run w.variant("d")
+      run w.double(value)
+    }
+    EventData.Role { value } => {
+      run w.variant("u")
+      run w.uint32(value)
+    }
+    EventData.Bounds { value } => {
+      run w.variant("(iiii)")
+      run w.beginStruct()
+      run w.int32(f64ToI32(value.x0))
+      run w.int32(f64ToI32(value.y0))
+      run w.int32(f64ToI32(value.width()))
+      run w.int32(f64ToI32(value.height()))
+    }
+  }
+}
+
+fn f64ToI32(value: f64) -> i32 {
+  return match f64.checkedToI32(f64.round(value)) {
+    Option.Some { value: v } => v
+    Option.None => 0
+  }
+}
+
+/// The signal for `event`, or none for a cache addition of a node that is gone.
+pub effect fn signalOf(state: &AppState, bus: string, event: &Event) -> Option<Message>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match event.kind {
+    EventKind.CacheAdd => {
+      match event.target {
+        Target.Node { window, id } => match state.windowIndex(window) {
+          Option.Some {
+            value: index
+          } => match state.windows.asSlice()[index].tree.state().nodeById(id) {
+            Option.Some { value: node } => {
+              if commonFilter(&node) != FilterResult.Include {
+                Option.None
+              } else {
+                let mut message = run Message.signal(
+                  CACHE_PATH,
+                  "org.a11y.atspi.Cache",
+                  "AddAccessible",
+                )
+                let mut w = Writer.make()
+                run writeCacheItem(&mut w, bus, placeOf(state, index), &node)
+                run message.setBody("((so)(so)(so)iiassusau)", move w)
+                Option.Some { value: move message }
+              }
+            }
+            Option.None => Option.None
+          }
+          Option.None => Option.None
+        }
+        Target.App => Option.None
+      }
+    }
+    EventKind.CacheRemove => {
+      let mut message = run Message.signal(CACHE_PATH, "org.a11y.atspi.Cache", "RemoveAccessible")
+      let mut w = Writer.make()
+      run writeTarget(&mut w, bus, event.target)
+      run message.setBody("(so)", move w)
+      Option.Some { value: move message }
+    }
+    _ => {
+      let path = run targetPath(event.target)
+      let mut message = run Message.signal(path.view(), event.interfaceName(), event.member)
+      let mut w = Writer.make()
+      run w.string(event.detail)
+      run w.int32(event.detail1)
+      run w.int32(event.detail2)
+      run writeData(&mut w, bus, &event.data)
+      let mark = run w.beginArray(8)
+      w.endArray(mark)
+      run message.setBody("siiva{sv}", move w)
+      Option.Some { value: move message }
+    }
+  }
+}

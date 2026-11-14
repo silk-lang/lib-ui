@@ -1,0 +1,335 @@
+//! D-Bus messages: method calls, replies, errors and signals, with their header fields, and
+//! the bytes they travel as.
+import wire { Writer, Reader, DBusError }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+import silk.text.string { String }
+
+/// What a message is.
+pub enum MessageType {
+  Invalid,
+  MethodCall,
+  MethodReturn,
+  Error,
+  Signal,
+}
+
+/// Flag: the sender wants no reply.
+pub fn NO_REPLY_EXPECTED() -> u8 {
+  return 1
+}
+
+/// Flag: the bus should not start a service to deliver the message.
+pub fn NO_AUTO_START() -> u8 {
+  return 2
+}
+
+fn typeCode(kind: MessageType) -> u8 {
+  return match kind {
+    MessageType.Invalid => 0
+    MessageType.MethodCall => 1
+    MessageType.MethodReturn => 2
+    MessageType.Error => 3
+    MessageType.Signal => 4
+  }
+}
+
+fn typeOf(code: u8) -> MessageType {
+  if code == 1 {
+    return MessageType.MethodCall
+  }
+  if code == 2 {
+    return MessageType.MethodReturn
+  }
+  if code == 3 {
+    return MessageType.Error
+  }
+  if code == 4 {
+    return MessageType.Signal
+  }
+  return MessageType.Invalid
+}
+
+/// One D-Bus message. Empty strings stand for absent header fields, and a `replySerial` of 0
+/// for none.
+pub struct Message {
+  pub kind: MessageType,
+  pub flags: u8,
+  /// Set when the message is sent or read.
+  pub serial: u32,
+  pub path: String,
+  pub interfaceName: String,
+  pub member: String,
+  pub errorName: String,
+  pub replySerial: u32,
+  pub destination: String,
+  pub sender: String,
+  /// The signature of the body.
+  pub signature: String,
+  /// The marshalled body. It starts 8-aligned in the message.
+  pub body: List<u8>,
+  /// The byte order of a message that was read; sent messages are little-endian.
+  pub bigEndian: bool,
+}
+
+/// A message read from bytes, and how many bytes it took.
+pub struct Decoded {
+  pub message: Message,
+  pub length: usize,
+}
+
+effect fn copied(value: string) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return run String.copy(value)
+}
+
+impl Message {
+  fn blank(kind: MessageType) -> Message {
+    return Message {
+      kind: kind,
+      flags: 0,
+      serial: 0,
+      path: String.make(),
+      interfaceName: String.make(),
+      member: String.make(),
+      errorName: String.make(),
+      replySerial: 0,
+      destination: String.make(),
+      sender: String.make(),
+      signature: String.make(),
+      body: List<u8>.make(),
+      bigEndian: false,
+    }
+  }
+
+  /// A call of `interface.member` on the object at `path` of `destination`.
+  pub effect fn methodCall(
+    destination: string,
+    path: string,
+    interfaceName: string,
+    member: string,
+  ) -> Message
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut message = Message.blank(MessageType.MethodCall)
+    message.destination = run copied(destination)
+    message.path = run copied(path)
+    message.interfaceName = run copied(interfaceName)
+    message.member = run copied(member)
+    return move message
+  }
+
+  /// A signal `interface.member` from the object at `path`.
+  pub effect fn signal(path: string, interfaceName: string, member: string) -> Message
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut message = Message.blank(MessageType.Signal)
+    message.path = run copied(path)
+    message.interfaceName = run copied(interfaceName)
+    message.member = run copied(member)
+    return move message
+  }
+
+  /// The successful reply to `call`.
+  pub effect fn methodReturn(call: &Message) -> Message
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut message = Message.blank(MessageType.MethodReturn)
+    message.replySerial = call.serial
+    message.destination = run copied(String.view(&call.sender))
+    message.flags = NO_AUTO_START()
+    return move message
+  }
+
+  /// The error reply `name` to `call`, with a human-readable `text`.
+  pub effect fn errorReply(call: &Message, name: string, text: string) -> Message
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut message = Message.blank(MessageType.Error)
+    message.replySerial = call.serial
+    message.destination = run copied(String.view(&call.sender))
+    message.errorName = run copied(name)
+    message.flags = NO_AUTO_START()
+    let mut body = Writer.make()
+    run body.string(text)
+    run message.setBody("s", move body)
+    return move message
+  }
+
+  /// Sets the body to what `body` holds, of `signature`.
+  pub effect fn setBody(self: &mut Self, signature: string, body: Writer) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.signature = run copied(signature)
+    self.body = body.finish()
+  }
+
+  /// A reader over the body.
+  pub fn reader(self: &Self) -> Reader<'_> {
+    return Reader.make(self.body.asSlice(), self.bigEndian)
+  }
+
+  pub fn isCall(self: &Self, interfaceName: string, member: string) -> bool {
+    return self.kind == MessageType.MethodCall && String.view(&self.interfaceName) == interfaceName
+      && String.view(&self.member) == member
+  }
+
+  pub fn isSignal(self: &Self, interfaceName: string, member: string) -> bool {
+    return self.kind == MessageType.Signal && String.view(&self.interfaceName) == interfaceName
+      && String.view(&self.member) == member
+  }
+
+  /// The message as bytes, with `serial`.
+  pub effect fn encode(self: &Self, serial: u32) -> List<u8>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut out = Writer.make()
+    run out.byte(108)
+    run out.byte(typeCode(self.kind))
+    run out.byte(self.flags)
+    run out.byte(1)
+    run out.uint32(usize.toU32(self.body.length()))
+    run out.uint32(serial)
+    let fields = run out.beginArray(8)
+    run stringField(&mut out, 1, "o", String.view(&self.path))
+    run stringField(&mut out, 2, "s", String.view(&self.interfaceName))
+    run stringField(&mut out, 3, "s", String.view(&self.member))
+    run stringField(&mut out, 4, "s", String.view(&self.errorName))
+    if self.replySerial != 0 {
+      run out.beginStruct()
+      run out.byte(5)
+      run out.variant("u")
+      run out.uint32(self.replySerial)
+    }
+    run stringField(&mut out, 6, "s", String.view(&self.destination))
+    run stringField(&mut out, 7, "s", String.view(&self.sender))
+    run stringField(&mut out, 8, "g", String.view(&self.signature))
+    out.endArray(fields)
+    run out.pad(8)
+    run out.raw(self.body.asSlice())
+    return out.finish()
+  }
+}
+
+effect fn stringField(out: &mut Writer, code: u8, signature: string, value: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if String.byteLength(value) == 0 {
+    return ()
+  }
+  run out.beginStruct()
+  run out.byte(code)
+  run out.variant(signature)
+  if code == 8 {
+    run out.signature(value)
+  } else {
+    run out.string(value)
+  }
+}
+
+fn readU32(data: &[u8], at: usize, bigEndian: bool) -> u32 {
+  let mut value: u32 = 0
+  let mut i: usize = 0
+  while i < 4 {
+    let b = u8.toU32(data[at + i])
+    let shift = if bigEndian {
+      (3 - i) * 8
+    } else {
+      i * 8
+    }
+    value = value | u32.shiftLeft(b, usize.toU32(shift))
+    i = i + 1
+  }
+  return value
+}
+
+/// How many bytes the message at the start of `data` takes, or 0 when `data` does not hold
+/// all of its fixed header yet.
+pub effect fn messageLength(data: &[u8]) -> usize
+  ! DBusError {
+  if data.length < 16 {
+    return 0
+  }
+  let order = data[0]
+  if order != 108 && order != 66 {
+    fail DBusError.Malformed { reason: "a message has an unknown byte order" }
+  }
+  let bigEndian = order == 66
+  let bodyLength = u32.toUsize(readU32(data, 4, bigEndian))
+  let fieldsLength = u32.toUsize(readU32(data, 12, bigEndian))
+  let mut headerEnd = 16 + fieldsLength
+  while headerEnd % 8 != 0 {
+    headerEnd = headerEnd + 1
+  }
+  if bodyLength > 134217728 || fieldsLength > 67108864 {
+    fail DBusError.Malformed { reason: "a message is longer than D-Bus allows" }
+  }
+  return headerEnd + bodyLength
+}
+
+/// Reads the message at the start of `data`, or none while `data` does not hold all of it.
+pub effect fn decode(data: &[u8]) -> Option<Decoded>
+  ! DBusError | OutOfMemoryError
+  ? &mut Allocator {
+  let total = run messageLength(data)
+  if total == 0 || data.length < total {
+    return Option.None
+  }
+  let bigEndian = data[0] == 66
+  let mut message = Message.blank(typeOf(data[1]))
+  message.bigEndian = bigEndian
+  message.flags = data[2]
+  if data[3] != 1 {
+    fail DBusError.Malformed { reason: "a message has an unknown protocol version" }
+  }
+  let bodyLength = u32.toUsize(readU32(data, 4, bigEndian))
+  message.serial = readU32(data, 8, bigEndian)
+  let headerEnd = total - bodyLength
+  let mut reader = Reader.make(Slice.view<u8>(data, 0, headerEnd), bigEndian)
+  reader.position = 12
+  let fieldsEnd = run reader.beginArray(8)
+  while reader.position < fieldsEnd {
+    run reader.beginStruct()
+    let code = run reader.byte()
+    let signature = run reader.signature()
+    if code == 5 && signature == "u" {
+      message.replySerial = run reader.uint32()
+    } else if code >= 1 && code <= 8 && (signature == "s" || signature == "o" || signature == "g") {
+      let value = if signature == "g" {
+        run reader.signature()
+      } else {
+        run reader.string()
+      }
+      let owned = run copied(value)
+      if code == 1 {
+        message.path = move owned
+      } else if code == 2 {
+        message.interfaceName = move owned
+      } else if code == 3 {
+        message.member = move owned
+      } else if code == 4 {
+        message.errorName = move owned
+      } else if code == 6 {
+        message.destination = move owned
+      } else if code == 7 {
+        message.sender = move owned
+      } else if code == 8 {
+        message.signature = move owned
+      }
+    } else {
+      run reader.skip(signature)
+    }
+  }
+  let mut i = headerEnd
+  while i < total {
+    run message.body.append(data[i])
+    i = i + 1
+  }
+  return Option.Some { value: Decoded { message: move message, length: total } }
+}

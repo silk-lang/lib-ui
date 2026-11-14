@@ -1,0 +1,1648 @@
+//! Tests of the consumer, ported from AccessKit's `accesskit_consumer` tests (the shared test
+//! tree in `lib.rs`, and the tests in `filters.rs`, `iterators.rs`, `node.rs`, `tree.rs` and
+//! `text.rs`).
+import accesskit.lib {
+  Node,
+  NodeId,
+  Role,
+  Action,
+  TreeId,
+  TreeInfo,
+  TreeUpdate,
+  TextDirection,
+  TextSelection,
+  TextPosition,
+  TextDecoration,
+  TextDecorationStyle,
+  Color,
+  Rect,
+  Affine,
+  Point,
+  Vec2
+}
+import lib {
+  Tree,
+  TreeState,
+  TreeIndex,
+  FullNodeId,
+  ChangeHandler,
+  NodeRef,
+  FilteredCursor,
+  NodeFilter,
+  FilterResult,
+  CommonFilter,
+  commonFilter,
+  commonFilterWithRootException,
+  RangeValue
+}
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.usize
+import silk.num.f64
+import silk.text.string { String }
+import silk.testing.testing { Testing, AssertionError }
+
+// ---------------------------------------------------------------------------------------------
+// Shared helpers
+
+fn nid(value: u64) -> FullNodeId {
+  return FullNodeId.make(NodeId.of(value), TreeIndex { value: 0 })
+}
+
+effect fn withChildren(kind: Role, children: &[u64]) -> Node
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut node = Node.make(kind)
+  let mut i: usize = 0
+  while i < children.length {
+    run node.pushChild(NodeId.of(children[i]))
+    i = i + 1
+  }
+  return move node
+}
+
+fn idIs(node: Option<NodeRef<'_>>, expected: u64) -> bool {
+  return match node {
+    Option.Some { value } => value.id.equals(nid(expected))
+    Option.None => false
+  }
+}
+
+fn isNone(node: Option<NodeRef<'_>>) -> bool {
+  return match node {
+    Option.Some { value: _ } => false
+    Option.None => true
+  }
+}
+
+fn nodeAt<'a>(state: &'a TreeState, id: u64) -> NodeRef<'a> {
+  return match state.nodeById(nid(id)) {
+    Option.Some { value } => value
+    Option.None => Intrinsic.trap("test: missing node")
+  }
+}
+
+fn closeTo(a: f64, b: f64) -> bool {
+  return f64.abs(a - b) < 0.0001
+}
+
+fn rectIs(rect: Rect, x0: f64, y0: f64, x1: f64, y1: f64) -> bool {
+  return closeTo(rect.x0, x0) && closeTo(rect.y0, y0) && closeTo(rect.x1, x1)
+    && closeTo(rect.y1, y1)
+}
+
+/// Walks `cursor` forward (or backward) and checks that it yields `expected`, in order.
+fn cursorYields<F: NodeFilter>(
+  cursor: FilteredCursor<'_>,
+  filter: &F,
+  expected: &[u64],
+  backward: bool,
+) -> bool {
+  let mut cursor = cursor
+  let mut i: usize = 0
+  while true {
+    let next = if backward {
+      cursor.nextBack(filter)
+    } else {
+      cursor.next(filter)
+    }
+    match next {
+      Option.Some { value } => {
+        if i >= expected.length || !value.id.equals(nid(expected[i])) {
+          return false
+        }
+        i = i + 1
+      }
+      Option.None => {
+        return i == expected.length
+      }
+    }
+  }
+  return false
+}
+
+// The test tree from `accesskit_consumer/src/lib.rs`.
+fn ROOT_ID() -> u64 {
+  return 0
+}
+
+fn PARAGRAPH_0_ID() -> u64 {
+  return 1
+}
+
+fn LABEL_0_0_IGNORED_ID() -> u64 {
+  return 2
+}
+
+fn PARAGRAPH_1_IGNORED_ID() -> u64 {
+  return 3
+}
+
+fn BUTTON_1_0_HIDDEN_ID() -> u64 {
+  return 4
+}
+
+fn CONTAINER_1_0_0_HIDDEN_ID() -> u64 {
+  return 5
+}
+
+fn LABEL_1_1_ID() -> u64 {
+  return 6
+}
+
+fn BUTTON_1_2_HIDDEN_ID() -> u64 {
+  return 7
+}
+
+fn CONTAINER_1_2_0_HIDDEN_ID() -> u64 {
+  return 8
+}
+
+fn PARAGRAPH_2_ID() -> u64 {
+  return 9
+}
+
+fn LABEL_2_0_ID() -> u64 {
+  return 10
+}
+
+fn PARAGRAPH_3_IGNORED_ID() -> u64 {
+  return 11
+}
+
+fn EMPTY_CONTAINER_3_0_IGNORED_ID() -> u64 {
+  return 12
+}
+
+fn LINK_3_1_IGNORED_ID() -> u64 {
+  return 13
+}
+
+fn LABEL_3_1_0_ID() -> u64 {
+  return 14
+}
+
+fn BUTTON_3_2_ID() -> u64 {
+  return 15
+}
+
+fn EMPTY_CONTAINER_3_3_IGNORED_ID() -> u64 {
+  return 16
+}
+
+effect fn testTree() -> Tree
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut update = TreeUpdate.make(NodeId.of(0))
+  update.tree = Option.Some { value: TreeInfo.make(NodeId.of(0)) }
+  run update.push(NodeId.of(0), run withChildren(Role.RootWebArea, &[1, 3, 9, 11]))
+  run update.push(NodeId.of(1), run withChildren(Role.Paragraph, &[2]))
+  let mut label00 = Node.make(Role.Label)
+  run label00.setValue("label_0_0_ignored")
+  run update.push(NodeId.of(2), move label00)
+  let mut paragraph1 = run withChildren(Role.Paragraph, &[4, 6, 7])
+  run paragraph1.setTransform(Affine.translate(Vec2.make(10.0, 40.0)))
+  run paragraph1.setBounds(Rect.make(0.0, 0.0, 800.0, 40.0))
+  run update.push(NodeId.of(3), move paragraph1)
+  let mut button10 = run withChildren(Role.Button, &[5])
+  run button10.setLabel("button_1_0_hidden")
+  button10.setHidden()
+  run update.push(NodeId.of(4), move button10)
+  let mut container100 = Node.make(Role.GenericContainer)
+  container100.setHidden()
+  run update.push(NodeId.of(5), move container100)
+  let mut label11 = Node.make(Role.Label)
+  run label11.setBounds(Rect.make(10.0, 10.0, 90.0, 30.0))
+  run label11.setValue("label_1_1")
+  run update.push(NodeId.of(6), move label11)
+  let mut button12 = run withChildren(Role.Button, &[8])
+  run button12.setLabel("button_1_2_hidden")
+  button12.setHidden()
+  run update.push(NodeId.of(7), move button12)
+  let mut container120 = Node.make(Role.GenericContainer)
+  container120.setHidden()
+  run update.push(NodeId.of(8), move container120)
+  run update.push(NodeId.of(9), run withChildren(Role.Paragraph, &[10]))
+  let mut label20 = Node.make(Role.Label)
+  run label20.setLabel("label_2_0")
+  run update.push(NodeId.of(10), move label20)
+  run update.push(NodeId.of(11), run withChildren(Role.Paragraph, &[12, 13, 15, 16]))
+  run update.push(NodeId.of(12), Node.make(Role.GenericContainer))
+  run update.push(NodeId.of(13), run withChildren(Role.Link, &[14]))
+  let mut label310 = Node.make(Role.Label)
+  run label310.setValue("label_3_1_0")
+  run update.push(NodeId.of(14), move label310)
+  let mut button32 = Node.make(Role.Button)
+  run button32.setLabel("button_3_2")
+  run update.push(NodeId.of(15), move button32)
+  run update.push(NodeId.of(16), Node.make(Role.GenericContainer))
+  return run Tree.make(move update, false)
+}
+
+/// `test_tree_filter` from `lib.rs`.
+struct TestTreeFilter {}
+
+impl NodeFilter for TestTreeFilter {
+  fn filter(self: &Self, node: &NodeRef<'_>) -> FilterResult {
+    if node.isHidden() {
+      return FilterResult.ExcludeSubtree
+    }
+    let v = node.id.local.value
+    if v == LABEL_0_0_IGNORED_ID() || v == PARAGRAPH_1_IGNORED_ID() || v == PARAGRAPH_3_IGNORED_ID()
+      || v == EMPTY_CONTAINER_3_0_IGNORED_ID()
+      || v == LINK_3_1_IGNORED_ID()
+      || v == EMPTY_CONTAINER_3_3_IGNORED_ID() {
+      return FilterResult.ExcludeNode
+    }
+    return FilterResult.Include
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// node.rs
+
+effect fn nodeNavigation() -> ()
+  ! OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let tree = run testTree()
+  let state = tree.state()
+  let filter = TestTreeFilter {}
+  run Testing.expect(isNone(state.rootNode().parent()), "the root has no parent")
+  let p1 = nodeAt(state, PARAGRAPH_1_IGNORED_ID())
+  run Testing.expect(idIs(p1.parent(), ROOT_ID()), "parent of paragraph 1")
+  run Testing.expect(
+    match p1.indexInParent() {
+      Option.Some { value } => value == 1
+      Option.None => false
+    },
+    "index of paragraph 1",
+  )
+  run Testing.expect(
+    idIs(nodeAt(state, LABEL_2_0_ID()).parent(), PARAGRAPH_2_ID()),
+    "parent of label 2.0",
+  )
+
+  // deepest_first_child
+  run Testing.expect(
+    idIs(state.rootNode().deepestFirstChild(), LABEL_0_0_IGNORED_ID()),
+    "deepest first child of root",
+  )
+  run Testing.expect(
+    idIs(nodeAt(state, PARAGRAPH_0_ID()).deepestFirstChild(), LABEL_0_0_IGNORED_ID()),
+    "deepest first child of paragraph 0",
+  )
+  run Testing.expect(
+    isNone(nodeAt(state, LABEL_0_0_IGNORED_ID()).deepestFirstChild()),
+    "a leaf has no deepest first child",
+  )
+
+  // deepest_last_child
+  run Testing.expect(
+    idIs(state.rootNode().deepestLastChild(), EMPTY_CONTAINER_3_3_IGNORED_ID()),
+    "deepest last child of root",
+  )
+  run Testing.expect(
+    idIs(
+      nodeAt(state, PARAGRAPH_3_IGNORED_ID()).deepestLastChild(),
+      EMPTY_CONTAINER_3_3_IGNORED_ID(),
+    ),
+    "deepest last child of paragraph 3",
+  )
+  run Testing.expect(
+    isNone(nodeAt(state, BUTTON_3_2_ID()).deepestLastChild()),
+    "a leaf has no deepest last child",
+  )
+
+  // filtered_parent
+  run Testing.expect(
+    idIs(nodeAt(state, LABEL_1_1_ID()).filteredParent(&filter), ROOT_ID()),
+    "filtered parent of label 1.1",
+  )
+  run Testing.expect(
+    isNone(state.rootNode().filteredParent(&filter)),
+    "the root has no filtered parent",
+  )
+
+  // deepest_first_filtered_child / deepest_last_filtered_child
+  run Testing.expect(
+    idIs(state.rootNode().deepestFirstFilteredChild(&filter), PARAGRAPH_0_ID()),
+    "deepest first filtered child of root",
+  )
+  run Testing.expect(
+    isNone(nodeAt(state, PARAGRAPH_0_ID()).deepestFirstFilteredChild(&filter)),
+    "paragraph 0 has no filtered children",
+  )
+  run Testing.expect(
+    idIs(state.rootNode().deepestLastFilteredChild(&filter), BUTTON_3_2_ID()),
+    "deepest last filtered child of root",
+  )
+
+  // first_filtered_child / last_filtered_child
+  run Testing.expect(
+    idIs(state.rootNode().firstFilteredChild(&filter), PARAGRAPH_0_ID()),
+    "first filtered child of root",
+  )
+  run Testing.expect(
+    isNone(nodeAt(state, PARAGRAPH_0_ID()).firstFilteredChild(&filter)),
+    "paragraph 0 first filtered child",
+  )
+  run Testing.expect(
+    idIs(state.rootNode().lastFilteredChild(&filter), BUTTON_3_2_ID()),
+    "last filtered child of root",
+  )
+
+  // is_descendant_of
+  run Testing.expect(
+    nodeAt(state, PARAGRAPH_0_ID()).isDescendantOf(&state.rootNode()),
+    "paragraph 0 descends from root",
+  )
+  run Testing.expect(
+    nodeAt(state, LABEL_0_0_IGNORED_ID()).isDescendantOf(&state.rootNode()),
+    "label 0.0 descends from root",
+  )
+  run Testing.expect(
+    nodeAt(state, LABEL_0_0_IGNORED_ID()).isDescendantOf(&nodeAt(state, PARAGRAPH_0_ID())),
+    "label 0.0 descends from paragraph 0",
+  )
+  run Testing.expect(
+    !nodeAt(state, LABEL_0_0_IGNORED_ID()).isDescendantOf(&nodeAt(state, PARAGRAPH_2_ID())),
+    "label 0.0 is not under paragraph 2",
+  )
+  run Testing.expect(
+    !nodeAt(state, PARAGRAPH_0_ID()).isDescendantOf(&nodeAt(state, PARAGRAPH_2_ID())),
+    "siblings are not descendants",
+  )
+
+  // is_root
+  run Testing.expect(state.rootNode().isRoot(), "the root is the root")
+  run Testing.expect(!nodeAt(state, PARAGRAPH_0_ID()).isRoot(), "paragraph 0 is not the root")
+}
+
+test effect fn nodeNavigationMatchesAccessKit() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run nodeNavigation() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn nodeGeometry() -> ()
+  ! OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let tree = run testTree()
+  let state = tree.state()
+  let filter = TestTreeFilter {}
+  run Testing.expect(isNone2(state.rootNode().boundingBox()), "the root has no bounding box")
+  run Testing.expect(
+    match nodeAt(state, PARAGRAPH_1_IGNORED_ID()).boundingBox() {
+      Option.Some { value } => rectIs(value, 10.0, 40.0, 810.0, 80.0)
+      Option.None => false
+    },
+    "bounding box of paragraph 1",
+  )
+  run Testing.expect(
+    match nodeAt(state, LABEL_1_1_ID()).boundingBox() {
+      Option.Some { value } => rectIs(value, 20.0, 50.0, 100.0, 70.0)
+      Option.None => false
+    },
+    "bounding box of label 1.1",
+  )
+
+  // node_at_point
+  let root = state.rootNode()
+  run Testing.expect(
+    isNone(root.nodeAtPoint(Point.make(10.0, 40.0), &filter)),
+    "nothing at (10, 40)",
+  )
+  run Testing.expect(
+    idIs(root.nodeAtPoint(Point.make(20.0, 50.0), &filter), LABEL_1_1_ID()),
+    "label 1.1 at (20, 50)",
+  )
+  run Testing.expect(
+    idIs(root.nodeAtPoint(Point.make(50.0, 60.0), &filter), LABEL_1_1_ID()),
+    "label 1.1 at (50, 60)",
+  )
+  run Testing.expect(
+    isNone(root.nodeAtPoint(Point.make(100.0, 70.0), &filter)),
+    "nothing at (100, 70)",
+  )
+
+  // transform
+  run Testing.expect(
+    state.rootNode().transform().equals(Affine.identity()),
+    "the root transform is the identity",
+  )
+  run Testing.expect(
+    nodeAt(state, PARAGRAPH_1_IGNORED_ID()).transform().equals(
+      Affine.translate(Vec2.make(10.0, 40.0)),
+    ),
+    "paragraph 1 transform",
+  )
+  run Testing.expect(
+    nodeAt(state, LABEL_1_1_ID()).transform().equals(Affine.translate(Vec2.make(10.0, 40.0))),
+    "label 1.1 inherits the transform",
+  )
+  run Testing.expect(
+    nodeAt(state, LABEL_1_1_ID()).relativeTransform(
+      &nodeAt(state, PARAGRAPH_1_IGNORED_ID()),
+    ).equals(Affine.identity()),
+    "relative transform to the parent",
+  )
+  run Testing.expect(
+    nodeAt(state, LABEL_1_1_ID()).relativeTransform(&state.rootNode()).equals(
+      Affine.translate(Vec2.make(10.0, 40.0)),
+    ),
+    "relative transform to the root",
+  )
+}
+
+fn isNone2(rect: Option<Rect>) -> bool {
+  return match rect {
+    Option.Some { value: _ } => false
+    Option.None => true
+  }
+}
+
+test effect fn nodeGeometryMatchesAccessKit() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run nodeGeometry() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn labelOf(state: &TreeState, id: u64, expected: string) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match run nodeAt(state, id).label() {
+    Option.Some { value } => value.view() == expected
+    Option.None => false
+  }
+}
+
+effect fn labels() -> ()
+  ! OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  // no_label_or_labelled_by
+  let mut update = TreeUpdate.make(NodeId.of(0))
+  update.tree = Option.Some { value: TreeInfo.make(NodeId.of(0)) }
+  run update.push(NodeId.of(0), run withChildren(Role.Window, &[1]))
+  run update.push(NodeId.of(1), Node.make(Role.Button))
+  let tree = run Tree.make(move update, false)
+  run Testing.expect(
+    match run nodeAt(tree.state(), 1).label() {
+      Option.Some { value: _ } => false
+      Option.None => true
+    },
+    "a button with no label has none",
+  )
+
+  // label_from_labelled_by
+  let mut update2 = TreeUpdate.make(NodeId.of(0))
+  update2.tree = Option.Some { value: TreeInfo.make(NodeId.of(0)) }
+  run update2.push(NodeId.of(0), run withChildren(Role.Window, &[1, 2, 3, 4]))
+  let mut check = Node.make(Role.CheckBox)
+  run check.setLabelledBy(&[NodeId.of(2), NodeId.of(4)])
+  run update2.push(NodeId.of(1), move check)
+  let mut label1 = Node.make(Role.Label)
+  run label1.setValue("Check email every")
+  run update2.push(NodeId.of(2), move label1)
+  let mut input = Node.make(Role.TextInput)
+  run input.pushLabelledBy(NodeId.of(4))
+  run update2.push(NodeId.of(3), move input)
+  let mut label2 = Node.make(Role.Label)
+  run label2.setValue("minutes")
+  run update2.push(NodeId.of(4), move label2)
+  let tree2 = run Tree.make(move update2, false)
+  run Testing.expect(
+    run labelOf(tree2.state(), 1, "Check email every minutes"),
+    "labelled by two labels",
+  )
+  run Testing.expect(run labelOf(tree2.state(), 3, "minutes"), "labelled by one label")
+
+  // label_from_descendant_label
+  let mut update3 = TreeUpdate.make(NodeId.of(0))
+  update3.tree = Option.Some { value: TreeInfo.make(NodeId.of(0)) }
+  run update3.push(NodeId.of(0), run withChildren(Role.Window, &[1]))
+  run update3.push(NodeId.of(1), run withChildren(Role.Button, &[2]))
+  let mut inner = Node.make(Role.Label)
+  run inner.setValue("OK")
+  run update3.push(NodeId.of(2), move inner)
+  let tree3 = run Tree.make(move update3, false)
+  run Testing.expect(run labelOf(tree3.state(), 1, "OK"), "a button is named by its label child")
+}
+
+test effect fn labelsMatchAccessKit() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run labels() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn textInputValue(kind: Role, value: string, expected: string) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut update = TreeUpdate.make(NodeId.of(0))
+  update.tree = Option.Some { value: TreeInfo.make(NodeId.of(0)) }
+  run update.push(NodeId.of(0), run withChildren(Role.Window, &[1]))
+  let mut input = Node.make(kind)
+  run input.setValue(value)
+  run update.push(NodeId.of(1), move input)
+  let tree = run Tree.make(move update, false)
+  return match run nodeAt(tree.state(), 1).value() {
+    Option.Some { value: got } => got.view() == expected
+    Option.None => false
+  }
+}
+
+effect fn passwordValues() -> ()
+  ! OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  run Testing.expect(
+    run textInputValue(Role.PasswordInput, "***", "***"),
+    "a masked password value is exposed as is",
+  )
+  run Testing.expect(
+    run textInputValue(Role.PasswordInput, "a\u{1f44d}b", "\u{2022}\u{2022}\u{2022}"),
+    "an unmasked password value is masked",
+  )
+  run Testing.expect(
+    run textInputValue(Role.TextInput, "a\u{1f44d}b", "a\u{1f44d}b"),
+    "a text input value is not masked",
+  )
+}
+
+test effect fn passwordValuesMatchAccessKit() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run passwordValues() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn focusState() -> ()
+  ! OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  // is_focused_when_node_has_focus / does_not_have_focus
+  let mut update = TreeUpdate.make(NodeId.of(1))
+  update.tree = Option.Some { value: TreeInfo.make(NodeId.of(0)) }
+  run update.push(NodeId.of(0), run withChildren(Role.Window, &[1, 2]))
+  run update.push(NodeId.of(1), Node.make(Role.Button))
+  run update.push(NodeId.of(2), Node.make(Role.Button))
+  let tree = run Tree.make(move update, true)
+  run Testing.expect(nodeAt(tree.state(), 1).isFocused(), "the focused node is focused")
+  run Testing.expect(!nodeAt(tree.state(), 2).isFocused(), "another node is not focused")
+
+  // is_focused_active_descendant_is_focused
+  let mut update2 = TreeUpdate.make(NodeId.of(1))
+  update2.tree = Option.Some { value: TreeInfo.make(NodeId.of(0)) }
+  run update2.push(NodeId.of(0), run withChildren(Role.Window, &[1]))
+  let mut list = run withChildren(Role.ListBox, &[2])
+  run list.setActiveDescendant(NodeId.of(2))
+  run update2.push(NodeId.of(1), move list)
+  run update2.push(NodeId.of(2), Node.make(Role.ListBoxOption))
+  let tree2 = run Tree.make(move update2, true)
+  run Testing.expect(nodeAt(tree2.state(), 2).isFocused(), "the active descendant is focused")
+  run Testing.expect(
+    !nodeAt(tree2.state(), 1).isFocused(),
+    "the node with an active descendant is not",
+  )
+  run Testing.expect(idIs(tree2.state().focusNode(), 2), "focus resolves to the active descendant")
+}
+
+test effect fn focusStateMatchesAccessKit() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run focusState() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// ---------------------------------------------------------------------------------------------
+// iterators.rs
+
+effect fn iterators() -> ()
+  ! OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let tree = run testTree()
+  let state = tree.state()
+  let filter = TestTreeFilter {}
+
+  // following_filtered_siblings
+  run Testing.expect(
+    cursorYields(state.rootNode().followingFilteredSiblings(&filter), &filter, &[], false),
+    "the root has no following siblings",
+  )
+  run Testing.expect(
+    cursorYields(
+      nodeAt(state, PARAGRAPH_0_ID()).followingFilteredSiblings(&filter),
+      &filter,
+      &[LABEL_1_1_ID(), PARAGRAPH_2_ID(), LABEL_3_1_0_ID(), BUTTON_3_2_ID()],
+      false,
+    ),
+    "following filtered siblings of paragraph 0",
+  )
+  run Testing.expect(
+    cursorYields(
+      nodeAt(state, PARAGRAPH_0_ID()).followingFilteredSiblings(&filter),
+      &filter,
+      &[BUTTON_3_2_ID(), LABEL_3_1_0_ID(), PARAGRAPH_2_ID(), LABEL_1_1_ID()],
+      true,
+    ),
+    "following filtered siblings reversed",
+  )
+  run Testing.expect(
+    cursorYields(
+      nodeAt(state, PARAGRAPH_3_IGNORED_ID()).followingFilteredSiblings(&filter),
+      &filter,
+      &[],
+      false,
+    ),
+    "the last child has no following siblings",
+  )
+
+  // preceding_filtered_siblings
+  run Testing.expect(
+    cursorYields(
+      nodeAt(state, PARAGRAPH_3_IGNORED_ID()).precedingFilteredSiblings(&filter),
+      &filter,
+      &[PARAGRAPH_2_ID(), LABEL_1_1_ID(), PARAGRAPH_0_ID()],
+      false,
+    ),
+    "preceding filtered siblings of paragraph 3",
+  )
+  run Testing.expect(
+    cursorYields(
+      nodeAt(state, PARAGRAPH_3_IGNORED_ID()).precedingFilteredSiblings(&filter),
+      &filter,
+      &[PARAGRAPH_0_ID(), LABEL_1_1_ID(), PARAGRAPH_2_ID()],
+      true,
+    ),
+    "preceding filtered siblings reversed",
+  )
+  run Testing.expect(
+    cursorYields(
+      nodeAt(state, PARAGRAPH_0_ID()).precedingFilteredSiblings(&filter),
+      &filter,
+      &[],
+      false,
+    ),
+    "the first child has no preceding siblings",
+  )
+
+  // filtered_children
+  run Testing.expect(
+    cursorYields(
+      state.rootNode().filteredChildren(&filter),
+      &filter,
+      &[PARAGRAPH_0_ID(), LABEL_1_1_ID(), PARAGRAPH_2_ID(), LABEL_3_1_0_ID(), BUTTON_3_2_ID()],
+      false,
+    ),
+    "filtered children of root",
+  )
+  run Testing.expect(
+    cursorYields(
+      state.rootNode().filteredChildren(&filter),
+      &filter,
+      &[BUTTON_3_2_ID(), LABEL_3_1_0_ID(), PARAGRAPH_2_ID(), LABEL_1_1_ID(), PARAGRAPH_0_ID()],
+      true,
+    ),
+    "filtered children reversed",
+  )
+  run Testing.expect(
+    cursorYields(nodeAt(state, PARAGRAPH_0_ID()).filteredChildren(&filter), &filter, &[], false),
+    "paragraph 0 has no filtered children",
+  )
+  run Testing.expect(
+    cursorYields(
+      nodeAt(state, LABEL_0_0_IGNORED_ID()).filteredChildren(&filter),
+      &filter,
+      &[],
+      false,
+    ),
+    "a leaf has no filtered children",
+  )
+
+  // following_siblings / preceding_siblings (unfiltered)
+  run Testing.expect(
+    idIs(nodeAt(state, PARAGRAPH_0_ID()).followingSibling(), PARAGRAPH_1_IGNORED_ID()),
+    "following sibling of paragraph 0",
+  )
+  run Testing.expect(
+    isNone(nodeAt(state, PARAGRAPH_3_IGNORED_ID()).followingSibling()),
+    "no sibling after paragraph 3",
+  )
+  run Testing.expect(
+    idIs(nodeAt(state, PARAGRAPH_3_IGNORED_ID()).precedingSibling(), PARAGRAPH_2_ID()),
+    "preceding sibling of paragraph 3",
+  )
+  run Testing.expect(
+    isNone(nodeAt(state, PARAGRAPH_0_ID()).precedingSibling()),
+    "no sibling before paragraph 0",
+  )
+}
+
+test effect fn iteratorsMatchAccessKit() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run iterators() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// ---------------------------------------------------------------------------------------------
+// filters.rs
+
+effect fn twoNodeTree(
+  rootRole: Role,
+  rootHidden: bool,
+  childRole: Role,
+  childHidden: bool,
+  focus: u64,
+) -> Tree
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut update = TreeUpdate.make(NodeId.of(focus))
+  update.tree = Option.Some { value: TreeInfo.make(NodeId.of(0)) }
+  let mut root = run withChildren(rootRole, &[1])
+  if rootHidden {
+    root.setHidden()
+  }
+  run update.push(NodeId.of(0), move root)
+  let mut child = Node.make(childRole)
+  if childHidden {
+    child.setHidden()
+  }
+  run update.push(NodeId.of(1), move child)
+  return run Tree.make(move update, focus != 0)
+}
+
+fn filterIs(tree: &Tree, id: u64, expected: FilterResult) -> bool {
+  return commonFilter(&nodeAt(tree.state(), id)) == expected
+}
+
+/// `clipped_children_test_tree` from `filters.rs`: a clipping scroll view at y 0..30 with
+/// eleven 10-high children from y -30 to 60, two of them hidden and unpositioned.
+effect fn clippedChildrenTree() -> Tree
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut update = TreeUpdate.make(NodeId.of(0))
+  update.tree = Option.Some { value: TreeInfo.make(NodeId.of(0)) }
+  let mut view = run withChildren(Role.ScrollView, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+  run view.setBounds(Rect.make(0.0, 0.0, 30.0, 30.0))
+  view.setClipsChildren()
+  run update.push(NodeId.of(0), move view)
+  let tops: [f64; 11] = [-30.0, -20.0, -10.0, 0.0, 0.0, 10.0, 20.0, 0.0, 30.0, 40.0, 50.0]
+  let mut i: usize = 0
+  while i < 11 {
+    let mut item = Node.make(Role.Unknown)
+    if i == 3 || i == 7 {
+      item.setHidden()
+    } else {
+      run item.setBounds(Rect.make(0.0, tops[i], 30.0, tops[i] + 10.0))
+    }
+    run update.push(NodeId.of(usize.toU64(i + 1)), move item)
+    i = i + 1
+  }
+  return run Tree.make(move update, false)
+}
+
+effect fn filters() -> ()
+  ! OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let normal = run twoNodeTree(Role.Window, false, Role.Button, false, 0)
+  run Testing.expect(filterIs(&normal, 1, FilterResult.Include), "normal")
+  let hidden = run twoNodeTree(Role.Window, false, Role.Button, true, 0)
+  run Testing.expect(filterIs(&hidden, 1, FilterResult.ExcludeSubtree), "hidden")
+  let hiddenFocused = run twoNodeTree(Role.Window, false, Role.Button, true, 1)
+  run Testing.expect(filterIs(&hiddenFocused, 1, FilterResult.Include), "hidden but focused")
+  let generic = run twoNodeTree(Role.GenericContainer, false, Role.Button, false, 0)
+  run Testing.expect(filterIs(&generic, 0, FilterResult.ExcludeNode), "generic container")
+  run Testing.expect(
+    commonFilterWithRootException(&nodeAt(generic.state(), 0)) == FilterResult.Include,
+    "generic container root exception",
+  )
+  run Testing.expect(filterIs(&generic, 1, FilterResult.Include), "child of generic container")
+  let hiddenParent = run twoNodeTree(Role.GenericContainer, true, Role.Button, false, 0)
+  run Testing.expect(filterIs(&hiddenParent, 0, FilterResult.ExcludeSubtree), "hidden parent")
+  run Testing.expect(
+    filterIs(&hiddenParent, 1, FilterResult.ExcludeSubtree),
+    "child of hidden parent",
+  )
+  let hiddenParentFocused = run twoNodeTree(Role.GenericContainer, true, Role.Button, false, 1)
+  run Testing.expect(
+    filterIs(&hiddenParentFocused, 0, FilterResult.ExcludeSubtree),
+    "hidden parent of focus",
+  )
+  run Testing.expect(
+    filterIs(&hiddenParentFocused, 1, FilterResult.Include),
+    "focused child of hidden parent",
+  )
+  let textRun = run twoNodeTree(Role.TextInput, false, Role.TextRun, false, 0)
+  run Testing.expect(filterIs(&textRun, 1, FilterResult.ExcludeNode), "text run")
+
+  // clipped_children_*
+  let clipped = run clippedChildrenTree()
+  run Testing.expect(
+    filterIs(&clipped, 1, FilterResult.ExcludeSubtree)
+      && filterIs(&clipped, 2, FilterResult.ExcludeSubtree),
+    "clipped children excluded above",
+  )
+  run Testing.expect(filterIs(&clipped, 3, FilterResult.Include), "clipped child included above")
+  run Testing.expect(
+    filterIs(&clipped, 4, FilterResult.ExcludeSubtree)
+      && filterIs(&clipped, 8, FilterResult.ExcludeSubtree),
+    "clipped children hidden",
+  )
+  run Testing.expect(
+    filterIs(&clipped, 5, FilterResult.Include) && filterIs(&clipped, 6, FilterResult.Include)
+      && filterIs(&clipped, 7, FilterResult.Include),
+    "clipped children visible",
+  )
+  run Testing.expect(filterIs(&clipped, 9, FilterResult.Include), "clipped child included below")
+  run Testing.expect(
+    filterIs(&clipped, 10, FilterResult.ExcludeSubtree)
+      && filterIs(&clipped, 11, FilterResult.ExcludeSubtree),
+    "clipped children excluded below",
+  )
+}
+
+test effect fn filtersMatchAccessKit() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run filters() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// ---------------------------------------------------------------------------------------------
+// tree.rs
+
+/// Records what a tree update reported.
+struct Recorder {
+  added: List<u64>,
+  updated: List<u64>,
+  removed: List<u64>,
+  focusFrom: List<u64>,
+  focusTo: List<u64>,
+}
+
+fn optionalId(node: Option<NodeRef<'_>>) -> u64 {
+  return match node {
+    Option.Some { value } => value.id.local.value
+    Option.None => 1000000
+  }
+}
+
+impl Recorder {
+  fn make() -> Recorder {
+    return Recorder {
+      added: List<u64>.make(),
+      updated: List<u64>.make(),
+      removed: List<u64>.make(),
+      focusFrom: List<u64>.make(),
+      focusTo: List<u64>.make(),
+    }
+  }
+
+  fn total(self: &Self) -> usize {
+    return self.added.length() + self.updated.length() + self.removed.length()
+      + self.focusTo.length()
+  }
+}
+
+impl ChangeHandler for Recorder {
+  effect fn nodeAdded(self: &mut Self, node: &NodeRef<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.added.append(node.id.local.value)
+  }
+
+  effect fn nodeUpdated(self: &mut Self, old: &NodeRef<'_>, new: &NodeRef<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.updated.append(new.id.local.value)
+  }
+
+  effect fn focusMoved(self: &mut Self, old: Option<NodeRef<'_>>, new: Option<NodeRef<'_>>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.focusFrom.append(optionalId(old))
+    run self.focusTo.append(optionalId(new))
+  }
+
+  effect fn nodeRemoved(self: &mut Self, node: &NodeRef<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.removed.append(node.id.local.value)
+  }
+}
+
+fn listIs(list: &List<u64>, expected: &[u64]) -> bool {
+  if list.length() != expected.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < expected.length {
+    if list.get(i) != expected[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+effect fn treeUpdates() -> ()
+  ! OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  // init_tree_with_root_node
+  let mut first = TreeUpdate.make(NodeId.of(0))
+  first.tree = Option.Some { value: TreeInfo.make(NodeId.of(0)) }
+  run first.push(NodeId.of(0), Node.make(Role.Window))
+  let mut tree = run Tree.make(move first, false)
+  run Testing.expect(tree.state().rootNode().id.equals(nid(0)), "the root is node 0")
+  run Testing.expect(tree.state().rootNode().accessRole() == Role.Window, "the root is a window")
+  run Testing.expect(tree.state().rootNode().childCount() == 0, "the root starts with no children")
+
+  // add_child_to_root_node
+  let mut second = TreeUpdate.make(NodeId.of(0))
+  run second.push(NodeId.of(0), run withChildren(Role.Window, &[1]))
+  run second.push(NodeId.of(1), Node.make(Role.RootWebArea))
+  let mut added = Recorder.make()
+  run tree.update(move second, &mut added)
+  run Testing.expect(listIs(&added.added, &[1]), "the child was added")
+  run Testing.expect(listIs(&added.updated, &[0]), "the root was updated")
+  run Testing.expect(added.total() == 2, "nothing else changed")
+  run Testing.expect(tree.state().rootNode().childCount() == 1, "the root has one child")
+  run Testing.expect(idIs(nodeAt(tree.state(), 1).parent(), 0), "the child's parent is the root")
+
+  // no_change_update
+  let mut same = TreeUpdate.make(NodeId.of(0))
+  run same.push(NodeId.of(0), run withChildren(Role.Window, &[1]))
+  let mut unchanged = Recorder.make()
+  run tree.update(move same, &mut unchanged)
+  run Testing.expect(unchanged.total() == 0, "an identical update reports nothing")
+
+  // update_node
+  let mut relabel = TreeUpdate.make(NodeId.of(0))
+  let mut renamed = Node.make(Role.RootWebArea)
+  run renamed.setLabel("renamed")
+  run relabel.push(NodeId.of(1), move renamed)
+  let mut updated = Recorder.make()
+  run tree.update(move relabel, &mut updated)
+  run Testing.expect(listIs(&updated.updated, &[1]), "the changed node was updated")
+  run Testing.expect(updated.total() == 1, "only that node")
+  run Testing.expect(run labelOf(tree.state(), 1, "renamed"), "the new label is visible")
+
+  // remove_child_from_root_node
+  let mut third = TreeUpdate.make(NodeId.of(0))
+  run third.push(NodeId.of(0), Node.make(Role.Window))
+  let mut removed = Recorder.make()
+  run tree.update(move third, &mut removed)
+  run Testing.expect(listIs(&removed.removed, &[1]), "the child was removed")
+  run Testing.expect(listIs(&removed.updated, &[0]), "the root was updated")
+  run Testing.expect(removed.total() == 2, "nothing else changed")
+  run Testing.expect(tree.state().rootNode().childCount() == 0, "the root has no children again")
+  run Testing.expect(isNone(tree.state().nodeById(nid(1))), "the removed node is gone")
+}
+
+test effect fn treeUpdatesMatchAccessKit() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run treeUpdates() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn focusMoves() -> ()
+  ! OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  // move_focus_between_siblings
+  let mut first = TreeUpdate.make(NodeId.of(1))
+  first.tree = Option.Some { value: TreeInfo.make(NodeId.of(0)) }
+  run first.push(NodeId.of(0), run withChildren(Role.Window, &[1, 2]))
+  run first.push(NodeId.of(1), Node.make(Role.Button))
+  run first.push(NodeId.of(2), Node.make(Role.Button))
+  let mut tree = run Tree.make(move first, true)
+  run Testing.expect(nodeAt(tree.state(), 1).isFocused(), "button 1 starts focused")
+  let second = TreeUpdate.make(NodeId.of(2))
+  let mut moved = Recorder.make()
+  run tree.update(move second, &mut moved)
+  run Testing.expect(
+    listIs(&moved.focusFrom, &[1]) && listIs(&moved.focusTo, &[2]),
+    "focus moved from 1 to 2",
+  )
+  run Testing.expect(
+    listIs(&moved.updated, &[1, 2]) || listIs(&moved.updated, &[2, 1]),
+    "both buttons were updated",
+  )
+  run Testing.expect(nodeAt(tree.state(), 2).isFocused(), "button 2 is focused")
+  run Testing.expect(!nodeAt(tree.state(), 1).isFocused(), "button 1 is not")
+
+  // host focus changes
+  let mut blurred = Recorder.make()
+  run tree.updateHostFocusState(false, &mut blurred)
+  run Testing.expect(
+    listIs(&blurred.focusFrom, &[2]) && listIs(&blurred.focusTo, &[1000000]),
+    "focus left with the host window",
+  )
+  run Testing.expect(isNone(tree.state().focusNode()), "no node is focused while the host is not")
+
+  // move_node
+  let mut third = TreeUpdate.make(NodeId.of(2))
+  run third.push(NodeId.of(0), run withChildren(Role.Window, &[1]))
+  run third.push(NodeId.of(1), run withChildren(Role.Group, &[2]))
+  let mut reparented = Recorder.make()
+  run tree.update(move third, &mut reparented)
+  run Testing.expect(idIs(nodeAt(tree.state(), 2).parent(), 1), "button 2 moved under node 1")
+  run Testing.expect(
+    reparented.removed.length() == 0 && reparented.added.length() == 0,
+    "moving a node neither adds nor removes it",
+  )
+}
+
+test effect fn focusMovesMatchAccessKit() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run focusMoves() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn toolkitInfo() -> ()
+  ! OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let mut update = TreeUpdate.make(NodeId.of(0))
+  let mut info = TreeInfo.make(NodeId.of(0))
+  info.toolkitName = Option.Some { value: run String.copy("silk") }
+  info.toolkitVersion = Option.Some { value: run String.copy("1.0") }
+  update.tree = Option.Some { value: move info }
+  run update.push(NodeId.of(0), Node.make(Role.Window))
+  let tree = run Tree.make(move update, false)
+  run Testing.expect(tree.state().toolkitName() == "silk", "the toolkit name is reported")
+  run Testing.expect(
+    match tree.state().toolkitVersion() {
+      Option.Some { value } => value == "1.0"
+      Option.None => false
+    },
+    "the toolkit version is reported",
+  )
+
+  let mut bare = TreeUpdate.make(NodeId.of(0))
+  bare.tree = Option.Some { value: TreeInfo.make(NodeId.of(0)) }
+  run bare.push(NodeId.of(0), Node.make(Role.Window))
+  let bareTree = run Tree.make(move bare, false)
+  run Testing.expect(
+    bareTree.state().toolkitName() == "AccessKit",
+    "the toolkit name falls back to AccessKit",
+  )
+  run Testing.expect(
+    match bareTree.state().toolkitVersion() {
+      Option.Some { value: _ } => false
+      Option.None => true
+    },
+    "no version without a name",
+  )
+}
+
+test effect fn toolkitInfoMatchesAccessKit() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run toolkitInfo() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// A tree with a graft (node 1) whose subtree has root 0 and a button child 1.
+effect fn graftTrees() -> ()
+  ! OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let mut subtreeId = TreeId.root()
+  subtreeId.bytes[15] = 1
+  let mut first = TreeUpdate.make(NodeId.of(0))
+  first.tree = Option.Some { value: TreeInfo.make(NodeId.of(0)) }
+  run first.push(NodeId.of(0), run withChildren(Role.Window, &[1]))
+  let mut graft = Node.make(Role.GenericContainer)
+  run graft.setTreeId(subtreeId)
+  run first.push(NodeId.of(1), move graft)
+  let mut tree = run Tree.make(move first, true)
+  run Testing.expect(
+    nodeAt(tree.state(), 1).childCount() == 0,
+    "a graft has no children before its subtree arrives",
+  )
+  let filter = CommonFilter {}
+  run Testing.expect(
+    cursorYields(nodeAt(tree.state(), 1).filteredChildren(&filter), &filter, &[], false),
+    "graft node without subtree has no filtered children",
+  )
+
+  let mut sub = TreeUpdate.make(NodeId.of(0))
+  sub.treeId = subtreeId
+  sub.tree = Option.Some { value: TreeInfo.make(NodeId.of(0)) }
+  run sub.push(NodeId.of(0), run withChildren(Role.Document, &[1]))
+  run sub.push(NodeId.of(1), Node.make(Role.Button))
+  let mut pushed = Recorder.make()
+  run tree.update(move sub, &mut pushed)
+  run Testing.expect(pushed.added.length() == 2, "both subtree nodes were added")
+  let graftNode = nodeAt(tree.state(), 1)
+  run Testing.expect(graftNode.childCount() == 1, "the graft now has the subtree root as its child")
+  let subRoot = match graftNode.firstChild() {
+    Option.Some { value } => value
+    Option.None => Intrinsic.trap("test: no subtree root")
+  }
+  run Testing.expect(subRoot.accessRole() == Role.Document, "the graft's child is the subtree root")
+  run Testing.expect(subRoot.id.tree.value != 0, "subtree nodes get their own tree index")
+  run Testing.expect(idIs(subRoot.parent(), 1), "the subtree root's parent is the graft")
+  run Testing.expect(subRoot.locate().tree.equals(subtreeId), "locate names the subtree")
+  run Testing.expect(
+    match tree.state().nodeByTreeLocalId(NodeId.of(1), subtreeId) {
+      Option.Some { value } => value.accessRole() == Role.Button
+      Option.None => false
+    },
+    "node by tree-local id finds the subtree button",
+  )
+  run Testing.expect(
+    match tree.state().nodeByTreeLocalId(NodeId.of(1), TreeId.root()) {
+      Option.Some { value } => value.accessRole() == Role.GenericContainer
+      Option.None => false
+    },
+    "node by tree-local id finds the main tree graft",
+  )
+
+  // filtered_children_crosses_subtree_boundary: the graft is looked through, the document is kept.
+  run Testing.expect(
+    cursorYields(tree.state().rootNode().filteredChildren(&filter), &filter, &[], false) == false,
+    "the root's filtered children reach into the subtree",
+  )
+
+  // subtree_nodes_removed_when_graft_removed
+  let mut cut = TreeUpdate.make(NodeId.of(0))
+  run cut.push(NodeId.of(0), Node.make(Role.Window))
+  let mut removed = Recorder.make()
+  run tree.update(move cut, &mut removed)
+  run Testing.expect(removed.removed.length() == 3, "the graft and both subtree nodes were removed")
+  run Testing.expect(
+    match tree.state().nodeByTreeLocalId(NodeId.of(1), subtreeId) {
+      Option.Some { value: _ } => false
+      Option.None => true
+    },
+    "the subtree is gone",
+  )
+}
+
+test effect fn graftsMatchAccessKit() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run graftTrees() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// ---------------------------------------------------------------------------------------------
+// text.rs
+
+fn decoration1() -> TextDecoration {
+  return TextDecoration {
+    style: TextDecorationStyle.Solid,
+    color: Color { red: 0, green: 0, blue: 0, alpha: 255 },
+  }
+}
+
+effect fn textRun(
+  value: string,
+  bounds: Rect,
+  lengths: &[u8],
+  positions: &[f32],
+  widths: &[f32],
+  wordStarts: &[u8],
+) -> Node
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut node = Node.make(Role.TextRun)
+  run node.setBounds(bounds)
+  run node.setValue(value)
+  run node.setCharacterLengths(lengths)
+  run node.setCharacterPositions(positions)
+  run node.setCharacterWidths(widths)
+  run node.setWordStarts(wordStarts)
+  return move node
+}
+
+fn evenPositions(out: &mut [f32], step: f32) -> () {
+  let mut i: usize = 0
+  while i < out.length {
+    out[i] = usize.toF32(i) * step
+    i = i + 1
+  }
+}
+
+/// `main_multiline_tree` from `text.rs`, with the same text, runs and geometry.
+effect fn multilineTree(selection: Option<TextSelection>) -> Tree
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut update = TreeUpdate.make(NodeId.of(1))
+  update.tree = Option.Some { value: TreeInfo.make(NodeId.of(0)) }
+  let mut window = run withChildren(Role.Window, &[1])
+  run window.setTransform(Affine.scale(1.5))
+  run update.push(NodeId.of(0), move window)
+  let mut input = run withChildren(Role.MultilineTextInput, &[2, 3, 4, 5, 6, 7, 8, 9])
+  run input.setBounds(Rect.make(8.0, 31.666664123535156, 296.0, 123.66666412353516))
+  input.addAction(Action.Focus)
+  run input.setTextDirection(TextDirection.LeftToRight)
+  match selection {
+    Option.Some { value } => {
+      run input.setTextSelection(value)
+    }
+    Option.None => {}
+  }
+  run update.push(NodeId.of(1), move input)
+
+  let mut w38: [f32; 38] = [7.58557; 38]
+  let mut p38: [f32; 38] = [0.0; 38]
+  evenPositions(&mut p38, 7.3333335)
+  let mut l38: [u8; 38] = [1; 38]
+  l38[17] = 2
+  run update.push(
+    NodeId.of(2),
+    run textRun(
+      "This paragraph is\u{a0}long enough to wrap ",
+      Rect.make(12.0, 33.666664123535156, 290.9189147949219, 48.33333206176758),
+      &l38,
+      &p38,
+      &w38,
+      &[5, 15, 18, 23, 30, 33],
+    ),
+  )
+
+  let mut to = run textRun(
+    "to ",
+    Rect.make(12.0, 48.33333206176758, 34.252257, 63.0),
+    &[1, 1, 1],
+    &[0.0, 7.3333435, 14.666687],
+    &[7.58557, 7.58557, 7.58557],
+    &[0],
+  )
+  run to.setNextOnLine(NodeId.of(4))
+  run update.push(NodeId.of(3), move to)
+
+  let mut another = run textRun(
+    "another",
+    Rect.make(34.0, 48.33333206176758, 85.58557, 63.0),
+    &[1, 1, 1, 1, 1, 1, 1],
+    &[0.0, 7.333344, 14.666687, 22.0, 29.333344, 36.666687, 44.0],
+    &[7.58557, 7.58557, 7.58557, 7.58557, 7.58557, 7.58557, 7.58557],
+    &[0],
+  )
+  run another.setUnderline(decoration1())
+  run another.setPreviousOnLine(NodeId.of(3))
+  run another.setNextOnLine(NodeId.of(5))
+  run update.push(NodeId.of(4), move another)
+
+  let mut line = run textRun(
+    " line.\n",
+    Rect.make(85.33334, 48.33333206176758, 129.5855712890625, 63.0),
+    &[1, 1, 1, 1, 1, 1, 1],
+    &[0.0, 7.333344, 14.666687, 22.0, 29.333344, 36.666687, 44.25226],
+    &[7.58557, 7.58557, 7.58557, 7.58557, 7.58557, 7.58557, 0.0],
+    &[1],
+  )
+  run line.setPreviousOnLine(NodeId.of(4))
+  run update.push(NodeId.of(5), move line)
+
+  let mut w19: [f32; 19] = [7.58557; 19]
+  w19[18] = 0.0
+  let mut p19: [f32; 19] = [0.0; 19]
+  evenPositions(&mut p19, 7.3333335)
+  p19[18] = 132.25223
+  let l19: [u8; 19] = [1; 19]
+  run update.push(
+    NodeId.of(6),
+    run textRun(
+      "Another paragraph.\n",
+      Rect.make(12.0, 63.0, 144.25222778320313, 77.66666412353516),
+      &l19,
+      &p19,
+      &w19,
+      &[8],
+    ),
+  )
+
+  run update.push(
+    NodeId.of(7),
+    run textRun(
+      "\n",
+      Rect.make(12.0, 77.66666412353516, 12.0, 92.33332824707031),
+      &[1],
+      &[0.0],
+      &[0.0],
+      &[],
+    ),
+  )
+
+  let mut w21: [f32; 21] = [7.58557; 21]
+  w21[20] = 0.0
+  let mut p21: [f32; 21] = [0.0; 21]
+  evenPositions(&mut p21, 7.3333335)
+  p21[20] = 146.9189
+  let mut l21: [u8; 21] = [1; 21]
+  l21[19] = 8
+  run update.push(
+    NodeId.of(8),
+    run textRun(
+      "Last non-blank line\u{1f44d}\u{1f3fb}\n",
+      Rect.make(12.0, 92.33332824707031, 158.9188995361328, 107.0),
+      &l21,
+      &p21,
+      &w21,
+      &[5, 9, 15],
+    ),
+  )
+
+  run update.push(
+    NodeId.of(9),
+    run textRun("", Rect.make(12.0, 107.0, 12.0, 121.66666412353516), &[], &[], &[], &[]),
+  )
+  return run Tree.make(move update, true)
+}
+
+fn caretAt(node: u64, index: usize) -> TextSelection {
+  let pos = TextPosition { node: NodeId.of(node), characterIndex: index }
+  return TextSelection { anchor: pos, focus: pos }
+}
+
+effect fn textRanges() -> ()
+  ! OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let noSelection: Option<TextSelection> = Option.None
+  let tree = run multilineTree(noSelection)
+  let state = tree.state()
+
+  // supports_text_ranges
+  run Testing.expect(!nodeAt(state, 0).supportsTextRanges(), "the window has no text ranges")
+  run Testing.expect(nodeAt(state, 1).supportsTextRanges(), "the text input has text ranges")
+
+  // multiline_document_range
+  let node = nodeAt(state, 1)
+  let range = node.documentRange()
+  let start = range.startPosition()
+  run Testing.expect(
+    start.isWordStart() && start.isLineStart() && !start.isLineEnd(),
+    "document start is a word and line start",
+  )
+  run Testing.expect(
+    start.isParagraphStart() && start.isDocumentStart() && !start.isDocumentEnd(),
+    "document start is a paragraph and document start",
+  )
+  let end = range.endPosition()
+  run Testing.expect(start.compare(&end) < 0, "start is before end")
+  run Testing.expect(
+    end.isWordStart() && end.isLineStart() && end.isLineEnd(),
+    "document end is a word, line start and line end",
+  )
+  run Testing.expect(
+    end.isParagraphStart() && !end.isDocumentStart() && end.isDocumentEnd(),
+    "document end is a paragraph start and the document end",
+  )
+  let text = run range.text()
+  run Testing.expect(
+    text.view()
+      == "This paragraph is\u{a0}long enough to wrap to another line.\nAnother paragraph.\n\nLast non-blank line\u{1f44d}\u{1f3fb}\n",
+    "document text",
+  )
+  let mut boxes = List<Rect>.make()
+  run range.boundingBoxes(&mut boxes)
+  run Testing.expect(boxes.length() == 7, "seven boxes, one per run with text")
+  run Testing.expect(
+    rectIs(boxes.get(0), 18.0, 50.499996185302734, 436.3783721923828, 72.49999809265137),
+    "first box",
+  )
+  run Testing.expect(rectIs(boxes.get(2), 51.0, 72.49999809265137, 128.378355, 94.5), "third box")
+  run Testing.expect(
+    rectIs(boxes.get(6), 18.0, 138.49999237060547, 238.37834930419922, 160.5),
+    "last box",
+  )
+
+  // global indices: the end of the document
+  run Testing.expect(end.toGlobalUsvIndex() == 97, "usv index of the document end")
+  run Testing.expect(end.toGlobalUtf16Index() == 99, "utf-16 index of the document end")
+  run Testing.expect(end.toLineIndex() == 5, "the document end is on line 5")
+  run Testing.expect(start.toLineIndex() == 0, "the document start is on line 0")
+
+  // multiline_document_range_to_first_format_change
+  let formatEnd = start.forwardToFormatEnd()
+  let mut firstFormat = node.documentRange()
+  firstFormat.setEnd(formatEnd)
+  let firstFormatText = run firstFormat.text()
+  run Testing.expect(
+    firstFormatText.view() == "This paragraph is\u{a0}long enough to wrap to ",
+    "text before the first format change",
+  )
+  run Testing.expect(
+    match run firstFormat.underline() {
+      RangeValue.Single { value } => match value {
+        Option.Some { value: _ } => false
+        Option.None => true
+      }
+      RangeValue.Mixed => false
+    },
+    "the first format run has no underline",
+  )
+  run Testing.expect(
+    match run node.documentRange().underline() {
+      RangeValue.Single { value: _ } => false
+      RangeValue.Mixed => true
+    },
+    "the whole document has mixed underline",
+  )
+}
+
+test effect fn textRangesMatchAccessKit() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run textRanges() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn textMovement() -> ()
+  ! OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  // multiline_find_word_ends_from_middle
+  let tree = run multilineTree(Option.Some { value: caretAt(4, 3) })
+  let state = tree.state()
+  let node = nodeAt(state, 1)
+  let mut range = match node.textSelection() {
+    Option.Some { value } => value
+    Option.None => Intrinsic.trap("test: no selection")
+  }
+  run Testing.expect(range.isDegenerate(), "the caret is a degenerate range")
+  let pos = range.startPosition()
+  run Testing.expect(
+    !pos.isWordStart() && !pos.isDocumentStart() && !pos.isDocumentEnd(),
+    "the caret is mid-word",
+  )
+  let wordStart = pos.backwardToWordStart()
+  range.setStart(wordStart)
+  let wordEnd = wordStart.forwardToWordEnd()
+  run Testing.expect(
+    wordEnd.equals(&pos.forwardToWordEnd()),
+    "word end from the start and from the caret agree",
+  )
+  run Testing.expect(
+    wordStart.equals(&wordEnd.backwardToWordStart()),
+    "word start from the end agrees",
+  )
+  range.setEnd(wordEnd)
+  run Testing.expect(!range.isDegenerate(), "the word range is not degenerate")
+  let word = run range.text()
+  run Testing.expect(word.view() == "another ", "the word is \"another \"")
+  let mut boxes = List<Rect>.make()
+  run range.boundingBoxes(&mut boxes)
+  run Testing.expect(boxes.length() == 2, "the word spans two runs")
+  run Testing.expect(
+    rectIs(boxes.get(0), 51.0, 72.49999809265137, 128.378355, 94.5),
+    "first word box",
+  )
+  run Testing.expect(
+    rectIs(boxes.get(1), 128.00001, 72.49999809265137, 139.37836478782654, 94.5),
+    "second word box",
+  )
+
+  // multiline_find_line_ends_from_middle
+  let lineStart = pos.backwardToLineStart()
+  let lineEnd = pos.forwardToLineEnd()
+  let mut lineRange = node.documentRange()
+  lineRange.setStart(lineStart)
+  lineRange.setEnd(lineEnd)
+  let lineText = run lineRange.text()
+  run Testing.expect(lineText.view() == "to another line.\n", "the second line")
+  run Testing.expect(lineStart.isLineStart() && lineEnd.isLineEnd(), "line ends are line ends")
+  run Testing.expect(pos.toLineIndex() == 1, "the caret is on line 1")
+
+  // multiline_find_paragraph_ends_from_middle
+  let paragraphStart = pos.backwardToParagraphStart()
+  run Testing.expect(paragraphStart.isDocumentStart(), "the first paragraph starts the document")
+  let paragraphEnd = pos.forwardToParagraphEnd()
+  let mut paragraphRange = node.documentRange()
+  paragraphRange.setStart(paragraphStart)
+  paragraphRange.setEnd(paragraphEnd)
+  let paragraphText = run paragraphRange.text()
+  run Testing.expect(
+    paragraphText.view() == "This paragraph is\u{a0}long enough to wrap to another line.\n",
+    "the first paragraph",
+  )
+
+  // character movement
+  let next = pos.forwardToCharacterEnd()
+  let mut charRange = node.documentRange()
+  charRange.setStart(pos)
+  charRange.setEnd(next)
+  let ch = run charRange.text()
+  run Testing.expect(ch.view() == "t", "the character after the caret")
+  run Testing.expect(pos.toGlobalUsvIndex() == 44, "usv index of the caret")
+}
+
+test effect fn textMovementMatchesAccessKit() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run textMovement() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn hitText(node: NodeRef<'_>, x: f64, y: f64, expected: string, mode: u8) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let pos = node.textPositionAtPoint(Point.make(x, y))
+  let mut range = pos.toDegenerateRange()
+  if mode == 0 {
+    range.setEnd(pos.forwardToCharacterEnd())
+  } else if mode == 1 {
+    range.setStart(pos.backwardToWordStart())
+  } else if mode == 2 {
+    range.setEnd(pos.forwardToWordEnd())
+  } else {
+    range.setStart(pos.backwardToLineStart())
+  }
+  let text = run range.text()
+  return text.view() == expected
+}
+
+effect fn textHitTesting() -> ()
+  ! OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let noSelection: Option<TextSelection> = Option.None
+  let tree = run multilineTree(noSelection)
+  let state = tree.state()
+  let node = nodeAt(state, 1)
+
+  // text_position_at_point
+  run Testing.expect(
+    node.textPositionAtPoint(Point.make(8.0, 31.666664123535156)).isDocumentStart(),
+    "the top-left corner is the document start",
+  )
+  run Testing.expect(
+    node.textPositionAtPoint(Point.make(12.0, 33.666664123535156)).isDocumentStart(),
+    "the first run's corner is the document start",
+  )
+  run Testing.expect(
+    node.textPositionAtPoint(Point.make(16.0, 40.0)).isDocumentStart(),
+    "inside the first character",
+  )
+  let l1 = node.textPositionAtPoint(Point.make(144.0, 40.0))
+  run Testing.expect(
+    !l1.isDocumentStart() && !l1.isDocumentEnd() && !l1.isLineEnd(),
+    "(144, 40) is mid-line",
+  )
+  run Testing.expect(run hitText(node, 144.0, 40.0, "l", 0), "(144, 40) hits an l")
+  run Testing.expect(run hitText(node, 150.0, 40.0, "l", 0), "(150, 40) hits an l")
+  run Testing.expect(
+    node.textPositionAtPoint(Point.make(291.0, 40.0)).isLineEnd(),
+    "(291, 40) is the end of the wrapped line",
+  )
+  run Testing.expect(
+    run hitText(node, 291.0, 40.0, "wrap ", 1),
+    "the word before the wrapped line end",
+  )
+  let to = node.textPositionAtPoint(Point.make(12.0, 50.0))
+  run Testing.expect(to.isLineStart() && !to.isParagraphStart(), "(12, 50) starts a wrapped line")
+  run Testing.expect(run hitText(node, 12.0, 50.0, "to ", 2), "the word at (12, 50)")
+  run Testing.expect(
+    node.textPositionAtPoint(Point.make(130.0, 50.0)).isLineEnd(),
+    "(130, 50) is a line end",
+  )
+  run Testing.expect(run hitText(node, 130.0, 50.0, "line.\n", 1), "the word before (130, 50)")
+  run Testing.expect(node.textPositionAtPoint(Point.make(12.0, 80.0)).isLineEnd(), "the blank line")
+  run Testing.expect(run hitText(node, 12.0, 80.0, "\n", 3), "the blank line's text")
+  run Testing.expect(
+    node.textPositionAtPoint(Point.make(12.0, 120.0)).isDocumentEnd(),
+    "(12, 120) is the document end",
+  )
+  run Testing.expect(
+    node.textPositionAtPoint(Point.make(250.0, 122.0)).isDocumentEnd(),
+    "(250, 122) is the document end",
+  )
+
+  // to_global_usv_index / text_position_from_global_usv_index
+  let lineEnd = node.documentStart().forwardToLineEnd()
+  run Testing.expect(lineEnd.toGlobalUsvIndex() == 38, "the wrapped line ends at 38")
+  let nextLine = node.documentStart().forwardToLineStart()
+  run Testing.expect(
+    nextLine.toGlobalUsvIndex() == 38 && nextLine.toLineIndex() == 1,
+    "the next line starts at 38 on line 1",
+  )
+  let afterOne = nextLine.forwardToCharacterStart()
+  run Testing.expect(
+    afterOne.toGlobalUsvIndex() == 39 && afterOne.toGlobalUtf16Index() == 39,
+    "one character later",
+  )
+  let third = afterOne.forwardToLineStart()
+  run Testing.expect(
+    third.toGlobalUsvIndex() == 55 && third.toGlobalUtf16Index() == 55 && third.toLineIndex() == 2,
+    "the third line starts at 55",
+  )
+  run Testing.expect(
+    match node.textPositionFromGlobalUsvIndex(55) {
+      Option.Some { value } => value.toGlobalUsvIndex() == 55
+      Option.None => false
+    },
+    "global usv index 55 maps back",
+  )
+  run Testing.expect(
+    match node.textPositionFromGlobalUsvIndex(97) {
+      Option.Some { value } => value.isDocumentEnd()
+      Option.None => false
+    },
+    "global usv index 97 is the document end",
+  )
+  run Testing.expect(
+    match node.textPositionFromGlobalUsvIndex(98) {
+      Option.Some { value: _ } => false
+      Option.None => true
+    },
+    "past the end has no position",
+  )
+}
+
+test effect fn textHitTestingMatchesAccessKit() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run textHitTesting() |> Effect.provideMut<Allocator>(&mut allocator)
+}
