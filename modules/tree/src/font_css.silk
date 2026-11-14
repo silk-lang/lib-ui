@@ -1,0 +1,319 @@
+//! The `font` and `text-decoration` shorthands, which css-properties does not expand: each
+//! becomes CSS text for its longhands, parsed as any declaration is.
+// TODO(css-properties): move these next to the other shorthands once its values can be read
+// back as tokens there.
+import mutation { Declaration, CssProperty }
+import properties.values
+import svg_css.written as written
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+
+/// Whether the tree expands `property` here.
+pub fn expands(property: CssProperty) -> bool {
+  return property == CssProperty.Font || property == CssProperty.TextDecoration
+}
+
+// The value's components, split at top-level spaces (and, for `font`, the first top-level
+// comma, whose rest is returned in `tail`). Quotes and parentheses keep a component whole.
+effect fn components(css: &[u8], out: &mut List<Bytes>, tail: &mut Bytes, stopAtComma: bool) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut depth: usize = 0
+  let mut quote: u8 = 0
+  let mut start: usize = 0
+  let mut i: usize = 0
+  while i < css.length {
+    let byte = css[i]
+    if quote != 0 {
+      if byte == 92 {
+        i = i + 1
+      } else if byte == quote {
+        quote = 0
+      }
+    } else if byte == 34 || byte == 39 {
+      quote = byte
+    } else if byte == 40 {
+      depth = depth + 1
+    } else if byte == 41 {
+      if depth == 0 {
+        return false
+      }
+      depth = depth - 1
+    } else if depth == 0 && (byte == 32 || byte == 9 || byte == 10 || byte == 13) {
+      if i > start {
+        run out.append(run Bytes.copy(Slice.view(css, start, i - start)))
+      }
+      start = i + 1
+    } else if depth == 0 && byte == 44 && stopAtComma {
+      if i > start {
+        run out.append(run Bytes.copy(Slice.view(css, start, i - start)))
+      }
+      run tail.append(Slice.view(css, i, css.length - i))
+      return quote == 0
+    }
+    i = i + 1
+  }
+  if quote != 0 || depth != 0 {
+    return false
+  }
+  if css.length > start {
+    run out.append(run Bytes.copy(Slice.view(css, start, css.length - start)))
+  }
+  return true
+}
+
+fn lower(byte: u8) -> u8 {
+  if byte >= 65 && byte <= 90 {
+    return byte + 32
+  }
+  return byte
+}
+
+fn named(part: &[u8], name: &[u8]) -> bool {
+  if part.length != name.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < part.length {
+    if lower(part[i]) != name[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn oneOf(part: &[u8], names: &[&'static [u8]]) -> bool {
+  let mut i: usize = 0
+  while i < names.length {
+    if named(part, names[i]) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+fn digit(byte: u8) -> bool {
+  return byte >= 48 && byte <= 57
+}
+
+// A bare number, as a font weight is written.
+fn plainNumber(part: &[u8]) -> bool {
+  if part.length == 0 {
+    return false
+  }
+  let mut i: usize = 0
+  while i < part.length {
+    if !digit(part[i]) && part[i] != 46 {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+const STRETCHES: [&'static [u8]; 8] = [
+  b"ultra-condensed", b"extra-condensed", b"condensed", b"semi-condensed", b"semi-expanded",
+  b"expanded", b"extra-expanded", b"ultra-expanded",
+]
+
+const SIZES: [&'static [u8]; 10] = [
+  b"xx-small", b"x-small", b"small", b"medium", b"large", b"x-large", b"xx-large", b"xxx-large",
+  b"larger", b"smaller",
+]
+
+const SYSTEM: [&'static [u8]; 6] = [
+  b"caption", b"icon", b"menu", b"message-box", b"small-caption", b"status-bar",
+]
+
+effect fn line(out: &mut Bytes, name: &[u8], value: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  run out.append(name)
+  run out.append(b": ")
+  run out.append(value)
+  run out.append(b"; ")
+}
+
+// `font`: [style || variant || weight || stretch]? size[/line-height]? family. Every longhand
+// the tree reads is set, to its initial value when the shorthand leaves it out.
+effect fn fontText(css: &[u8], out: &mut Bytes) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut parts = List<Bytes>.make()
+  let mut tail = Bytes.make()
+  if !run components(css, &mut parts, &mut tail, true) {
+    return false
+  }
+  let items = parts.asSlice()
+  if items.length == 1 && Bytes.length(&tail) == 0 && oneOf(Bytes.asSlice(&items[0]), &SYSTEM) {
+    // System fonts are the host's; nothing here knows them.
+    return false
+  }
+  let mut style = run Bytes.copy(b"normal")
+  let mut weight = run Bytes.copy(b"normal")
+  let mut width = run Bytes.copy(b"normal")
+  let mut at: usize = 0
+  let mut seen: usize = 0
+  while at < items.length && seen < 4 {
+    let part = Bytes.asSlice(&items[at])
+    if named(part, b"normal") || named(part, b"small-caps") {
+      // `normal` resets whichever of the four it stands for; the tree reads no font-variant.
+    } else if named(part, b"italic") || named(part, b"oblique") {
+      style = run Bytes.copy(part)
+    } else if oneOf(part, &[b"bold", b"bolder", b"lighter"]) || plainNumber(part) {
+      weight = run Bytes.copy(part)
+    } else if oneOf(part, &STRETCHES) {
+      width = run Bytes.copy(part)
+    } else {
+      break
+    }
+    at = at + 1
+    seen = seen + 1
+  }
+  if at >= items.length {
+    return false
+  }
+
+  // The size, with an optional `/line-height` joined to it or apart.
+  let mut joined = Bytes.make()
+  while at < items.length {
+    let part = Bytes.asSlice(&items[at])
+    run Bytes.append(&mut joined, part)
+    at = at + 1
+    let written = Bytes.asSlice(&joined)
+    let slash = written[written.length - 1] == 47
+    let next = at < items.length && Bytes.asSlice(&items[at])[0] == 47
+    if !slash && !next {
+      break
+    }
+  }
+  let sized = Bytes.asSlice(&joined)
+  let mut cut = sized.length
+  let mut i: usize = 0
+  while i < sized.length {
+    if sized[i] == 47 {
+      cut = i
+      break
+    }
+    i = i + 1
+  }
+  let size = Slice.view(sized, 0, cut)
+  let height: &[u8] = if cut < sized.length { Slice.view(sized, cut + 1, sized.length - cut - 1) } else { b"normal" }
+  if size.length == 0 || height.length == 0 || !(digit(size[0]) || size[0] == 46 || oneOf(size, &SIZES) || named(Slice.view(size, 0, if size.length < 5 { size.length } else { 5 }), b"calc(")) {
+    return false
+  }
+
+  let mut family = Bytes.make()
+  while at < items.length {
+    if Bytes.length(&family) > 0 {
+      run Bytes.append(&mut family, b" ")
+    }
+    run Bytes.append(&mut family, Bytes.asSlice(&items[at]))
+    at = at + 1
+  }
+  if Bytes.length(&family) == 0 {
+    return false
+  }
+  run Bytes.append(&mut family, Bytes.asSlice(&tail))
+  run line(&mut out, b"font-style", Bytes.asSlice(&style))
+  run line(&mut out, b"font-weight", Bytes.asSlice(&weight))
+  run line(&mut out, b"font-width", Bytes.asSlice(&width))
+  run line(&mut out, b"font-size", size)
+  run line(&mut out, b"line-height", height)
+  run line(&mut out, b"font-family", Bytes.asSlice(&family))
+  return true
+}
+
+const LINES: [&'static [u8]; 4] = [b"underline", b"overline", b"line-through", b"blink"]
+
+const STYLES: [&'static [u8]; 5] = [b"solid", b"double", b"dotted", b"dashed", b"wavy"]
+
+// `text-decoration`: line || style || color || thickness, in any order.
+effect fn decorationText(css: &[u8], out: &mut Bytes) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut parts = List<Bytes>.make()
+  let mut tail = Bytes.make()
+  if !run components(css, &mut parts, &mut tail, false) {
+    return false
+  }
+  let mut lines = Bytes.make()
+  let mut none = false
+  let mut style = run Bytes.copy(b"solid")
+  let mut styled = false
+  let mut color = run Bytes.copy(b"currentcolor")
+  let mut colored = false
+  let mut thickness = run Bytes.copy(b"auto")
+  let mut thick = false
+  let items = parts.asSlice()
+  let mut i: usize = 0
+  while i < items.length {
+    let part = Bytes.asSlice(&items[i])
+    if named(part, b"none") {
+      if none || Bytes.length(&lines) > 0 {
+        return false
+      }
+      none = true
+    } else if oneOf(part, &LINES) {
+      if none {
+        return false
+      }
+      if Bytes.length(&lines) > 0 {
+        run Bytes.append(&mut lines, b" ")
+      }
+      run Bytes.append(&mut lines, part)
+    } else if oneOf(part, &STYLES) {
+      if styled {
+        return false
+      }
+      style = run Bytes.copy(part)
+      styled = true
+    } else if digit(part[0]) || part[0] == 46 || named(part, b"from-font") || (named(part, b"auto") && !thick) {
+      if thick {
+        return false
+      }
+      thickness = run Bytes.copy(part)
+      thick = true
+    } else {
+      if colored {
+        return false
+      }
+      color = run Bytes.copy(part)
+      colored = true
+    }
+    i = i + 1
+  }
+  run line(&mut out, b"text-decoration-line", if Bytes.length(&lines) > 0 { Bytes.asSlice(&lines) } else { b"none" })
+  run line(&mut out, b"text-decoration-style", Bytes.asSlice(&style))
+  run line(&mut out, b"text-decoration-color", Bytes.asSlice(&color))
+  run line(&mut out, b"text-decoration-thickness", Bytes.asSlice(&thickness))
+  return true
+}
+
+/// Appends the longhands of `declaration` (a property `expands` takes) to `out`, with its
+/// `!important`. A value that does not parse adds nothing, as CSS drops it.
+pub effect fn expand(declaration: &Declaration, out: &mut List<Declaration>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let css = run values.cssText(&declaration.value)
+  let mut text = Bytes.make()
+  let fine = if declaration.property == CssProperty.Font {
+    run fontText(Bytes.asSlice(&css), &mut text)
+  } else {
+    run decorationText(Bytes.asSlice(&css), &mut text)
+  }
+  if !fine {
+    return ()
+  }
+  match run Effect.result(written.declarations(Bytes.asSlice(&text))) {
+    Result.Success { value: parsed } => {
+      let mut list = move parsed
+      while list.length() > 0 {
+        let mut part = list.remove(0)
+        part.important = declaration.important
+        run out.append(move part)
+      }
+    }
+    Result.Failure { error: _ } => {}
+  }
+}
