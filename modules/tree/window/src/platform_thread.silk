@@ -16,8 +16,8 @@
 //!
 //! Everything crossing threads is allocated with the system allocator, whatever allocator the
 //! app's code provides.
-import accessibility { AxAction, AxNode }
-import accessibility as access
+import accessibility { Bridge }
+import accesskit.lib { TreeUpdate, ActionRequest }
 import adapter { LINE_PIXELS }
 import render_thread { Compositor, FastScrolled }
 import window.event { ScrollDelta }
@@ -98,7 +98,7 @@ union Command {
   },
   ReadClipboard,
   WriteClipboard { text: String },
-  Accessibility { window: WindowId, nodes: List<AxNode> },
+  Accessibility { window: WindowId, update: TreeUpdate },
 }
 
 /// The platform thread's answer to a command that waits for one.
@@ -125,7 +125,9 @@ struct Link {
   commands: List<Command>,
   reply: Option<Reply>,
   /// Accessibility actions the OS asked for, for the UI thread.
-  actions: List<AxAction>,
+  actions: List<ActionRequest>,
+  /// Whether assistive technology asked the first window for its elements.
+  accessWanted: bool,
   /// The first window the app opened, for polling accessibility actions and for the
   /// compositor; 0 before.
   window: u32,
@@ -389,7 +391,8 @@ effect fn makeLink(appearance: Appearance) -> Arc<Mutex<Link>>
     events: List<Event>.make(),
     commands: List<Command>.make(),
     reply: Option<Reply>.None,
-    actions: List<AxAction>.make(),
+    actions: List<ActionRequest>.make(),
+    accessWanted: false,
     window: 0,
     size: Size2<f64>.new(0.0, 0.0),
     scale: 1.0,
@@ -436,13 +439,14 @@ effect fn servePlatform(
 ) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
+  let mut bridge = Bridge.make()
   while true {
     let mut commands = takeCommands(link)
     let list = commands.asMutSlice()
     let mut i: usize = 0
     while i < list.length {
       let command = Intrinsic.replace(list[i], Command.ReadClipboard)
-      run execute(&mut platform, link, wakeUi, move command)
+      run execute(&mut platform, link, wakeUi, &mut bridge, move command)
       i = i + 1
     }
     drop commands
@@ -459,19 +463,24 @@ effect fn servePlatform(
       next = Option<Event>.None
     }
     let window = link.get().lock().get().window
-    let mut actions = List<AxAction>.make()
+    let mut actions = List<ActionRequest>.make()
     if window != 0 {
-      run access.nativeActions(WindowId { value: window }, &mut actions)
+      bridge.attach(WindowId { value: window }, platform.rawSurface(WindowId { value: window }))
+      actions = run bridge.takeRequests()
     }
+    let wanted = bridge.wanted()
     let mut forUi = actions.length() != 0 || handled
     let mut guard = link.get().lock()
     let state = guard.getMut()
-    let moved = actions.asMutSlice()
-    let mut a: usize = 0
-    while a < moved.length {
-      let action = Intrinsic.replace(moved[a], AxAction.none())
-      run state.actions.append(move action)
-      a = a + 1
+    if wanted && !state.accessWanted {
+      state.accessWanted = true
+      forUi = true
+    }
+    while actions.length() != 0 {
+      match actions.pop() {
+        Option.Some { value } => run state.actions.insert(0, move value)
+        Option.None => {}
+      }
     }
     match move next {
       Option<Event>.Some { value } => {
@@ -617,6 +626,7 @@ effect fn execute(
   platform: &mut NativePlatform,
   link: &Arc<Mutex<Link>>,
   wakeUi: &Unparker,
+  bridge: &mut Bridge,
   command: Command,
 ) -> ()
   ! OutOfMemoryError
@@ -754,7 +764,10 @@ effect fn execute(
     Command.WriteClipboard { text } => {
       run platform.writeClipboard(String.view(&text))
     }
-    Command.Accessibility { window, nodes } => access.publish(window, nodes.asSlice())
+    Command.Accessibility { window, update } => {
+      drop window
+      run bridge.update(move update, true)
+    }
   }
 }
 
@@ -1422,32 +1435,26 @@ pub struct AccessLink {
 }
 
 impl AccessLink {
-  /// Sends a snapshot of `window`'s accessibility tree to the platform thread. Its nodes must
+  /// Sends `update` for `window`'s accessibility tree to the platform thread. Its values must
   /// use the system allocator.
-  pub effect fn publish(self: &Self, window: WindowId, nodes: List<AxNode>) -> ()
+  pub effect fn publish(self: &Self, window: WindowId, update: TreeUpdate) -> ()
     ! OutOfMemoryError {
     let mut heap = Allocator.systemAllocatorProvider()
     let mut guard = self.link.get().lock()
-    run guard.getMut().commands.append(Command.Accessibility { window: window, nodes: move nodes })
+    run guard.getMut().commands.append(Command.Accessibility { window: window, update: move update })
       |> Effect.provideMut<Allocator>(&mut heap)
     drop guard
     self.waker.wake()
   }
 
-  /// Moves the actions the OS asked for into `out`.
-  pub effect fn take(self: &Self, out: &mut List<AxAction>) -> ()
-    ! OutOfMemoryError
-    ? &mut Allocator {
+  /// Whether assistive technology asked for the window's elements.
+  pub fn wanted(self: &Self) -> bool {
+    return self.link.get().lock().get().accessWanted
+  }
+
+  /// The actions the OS asked for since the last call.
+  pub fn take(self: &Self) -> List<ActionRequest> {
     let mut guard = self.link.get().lock()
-    let taken = Intrinsic.replace(guard.getMut().actions, List<AxAction>.make())
-    drop guard
-    let mut actions = move taken
-    let list = actions.asMutSlice()
-    let mut i: usize = 0
-    while i < list.length {
-      let action = Intrinsic.replace(list[i], AxAction.none())
-      run out.append(move action)
-      i = i + 1
-    }
+    return Intrinsic.replace(guard.getMut().actions, List<ActionRequest>.make())
   }
 }
