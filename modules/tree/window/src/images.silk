@@ -9,6 +9,7 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
   import codec.image { Image }
   import codec.decode
   import font_web.lib { decode as decodeFont, WebFontError }
+  import font_web.fetch
   import silk.collections.bytes { Bytes }
   import silk.collections.list { List }
   import silk.concurrency.thread { Transferable }
@@ -35,7 +36,9 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
 
   union Source {
     File { path: String },
-    Url { url: String }
+    Url { url: String },
+    /// A font stylesheet at an HTTP(S) URL, asked for as a desktop browser asks for one.
+    Sheet { url: String }
   }
 
   struct LoadInput {
@@ -43,6 +46,8 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
     icon: bool,
     /// Whether the file is a font: WOFF and WOFF2 are decoded to sfnt on the worker.
     font: bool,
+    /// Whether the file is a font stylesheet, handed back as it is (see `forSheets`).
+    sheet: bool,
     cancel: Cancellation
   }
 
@@ -54,6 +59,8 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
     Svg { data: Bytes },
     /// A font file as TrueType or OpenType (WOFF and WOFF2 decoded), for `loadFontFace`.
     Font { data: Bytes },
+    /// A stylesheet's bytes, for `takeSheets`.
+    Sheet { data: Bytes },
     Failed { error: ImageError },
     Cancelled
   }
@@ -83,18 +90,80 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
     running: List<Load>,
     /// Whether the ids are font faces (`forFonts`) rather than image and icon resources.
     fonts: bool,
+    /// Whether the ids are font stylesheets (`forSheets`).
+    sheets: bool,
+    /// Stylesheets read and not yet taken.
+    finished: List<SheetData>,
+  }
+
+  /// A font stylesheet a worker read (see `Images.forSheets`).
+  pub struct SheetData {
+    pub id: u32,
+    pub css: Bytes,
   }
 
   impl Images {
     /// Creates an empty native image loader.
     pub fn make() -> Images {
-      return Images { entries: List<Entry>.make(), running: List<Load>.make(), fonts: false }
+      return Images {
+        entries: List<Entry>.make(),
+        running: List<Load>.make(),
+        fonts: false,
+        sheets: false,
+        finished: List<SheetData>.make(),
+      }
     }
 
     /// A loader of font files for the tree's declared faces (`UiTree.loadFontFace`), by face
     /// id. Queue them with `fontFile` and `fontUrl`.
     pub fn forFonts() -> Images {
-      return Images { entries: List<Entry>.make(), running: List<Load>.make(), fonts: true }
+      return Images {
+        entries: List<Entry>.make(),
+        running: List<Load>.make(),
+        fonts: true,
+        sheets: false,
+        finished: List<SheetData>.make(),
+      }
+    }
+
+    /// A loader of font stylesheets by id: queue them with `sheetFile` and `sheetUrl`, then
+    /// take what was read with `takeSheets` after each `poll`.
+    pub fn forSheets() -> Images {
+      return Images {
+        entries: List<Entry>.make(),
+        running: List<Load>.make(),
+        fonts: false,
+        sheets: true,
+        finished: List<SheetData>.make(),
+      }
+    }
+
+    /// Queues reading the stylesheet at local `path` as sheet `id` (see `forSheets`).
+    pub effect fn sheetFile(self: &mut Self, id: u32, path: string) -> ()
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      run self.fileIcon(id, path)
+    }
+
+    /// Queues fetching the stylesheet at HTTP(S) `url` as sheet `id`, with a desktop
+    /// browser's `User-Agent` so Google Fonts answers with WOFF2 faces (see `forSheets`).
+    pub effect fn sheetUrl(self: &mut Self, id: u32, url: string) -> ()
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      let mut owned = Allocator.systemAllocatorProvider()
+      let url = run fetch.encode(url) |> Effect.provideMut<Allocator>(&mut owned)
+      run self.request(id, Source.Sheet { url: move url }, true)
+    }
+
+    /// Moves the stylesheets read since the last call to `out`.
+    pub effect fn takeSheets(self: &mut Self, out: &mut List<SheetData>) -> ()
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      let finished = Intrinsic.replace(self.finished, List<SheetData>.make())
+      let mut values = move finished
+      while values.length() > 0 {
+        run out.append(values.remove(0))
+      }
     }
 
     /// Queues reading the font file at local `path` for face `face` (see `forFonts`).
@@ -271,6 +340,7 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
       ! TreeError | OutOfMemoryError
       ? &mut Allocator {
       let fonts = self.fonts
+      let sheets = self.sheets
       let mut changed = false
       let mut i: usize = 0
       while i < self.running.length() {
@@ -303,6 +373,10 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
                     ImageError.Decode
                   }
                   drop entries[j].load.finish(job.generation, error)
+                }
+                Loaded.Sheet { data } => {
+                  run self.finished.append(SheetData { id: job.resource, css: move data })
+                  drop entries[j].load.finish(job.generation, ImageError.None)
                 }
                 Loaded.Svg { data } => {
                   let mut batch = Batch.make()
@@ -342,12 +416,13 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
             source: move source,
             icon: entries[i].icon,
             font: fonts,
+            sheet: sheets,
             cancel: cancel.clone(),
           }
           let start = run Effect.result(
             Background<LoadOutput>.start(
               fn() -> LoadOutput {
-                return LoadOutput { value: load(move input.source, input.icon, input.font, move input.cancel) }
+                return LoadOutput { value: load(move input.source, input.icon, input.font, input.sheet, move input.cancel) }
               },
             ),
           )
@@ -429,6 +504,25 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
           }
         }
       }
+      Source.Sheet { url } => {
+        let mut request = Request.get(String.view(&url)).timeoutSeconds(15).maxBodyBytes(16777216)
+        run request.header("User-Agent", fetch.USER_AGENT)
+        run request.header("Accept", "text/css,*/*;q=0.1")
+        let mut http = NativeHttp.make()
+        let response = run Effect.result(Http.send(move request)) |> Effect.provideMut<Http>(&mut http)
+        match move response {
+          Result.Success { value } => {
+            if !value.ok() {
+              fail ImageError.HttpStatus
+            }
+            value.intoBody()
+          }
+          Result.Failure { error } => {
+            drop error
+            fail ImageError.Network
+          }
+        }
+      }
     }
   }
 
@@ -444,7 +538,7 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
     return false
   }
 
-  effect fn decodeSource(source: Source, icon: bool, font: bool, cancel: Cancellation) -> Loaded
+  effect fn decodeSource(source: Source, icon: bool, font: bool, sheet: bool, cancel: Cancellation) -> Loaded
     ! ImageError | OutOfMemoryError
     ? &mut Allocator {
     if cancel.cancelled() {
@@ -453,6 +547,9 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
     let bytes = run read(&source)
     if bytes.length() > 16777216 {
       fail ImageError.TooLarge
+    }
+    if sheet {
+      return Loaded.Sheet { data: move bytes }
     }
     if font {
       return match move run Effect.result(decodeFont(bytes.asSlice())) {
@@ -487,9 +584,9 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
     }
   }
 
-  fn load(source: Source, icon: bool, font: bool, cancel: Cancellation) -> Loaded {
+  fn load(source: Source, icon: bool, font: bool, sheet: bool, cancel: Cancellation) -> Loaded {
     let mut allocator = Allocator.systemAllocatorProvider()
-    let result = run Effect.result(decodeSource(move source, icon, font, move cancel))
+    let result = run Effect.result(decodeSource(move source, icon, font, sheet, move cancel))
       |> Effect.provideMut<Allocator>(&mut allocator)
     return match move result {
       Result.Success { value } => move value

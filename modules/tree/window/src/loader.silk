@@ -15,10 +15,10 @@
 //! with `font_web`) or fails, and its text keeps the fallback.
 //!
 //! A font stylesheet (`Mutation.LoadFontStylesheet`, such as a Google Fonts `css2` URL) is read
-//! or fetched the same way (see `sheets`), and each of its `@font-face` rules is declared into
+//! or fetched the same way (`Images.forSheets`, parsed by `sheets`), and each of its `@font-face` rules is declared into
 //! the tree (`UiTree.declareHostFontFace`), whose file the tree asks for once text needs it.
-import remote { Remote, ImageState }
-import sheets { Sheets, Sheet, rulesOf }
+import remote { Remote, ImageState, SheetData }
+import sheets { rulesOf }
 import ui_tree.legacy { UiTree, TreeError, Batch, Mutation }
 import ui_tree.lib { FaceRule, FaceStyle, Range, UnicodeRange }
 import font_web.lib { decode as decodeFont, WebFontError }
@@ -35,6 +35,15 @@ import silk.encoding.base64 { Base64 }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.text.string { String }
 import silk.url.percent { UrlPercent }
+
+/// A font stylesheet being read: where its relative `src` URLs resolve.
+struct SheetLoad {
+  id: u32,
+  /// The sheet's directory, for a local sheet.
+  directory: String,
+  /// The sheet's URL, for one fetched over HTTP(S).
+  base: String,
+}
 
 /// A file the program carries, served for the relative URL `path`.
 struct File {
@@ -63,8 +72,10 @@ pub struct Loader {
   faces: Remote,
   /// Faces handed to `faces` that have not settled.
   waitingFaces: List<u32>,
-  /// Font stylesheets being read or fetched.
-  sheets: Sheets,
+  /// Font stylesheets, by an id of the loader's own.
+  sheets: Remote,
+  waitingSheets: List<SheetLoad>,
+  nextSheet: u32,
 }
 
 impl Loader {
@@ -76,7 +87,9 @@ impl Loader {
       settled: List<Settled>.make(),
       faces: Remote.forFonts(),
       waitingFaces: List<u32>.make(),
-      sheets: Sheets.make(),
+      sheets: Remote.forSheets(),
+      waitingSheets: List<SheetLoad>.make(),
+      nextSheet: 1,
     }
   }
 
@@ -116,15 +129,33 @@ impl Loader {
       }
       i = i + 1
     }
-    if self.sheets.pending() {
-      let mut done = List<Sheet>.make()
-      run self.sheets.poll(&mut done)
-      let finished = done.asSlice()
-      let mut s: usize = 0
-      while s < finished.length {
-        drop run declareRules(&mut tree, finished[s].rules.asSlice(), String.view(&finished[s].directory))
-        changed = true
-        s = s + 1
+    if self.waitingSheets.length() > 0 {
+      changed = (run self.sheets.poll(&mut tree)) || changed
+      let mut read = List<SheetData>.make()
+      run self.sheets.takeSheets(&mut read)
+      let done = read.asSlice()
+      let mut d: usize = 0
+      while d < done.length {
+        let loads = self.waitingSheets.asSlice()
+        let mut l: usize = 0
+        while l < loads.length {
+          if loads[l].id == done[d].id {
+            let rules = run rulesOf(done[d].css.asSlice(), String.view(&loads[l].base))
+            drop run declareRules(&mut tree, rules.asSlice(), String.view(&loads[l].directory))
+            changed = true
+          }
+          l = l + 1
+        }
+        d = d + 1
+      }
+      // A sheet that was read or failed is done, as a failed stylesheet link is.
+      let mut w: usize = 0
+      while w < self.waitingSheets.length() {
+        if self.sheets.state(self.waitingSheets.asSlice()[w].id) == ImageState.Loading {
+          w = w + 1
+          continue
+        }
+        drop self.waitingSheets.remove(w)
       }
     }
     if self.waiting.length() > 0 {
@@ -173,7 +204,7 @@ impl Loader {
   /// Whether loads are still running, so the host keeps polling.
   pub fn pending(self: &Self) -> bool {
     return self.waiting.length() > 0 || self.remote.pending() || self.waitingFaces.length() > 0
-      || self.faces.pending() || self.sheets.pending()
+      || self.faces.pending() || self.waitingSheets.length() > 0 || self.sheets.pending()
   }
 
   /// Starts loading the font stylesheet at `url`, by scheme as for images. Returns whether
@@ -190,22 +221,20 @@ impl Loader {
       let mut f: usize = 0
       while f < files.length {
         if same(String.utf8Bytes(files[f].path), path) {
-          let rules = run rulesOf(files[f].data)
+          let rules = run rulesOf(files[f].data, "")
           return run declareRules(&mut tree, rules.asSlice(), directory)
         }
         f = f + 1
       }
       drop files
-      run self.sheets.file(
-        String.slice(url, bytes.length - path.length, path.length),
-        directory,
-      )
+      let id = run self.sheetLoad(directory, "")
+      run self.sheets.sheetFile(id, String.slice(url, bytes.length - path.length, path.length))
       return false
     }
     if lowered(bytes, scheme, "data") {
       let mut decoded = Bytes.make()
       if run dataBytes(&mut decoded, Slice.view(bytes, scheme + 1, bytes.length - scheme - 1)) {
-        let rules = run rulesOf(decoded.asSlice())
+        let rules = run rulesOf(decoded.asSlice(), "")
         return run declareRules(&mut tree, rules.asSlice(), "")
       }
       return false
@@ -214,13 +243,27 @@ impl Loader {
       let mut path = String.make()
       run UrlPercent.appendDecodedText(&mut path, filePath(bytes, scheme), false)
       let directory = String.slice(url, 0, directoryLength(bytes))
-      run self.sheets.file(String.view(&path), directory)
+      let id = run self.sheetLoad(directory, "")
+      run self.sheets.sheetFile(id, String.view(&path))
       return false
     }
     if lowered(bytes, scheme, "http") || lowered(bytes, scheme, "https") {
-      run self.sheets.url(url)
+      let id = run self.sheetLoad("", url)
+      run self.sheets.sheetUrl(id, url)
     }
     return false
+  }
+
+  /// Records a stylesheet about to be read, and returns its id.
+  effect fn sheetLoad(self: &mut Self, directory: string, base: string) -> u32
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let id = self.nextSheet
+    self.nextSheet = id + 1
+    run self.waitingSheets.append(
+      SheetLoad { id: id, directory: run String.copy(directory), base: run String.copy(base) },
+    )
+    return id
   }
 
   /// Starts loading the file of font face `face` from `url`. Returns whether the face changed

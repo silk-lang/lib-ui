@@ -1,289 +1,36 @@
-//! Font stylesheets (`Mutation.LoadFontStylesheet`) read or fetched off the UI thread: a
-//! local file, or an HTTP(S) URL fetched as a browser does (as `font_web.fetch.stylesheet` does, with
-//! a desktop browser's `User-Agent`, so Google Fonts answers with WOFF2 faces). The loader
-//! declares each `@font-face` rule of a finished sheet into the tree. A WebAssembly host reads
-//! no files or URLs here, so its sheets fail (a page links its stylesheets itself).
+//! Reading font stylesheets (`Mutation.LoadFontStylesheet`) into `@font-face` rules. The
+//! loader reads or fetches a sheet off the UI thread (`Images.forSheets`, with a desktop
+//! browser's `User-Agent`, so Google Fonts answers with WOFF2 faces) and parses it here. A
+//! WebAssembly host reads no rules: a page links its font stylesheets itself.
 import font_web.stylesheet { FontFaceRule }
 import silk.collections.list { List }
-import silk.text.string { String }
-
-/// The rules of a stylesheet that finished loading, and the directory of the sheet that
-/// relative `src` URLs of a local sheet resolve against (empty when they already resolved).
-pub struct Sheet {
-  pub rules: List<FontFaceRule>,
-  pub directory: String,
-}
+import silk.mem.allocator { Allocator, OutOfMemoryError }
 
 static if Intrinsic.targetArchitecture() == "wasm32" {
-  import silk.mem.allocator { Allocator, OutOfMemoryError }
-
-  /// Loads nothing: a sheet from a file or URL is dropped.
-  pub struct Sheets {}
-
-  impl Sheets {
-    pub fn make() -> Sheets {
-      return Sheets {}
-    }
-
-    pub effect fn file(self: &mut Self, path: string, directory: string) -> ()
-      ! OutOfMemoryError
-      ? &mut Allocator {}
-
-    pub effect fn url(self: &mut Self, url: string) -> ()
-      ! OutOfMemoryError
-      ? &mut Allocator {}
-
-    pub fn pending(self: &Self) -> bool {
-      return false
-    }
-
-    pub effect fn poll(self: &mut Self, done: &mut List<Sheet>) -> ()
-      ! OutOfMemoryError
-      ? &mut Allocator {}
-  }
-
-  /// Reads no rules: a page links its font stylesheets itself.
-  pub effect fn rulesOf(css: &[u8]) -> List<FontFaceRule>
+  /// Reads no rules in a WebAssembly host.
+  pub effect fn rulesOf(css: &[u8], base: string) -> List<FontFaceRule>
     ! OutOfMemoryError
     ? &mut Allocator {
     return List<FontFaceRule>.make()
   }
 } else {
-  import background { Background }
-  import images { resolveFile }
-  import font_web.fetch
   import font_web.stylesheet { parse }
-  import silk.collections.bytes { Bytes }
-  import silk.concurrency.thread { Transferable }
-  import silk.core.effect { Effect }
   import silk.core.option { Option }
-  import silk.core.result { Result }
-  import silk.http.client { Http, HttpError, Request }
-  import silk.http.client_native { NativeHttp }
-  import silk.mem.allocator { Allocator, OutOfMemoryError }
-  import silk.system.filesystem { FileSystem, Path }
-  import silk.system.filesystem_machine { MachineFileSystem }
+  import silk.text.string { String }
   import silk.url.url { Url }
 
-  /// Where a sheet is: a resolved local path, or an HTTP(S) URL.
-  union Source {
-    File { path: String },
-    Url { url: String }
-  }
-
-  struct Input {
-    source: Source,
-  }
-
-  impl Transferable for Input {}
-
-  /// What a worker read: plain bytes, parsed on the UI thread (rules crossing threads made
-  /// silkc dev.74 fail with an internal error).
-  struct Output {
-    ok: bool,
-    css: Bytes,
-    /// The URL the response came from, empty for a file.
-    base: String,
-  }
-
-  impl Transferable for Output {}
-
-  struct Running {
-    task: Background<Output>,
-    directory: String,
-  }
-
-  /// Stylesheets loading on native workers. See the module documentation.
-  pub struct Sheets {
-    running: List<Running>,
-  }
-
-  impl Sheets {
-    pub fn make() -> Sheets {
-      return Sheets { running: List<Running>.make() }
-    }
-
-    /// Starts reading the stylesheet at local `path` (relative to the working directory);
-    /// its relative `src` URLs resolve against `directory`.
-    pub effect fn file(self: &mut Self, path: string, directory: string) -> ()
-      ! OutOfMemoryError
-      ? &mut Allocator {
-      let mut owned = Allocator.systemAllocatorProvider()
-      let resolved = run Effect.result(resolveFile(path)) |> Effect.provideMut<Allocator>(&mut owned)
-      let canonical = match move resolved {
-        Result.Success { value } => move value
-        Result.Failure { error } => {
-          drop error
-          String.make()
-        }
-      }
-      run self.start(Source.File { path: move canonical }, directory)
-    }
-
-    /// Starts fetching the stylesheet at HTTP(S) `url`. Its `src` URLs resolve against the
-    /// URL the response came from.
-    pub effect fn url(self: &mut Self, url: string) -> ()
-      ! OutOfMemoryError
-      ? &mut Allocator {
-      let mut owned = Allocator.systemAllocatorProvider()
-      let copied = run String.copy(url) |> Effect.provideMut<Allocator>(&mut owned)
-      run self.start(Source.Url { url: move copied }, "")
-    }
-
-    /// Whether sheets are still loading.
-    pub fn pending(self: &Self) -> bool {
-      return self.running.length() > 0
-    }
-
-    /// Moves the sheets that finished to `done`; a sheet that could not be read is dropped,
-    /// as a browser drops a stylesheet link that fails.
-    pub effect fn poll(self: &mut Self, done: &mut List<Sheet>) -> ()
-      ! OutOfMemoryError
-      ? &mut Allocator {
-      let mut i: usize = 0
-      while i < self.running.length() {
-        if !self.running.asSlice()[i].task.ready() {
-          i = i + 1
-          continue
-        }
-        let mut job = self.running.remove(i)
-        if let Option<Output>.Some { value: output } = job.task.poll() {
-          if output.ok {
-            let rules = run parseAt(output.css.asSlice(), String.view(&output.base))
-            run done.append(Sheet { rules: move rules, directory: move job.directory })
-          }
-        }
-      }
-    }
-
-    effect fn start(self: &mut Self, source: Source, directory: string) -> ()
-      ! OutOfMemoryError
-      ? &mut Allocator {
-      let input = Input { source: move source }
-      let started = run Effect.result(
-        Background<Output>.start(
-          fn() -> Output {
-            return load(move input.source)
-          },
-        ),
-      )
-      match move started {
-        Result.Success { value: task } => {
-          let copied = run String.copy(directory)
-          run self.running.append(Running { task: move task, directory: move copied })
-        }
-        Result.Failure { error } => {
-          drop error
-        }
-      }
-    }
-  }
-
-  /// The `@font-face` rules of a stylesheet the loader has at hand, with their URLs as
-  /// written.
-  pub effect fn rulesOf(css: &[u8]) -> List<FontFaceRule>
-    ! OutOfMemoryError
-    ? &mut Allocator {
-    return run parse(css, Option<&'static Url>.None)
-  }
-
-  /// The rules of `css`, with relative URLs resolved against `base` when it is a URL.
-  effect fn parseAt(css: &[u8], base: string) -> List<FontFaceRule>
+  /// The `@font-face` rules of `css`, with relative URLs resolved against `base` when it is
+  /// an absolute URL, and kept as written otherwise.
+  pub effect fn rulesOf(css: &[u8], base: string) -> List<FontFaceRule>
     ! OutOfMemoryError
     ? &mut Allocator {
     if String.byteLength(base) == 0 {
-      return run rulesOf(css)
+      return run parse(css, Option<&'static Url>.None)
     }
     let parsed = run Url.parse(base, Option<&'static Url>.None)
     return match move parsed {
       Option<Url>.Some { value } => run parse(css, Option<&Url>.Some { value: &value })
-      Option<Url>.None => run rulesOf(css)
-    }
-  }
-
-  fn failed() -> Output {
-    return Output { ok: false, css: Bytes.make(), base: String.make() }
-  }
-
-  /// Reads or fetches a sheet on a worker, with its own allocator.
-  fn load(source: Source) -> Output {
-    let mut allocator = Allocator.systemAllocatorProvider()
-    return match move source {
-      Source.File { path } => {
-        let read = run Effect.result(readFile(String.view(&path)))
-          |> Effect.provideMut<Allocator>(&mut allocator)
-        match move read {
-          Result.Success { value } => move value
-          Result.Failure { error } => {
-            drop error
-            failed()
-          }
-        }
-      }
-      Source.Url { url } => {
-        let mut http = NativeHttp.make()
-        let fetched = run Effect.result(fetchSheet(String.view(&url)))
-          |> Effect.provideMut<Http>(&mut http)
-          |> Effect.provideMut<Allocator>(&mut allocator)
-        match move fetched {
-          Result.Success { value } => move value
-          Result.Failure { error } => {
-            drop error
-            failed()
-          }
-        }
-      }
-    }
-  }
-
-  /// Fetches the stylesheet at HTTP(S) `url` as a desktop browser does (as
-  /// `font_web.fetch.stylesheet` does), so Google Fonts answers with WOFF2 faces.
-  effect fn fetchSheet(url: string) -> Output
-    ! HttpError | OutOfMemoryError
-    ? &mut Http | &mut Allocator {
-    let encoded = run fetch.encode(url)
-    let mut request = Request.get(String.view(&encoded)).timeoutSeconds(15).maxBodyBytes(fetch.MAX_BODY_BYTES)
-    run request.header("User-Agent", fetch.USER_AGENT)
-    run request.header("Accept", "text/css,*/*;q=0.1")
-    let response = run Http.send(move request)
-    if !response.ok() {
-      return failed()
-    }
-    let base = if response.url() == "" {
-      move encoded
-    } else {
-      run String.copy(response.url())
-    }
-    return Output { ok: true, css: response.intoBody(), base: move base }
-  }
-
-  /// The stylesheet file at `path`.
-  effect fn readFile(path: string) -> Output
-    ! OutOfMemoryError
-    ? &mut Allocator {
-    let made = run Effect.result(MachineFileSystem.make())
-    let mut fs = match move made {
-      Result.Success { value } => move value
-      Result.Failure { error } => {
-        drop error
-        return failed()
-      }
-    }
-    let parsed = run Effect.result(Path.fromBytes(String.utf8Bytes(path)))
-    let file = match move parsed {
-      Result.Success { value } => move value
-      Result.Failure { error } => {
-        drop error
-        return failed()
-      }
-    }
-    let read = run Effect.result(FileSystem.readFile(&file)) |> Effect.provideMut<FileSystem>(&mut fs)
-    return match move read {
-      Result.Success { value: bytes } => Output { ok: true, css: move bytes, base: String.make() }
-      Result.Failure { error } => {
-        drop error
-        failed()
-      }
+      Option<Url>.None => run parse(css, Option<&'static Url>.None)
     }
   }
 }
