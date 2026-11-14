@@ -1,0 +1,87 @@
+name: UI full
+# Every check on every platform, as each pull request ran before ui.yml was trimmed: release
+# builds of all window demos and the whole package suite on macOS and Windows.
+on:
+  schedule:
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ui-full
+  cancel-in-progress: true
+jobs:
+  packages:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-26.04, macos-26, windows-2025-vs2026]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+        with:
+          arch: x64
+      - name: Install Linux window headers
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxkbcommon-dev libwayland-dev wayland-protocols
+      - uses: ./.github/actions/setup-silk
+      - name: Provision pinned LLVM and native tools
+        run: silk task setup-ci
+      - name: Every package, tests, HTTP images, goldens and wasm API checks
+        if: runner.os != 'Windows'
+        run: silk task check
+      # Managed HTTP/native fixtures require silk-lang/silk#3034 on Windows.
+      - name: Windows package checks
+        if: runner.os == 'Windows'
+        run: silk task check-packages
+      - name: Windows unit tests
+        if: runner.os == 'Windows'
+        run: silk task unit-tests
+      - name: Windows goldens
+        if: runner.os == 'Windows'
+        run: silk task goldens
+      - name: Windows tools
+        if: runner.os == 'Windows'
+        run: silk task build-tools
+      - name: Windows embedded asset freshness
+        if: runner.os == 'Windows'
+        run: silk task embed-assets --check
+      - name: Windows browser export freshness
+        if: runner.os == 'Windows'
+        run: silk task generate-browser-exports --check
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: ui-package-failures-${{ runner.os }}
+          path: |
+            build/test-results
+            modules/**/actual*
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows managed integration is blocked by silk-lang/silk#3034.
+        os: [ubuntu-26.04, macos-26]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux window hosts
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxkbcommon-dev libwayland-dev wayland-protocols xvfb xauth weston
+      - uses: ./.github/actions/setup-silk
+      - if: runner.os == 'Linux'
+        run: silk task setup-ci --linux-gpu
+      - if: runner.os != 'Linux'
+        run: silk task setup-ci
+      - name: Native rendering, input, inspector, MCP and devtools
+        run: silk task native check
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ui-inspector-${{ runner.os }}
+          path: .cache/ui-inspect/*.png
+          if-no-files-found: ignore

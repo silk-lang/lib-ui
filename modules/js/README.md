@@ -53,10 +53,10 @@ mount(createBox({ width: 400, height: 300 }, button));
   `not-allowed` and the resize ones); the `cursor` style property does the same, and a node
   without one shows its nearest ancestor's.
 - **Accessibility.** `role` and `aria-*` work as in the DOM, as `aria-label` or `ariaLabel`.
-  `role` takes the first word that names a role the tree has (`"switch checkbox"`), and
-  `aria-label`, `aria-checked`, `aria-selected`, `aria-expanded` and `aria-valuemin`,
-  `aria-valuemax`, `aria-valuenow` set the tree's attributes. Other roles and ARIA names are
-  ignored with one console warning each, until the tree has them.
+  `role` takes the first word that names a role the tree has (`"switch checkbox"`). The
+  tree has the ARIA states and properties for names, values, levels, sets, toggles, validity
+  and live regions (`aria-level`, `aria-pressed`, `aria-live`, `aria-checked="mixed"` and so
+  on). Other roles and ARIA names are ignored with one console warning each.
 - **Links.** A node with an `href` is a link, as an `<a>` is: a click on it or inside it that
   no listener prevented calls `open(href)`, which hands the address to the host.
 - **Markdown.** `parseMarkdown(text, options)` returns the syntax tree of the text in
