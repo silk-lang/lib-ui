@@ -45,6 +45,7 @@ import input { Input }
 import interact
 import layers
 import edit
+import rich
 import edit { EditState, HostRequest, Keymap, ImeArea, NATIVE_KEYMAP }
 import style { Computed, TextStyle }
 import motion
@@ -305,6 +306,11 @@ fn nodeOf(mutation: &Mutation) -> u32 {
     Mutation.SetGrid { id, .. } => id
     Mutation.SetSource { id, .. } => id
     Mutation.SetCanvas { id, .. } => id
+    Mutation.SetRichText { id, .. } => id
+    Mutation.DefineMark { id, .. } => id
+    Mutation.DefineAtom { id, .. } => id
+    Mutation.Format { id, .. } => id
+    Mutation.InsertAtom { id, .. } => id
     _ => NONE
   }
 }
@@ -382,7 +388,7 @@ fn defaultDisplay(kind: NodeKind) -> CssDisplay {
   }
 }
 
-effect fn applyAll(computed: &mut Computed, list: &List<Declaration>, stops: &mut EasingStops) -> ()
+pub effect fn applyAll(computed: &mut Computed, list: &List<Declaration>, stops: &mut EasingStops) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   let items = list.asSlice()
@@ -935,6 +941,13 @@ impl<'a> UiTree<'a> {
     return NONE
   }
 
+  /// Maps css-layout node `index`, one the tree made for itself, to no slot.
+  pub effect fn forgetCss(self: &mut Self, index: usize) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.mapCss(index, NONE)
+  }
+
   effect fn mapCss(self: &mut Self, index: usize, slot: u32) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
@@ -1159,6 +1172,26 @@ impl<'a> UiTree<'a> {
         if hadGrid {
           run self.styleGrid(slot)
         }
+      }
+      Mutation.SetRichText { id, value, marks, atoms } => {
+        let slot = run self.requireInput(index, id)
+        run edit.setRich(&mut self, slot, move value, move marks, move atoms)
+      }
+      Mutation.DefineMark { id, mark, declarations } => {
+        let slot = run self.requireInput(index, id)
+        run edit.defineStyle(&mut self, slot, false, mark, move declarations)
+      }
+      Mutation.DefineAtom { id, kind, declarations } => {
+        let slot = run self.requireInput(index, id)
+        run edit.defineStyle(&mut self, slot, true, kind, move declarations)
+      }
+      Mutation.Format { id, mark, on } => {
+        let slot = run self.requireInput(index, id)
+        run edit.format(&mut self, slot, mark, on)
+      }
+      Mutation.InsertAtom { id, start, end, atom } => {
+        let slot = run self.requireInput(index, id)
+        run edit.insertAtom(&mut self, slot, start, end, move atom)
       }
       Mutation.SetText { id, value } => {
         let slot = run self.require(index, id)
@@ -1578,6 +1611,16 @@ impl<'a> UiTree<'a> {
     self.nextHostFace = id + 1
     run self.declareFaceAt(id, move rule, run String.copy(url))
     return id
+  }
+
+  /// The slot of input `id`.
+  effect fn requireInput(self: &Self, index: usize, id: u32) -> u32
+    ! TreeError {
+    let slot = run self.require(index, id)
+    if self.node(slot).kind != NodeKind.Input {
+      fail TreeError.WrongKind { index: index, id: id }
+    }
+    return slot
   }
 
   effect fn require(self: &Self, index: usize, id: u32) -> u32
@@ -2969,7 +3012,7 @@ impl<'a> UiTree<'a> {
   // Styles.
 
   /// The font key of a text style, registering it with the text system on first use.
-  effect fn fontKeyOf(self: &mut Self, text: TextStyle) -> usize
+  pub effect fn fontKeyOf(self: &mut Self, text: TextStyle) -> usize
     ! OutOfMemoryError
     ? &mut Allocator {
     let italic = text.style == FontStyle.Italic
@@ -3367,6 +3410,9 @@ impl<'a> UiTree<'a> {
     }
     if kind == NodeKind.Icon && sizeChanged {
       run self.updateNatural(slot)
+    }
+    if kind == NodeKind.Input && self.node(slot).edit().runs.length() != 0 {
+      run rich.styleRuns(&mut self, slot)
     }
   }
 

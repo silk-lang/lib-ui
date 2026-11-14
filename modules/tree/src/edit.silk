@@ -17,12 +17,40 @@ import caret {
   spanX,
   offsetNear,
   lineRange,
-  adjacentLine
+  adjacentLine,
+  RunSource,
+  collectRuns
+}
+import rich
+import rich {
+  MarkSpan,
+  Atom,
+  OBJECT,
+  Styled,
+  Run,
+  marksBefore,
+  spliceMarks,
+  formatMarks,
+  allMarked,
+  cleanMarks,
+  spliceAtoms,
+  fitAtoms,
+  copyAtoms,
+  copySpans,
+  sameSpans,
+  sameAtoms,
+  objectAt,
+  withoutObjects,
+  syncRuns,
+  dropRuns
 }
 import paint { Painter, contentBox }
+import layout.lib { LayoutTree }
+import ui_text.system { TextSystem }
 import node { NONE, NO_INDEX, Event, EventKind }
 import input { MOD_SHIFT, MOD_CONTROL, MOD_ALT, MOD_META }
-import mutation { NodeKind, LISTEN_INPUT }
+import mutation { NodeKind, LISTEN_INPUT, Declaration }
+import node { Node }
 import scrollbar { rangeOf }
 import layout.lib { NodeId, InvalidNode }
 import ui_scene.primitives { Background, ContentMask, Quad }
@@ -64,6 +92,8 @@ pub struct Snapshot {
   pub value: String,
   pub anchor: usize,
   pub focus: usize,
+  pub marks: List<MarkSpan>,
+  pub atoms: List<Atom>,
 }
 
 /// Undo groups: consecutive edits of one kind at the caret merge into one undo step.
@@ -130,6 +160,16 @@ pub struct EditState {
   drag: u32,
   dragStart: usize,
   dragEnd: usize,
+  /// A rich input: its value has marks and atoms (`rich.silk`) and lays out as runs.
+  pub rich: bool,
+  pub marks: List<MarkSpan>,
+  pub atoms: List<Atom>,
+  /// The marks the next typed text gets, set by `Format` at a caret until the caret moves.
+  pub typing: u32,
+  pub hasTyping: bool,
+  pub markStyles: List<Styled>,
+  pub atomStyles: List<Styled>,
+  pub runs: List<Run>,
 }
 
 impl EditState {
@@ -162,7 +202,51 @@ impl EditState {
       drag: DRAG_NONE,
       dragStart: 0,
       dragEnd: 0,
+      rich: false,
+      marks: List<MarkSpan>.make(),
+      atoms: List<Atom>.make(),
+      typing: 0,
+      hasTyping: false,
+      markStyles: List<Styled>.make(),
+      atomStyles: List<Styled>.make(),
+      runs: List<Run>.make(),
     }
+  }
+
+  /// The marks text typed over the selection gets: those set by `Format` at the caret, or
+  /// those of the text before it.
+  pub fn activeMarks(self: &Self, value: string) -> u32 {
+    if self.hasTyping {
+      return self.typing
+    }
+    return marksBefore(&self.marks, value, minimum(self.anchor, self.focus))
+  }
+
+  /// The runs as the caret code reads them.
+  pub effect fn runSources(self: &Self) -> List<RunSource>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut out = List<RunSource>.make()
+    let runs = self.runs.asSlice()
+    let mut i: usize = 0
+    while i < runs.length {
+      run out.append(
+        RunSource {
+          css: runs[i].css,
+          text: runs[i].text,
+          start: runs[i].start,
+          end: runs[i].end,
+          atom: runs[i].atom,
+        },
+      )
+      i = i + 1
+    }
+    return move out
+  }
+
+  /// Whether the display text lays out as runs.
+  pub fn hasRuns(self: &Self) -> bool {
+    return self.rich && !self.showsPlaceholder
   }
 
   /// The selection's start and end, start first.
@@ -327,7 +411,12 @@ pub effect fn syncDisplay(tree: &mut UiTree<'_>, slot: u32) -> ()
   if filler {
     run display.append(FILLER)
   }
-  let copy = run String.copy(String.view(&display))
+  let rich = state(&tree.*, slot).rich && !placeholder
+  let copy = if rich {
+    String.make()
+  } else {
+    run String.copy(String.view(&display))
+  }
   let inner = tree.node(slot).inner
   let e = stateMut(&mut tree, slot)
   e.display = move display
@@ -337,6 +426,11 @@ pub effect fn syncDisplay(tree: &mut UiTree<'_>, slot: u32) -> ()
     tree.layout.setText(NodeId { index: inner }, move copy),
     ignoreInvalid,
   )
+  if rich {
+    run syncRuns(&mut tree, slot)
+  } else if state(&tree.*, slot).runs.length() != 0 {
+    run dropRuns(&mut tree, slot)
+  }
   touched(&mut tree, slot)
 }
 
@@ -480,6 +574,24 @@ effect fn fresh(tree: &mut UiTree<'_>) -> ()
   }
 }
 
+/// The text pieces of input `node` inside fragment `root`, as laid out.
+pub effect fn collectOf(
+  output: &LayoutTree,
+  text: &TextSystem<'_>,
+  root: usize,
+  node: &Node,
+  out: &mut List<Piece>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if node.edit().hasRuns() {
+    let sources = run node.edit().runSources()
+    run collectRuns(output, text, root, sources.asSlice(), &mut out.*)
+  } else {
+    run collect(output, text, root, node.inner, &mut out.*)
+  }
+}
+
 /// The input's text pieces in the last layout, where they draw (scrolled).
 pub effect fn piecesOf(tree: &UiTree<'_>, slot: u32) -> List<Piece>
   ! OutOfMemoryError
@@ -488,7 +600,7 @@ pub effect fn piecesOf(tree: &UiTree<'_>, slot: u32) -> List<Piece>
   let css = tree.node(slot).css
   if css < tree.fragmentOf.length() {
     let root = tree.fragmentOf.get(css)
-    run collect(&tree.output, &tree.provider.text, root, tree.node(slot).inner, &mut pieces)
+    run collectOf(&tree.output, &tree.provider.text, root, tree.node(slot), &mut pieces)
   }
   let list = pieces.asMutSlice()
   let mut i: usize = 0
@@ -534,6 +646,7 @@ effect fn select(tree: &mut UiTree<'_>, slot: u32, anchor: usize, focus: usize) 
   e.anchor = anchor
   e.focus = focus
   e.group = GROUP_NONE
+  e.hasTyping = false
   touched(&mut tree, slot)
 }
 
@@ -621,6 +734,12 @@ effect fn inputRecord(tree: &mut UiTree<'_>, slot: u32, inputType: string) -> ()
   event.inputType = run String.copy(inputType)
   event.selectionStart = state(&tree.*, slot).low()
   event.selectionEnd = state(&tree.*, slot).high()
+  let e = state(&tree.*, slot)
+  if e.rich {
+    event.marks = run copySpans(&e.marks)
+    event.atoms = run copyAtoms(&e.atoms)
+    event.activeMarks = e.activeMarks(String.view(&tree.node(slot).text))
+  }
   run tree.queueEvent(move event)
 }
 
@@ -638,6 +757,41 @@ effect fn replace(
 ) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
+  if state(&tree.*, slot).rich && String.byteLength(insert) != 0 {
+    let clean = run withoutObjects(insert)
+    run replaceWith(&mut tree, slot, lo, hi, String.view(&clean), Option<Atom>.None, inputType, group)
+    return ()
+  }
+  run replaceWith(&mut tree, slot, lo, hi, insert, Option<Atom>.None, inputType, group)
+}
+
+/// The state of input `slot` for its undo history.
+effect fn snapshotOf(tree: &UiTree<'_>, slot: u32) -> Snapshot
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let e = state(tree, slot)
+  return Snapshot {
+    value: run String.copy(String.view(&tree.node(slot).text)),
+    anchor: e.anchor,
+    focus: e.focus,
+    marks: run copySpans(&e.marks),
+    atoms: run copyAtoms(&e.atoms),
+  }
+}
+
+/// [`replace`], with `atom` put in when `insert` is its object character.
+effect fn replaceWith(
+  tree: &mut UiTree<'_>,
+  slot: u32,
+  lo: usize,
+  hi: usize,
+  insert: string,
+  atom: Option<Atom>,
+  inputType: string,
+  group: u32,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
   if lo == hi && String.byteLength(insert) == 0 {
     return ()
   }
@@ -646,16 +800,29 @@ effect fn replace(
     && e.groupEnd == e.focus
     && e.undo.length() != 0
   if !merges {
-    let snapshot = Snapshot {
-      value: run String.copy(String.view(&tree.node(slot).text)),
-      anchor: e.anchor,
-      focus: e.focus,
-    }
+    let snapshot = run snapshotOf(&tree.*, slot)
     let st = stateMut(&mut tree, slot)
     run st.undo.append(move snapshot)
     if st.undo.length() > UNDO_LIMIT {
       drop st.undo.remove(0)
     }
+  }
+  if state(&tree.*, slot).rich {
+    let isAtom = atom.isSome()
+    let marks = if isAtom {
+      0
+    } else {
+      state(&tree.*, slot).activeMarks(String.view(&tree.node(slot).text))
+    }
+    let spans = run spliceMarks(&state(&tree.*, slot).marks, lo, hi, String.byteLength(insert), marks)
+    let mut atoms = run stateMut(&mut tree, slot).atoms.splitOff(0)
+    run spliceAtoms(&mut atoms, String.view(&tree.node(slot).text), lo, hi, move atom)
+    let st = stateMut(&mut tree, slot)
+    st.marks = move spans
+    st.atoms = move atoms
+    st.hasTyping = false
+  } else {
+    drop atom
   }
   let value = run spliced(&tree.node(slot).text, lo, hi, insert)
   let caret = lo + String.byteLength(insert)
@@ -711,7 +878,130 @@ pub effect fn setValue(tree: &mut UiTree<'_>, slot: u32, value: String) -> ()
   edited.redo.clear()
   edited.group = GROUP_NONE
   edited.hasPreferredX = false
+  edited.hasTyping = false
+  if edited.rich {
+    edited.marks.clear()
+    let mut atoms = run edited.atoms.splitOff(0)
+    run fitAtoms(&mut atoms, String.view(&tree.node(slot).text))
+    let st = stateMut(&mut tree, slot)
+    st.atoms = move atoms
+  }
   run syncDisplay(&mut tree, slot)
+}
+
+/// The `SetRichText` mutation: like `SetText`, with the marks and atoms of the value. The
+/// rich value the input already has changes nothing.
+pub effect fn setRich(tree: &mut UiTree<'_>, slot: u32, value: String, marks: List<MarkSpan>, atoms: List<Atom>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let spans = run cleanMarks(move marks, String.view(&value))
+  let mut fitted = move atoms
+  run fitAtoms(&mut fitted, String.view(&value))
+  let e = state(&tree.*, slot)
+  if e.rich && String.view(&tree.node(slot).text) == String.view(&value) && sameSpans(&e.marks, &spans)
+    && sameAtoms(&e.atoms, &fitted) {
+    return ()
+  }
+  let length = String.byteLength(String.view(&value))
+  let node = &mut tree.nodes.asMutSlice()[u32.toUsize(slot)]
+  node.text = move value
+  let edited = node.editMut()
+  edited.rich = true
+  edited.marks = move spans
+  edited.atoms = move fitted
+  edited.anchor = length
+  edited.focus = length
+  edited.composing = false
+  edited.preedit.clear()
+  edited.undo.clear()
+  edited.redo.clear()
+  edited.group = GROUP_NONE
+  edited.hasPreferredX = false
+  edited.hasTyping = false
+  run syncDisplay(&mut tree, slot)
+}
+
+/// Makes input `slot` rich, keeping its value.
+pub effect fn makeRich(tree: &mut UiTree<'_>, slot: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if state(&tree.*, slot).rich {
+    return ()
+  }
+  let mut atoms = List<Atom>.make()
+  run fitAtoms(&mut atoms, String.view(&tree.node(slot).text))
+  let e = stateMut(&mut tree, slot)
+  e.rich = true
+  e.atoms = move atoms
+  run syncDisplay(&mut tree, slot)
+}
+
+/// The `DefineMark` and `DefineAtom` mutations.
+pub effect fn defineStyle(tree: &mut UiTree<'_>, slot: u32, atom: bool, key: u32, declarations: List<Declaration>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run makeRich(&mut tree, slot)
+  let e = stateMut(&mut tree, slot)
+  if atom {
+    run rich.define(&mut e.atomStyles, key, move declarations)
+  } else {
+    run rich.define(&mut e.markStyles, key, move declarations)
+  }
+  tree.restyle(slot)
+}
+
+/// The `Format` mutation: mark `mark` on or off over the selection, or for the text typed
+/// next at a caret.
+pub effect fn format(tree: &mut UiTree<'_>, slot: u32, mark: u32, on: bool) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if mark >= 32 {
+    return ()
+  }
+  run makeRich(&mut tree, slot)
+  run endComposition(&mut tree, slot)
+  let bit = u32.shiftLeft(1, mark)
+  let lo = state(&tree.*, slot).low()
+  let hi = state(&tree.*, slot).high()
+  if lo == hi {
+    let active = state(&tree.*, slot).activeMarks(String.view(&tree.node(slot).text))
+    let e = stateMut(&mut tree, slot)
+    e.typing = if on {
+      u32.bitOr(active, bit)
+    } else {
+      u32.bitAnd(active, u32.bitNot(bit))
+    }
+    e.hasTyping = true
+    touched(&mut tree, slot)
+    return ()
+  }
+  if allMarked(&state(&tree.*, slot).marks, lo, hi, bit) == on {
+    return ()
+  }
+  let snapshot = run snapshotOf(&tree.*, slot)
+  let spans = run formatMarks(&state(&tree.*, slot).marks, lo, hi, bit, on)
+  let e = stateMut(&mut tree, slot)
+  run e.undo.append(move snapshot)
+  if e.undo.length() > UNDO_LIMIT {
+    drop e.undo.remove(0)
+  }
+  e.redo.clear()
+  e.group = GROUP_NONE
+  e.marks = move spans
+  run syncDisplay(&mut tree, slot)
+  run inputRecord(&mut tree, slot, "format")
+}
+
+/// The `InsertAtom` mutation: replaces value bytes [`start`, `end`) with `atom`.
+pub effect fn insertAtom(tree: &mut UiTree<'_>, slot: u32, start: usize, end: usize, atom: Atom) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run makeRich(&mut tree, slot)
+  run endComposition(&mut tree, slot)
+  let value = String.view(&tree.node(slot).text)
+  let lo = snap(value, minimum(start, end))
+  let hi = snap(value, maximum(start, end))
+  run replaceWith(&mut tree, slot, lo, hi, OBJECT, Option<Atom>.Some { value: move atom }, "insertAtom", GROUP_NONE)
 }
 
 /// Steps back (`redo` false) or forward through the undo history.
@@ -726,11 +1016,7 @@ effect fn history(tree: &mut UiTree<'_>, slot: u32, redo: bool) -> ()
   if available == 0 {
     return ()
   }
-  let current = Snapshot {
-    value: run String.copy(String.view(&tree.node(slot).text)),
-    anchor: state(&tree.*, slot).anchor,
-    focus: state(&tree.*, slot).focus,
-  }
+  let current = run snapshotOf(&tree.*, slot)
   let node = &mut tree.nodes.asMutSlice()[u32.toUsize(slot)]
   let popped = if redo {
     node.editMut().redo.pop()
@@ -751,6 +1037,9 @@ effect fn history(tree: &mut UiTree<'_>, slot: u32, redo: bool) -> ()
       let edited = node.editMut()
       edited.anchor = snapshot.anchor
       edited.focus = snapshot.focus
+      edited.marks = move snapshot.marks
+      edited.atoms = move snapshot.atoms
+      edited.hasTyping = false
       edited.group = GROUP_NONE
       edited.hasPreferredX = false
       run syncDisplay(&mut tree, slot)
@@ -1192,6 +1481,33 @@ effect fn delete(
   }
 }
 
+/// Value bytes [`lo`, `hi`) of input `slot` as plain text: atoms read as their labels.
+effect fn plainText(tree: &UiTree<'_>, slot: u32, lo: usize, hi: usize) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let value = String.view(&tree.node(slot).text)
+  let mut out = String.make()
+  let mut start = lo
+  let mut at = lo
+  let mut index = rich.objectsIn(value, 0, lo)
+  let atoms = state(tree, slot).atoms.asSlice()
+  while at < hi {
+    if objectAt(value, at) {
+      run out.append(String.slice(value, start, at - start))
+      if index < atoms.length {
+        run out.append(String.view(&atoms[index].label))
+      }
+      index = index + 1
+      at = at + 3
+      start = at
+    } else {
+      at = at + 1
+    }
+  }
+  run out.append(String.slice(value, start, minimum(hi, String.byteLength(value)) - start))
+  return move out
+}
+
 effect fn copySelection(tree: &mut UiTree<'_>, slot: u32) -> bool
   ! OutOfMemoryError
   ? &mut Allocator {
@@ -1200,7 +1516,7 @@ effect fn copySelection(tree: &mut UiTree<'_>, slot: u32) -> bool
   if lo == hi {
     return false
   }
-  let text = run String.copy(String.slice(String.view(&tree.node(slot).text), lo, hi - lo))
+  let text = run plainText(&tree.*, slot, lo, hi)
   run tree.requests.append(HostRequest.WriteClipboard { text: move text })
   return true
 }
@@ -1550,7 +1866,7 @@ pub effect fn paintSelection(
   let hi = e.toDisplay(e.high())
   let color = node.computed.text.selectionColor
   let mut pieces = List<Piece>.make()
-  run collect(p.output, p.text, index, node.inner, &mut pieces)
+  run collectOf(p.output, p.text, index, node, &mut pieces)
   let values = pieces.asSlice()
   let mut i: usize = 0
   while i < values.length {
@@ -1587,10 +1903,9 @@ pub effect fn paintCaret(p: &mut Painter<'_, '_>, slot: u32, index: usize, mask:
   let showCaret = e.caretOn && !e.readOnly && (e.anchor == e.focus || composing)
   let caretAt = e.caretDisplay()
   let text = node.computed.text
-  let inner = node.inner
   let s = p.scale
   let mut pieces = List<Piece>.make()
-  run collect(p.output, p.text, index, inner, &mut pieces)
+  run collectOf(p.output, p.text, index, node, &mut pieces)
   if composing {
     let thin = f32.max(1.0, f32.round(s))
     let values = pieces.asSlice()

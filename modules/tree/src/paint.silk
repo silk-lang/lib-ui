@@ -17,6 +17,7 @@ import layers { Sticky }
 import stacking
 import stacking { Stacking, IN_FLOW }
 import edit
+import rich
 import ui_text.system { TextSystem }
 import layout.lib { Tree, LayoutTree, Fragment, FragmentKind, TextFragmentKind }
 import font_raster.cache { GlyphCache, RasterGlyph }
@@ -417,7 +418,7 @@ effect fn paintText(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Co
   if slot == NONE {
     return ()
   }
-  let c = p.nodes.asSlice()[u32.toUsize(slot)].computed
+  let mut c = p.nodes.asSlice()[u32.toUsize(slot)].computed
   let mut color = c.text.color
 
   // An input's text ends where its value does: a filler after it has nothing to draw.
@@ -427,7 +428,15 @@ effect fn paintText(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Co
     if e.showsPlaceholder {
       color = c.text.placeholder()
     }
-    if e.filler {
+    let r = rich.runOf(&e.runs, f.source)
+    if e.hasRuns() && r != NO_INDEX {
+      let found = e.runs.get(r)
+      c = found.computed
+      color = c.text.color
+      if found.filler {
+        limit = found.end - found.start - 3
+      }
+    } else if e.filler {
       limit = String.byteLength(String.view(&e.display)) - 3
     }
   }
@@ -1548,6 +1557,8 @@ effect fn paintFragmentIn(p: &mut Painter<'_, '_>, index: usize, mask: ContentMa
         if c.text.visible && c.decorated() {
           run decorate(&mut p, &c, borderBox(&f), f.decorationEdges, mask)
         }
+      } else if slot == NONE && !f.nonpainting {
+        run decorateRun(&mut p, &f, mask)
       }
       run paintChildren(&mut p, index, mask)
       if slot != NONE && !f.nonpainting {
@@ -1642,11 +1653,34 @@ effect fn shiftOne(p: &mut Painter<'_, '_>, child: usize, from: usize, to: usize
   run shiftCaches(&mut p, child, from, to, mask)
 }
 
+/// The background and border of a rich input's run (a marked span or an atom), which has no
+/// slot of its own.
+effect fn decorateRun(p: &mut Painter<'_, '_>, f: &Fragment, mask: ContentMask) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let owner = styleSlot(&p.slotOfCss.*, &p.css.*, &p.nodes.*, f.source)
+  if owner == NONE || p.nodes.asSlice()[u32.toUsize(owner)].kind != NodeKind.Input {
+    return ()
+  }
+  let e = p.nodes.asSlice()[u32.toUsize(owner)].edit()
+  let r = rich.runOf(&e.runs, f.source)
+  if r == NO_INDEX || e.runs.get(r).css != f.source {
+    return ()
+  }
+  let c = e.runs.get(r).computed
+  if c.text.visible && c.decorated() {
+    run decorate(&mut p, &c, borderBox(f), f.decorationEdges, mask)
+  }
+}
+
 effect fn paintBox(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: ContentMask) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   let slot = slotIn(p.slotOfCss, f.source)
   if slot == NONE {
+    if !f.nonpainting {
+      run decorateRun(&mut p, &f, mask)
+    }
     run paintStack(&mut p, index, mask)
     return ()
   }

@@ -12,8 +12,10 @@ import silk.core.ownership { Copy }
 import silk.collections.slice { Slice }
 import silk.num.i32
 import silk.num.f64
+import silk.num.u8
+import silk.num.usize
 import ui_tree.css { Declaration }
-import ui_tree.legacy { Batch, NodeKind, Attribute, Mutation, StyleState, Cursor, Keyframe, Role }
+import ui_tree.legacy { Batch, NodeKind, Attribute, Mutation, StyleState, Cursor, Keyframe, Role, MarkSpan, Atom }
 import ui_tree.mutation { ariaAttribute }
 import css_style.tokens { CssError }
 import css_style.written as written
@@ -103,8 +105,21 @@ pub const KEYFRAME: u32 = 28
 /// `__ui.keyframes(name)`: defines `@keyframes name` from the frames added since the last
 /// one; none removes it.
 pub const KEYFRAMES: u32 = 29
+/// `__ui.richText(id, value, marks, atoms)`: sets a rich input's value. `marks` packs the
+/// mark spans as `"start,end,bits;..."` and `atoms` packs each atom as `kind\0label\0data\0`,
+/// with UTF-8 byte offsets.
+pub const RICH_TEXT: u32 = 30
+/// `__ui.mark(id, mark, css)`: what mark `mark` (0 to 31) of a rich input looks like.
+pub const MARK: u32 = 31
+/// `__ui.atomStyle(id, kind, css)`: what atoms of `kind` in a rich input look like.
+pub const ATOM_STYLE: u32 = 32
+/// `__ui.format(id, mark, on)`: turns a mark on or off over the selection.
+pub const FORMAT: u32 = 33
+/// `__ui.insertAtom(id, start, end, atom)`: replaces value bytes [start, end) with an atom
+/// packed as for `richText`.
+pub const INSERT_ATOM: u32 = 34
 /// The number of native functions, for the installer.
-pub const LAST: u32 = 29
+pub const LAST: u32 = 34
 
 /// The runtime's promise rejection tracker callback: [`Bridge`] keeps the promises that
 /// were rejected with no handler until one is added.
@@ -246,6 +261,11 @@ pub fn name(id: u32) -> &'static [u8] {
   if id == MARKDOWN { return b"markdown" }
   if id == KEYFRAME { return b"keyframe" }
   if id == KEYFRAMES { return b"keyframes" }
+  if id == RICH_TEXT { return b"richText" }
+  if id == MARK { return b"mark" }
+  if id == ATOM_STYLE { return b"atomStyle" }
+  if id == FORMAT { return b"format" }
+  if id == INSERT_ATOM { return b"insertAtom" }
   return b"requestFrame"
 }
 
@@ -255,6 +275,8 @@ pub fn arity(id: u32) -> i32 {
   if id == DEV_SEND || id == OPEN || id == KEYFRAMES { return 1 }
   if id == ROOT || id == FOCUS || id == REMOVE || id == DESTROY || id == CANCEL_TIMER || id == RELEASE { return 1 }
   if id == INSERT_BEFORE || id == STYLE || id == ATTRIBUTE || id == SCROLL_TO || id == SELECT { return 3 }
+  if id == MARK || id == ATOM_STYLE || id == FORMAT { return 3 }
+  if id == RICH_TEXT || id == INSERT_ATOM { return 4 }
   return 2
 }
 
@@ -283,6 +305,59 @@ fn truthy(value: ValueBits) -> bool {
     ValueBits.Null => false
     _ => true
   }
+}
+
+/// The number at the start of `bytes[at..]`, and where it ends.
+fn digits(bytes: &[u8], at: usize) -> [usize; 2] {
+  let mut value: usize = 0
+  let mut i = at
+  while i < bytes.length && bytes[i] >= 48 && bytes[i] <= 57 {
+    value = value * 10 + u8.toUsize(bytes[i] - 48)
+    i = i + 1
+  }
+  return [value, i]
+}
+
+/// Mark spans packed as `"start,end,bits;..."`.
+pub effect fn unpackMarks(packed: string) -> List<MarkSpan> ! OutOfMemoryError ? &mut Allocator {
+  let bytes = String.utf8Bytes(packed)
+  let mut out = List<MarkSpan>.make()
+  let mut at: usize = 0
+  while at < bytes.length {
+    let start = digits(bytes, at)
+    let end = digits(bytes, start[1] + 1)
+    let marks = digits(bytes, end[1] + 1)
+    run out.append(MarkSpan { start: start[0], end: end[0], marks: usize.toU32(marks[0]) })
+    at = marks[1] + 1
+  }
+  return move out
+}
+
+/// Atoms packed as `kind\0label\0data\0` each.
+pub effect fn unpackAtoms(packed: string) -> List<Atom> ! OutOfMemoryError ? &mut Allocator {
+  let bytes = String.utf8Bytes(packed)
+  let mut out = List<Atom>.make()
+  let mut fields = List<usize>.make()
+  let mut at: usize = 0
+  let mut start: usize = 0
+  while at < bytes.length {
+    if bytes[at] == 0 {
+      run fields.append(start)
+      run fields.append(at)
+      start = at + 1
+      if fields.length() == 6 {
+        let kind = digits(bytes, fields.get(0))
+        run out.append(Atom {
+          kind: usize.toU32(kind[0]),
+          label: run String.copy(String.slice(packed, fields.get(2), fields.get(3) - fields.get(2))),
+          data: run String.copy(String.slice(packed, fields.get(4), fields.get(5) - fields.get(4))),
+        })
+        fields.clear()
+      }
+    }
+    at = at + 1
+  }
+  return move out
 }
 
 fn kind(code: u32) -> NodeKind {
@@ -589,6 +664,33 @@ pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) 
     let name = run text(argv.get(0))
     let frames = Intrinsic.replace(bridge.frames, List<Keyframe>.make())
     run bridge.batch.keyframes(String.view(&name), move frames)
+  } else if function == RICH_TEXT {
+    let value = run text(argv.get(1))
+    let packedMarks = run text(argv.get(2))
+    let packedAtoms = run text(argv.get(3))
+    let marks = run unpackMarks(String.view(&packedMarks))
+    let atoms = run unpackAtoms(String.view(&packedAtoms))
+    run bridge.batch.push(Mutation.SetRichText { id: first, value: move value, marks: move marks, atoms: move atoms })
+  } else if function == MARK || function == ATOM_STYLE {
+    let css = run text(argv.get(2))
+    let declarations = run declarationsOf(&css)
+    let key = id(argv.get(1).view())
+    if function == MARK {
+      run bridge.batch.push(Mutation.DefineMark { id: first, mark: key, declarations: move declarations })
+    } else {
+      run bridge.batch.push(Mutation.DefineAtom { id: first, kind: key, declarations: move declarations })
+    }
+  } else if function == FORMAT {
+    run bridge.batch.format(first, id(argv.get(1).view()), truthy(argv.get(2).view()))
+  } else if function == INSERT_ATOM {
+    let packed = run text(argv.get(3))
+    let mut atoms = run unpackAtoms(String.view(&packed))
+    match atoms.pop() {
+      Option<Atom>.Some { value: atom } => {
+        run bridge.batch.insertAtom(first, f64.toUsize(number(argv.get(1).view())), f64.toUsize(number(argv.get(2).view())), move atom)
+      }
+      Option<Atom>.None => ()
+    }
   } else if function == SELECT {
     run bridge.batch.select(first, f64.toUsize(number(argv.get(1).view())), f64.toUsize(number(argv.get(2).view())))
   }
