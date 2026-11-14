@@ -50,7 +50,8 @@ mount(createBox({ width: 400, height: 300 }, button));
   `disabled`, `label`, `testId`, `placeholder`, `multiline`, `readOnly`, `checked`,
   `selected`, `expanded`, `focusTrap`, `href`, `cursor`, `transition`). A name the tree does
   not have throws a `TypeError`. `cursor` takes the CSS keywords (`pointer`, `text`, `grab`,
-  `not-allowed` and the resize ones).
+  `not-allowed` and the resize ones); the `cursor` style property does the same, and a node
+  without one shows its nearest ancestor's.
 - **Links.** A node with an `href` is a link, as an `<a>` is: a click on it or inside it that
   no listener prevented calls `open(href)`, which hands the address to the host.
 - **Errors.** A listener that throws does not stop the dispatch. `setErrorHandler` receives
