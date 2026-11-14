@@ -55,6 +55,8 @@ The node switches between these looks by itself. The model never hears of it, an
 
 `h.transition("border-color 150ms ease")` eases the change, with the syntax of the CSS `transition` property. A style can also set `transition` and `animation` as CSS does. `h.starting` is the look a node transitions from when it first shows, as CSS `@starting-style`, which is how a popup fades in.
 
+`transform`, `translate`, `rotate`, `scale` and `transform-origin` move, turn and scale a node as CSS does, in 2D or 3D with `perspective`. Layout does not change: the node draws, takes pointers and reports `getBoundingClientRect` where it shows. They transition and animate like any other property, and a `linear()` easing can take stops, such as `linear(0, 1.2 60%, 1)` for an overshoot.
+
 ## Colors
 
 A color is an `Rgba<f32>`: four numbers from 0 to 1. Most programs want to write hex codes, so the examples share a small helper.
