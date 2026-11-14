@@ -1,0 +1,301 @@
+//! Markdown for JavaScript: `silk.markdown` parses, and the tree is written as JSON in the
+//! shape of mdast (the syntax tree of remark and unified), which `JSON.parse` turns into
+//! plain objects in one native pass.
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.collections.slice { Slice }
+import silk.text.string { String }
+import silk.num.u8
+import silk.num.usize
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.markdown.document { MarkdownDocument, MarkdownOptions, MarkdownNodeId, MarkdownNodeKind, MarkdownAlignment, MarkdownTaskState, MarkdownFrontmatterKind, MarkdownAlertKind }
+
+/// `parseMarkdown` option bits, as `__ui.markdown(text, flags)` takes them.
+pub const TABLES: u32 = 1
+pub const STRIKETHROUGH: u32 = 2
+pub const TASK_LISTS: u32 = 4
+pub const AUTOLINK_LITERALS: u32 = 8
+pub const FOOTNOTES: u32 = 16
+pub const FRONTMATTER: u32 = 32
+pub const ALERTS: u32 = 64
+
+/// The mdast JSON of `source`, parsed with the extensions in `flags`.
+pub effect fn json(source: string, flags: u32) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+  let mut options = MarkdownOptions.make()
+  options.tables = flags & TABLES != 0
+  options.strikethrough = flags & STRIKETHROUGH != 0
+  options.taskLists = flags & TASK_LISTS != 0
+  options.autolinkLiterals = flags & AUTOLINK_LITERALS != 0
+  options.footnotes = flags & FOOTNOTES != 0
+  options.frontmatter = flags & FRONTMATTER != 0
+  options.alerts = flags & ALERTS != 0
+  let document = run MarkdownDocument.parseWithOptions(source, &options)
+  let mut out = List<u8>.make()
+  run node(&mut out, &document, document.root(), false)
+  return move out
+}
+
+fn typeOf(kind: MarkdownNodeKind) -> &'static [u8] {
+  if kind == MarkdownNodeKind.Document { return b"root" }
+  if kind == MarkdownNodeKind.Paragraph { return b"paragraph" }
+  if kind == MarkdownNodeKind.Heading { return b"heading" }
+  if kind == MarkdownNodeKind.ThematicBreak { return b"thematicBreak" }
+  if kind == MarkdownNodeKind.BlockQuote { return b"blockquote" }
+  if kind == MarkdownNodeKind.List { return b"list" }
+  if kind == MarkdownNodeKind.ListItem { return b"listItem" }
+  if kind == MarkdownNodeKind.CodeBlock { return b"code" }
+  if kind == MarkdownNodeKind.HtmlBlock || kind == MarkdownNodeKind.HtmlInline { return b"html" }
+  if kind == MarkdownNodeKind.HardBreak { return b"break" }
+  if kind == MarkdownNodeKind.Code { return b"inlineCode" }
+  if kind == MarkdownNodeKind.Emphasis { return b"emphasis" }
+  if kind == MarkdownNodeKind.Strong { return b"strong" }
+  if kind == MarkdownNodeKind.Link { return b"link" }
+  if kind == MarkdownNodeKind.Image { return b"image" }
+  if kind == MarkdownNodeKind.Table { return b"table" }
+  if kind == MarkdownNodeKind.TableRow { return b"tableRow" }
+  if kind == MarkdownNodeKind.TableCell { return b"tableCell" }
+  if kind == MarkdownNodeKind.Strikethrough { return b"delete" }
+  if kind == MarkdownNodeKind.FootnoteReference { return b"footnoteReference" }
+  if kind == MarkdownNodeKind.FootnoteDefinition { return b"footnoteDefinition" }
+  if kind == MarkdownNodeKind.Alert { return b"alert" }
+  return b"text"
+}
+
+fn alignmentOf(alignment: MarkdownAlignment) -> &'static [u8] {
+  if alignment == MarkdownAlignment.Left { return b"\"left\"" }
+  if alignment == MarkdownAlignment.Center { return b"\"center\"" }
+  if alignment == MarkdownAlignment.Right { return b"\"right\"" }
+  return b"null"
+}
+
+fn alertOf(kind: MarkdownAlertKind) -> &'static [u8] {
+  if kind == MarkdownAlertKind.Tip { return b"tip" }
+  if kind == MarkdownAlertKind.Important { return b"important" }
+  if kind == MarkdownAlertKind.Warning { return b"warning" }
+  if kind == MarkdownAlertKind.Caution { return b"caution" }
+  return b"note"
+}
+
+/// Writes node `id`. `spread` is its list's looseness, for a list item.
+effect fn node(out: &mut List<u8>, document: &MarkdownDocument<'_>, id: MarkdownNodeId, spread: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  let kind = document.kind(id)
+  if kind == MarkdownNodeKind.Frontmatter {
+    run out.appendSlice(if document.frontmatterKind(id) == MarkdownFrontmatterKind.Toml { b"{\"type\":\"toml\"" } else { b"{\"type\":\"yaml\"" })
+    run field(&mut out, b"value")
+    run quoted(&mut out, String.utf8Bytes(document.frontmatterBody(id)), true)
+    run out.append(125)
+    return
+  }
+  run out.appendSlice(b"{\"type\":\"")
+  run out.appendSlice(typeOf(kind))
+  run out.append(34)
+  if kind == MarkdownNodeKind.Heading {
+    run field(&mut out, b"depth")
+    run decimal(&mut out, u8.toUsize(document.headingLevel(id)))
+  } else if kind == MarkdownNodeKind.List {
+    let ordered = document.ordered(id)
+    run field(&mut out, b"ordered")
+    run boolean(&mut out, ordered)
+    run field(&mut out, b"start")
+    if ordered { run decimal(&mut out, document.start(id)) } else { run out.appendSlice(b"null") }
+    run field(&mut out, b"spread")
+    run boolean(&mut out, !document.tight(id))
+  } else if kind == MarkdownNodeKind.ListItem {
+    run field(&mut out, b"checked")
+    let state = document.taskState(id)
+    run out.appendSlice(if state == MarkdownTaskState.Checked { b"true" } else if state == MarkdownTaskState.Unchecked { b"false" } else { b"null" })
+    // mdast's item spread is a blank line between the item's own children; a loose list with
+    // two or more of them is that, nearly always.
+    let several = match document.firstChild(id) {
+      Option.Some { value } => document.nextSibling(value).isSome()
+      Option.None => false
+    }
+    run field(&mut out, b"spread")
+    run boolean(&mut out, spread && several)
+  } else if kind == MarkdownNodeKind.CodeBlock {
+    run code(&mut out, document.info(id))
+    run field(&mut out, b"value")
+    run quoted(&mut out, String.utf8Bytes(document.literal(id)), true)
+  } else if kind == MarkdownNodeKind.HtmlBlock || kind == MarkdownNodeKind.Code || kind == MarkdownNodeKind.HtmlInline {
+    run field(&mut out, b"value")
+    run quoted(&mut out, String.utf8Bytes(document.literal(id)), kind == MarkdownNodeKind.HtmlBlock)
+  } else if kind == MarkdownNodeKind.Link || kind == MarkdownNodeKind.Image {
+    run field(&mut out, b"url")
+    run quoted(&mut out, String.utf8Bytes(document.destination(id)), false)
+    run field(&mut out, b"title")
+    match document.title(id) {
+      Option.Some { value } => { run quoted(&mut out, String.utf8Bytes(value), false) }
+      Option.None => { run out.appendSlice(b"null") }
+    }
+    if kind == MarkdownNodeKind.Image {
+      let mut alt = List<u8>.make()
+      run plain(&mut alt, document, id)
+      run field(&mut out, b"alt")
+      run quoted(&mut out, alt.asSlice(), false)
+      run out.append(125)
+      return
+    }
+  } else if kind == MarkdownNodeKind.Table {
+    run field(&mut out, b"align")
+    run out.append(91)
+    let columns = document.tableColumns(id)
+    let mut column: usize = 0
+    while column < columns {
+      if column > 0 { run out.append(44) }
+      run out.appendSlice(alignmentOf(document.columnAlignment(id, column)))
+      column = column + 1
+    }
+    run out.append(93)
+  } else if kind == MarkdownNodeKind.FootnoteReference || kind == MarkdownNodeKind.FootnoteDefinition {
+    let label = String.utf8Bytes(document.footnoteLabel(id))
+    let mut identifier = List<u8>.make()
+    run identifier.appendSlice(label)
+    let folded = identifier.asMutSlice()
+    let mut i: usize = 0
+    while i < folded.length {
+      if folded[i] >= 65 && folded[i] <= 90 { folded[i] = folded[i] + 32 }
+      i = i + 1
+    }
+    // mdast's identifier is the normalized label; ASCII case is the part apps meet.
+    run field(&mut out, b"identifier")
+    run quoted(&mut out, identifier.asSlice(), false)
+    run field(&mut out, b"label")
+    run quoted(&mut out, label, false)
+  } else if kind == MarkdownNodeKind.Alert {
+    run field(&mut out, b"kind")
+    run out.append(34)
+    run out.appendSlice(alertOf(document.alertKind(id)))
+    run out.append(34)
+  }
+  if kind == MarkdownNodeKind.ThematicBreak || kind == MarkdownNodeKind.HardBreak || kind == MarkdownNodeKind.CodeBlock
+    || kind == MarkdownNodeKind.HtmlBlock || kind == MarkdownNodeKind.Code || kind == MarkdownNodeKind.HtmlInline
+    || kind == MarkdownNodeKind.FootnoteReference {
+    run out.append(125)
+    return
+  }
+  run children(&mut out, document, id, kind == MarkdownNodeKind.List && !document.tight(id))
+  run out.append(125)
+}
+
+/// Writes `,"children":[...]`. Runs of text and soft breaks become one text node, as in
+/// mdast, where a soft break is the line feed in its text.
+effect fn children(out: &mut List<u8>, document: &MarkdownDocument<'_>, id: MarkdownNodeId, spread: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  run field(&mut out, b"children")
+  run out.append(91)
+  let mut first = true
+  let mut text = List<u8>.make()
+  let mut inText = false
+  let mut child = document.firstChild(id)
+  while true {
+    let current = match child {
+      Option.Some { value } => value
+      Option.None => { break }
+    }
+    let kind = document.kind(current)
+    if kind == MarkdownNodeKind.Text || kind == MarkdownNodeKind.SoftBreak {
+      if kind == MarkdownNodeKind.Text { run text.appendSlice(String.utf8Bytes(document.literal(current))) } else { run text.append(10) }
+      inText = true
+    } else {
+      if inText {
+        run separate(&mut out, &mut first)
+        run textNode(&mut out, text.asSlice())
+        text.clear()
+        inText = false
+      }
+      run separate(&mut out, &mut first)
+      run node(&mut out, document, current, spread)
+    }
+    child = document.nextSibling(current)
+  }
+  if inText {
+    run separate(&mut out, &mut first)
+    run textNode(&mut out, text.asSlice())
+  }
+  run out.append(93)
+}
+
+effect fn separate(out: &mut List<u8>, first: &mut bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  if !first.* { run out.append(44) }
+  first.* = false
+}
+
+effect fn textNode(out: &mut List<u8>, value: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  run out.appendSlice(b"{\"type\":\"text\",\"value\":")
+  run quoted(&mut out, value, false)
+  run out.append(125)
+}
+
+/// The text content of `id`'s descendants, for an image's `alt`.
+effect fn plain(out: &mut List<u8>, document: &MarkdownDocument<'_>, id: MarkdownNodeId) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut child = document.firstChild(id)
+  while true {
+    let current = match child {
+      Option.Some { value } => value
+      Option.None => { break }
+    }
+    let kind = document.kind(current)
+    if kind == MarkdownNodeKind.SoftBreak { run out.append(10) }
+    else if kind == MarkdownNodeKind.Text || kind == MarkdownNodeKind.Code { run out.appendSlice(String.utf8Bytes(document.literal(current))) }
+    else { run plain(&mut out, document, current) }
+    child = document.nextSibling(current)
+  }
+}
+
+/// `,"lang":…,"meta":…` from a fence's info string: its first word, then the rest.
+effect fn code(out: &mut List<u8>, info: string) -> () ! OutOfMemoryError ? &mut Allocator {
+  let bytes = String.utf8Bytes(info)
+  let mut start: usize = 0
+  while start < bytes.length && space(bytes[start]) { start = start + 1 }
+  let mut end = start
+  while end < bytes.length && !space(bytes[end]) { end = end + 1 }
+  let mut rest = end
+  while rest < bytes.length && space(bytes[rest]) { rest = rest + 1 }
+  let mut last = bytes.length
+  while last > rest && space(bytes[last - 1]) { last = last - 1 }
+  run field(&mut out, b"lang")
+  if end > start { run quoted(&mut out, Slice.view(bytes, start, end - start), false) } else { run out.appendSlice(b"null") }
+  run field(&mut out, b"meta")
+  if last > rest { run quoted(&mut out, Slice.view(bytes, rest, last - rest), false) } else { run out.appendSlice(b"null") }
+}
+
+fn space(byte: u8) -> bool {
+  return byte == 32 || byte == 9
+}
+
+effect fn field(out: &mut List<u8>, name: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  run out.appendSlice(b",\"")
+  run out.appendSlice(name)
+  run out.appendSlice(b"\":")
+}
+
+effect fn boolean(out: &mut List<u8>, value: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  run out.appendSlice(if value { b"true" } else { b"false" })
+}
+
+effect fn decimal(out: &mut List<u8>, value: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  if value >= 10 { run decimal(&mut out, value / 10) }
+  run out.append(usize.toU8(48 + value % 10))
+}
+
+const HEX: &'static [u8] = b"0123456789abcdef"
+
+/// `value` as a JSON string. A block literal's final line feed is not part of mdast's value.
+effect fn quoted(out: &mut List<u8>, value: &[u8], block: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut length = value.length
+  if block && length > 0 && value[length - 1] == 10 { length = length - 1 }
+  run out.append(34)
+  let mut i: usize = 0
+  while i < length {
+    let byte = value[i]
+    if byte == 34 { run out.appendSlice(b"\\\"") }
+    else if byte == 92 { run out.appendSlice(b"\\\\") }
+    else if byte == 10 { run out.appendSlice(b"\\n") }
+    else if byte < 32 {
+      run out.appendSlice(b"\\u00")
+      run out.append(HEX[u8.toUsize(byte / 16)])
+      run out.append(HEX[u8.toUsize(byte % 16)])
+    } else { run out.append(byte) }
+    i = i + 1
+  }
+  run out.append(34)
+}
