@@ -16,6 +16,10 @@ export function installMock() {
   ]) {
     native[name] = record(name);
   }
+  native.markdown = (text, flags) => {
+    calls.push(["markdown", text, flags]);
+    return '{"type":"root","children":[]}';
+  };
   globalThis.__ui = native;
   return {
     calls,

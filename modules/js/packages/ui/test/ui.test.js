@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { installMock } from "./mock.js";
 
 const mock = installMock();
-const { createBox, createText, createInput, createIcon, mount, nodeById, setErrorHandler } = await import("../src/index.js");
+const { createBox, createText, createInput, createIcon, mount, nodeById, setErrorHandler, parseMarkdown } = await import("../src/index.js");
 
 test("nodes queue their mutations", () => {
   mock.take();
@@ -238,4 +238,12 @@ test("an unknown role or ARIA name warns once and throws nothing", () => {
   } finally {
     console.warn = warn;
   }
+});
+
+test("parseMarkdown turns GFM on unless told otherwise", () => {
+  mock.take();
+  assert.deepEqual(parseMarkdown("# hi"), { type: "root", children: [] });
+  parseMarkdown("x", { gfm: false, footnotes: true });
+  parseMarkdown("x", { tables: false, alerts: true });
+  assert.deepEqual(mock.take().map((call) => call[2]), [15, 16, 78]);
 });

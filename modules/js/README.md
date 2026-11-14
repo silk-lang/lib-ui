@@ -59,6 +59,15 @@ mount(createBox({ width: 400, height: 300 }, button));
   on). Other roles and ARIA names are ignored with one console warning each.
 - **Links.** A node with an `href` is a link, as an `<a>` is: a click on it or inside it that
   no listener prevented calls `open(href)`, which hands the address to the host.
+- **Markdown.** `parseMarkdown(text, options)` returns the syntax tree of the text in
+  the shape of [mdast](https://github.com/syntax-tree/mdast), the tree remark gives, so
+  renderers written for remark's tree work on it, and an application needs no Markdown
+  parser in its bundle. The parser is the Silk standard library's (`silk.markdown`):
+  CommonMark with GitHub's tables, strikethrough, task lists and autolinks. `gfm: false`
+  turns those four off, each can be set alone (`tables`, `strikethrough`, `taskLists`,
+  `autolinkLiterals`), and `footnotes`, `frontmatter` (a `yaml` or `toml` node) and
+  `alerts` (`> [!NOTE]`, a node of type `alert` with a `kind`) turn on more. Nodes have no
+  `position`.
 - **Errors.** A listener that throws does not stop the dispatch. `setErrorHandler` receives
   the exception. Without a handler the host reports the first one after the input.
 
