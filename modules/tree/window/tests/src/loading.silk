@@ -1,8 +1,11 @@
 //! The native loader serves the URLs a tree asks for: files the program carries, `data:` URLs,
 //! and schemes it has no loader for, which fail. The nodes showing a source hear how it ended.
 import ui_fixtures.fixtures as fixtures
+import ui_assets.assets as assets
+import ui_tree.css
+import ui_tree.lib { FaceRule, Range }
 import ui_tree.legacy { UiTree, TreeError, Batch, Event, EventKind, NodeKind }
-import ui_tree.mutation { LISTEN_LOAD, LISTEN_ERROR }
+import ui_tree.mutation { LISTEN_LOAD, LISTEN_ERROR, Mutation }
 import ui_tree_window.loader { Loader, schemeLength }
 import silk.collections.list { List }
 import silk.core.effect { Effect }
@@ -75,4 +78,62 @@ test effect fn loaderServesUrls() -> ()
   ! AssertionError<'static> | TreeError | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   run body() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn facesBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut loader = Loader.make()
+  // "Brand" is Geist Mono under another name; "Gone" has a URL no loader serves.
+  run loader.file("fonts/brand.ttf", assets.geistMonoFont())
+
+  let mut batch = Batch.make()
+  run batch.fontFace(1, "Brand", "fonts/brand.ttf", 400.0, 400.0)
+  run batch.fontFace(2, "Gone", "nope:gone.ttf", 400.0, 400.0)
+  run batch.fontFace(3, "Unused", "fonts/unused.ttf", 400.0, 400.0)
+  run batch.fontFamily(1, "Brand, Noto Sans")
+  run batch.fontFamily(2, "Gone, Noto Sans")
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.box(1, 2, &[css.fontFamily(1)])
+  run batch.text(2, 3, "iiiiiiiiii")
+  run batch.box(1, 4, &[css.fontFamily(2)])
+  run batch.text(4, 5, "iiiiiiiiii")
+  run tree.apply(run batch.take())
+  run Testing.expect((run tree.takeLoads()).length() == 0, "a declared face loads only once text needs it")
+
+  run tree.frame(fixtures.viewport(2))
+  run Testing.expect(!tree.needsFrame(), "the frame is done while the faces load")
+  run Testing.expect(run loader.serve(&mut tree), "the faces text needs are served")
+  run Testing.expect(tree.needsFrame(), "the loaded face lays its text out again")
+  run Testing.expect(!loader.pending(), "nothing is left to load")
+
+  run tree.frame(fixtures.viewport(2))
+  run Testing.expect(!(run loader.serve(&mut tree)), "a face is asked for once")
+
+  // A face can be loaded before text needs it, as `FontFace.load()` does.
+  run batch.push(Mutation.LoadFontFace { face: 3, url: run String.copy("data:,x") })
+  run tree.apply(run batch.take())
+  run Testing.expect(run loader.serve(&mut tree), "an early load is served")
+
+  // A face a host finds, as in a stylesheet, gets an id of its own and loads the same way.
+  let found = run tree.declareHostFontFace(
+    run FaceRule.make(String.utf8Bytes("Found"), Range.point(400.0)),
+    "fonts/brand.ttf",
+  )
+  run Testing.expect(found >= 0x80000000, "a host's face id is above the ones clients choose")
+  run batch.fontFamily(3, "Found")
+  run batch.box(1, 6, &[css.fontFamily(3)])
+  run batch.text(6, 7, "iiii")
+  run tree.apply(run batch.take())
+  run tree.frame(fixtures.viewport(2))
+  run Testing.expect(run loader.serve(&mut tree), "the host's face is served once text needs it")
+}
+
+test effect fn loaderServesFontFaces() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run facesBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }
