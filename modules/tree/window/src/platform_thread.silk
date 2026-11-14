@@ -180,6 +180,8 @@ struct Link {
   synthetic: List<Event>,
   /// A [`Nudge`] asked the UI thread's wait to end.
   nudged: bool,
+  /// Woken with the UI thread when the client waits itself (`HostPlatform.alsoWake`).
+  also: Option<AlsoWake>,
 }
 
 // The raw surface handles in a reply belong to the window, which outlives both threads' use
@@ -235,6 +237,7 @@ impl Nudge {
         state.nudged = true
         drop guard
         wake.unpark()
+        wakeAlso(&link)
       }
     }
   }
@@ -436,6 +439,7 @@ effect fn makeLink(appearance: Appearance) -> Arc<Mutex<Link>>
     fastScrolls: List<FastScrolled>.make(),
     synthetic: List<Event>.make(),
     nudged: false,
+    also: Option<AlsoWake>.None,
   }
   return run Arc<Mutex<Link>>.make(run Mutex<Link>.make(move link))
 }
@@ -582,6 +586,7 @@ effect fn servePlatform(
     drop guard
     if forUi {
       wakeUi.unpark()
+      wakeAlso(link)
     }
   }
 }
@@ -607,6 +612,27 @@ effect fn serveSynthetic(link: &Arc<Mutex<Link>>, wakeUi: &Unparker) -> ()
     i = i + 1
   }
   wakeUi.unpark()
+  wakeAlso(link)
+}
+
+/// What else to wake with the UI thread, for a client that waits itself: `wake(token)`, from
+/// any thread.
+pub struct AlsoWake {
+  pub wake: extern "C" fn(usize) -> (),
+  pub token: usize,
+}
+
+/// Ends the wait of a client that waits itself, when it gave a waker.
+fn wakeAlso(link: &Arc<Mutex<Link>>) -> () {
+  let guard = link.get().lock()
+  let also = match &guard.get().also {
+    Option<AlsoWake>.Some { value } => Option<AlsoWake>.some(AlsoWake { wake: value.wake, token: value.token })
+    Option<AlsoWake>.None => Option<AlsoWake>.None
+  }
+  drop guard
+  if let Option<AlsoWake>.Some { value } = &also {
+    unsafe (value.wake)(value.token)
+  }
 }
 
 /// Scrolls the frame on screen through the compositor when `event` is a wheel it can take on
@@ -1255,6 +1281,19 @@ impl HostPlatform {
   /// The platform thread of a launched app.
   pub fn proxied(launched: Launched) -> HostPlatform {
     return HostPlatform.Proxied { proxy: PlatformProxy.make(move launched) }
+  }
+
+  /// Makes window events and nudges also wake `waker`, for a client that waits itself
+  /// (`WindowClient.waitsItself`). A platform on this thread has no thread to wake it from.
+  pub fn alsoWake(self: &mut Self, waker: AlsoWake) -> () {
+    match &mut self.* {
+      HostPlatform.Proxied { proxy } => {
+        let mut guard = proxy.link.get().lock()
+        let state = guard.getMut()
+        state.also = Option<AlsoWake>.some(move waker)
+      }
+      _ => { drop waker }
+    }
   }
 
   /// A handle that ends this thread's wait in `nextEvent` from any thread.

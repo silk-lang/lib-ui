@@ -209,6 +209,21 @@ pub interface WindowClient<S, E, ? R> {
     return Option<f64>.None
   }
 
+  /// Whether the client waits for its own work, as an embedded JavaScript runtime with its
+  /// own timers and I/O does: the loop then calls [`WindowClient.wait`] instead of sleeping,
+  /// and window events end that wait through the waker given to `HostPlatform.alsoWake`.
+  fn waitsItself(self: &Self, state: &S) -> bool {
+    return false
+  }
+
+  /// Waits for the client's own work at most `seconds` (with no limit when negative) and runs
+  /// what is ready; true requests a frame. Only called when [`WindowClient.waitsItself`].
+  effect fn wait(self: &mut Self, state: &mut S, tree: &mut UiTree<'_>, seconds: f64) -> bool
+    ! WindowError | TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    return false
+  }
+
   /// Whether the client asked to close the window: the loop ends without asking `closing`.
   fn quitting(self: &Self, state: &S) -> bool {
     return false
@@ -1049,6 +1064,22 @@ pub effect fn runWindowWith<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
     }
     let mut next = if backlog.length() != 0 {
       Option<Event>.some(backlog.remove(0))
+    } else if !check && content.waitsItself(&state.*) {
+      let mut ready = run platform.nextEvent(Wait.Poll)
+      if ready.isNone() {
+        let limit = match wait {
+          Wait.Seconds { seconds } => seconds
+          Wait.Forever => -1.0
+          Wait.Poll => 0.0
+        }
+        // A platform on this thread sees window events only in its own wait.
+        let bounded = if platform.threaded() || (limit >= 0.0 && limit < 0.008) { limit } else { 0.008 }
+        if run content.wait(&mut state, &mut tree, bounded) {
+          platform.requestFrame(owner)
+        }
+        ready = run platform.nextEvent(Wait.Poll)
+      }
+      move ready
     } else {
       run platform.nextEvent(wait)
     }
