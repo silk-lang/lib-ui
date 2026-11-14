@@ -193,8 +193,11 @@ pub struct Stacking {
   pub entries: List<Entry>,
   /// The fragments flagged [`ROOT`].
   pub elements: List<usize>,
-  /// Per css-layout node: its place in document order.
+  /// Per css-layout node: its place in document order, and its first fragment.
   doc: List<u32>,
+  firstFragment: List<usize>,
+  /// Per fragment: for a fixed box's root, the fragment root it paints from, else `NO_INDEX`.
+  liftedInto: List<usize>,
 }
 
 impl Stacking {
@@ -204,6 +207,8 @@ impl Stacking {
       entries: List<Entry>.make(),
       elements: List<usize>.make(),
       doc: List<u32>.make(),
+      firstFragment: List<usize>.make(),
+      liftedInto: List<usize>.make(),
     }
   }
 
@@ -222,6 +227,14 @@ impl Stacking {
   /// Whether fragment `index` is painted from its stacking context's lists.
   pub fn hoisted(self: &Self, index: usize) -> bool {
     return (self.flagsOf(index) & HOISTED) != 0
+  }
+
+  /// For fragment root `index`, the fragment root whose lists paint it, or `NO_INDEX`.
+  pub fn rootContext(self: &Self, index: usize) -> usize {
+    if index < self.liftedInto.length() {
+      return self.liftedInto.get(index)
+    }
+    return NO_INDEX
   }
 
   /// Whether fragment `index` is a root element (see [`ROOT`]).
@@ -276,6 +289,8 @@ impl Stacking {
     self.entries.clear()
     self.elements.clear()
     run self.layers.appendRepeated(Layer.none(), count)
+    self.liftedInto.clear()
+    run self.liftedInto.appendRepeated(NO_INDEX, count)
     let values = output.fragments.values.asSlice()
     let mut hoists: usize = 0
     let mut index: usize = 0
@@ -284,6 +299,14 @@ impl Stacking {
       let mut layer = Layer.none()
       if f.parent == NO_INDEX {
         layer.flags = CONTEXT
+        // A fixed box is a fragment root of its own: it stacks in the root context of the
+        // tree it is in (see `rootAbove`), not over everything.
+        if let Option<Computed>.Some { value } = boxStyle(output, slots, nodes, index) {
+          layer.flags = CONTEXT | HOISTED
+          if !value.zAuto {
+            layer.z = value.zIndex
+          }
+        }
       } else if let Option<Computed>.Some { value } = boxStyle(output, slots, nodes, index) {
         let item = isItem(output, slots, nodes, index)
         if createsContext(&value, item) {
@@ -308,6 +331,16 @@ impl Stacking {
       return ()
     }
     run self.order(css)
+    self.firstFragment.clear()
+    run self.firstFragment.appendRepeated(NO_INDEX, css.nodes.length())
+    index = count
+    while index > 0 {
+      index = index - 1
+      let source = values[index].source
+      if source < self.firstFragment.length() {
+        self.firstFragment.set(source, index)
+      }
+    }
 
     // Each hoisted fragment joins the lists of the nearest context above it.
     index = 0
@@ -317,6 +350,17 @@ impl Stacking {
         let mut at = values[index].parent
         while at != NO_INDEX && (self.layers.get(at).flags & CONTEXT) == 0 {
           at = values[at].parent
+        }
+        if values[index].parent == NO_INDEX {
+          at = self.rootAbove(output, css, index)
+          if at == NO_INDEX {
+            // Nothing above it: it stays a root of its own and paints over the others.
+            let mut layer = self.layers.get(index)
+            layer.flags = layer.flags & (CONTEXT | ROOT)
+            self.layers.set(index, layer)
+          } else {
+            self.liftedInto.set(index, at)
+          }
         }
         if at != NO_INDEX {
           let source = values[index].source
@@ -345,6 +389,26 @@ impl Stacking {
       self.layers.set(entry.context, layer)
       i = i + 1
     }
+  }
+
+  /// For fragment root `index` that a node's box makes (a fixed box), the fragment root of
+  /// the nearest node above it in `css` that has a fragment, or `NO_INDEX`.
+  fn rootAbove(self: &Self, output: &LayoutTree, css: &Tree, index: usize) -> usize {
+    let values = output.fragments.values.asSlice()
+    let nodes = css.nodes.asSlice()
+    let mut node = values[index].source
+    while node < nodes.length {
+      node = nodes[node].parent
+      if node == NO_INDEX || node >= self.firstFragment.length() {
+        return NO_INDEX
+      }
+      let fragment = self.firstFragment.get(node)
+      if fragment != NO_INDEX {
+        let root = rootOf(output, fragment)
+        return if root == index { NO_INDEX } else { root }
+      }
+    }
+    return NO_INDEX
   }
 
   /// Numbers the nodes of `css` in document order.

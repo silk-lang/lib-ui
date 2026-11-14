@@ -1207,6 +1207,57 @@ pub effect fn inkFragments(
   }
 }
 
+/// Adds each fixed box's root to the hashes, ink and scrollers of the roots that paint it
+/// (see [`Stacking.rootContext`]), so their caches and culls cover it.
+pub effect fn foldLiftedRoots(
+  stacking: &Stacking,
+  hashes: &mut List<u64>,
+  ink: &mut List<Rect<f32>>,
+  scrollers: &mut List<bool>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let count = hashes.length()
+  let mut lifted = List<usize>.make()
+  let mut index: usize = 0
+  while index < count {
+    if stacking.rootContext(index) != NO_INDEX {
+      run lifted.append(index)
+    }
+    index = index + 1
+  }
+  if lifted.length() == 0 {
+    return ()
+  }
+  // Read every subtree before folding any, since lifted roots can nest.
+  let mut ownHashes = List<u64>.make()
+  let mut ownInks = List<Rect<f32>>.make()
+  let mut i: usize = 0
+  while i < lifted.length() {
+    run ownHashes.append(hashes.get(lifted.get(i)))
+    run ownInks.append(ink.get(lifted.get(i)))
+    i = i + 1
+  }
+  i = 0
+  while i < lifted.length() {
+    let root = lifted.get(i)
+    let mut at = stacking.rootContext(root)
+    let mut steps: usize = 0
+    while at != NO_INDEX && at < count && steps < count {
+      let hash = Hash.combine(hashes.get(at), ownHashes.get(i))
+      hashes.set(at, hash)
+      let bounds = unite(ink.get(at), ownInks.get(i))
+      ink.set(at, bounds)
+      if scrollers.get(root) {
+        scrollers.set(at, true)
+      }
+      at = stacking.rootContext(at)
+      steps = steps + 1
+    }
+    i = i + 1
+  }
+}
+
 /// Whether the subtree of fragment `index` can show inside `mask`.
 fn inkVisible(p: &Painter<'_, '_>, index: usize, mask: ContentMask) -> bool {
   if index >= p.ink.length() {
@@ -1668,7 +1719,9 @@ pub effect fn paintRoots(p: &mut Painter<'_, '_>, window: ContentMask) -> ()
   let count = p.output.fragments.values.length()
   let mut index: usize = 0
   while index < count {
-    if p.output.fragments.values.asSlice()[index].parent == NO_INDEX {
+    // A fixed box's root paints from the lists of the root context it stacks in.
+    if p.output.fragments.values.asSlice()[index].parent == NO_INDEX
+      && (p.only != NONE || !p.stacking.hoisted(index)) {
       run paintFragment(&mut p, index, window)
     }
     index = index + 1
