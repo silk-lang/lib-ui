@@ -36,14 +36,16 @@ const EVENT = {
   pointerCancel: 14,
   gotPointerCapture: 15,
   lostPointerCapture: 16,
-  transitionRun: 17,
-  transitionStart: 18,
-  transitionEnd: 19,
-  transitionCancel: 20,
-  animationStart: 21,
-  animationIteration: 22,
-  animationEnd: 23,
-  animationCancel: 24,
+  load: 17,
+  error: 18,
+  transitionRun: 19,
+  transitionStart: 20,
+  transitionEnd: 21,
+  transitionCancel: 22,
+  animationStart: 23,
+  animationIteration: 24,
+  animationEnd: 25,
+  animationCancel: 26,
 };
 
 // The listener flag of event kind `k` is `1 << k`.
@@ -199,17 +201,19 @@ class Writer {
  * Runs the program in `wasm` (a URL, a Response, bytes or a compiled module) inside `root`.
  *
  * `fonts` names the font families the program's `css.fontFamily(n)` numbers stand for, as CSS
- * `font-family` values: `{ 1: "Inter, sans-serif" }`. `images` and `icons` give the address of
- * each image and icon resource number the same way. `base` is what comes before a link's path
+ * `font-family` values: `{ 1: "Inter, sans-serif" }`. Images and icons are named by URL in the
+ * program (`h.image("photos/a.png")`): the page loads them, relative ones from the app's root.
+ * `loaders` adds schemes of the app's own, `{ db: async (url) => blob }`, each answering with a
+ * Blob or an address. `base` is what comes before a link's path
  * in its address when the site is not at the root of its origin (`"/docs"`). `imports` adds
  * host modules the program imports besides `dom`, `math` and the standard library's `silk`.
  *
  * When `root` already holds the markup of a server render (`Html` in `src/html.silk`), the
  * program adopts its nodes instead of making new ones.
  */
-export async function mount({ wasm, root, fonts = {}, images = {}, icons = {}, base = "", imports = {} }) {
+export async function mount({ wasm, root, fonts = {}, loaders = {}, base = "", imports = {} }) {
   const module = await compile(wasm);
-  const page = new Page(root, { fonts, images, icons, base });
+  const page = new Page(root, { fonts, loaders, base });
   const wanted = {};
   for (const entry of WebAssembly.Module.imports(module)) {
     const group = (wanted[entry.module] ??= {});
@@ -257,12 +261,14 @@ async function compile(wasm) {
 }
 
 class Page {
-  constructor(root, { fonts, images, icons, base }) {
+  constructor(root, { fonts, loaders = {}, base }) {
     this.root = root;
+    this.loaders = Object.fromEntries(Object.entries(loaders).map(([scheme, load]) => [scheme.toLowerCase(), load]));
     this.base = base.replace(/\/$/, "");
     this.fonts = new Map(Object.entries(fonts).map(([id, names]) => [String(id), names]));
-    this.images = new Map(Object.entries(images).map(([id, address]) => [Number(id), address]));
-    this.icons = new Map(Object.entries(icons).map(([id, address]) => [Number(id), address]));
+    // The address of each image and icon resource, by number.
+    this.images = new Map();
+    this.icons = new Map();
     // Addresses this page made for resources the program defined, to revoke.
     this.made = new Map();
     this.anchored = new Set();
@@ -688,7 +694,13 @@ class Page {
         case 30:
           this.clone(r);
           break;
-        case 31: {
+        case 31:
+          this.load(this.images, r.u32(), r.text());
+          break;
+        case 32:
+          this.load(this.icons, r.u32(), r.text());
+          break;
+        case 33: {
           // `@keyframes`, in a sheet of their own, one rule per name.
           const name = r.text();
           const frames = [];
@@ -751,7 +763,45 @@ class Page {
     } else if (meta.kind === KIND_ICON) {
       const address = this.icons.get(meta.source);
       this.fix(id, "icon", address ? [["--silk-icon", `url("${address}")`]] : []);
+      // A mask image says nothing when it loads; a probe tells the icon's listeners.
+      if (address && meta.listeners & ((1 << EVENT.load) | (1 << EVENT.error))) {
+        const probe = new Image();
+        probe.onload = () => this.nodes.get(id) === node && this.direct(EVENT.load, node);
+        probe.onerror = () => this.nodes.get(id) === node && this.direct(EVENT.error, node);
+        probe.src = address;
+      }
     }
+  }
+
+  // Loads a resource the program named by URL. A scheme the app gave a loader for goes to that
+  // loader, which answers with a Blob or an address; any other URL is the browser's to load.
+  // A relative URL is one of the app's own files, so it resolves against the app's root (the
+  // origin and `base`), not against the current route.
+  load(map, resource, url) {
+    const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(url)?.[1]?.toLowerCase();
+    const loader = scheme ? this.loaders[scheme] : undefined;
+    if (loader) {
+      Promise.resolve(loader(url)).then(
+        (found) => (found instanceof Blob ? this.define(map, resource, found) : this.set(map, resource, String(found))),
+        (error) => {
+          console.error(`silk-ui: could not load ${url}`, error);
+          const kind = map === this.images ? KIND_IMAGE : KIND_ICON;
+          for (const [id, meta] of this.meta) {
+            if (meta.source === resource && meta.kind === kind) this.direct(EVENT.error, this.nodes.get(id));
+          }
+        },
+      );
+      return;
+    }
+    this.set(map, resource, scheme ? url : new URL(url, `${location.origin}${this.base}/`).href);
+  }
+
+  set(map, resource, address) {
+    const key = `${map === this.images ? "image" : "icon"}:${resource}`;
+    if (this.made.has(key)) URL.revokeObjectURL(this.made.get(key));
+    this.made.delete(key);
+    map.set(resource, address);
+    for (const [id, meta] of this.meta) if (meta.source === resource) this.show(id);
   }
 
   define(map, resource, blob) {
@@ -1315,6 +1365,9 @@ class Page {
     on("gotpointercapture", (event) => this.forward(EVENT.gotPointerCapture, event));
     on("lostpointercapture", (event) => this.forward(EVENT.lostPointerCapture, event));
     on("click", (event) => this.forward(EVENT.click, event));
+    // An image's load and error do not bubble; the root hears them while capturing.
+    on("load", (event) => event.target instanceof HTMLImageElement && this.direct(EVENT.load, event.target, event), true);
+    on("error", (event) => event.target instanceof HTMLImageElement && this.direct(EVENT.error, event.target, event), true);
     // The elapsed time travels as x and the property or animation name as the value.
     const motion = (kind, name) => (event) =>
       this.forward(kind, event, event.target, { x: event.elapsedTime, y: 0, text: event[name] });

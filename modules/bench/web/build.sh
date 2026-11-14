@@ -6,9 +6,11 @@ root="$(cd "$here/../../.." && pwd)"
 target="${1:?usage: build.sh <js-framework-benchmark checkout>}/frameworks/keyed/silk-ui"
 optimization="${OPTIMIZATION:-speed}"
 
+# The linker's default stack is 1 MiB, which a page holds from the start whether it uses it or
+# not. The entry runs in 64 KiB (10,000 rows), so 256 KiB leaves room.
 cd "$root"
 silk build --manifest-path "$here/silk.toml" \
-  --profile-input "{\"target\":\"wasm32-unknown-unknown\",\"optimization\":\"$optimization\",\"debug\":false}"
+  --profile-input "{\"target\":\"wasm32-unknown-unknown\",\"optimization\":\"$optimization\",\"debug\":false,\"stack-size\":\"256KiB\"}"
 
 profile=release
 [ "$optimization" = "size" ] && profile=release-size

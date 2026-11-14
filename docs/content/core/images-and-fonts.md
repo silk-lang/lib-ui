@@ -10,29 +10,38 @@ Click a photo to open it, like it with the heart, search by title, or list only 
 
 ::source examples/src/core/album.silk
 
-## Resources are numbers
+## Pictures are URLs
 
-A view never holds a file. It names a picture or a font by a number, and whoever runs the program says what each number is.
+A view never holds a file. It names a picture by URL, as an `<img>` does, and the host loads it. A relative URL is one of the app's own files.
 
 ```silk
-pub const PHOTO: u32 = 101
+Photo { index: 0, title: "Dusk", file: "photos/dusk.png", png: true },
 
-pub const HEART: u32 = 121
-
-pub const DISPLAY: u32 = 11
+pub const HEART: string<'static> = "icons/heart.svg"
 ```
 
 | In the view | What it shows | The file |
 | --- | --- | --- |
-| `h.image(PHOTO + i, attrs)` | A raster image | A PNG or JPEG |
-| `h.icon(HEART, attrs)` | A vector icon | An SVG |
+| `h.image("photos/dusk.png", attrs)` | A raster image | A PNG or JPEG |
+| `h.icon("icons/heart.svg", attrs)` | A vector icon | An SVG |
 | `css.fontFamily(DISPLAY)` | Text in a font family | TTF, OTF or WOFF2 files |
 
-This keeps the program the same everywhere it runs. A page loads files from addresses, a native window has their bytes, and a test needs neither: the view is the same value in all three.
+The URL's scheme says how it loads:
+
+| URL | Loaded from |
+| --- | --- |
+| `photos/dusk.png` | The app's own files: next to the page, or built into a native program |
+| `https://example.com/a.png` | The network, off the UI thread natively |
+| `file:///home/me/a.png` | A local file (native only) |
+| `data:image/png;base64,...` | The URL itself |
+
+Each URL loads once, however many nodes show it. Until it has loaded, the node shows nothing. `h.onLoad(message)` and `h.onError(message)` say when it is ready or could not be loaded, as the DOM's `load` and `error` events do.
+
+Fonts are still named by number for now: whoever runs the program says what each family number is.
 
 ## Raster images
 
-`h.image` is the `<img>` of Silk UI. It takes the resource number and the usual attributes. Give it a label, which is its alt text.
+`h.image` is the `<img>` of Silk UI. It takes the URL and the usual attributes. Give it a label, which is its alt text.
 
 ::source examples/src/core/album.silk "fn viewer"
 
@@ -67,27 +76,27 @@ css.fontSize(px(22.0)),
 
 Family `1` is the default for all text, so set it too.
 
-## Giving the files: in a page
+## The files: in a page
 
-The page says where each file is when it mounts the program. Fonts are loaded the way any page loads them, with `@font-face`, and `fonts` maps each family number to a `font-family` value.
+On a page the browser loads the pictures, relative URLs from the app's root. Fonts are loaded the way any page loads them, with `@font-face`, and `fonts` maps each family number to a `font-family` value.
 
 ::source examples/apps/album-web/web/index.html
 
-The build copies the files next to the page, so the addresses are relative ones:
+The build copies the files next to the page, where the URLs point:
 
 ```sh
-cp -R docs/examples/apps/album/assets dist/assets
+cp -R docs/examples/apps/album/assets/. dist/
 ```
 
 Run `sh docs/examples/apps/album-web/build.sh serve` and open http://localhost:8019.
 
-## Giving the files: in a native window
+## The files: in a native window
 
-In a window, the bytes are part of the program. `Source.read` reads a file of the package while it compiles, so the app is one file with nothing to ship beside it. The files sit in `assets/`, next to the app's `silk.toml`.
+In a window, the app's own files are part of the program. `Source.read` reads a file of the package while it compiles, and `window.file` serves it for a relative URL, so the app is one file with nothing to ship beside it. The files sit in `assets/`, next to the app's `silk.toml`.
 
 ::source examples/apps/album/src/files.silk
 
-The window gets the images, the icons and the font families, and the font collection gets the font files:
+A relative URL the program does not carry is read from the working directory instead. The window gets the files and the font families, and the font collection gets the font files:
 
 ::source examples/apps/album/src/main.silk
 
@@ -99,10 +108,11 @@ Run it with `silk run --manifest-path docs/examples/apps/album/silk.toml`.
 
 ## Recap
 
-- A view names images, icons and font families by number: `h.image`, `h.icon`, `css.fontFamily`.
-- The host says what each number is. A page gives addresses to `mount`, and a window gets bytes with `window.image`, `window.icon` and `window.font`.
+- A view names images and icons by URL: `h.image("photos/dusk.png", attrs)`, `h.icon("icons/heart.svg", attrs)`. The scheme picks the loader; relative URLs are the app's own files.
+- A page loads them like any `<img>`. A native window serves the files the program carries with `window.file`, and loads `https:`, `file:` and `data:` URLs itself.
+- `h.onLoad` and `h.onError` say when a picture is ready or failed.
 - Icons are SVGs drawn in the text color. Images are PNGs or JPEGs, sized with CSS and fitted with `object-fit`.
-- `css.fontWeight` takes any weight a font has. A variable font has all of them in one file.
+- Font families are numbers for now, and `css.fontWeight` takes any weight a font has. A variable font has all of them in one file.
 
 The tree has the same three, without the numbers: see [Fonts and pictures](/tree/nodes-and-styles/#fonts-and-pictures).
 

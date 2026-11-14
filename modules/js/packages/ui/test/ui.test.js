@@ -92,8 +92,8 @@ test("transition events bubble with their property and elapsed time", () => {
   mock.take();
   let seen;
   outer.addEventListener("transitionend", (event) => (seen = [event.propertyName, event.elapsedTime, event.target]));
-  assert.deepEqual(mock.take(), [["listen", outer.id, 1 << 19]]);
-  mock.native.dispatch(19, inner.id, 0.25, 0, 0, 0, 0, "opacity");
+  assert.deepEqual(mock.take(), [["listen", outer.id, 1 << 21]]);
+  mock.native.dispatch(21, inner.id, 0.25, 0, 0, 0, 0, "opacity");
   assert.deepEqual(seen, ["opacity", 0.25, inner]);
 });
 

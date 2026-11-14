@@ -25,7 +25,7 @@ import diff { DiffState, diffFrom }
 import windows { Windows, WindowEvent, WindowRecord }
 import journal { Journal, MODEL_LIMIT, eventName }
 import show { Printer, show, showTree }
-import ui { Ui, Identity, AnchorRect, NO_ENTRY, ROOT_ID }
+import ui { Ui, Identity, AnchorRect, NO_ENTRY, ROOT_ID, Sources }
 import ui_protocol.mutation {
   Mutation,
   FIRST_ROOT,
@@ -376,13 +376,14 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
     ? &mut Allocator {
     run self.collectSubscriptions()
     self.batch.clear()
+    self.diffState.taken = 0
     let root = self.root
     run self.renderView(&mut tree, root)
     let nodes = self.ui.arena.entries.length()
     let reused = self.ui.reused
     run self.renderWindows(&mut tree)
     self.stats.renders = self.stats.renders + 1
-    self.stats.mutations = self.batch.length()
+    self.stats.mutations = self.batch.length() + self.diffState.taken
     self.stats.nodes = nodes
     self.stats.reused = reused
 
@@ -410,11 +411,13 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
     }
     self.diffState.marked = self.ui.hasMarks()
     self.diffState.transient = Backend.copiesBatches(&tree)
+    run self.sendLoads()
     run diffFrom(
       &mut self.ui.arena,
       &self.ui.previous,
       &mut self.diffState,
       &mut self.batch,
+      &mut tree,
       self.ui.rootId,
     )
     // Anchored placement is rare: skip both passes when no entry, new or old, has it.
@@ -497,6 +500,25 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
     }
   }
 
+  /// Asks the host to load the image and icon URLs the views named for the first time, before
+  /// the mutations that show them.
+  effect fn sendLoads(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let pending = Intrinsic.replace(self.ui.sources.pending, List<u32>.make())
+    let mut at: usize = 0
+    while at < pending.length() {
+      let resource = pending.asSlice()[at]
+      at = at + 1
+      let url = self.ui.sources.url(resource)
+      if self.ui.sources.isIcon(resource) {
+        run self.batch.append(Mutation.LoadIcon { resource: resource, url: run String.copy(url) })
+      } else {
+        run self.batch.append(Mutation.LoadImage { resource: resource, url: run String.copy(url) })
+      }
+    }
+  }
+
   /// Runs the view whose builder `self.ui` is: the app's, or in a window, that window's.
   fn runView(self: &mut Self) -> () {
     if !self.inWindow {
@@ -518,9 +540,11 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
     let state = Intrinsic.replace(list[at].diffState, DiffState.make())
     let key = list[at].key
     drop list
-    let mainUi = Intrinsic.replace(self.ui, move ui)
+    let mut mainUi = Intrinsic.replace(self.ui, move ui)
     let mainState = Intrinsic.replace(self.diffState, move state)
     self.diffState.nextId = nextId
+    // The windows share one URL table, so a resource id means one URL everywhere.
+    self.ui.sources = Intrinsic.replace(mainUi.sources, Sources.make())
     let back = self.opened.asMutSlice()
     back[at].ui = move mainUi
     back[at].diffState = move mainState
@@ -535,9 +559,10 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
     let mainUi = Intrinsic.replace(list[at].ui, Ui<M>.make())
     let mainState = Intrinsic.replace(list[at].diffState, DiffState.make())
     drop list
-    let ui = Intrinsic.replace(self.ui, move mainUi)
+    let mut ui = Intrinsic.replace(self.ui, move mainUi)
     let state = Intrinsic.replace(self.diffState, move mainState)
     self.diffState.nextId = nextId
+    self.ui.sources = Intrinsic.replace(ui.sources, Sources.make())
     let back = self.opened.asMutSlice()
     back[at].ui = move ui
     back[at].diffState = move state

@@ -17,13 +17,14 @@ const STATES = { base: 0, hover: 1, active: 2, focus: 3, focusVisible: 4, starti
 const TYPES = [
   "pointerdown", "pointerup", "click", "pointermove", "pointerenter", "pointerleave", "wheel",
   "keydown", "keyup", "focus", "blur", "input", "scroll", "layout", "pointercancel",
-  "gotpointercapture", "lostpointercapture", "transitionrun", "transitionstart", "transitionend",
-  "transitioncancel", "animationstart", "animationiteration", "animationend", "animationcancel",
+  "gotpointercapture", "lostpointercapture", "load", "error", "transitionrun", "transitionstart",
+  "transitionend", "transitioncancel", "animationstart", "animationiteration", "animationend",
+  "animationcancel",
 ];
 const KIND_OF = new Map(TYPES.map((type, kind) => [type, kind]));
 const CLICK = KIND_OF.get("click");
 // As on the web: these reach the target alone.
-const NO_BUBBLE = new Set(["pointerenter", "pointerleave", "focus", "blur", "scroll", "layout"]);
+const NO_BUBBLE = new Set(["pointerenter", "pointerleave", "focus", "blur", "scroll", "layout", "load", "error"]);
 // The tree has a default action to skip for these.
 const CANCELABLE = new Set(["pointerdown", "pointerup", "click", "wheel", "keydown", "keyup"]);
 
@@ -543,11 +544,11 @@ function fill(event, kind, a, b, modifiers, d, e, first, second) {
     event.scrollTop = b;
   } else if (kind === 13) {
     event.bounds = { x: a, y: b, width: d, height: e };
-  } else if (kind >= 17 && kind <= 20) {
+  } else if (kind >= 19 && kind <= 22) {
     event.propertyName = first;
     event.elapsedTime = a;
     event.pseudoElement = "";
-  } else if (kind >= 21) {
+  } else if (kind >= 23) {
     event.animationName = first;
     event.elapsedTime = a;
     event.pseudoElement = "";
