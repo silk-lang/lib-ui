@@ -9,10 +9,11 @@ import silk.core.effect { Effect }
 import silk.core.result { Result }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
+import silk.collections.slice { Slice }
 import silk.num.i32
 import silk.num.f64
 import ui_tree.css { Declaration }
-import ui_tree.legacy { Batch, NodeKind, Attribute, Mutation, StyleState, Cursor }
+import ui_tree.legacy { Batch, NodeKind, Attribute, Mutation, StyleState, Cursor, Role }
 import css_style.tokens { CssError }
 import css_style.written as written
 import silkjs.js_engine { Engine }
@@ -48,6 +49,9 @@ pub const STYLE: u32 = 7
 /// `__ui.clearStyle(id, state)`: forgets every declaration of that look.
 pub const CLEAR_STYLE: u32 = 8
 /// `__ui.attribute(id, name, value)`. Throws a `TypeError` for a name the tree does not have.
+/// `role` takes ARIA role text and returns whether one of its words is a role the tree has
+/// (the node has no role otherwise). `__ui.attribute(id, "valueRange", min, max, now)` sets
+/// the value range, and without numbers clears it.
 pub const ATTRIBUTE: u32 = 9
 /// `__ui.focus(id)`.
 pub const FOCUS: u32 = 10
@@ -284,6 +288,61 @@ effect fn attributeOf<'v>(name: string, value: ValueRef<'v>) -> Option<Attribute
   return Option<Attribute>.none()
 }
 
+/// The first role in ARIA role text the tree has: words are separated by spaces, and later
+/// ones are fallbacks, as in `role="switch checkbox"`. `none` and `presentation` are no role.
+fn roleOf(words: &[u8]) -> Option<Role> {
+  let mut start: usize = 0
+  while start < words.length {
+    let mut end = start
+    while end < words.length && !space(words[end]) { end = end + 1 }
+    if end > start {
+      match namedRole(Slice.view(words, start, end - start)) {
+        Option<Role>.Some { value } => { return Option<Role>.some(value) }
+        Option<Role>.None => {}
+      }
+    }
+    start = end + 1
+  }
+  return Option<Role>.none()
+}
+
+fn space(byte: u8) -> bool {
+  return byte == 32 || byte == 9 || byte == 10 || byte == 12 || byte == 13
+}
+
+/// The tree's role for one ARIA role name.
+fn namedRole(word: &[u8]) -> Option<Role> {
+  if same(word, b"none") || same(word, b"presentation") { return Option<Role>.some(Role.None) }
+  if same(word, b"generic") { return Option<Role>.some(Role.Generic) }
+  if same(word, b"button") { return Option<Role>.some(Role.Button) }
+  if same(word, b"link") { return Option<Role>.some(Role.Link) }
+  if same(word, b"checkbox") { return Option<Role>.some(Role.Checkbox) }
+  if same(word, b"radio") { return Option<Role>.some(Role.Radio) }
+  if same(word, b"textbox") { return Option<Role>.some(Role.TextBox) }
+  if same(word, b"heading") { return Option<Role>.some(Role.Heading) }
+  if same(word, b"paragraph") { return Option<Role>.some(Role.Paragraph) }
+  if same(word, b"list") { return Option<Role>.some(Role.List) }
+  if same(word, b"listitem") { return Option<Role>.some(Role.ListItem) }
+  if same(word, b"img") || same(word, b"image") { return Option<Role>.some(Role.Image) }
+  if same(word, b"dialog") { return Option<Role>.some(Role.Dialog) }
+  if same(word, b"menu") { return Option<Role>.some(Role.Menu) }
+  if same(word, b"menuitem") { return Option<Role>.some(Role.MenuItem) }
+  if same(word, b"tab") { return Option<Role>.some(Role.Tab) }
+  if same(word, b"tablist") { return Option<Role>.some(Role.TabList) }
+  if same(word, b"tabpanel") { return Option<Role>.some(Role.TabPanel) }
+  if same(word, b"toolbar") { return Option<Role>.some(Role.Toolbar) }
+  if same(word, b"navigation") { return Option<Role>.some(Role.Navigation) }
+  if same(word, b"main") { return Option<Role>.some(Role.Main) }
+  if same(word, b"form") { return Option<Role>.some(Role.Form) }
+  if same(word, b"group") { return Option<Role>.some(Role.Group) }
+  if same(word, b"slider") { return Option<Role>.some(Role.Slider) }
+  if same(word, b"switch") { return Option<Role>.some(Role.Switch) }
+  if same(word, b"listbox") { return Option<Role>.some(Role.ListBox) }
+  if same(word, b"option") { return Option<Role>.some(Role.Option) }
+  if same(word, b"tooltip") { return Option<Role>.some(Role.Tooltip) }
+  return Option<Role>.none()
+}
+
 /// The tree's cursor for a CSS `cursor` keyword. A keyword the tree has no cursor for is the
 /// default arrow.
 fn cursorOf(word: &[u8]) -> Cursor {
@@ -344,6 +403,28 @@ pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) 
     run bridge.batch.push(Mutation.ClearStyle { id: first, state: state(id(argv.get(1).view())) })
   } else if function == ATTRIBUTE {
     let attribute = run text(argv.get(1))
+    if String.view(&attribute) == "valueRange" {
+      let range = if argv.get(2).view().isNumber() {
+        Attribute.ValueRange { min: f64.toF32(number(argv.get(2).view())), max: f64.toF32(number(argv.get(3).view())), value: f64.toF32(number(argv.get(4).view())) }
+      } else { Attribute.ClearValueRange }
+      run bridge.batch.attribute(first, move range)
+      return Outcome.Returned { value: ValueBits.Undefined }
+    }
+    if String.view(&attribute) == "role" {
+      let words = run text(argv.get(2))
+      let bytes = String.utf8Bytes(String.view(&words))
+      let mut known = bytes.length == 0
+      let mut value = Role.None
+      match roleOf(bytes) {
+        Option<Role>.Some { value: found } => {
+          known = true
+          value = found
+        }
+        Option<Role>.None => {}
+      }
+      run bridge.batch.attribute(first, Attribute.Role { value: value })
+      return Outcome.Returned { value: ValueBits.Bool { value: known } }
+    }
     match run attributeOf(String.view(&attribute), argv.get(2)) {
       Option<Attribute>.Some { value } => { run bridge.batch.attribute(first, move value) }
       Option<Attribute>.None => {
@@ -391,7 +472,6 @@ pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) 
   }
   return Outcome.Returned { value: ValueBits.Undefined }
 }
-
 
 impl EngineServices for Bridge {
   /// A realm here has ECMAScript without ECMA-402 or Temporal (the prelude installs neither),
