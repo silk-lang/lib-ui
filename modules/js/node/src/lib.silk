@@ -1,0 +1,540 @@
+//! A ui-js application on the SilkJS runtime, in a platform window: Node's APIs and the web
+//! APIs Node has (`fetch`, `WebSocket`, `URL`, `TextEncoder`, `crypto`, `AbortController`,
+//! `structuredClone`, `Intl` and the rest) beside `@silk/ui`.
+//!
+//! The runtime runs on the window's UI thread and its loop turns there: the window host
+//! waits in the runtime ([`NodeClient`] waits itself), and window events end that wait. Timers,
+//! sockets and files are the runtime's; animation frames and events are the window's.
+//!
+//! ```silk
+//! let mut app = NodeWindow.make(fonts, options, client)
+//! run app.define(b"@silk/ui", uiPackage())
+//! run app.entry(b"/app/app.js", source)
+//! let status = run app.start(b"my-app")
+//! ```
+import ui_js.lib { Bridge, Outcome, kindCode, numbersOf, firstString, secondString }
+import ui_js.bridge as bridge
+import ui_js_window.opener { Openers }
+import ui_js_window.lib { write }
+import ui_tree.lib { EventRecord }
+import ui_tree.legacy { UiTree, TreeError, Mutation }
+import ui_tree.node { Event as RawEvent }
+import ui_tree_window.host { WindowClient, RunOptions, runWindow }
+import ui_tree_window.platform_thread { HostPlatform }
+import ui_inspect_server.lib { Inspector }
+import font_collection.lib { FontCollection }
+import node_runtime.runtime.embed { Host, Options }
+import node_runtime.runtime.embed as embed
+import node_runtime.runtime.session { Runtime, Turn }
+import node_runtime.libs.core.embedder { Embedder, EmbedderCall }
+import node_runtime.libs.core.embedder as embedder
+import node_runtime.libs.core.host { Services }
+import silkjs.js_engine { Engine }
+import silkjs.js_value { ValueBits }
+import silkjs.js_realm { Arguments, lendRealm }
+import silkjs.js_owned_value { Value }
+import silkjs.js_core_types { NativeFunctionId, NativeCallProtocol, NativeErrorKind }
+import silkjs.js_exceptions { JsException }
+import silkjs.js_strings { Strings }
+import silkjs.js_string_types { StringLengthError }
+import silkjs.js_atomics_native { SynchronizationError }
+import silkjs.js_native_functions as functions
+import silkjs.js_object_allocate as objects
+import silkjs.js_intl_common as common
+import silkjs.js_eval as evaluation
+import silkjs.js_errors as errors
+import silkjs.js_eval_compile as flags
+import window.types { WindowError, WindowId, WindowOptions, TitleBar }
+import window.event { Event, MouseButton }
+import window.platform { Platform }
+import webgpu.runtime { GpuError }
+import atlas.atlas { AtlasError }
+import vector.geometry_error { GeometryError }
+import generated_prelude { prelude }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.num.f64
+import silk.num.u32
+import silk.text.string { String }
+
+/// `__ui.*` in the runtime's realm: the bridge's functions, from the embedder's first id.
+export "C" fn uiNative(state: ?*mut u8, raw: ?*mut u8) -> u32 as "ui_js_node_native" {
+  let mut stateAnchor: u8 = 0
+  let mut callAnchor: u8 = 0
+  let mut argumentsAnchor: u8 = 0
+  let ui = unsafe Pointer.borrowMut<u8, Bridge>(&mut stateAnchor, unsafe embedder.typed<Bridge>(state))
+  let request = unsafe Pointer.borrowMut<u8, EmbedderCall>(&mut callAnchor, unsafe embedder.typed<EmbedderCall>(raw))
+  let arguments = unsafe Pointer.borrowMut<u8, Arguments<'static>>(&mut argumentsAnchor, unsafe embedder.typed<Arguments<'static>>(request.arguments))
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let called = run Effect.result(bridge.call(&mut ui.*, request.id - embedder.FIRST, arguments.*)) |> Effect.provideMut<Allocator>(&mut allocator)
+  return match move called {
+    Result<Outcome, OutOfMemoryError>.Success { value } => match move value {
+      Outcome.Returned { value: result } => {
+        request.result = result
+        embedder.STATUS_RETURNED
+      }
+      Outcome.TypeError { message } => {
+        let mut engineAnchor: u8 = 0
+        let engine = unsafe Pointer.borrowMut<u8, Engine<'static, Services>>(&mut engineAnchor, unsafe embedder.typed<Engine<'static, Services>>(request.engine))
+        let context = request.context
+        let memory = engine.memory
+        drop run Effect.result(errors.throwError(&mut engine.*, memory, unsafe lendRealm(&context, context), NativeErrorKind.Type, message.asSlice())) |> Effect.provideMut<Allocator>(&mut allocator)
+        embedder.STATUS_THREW
+      }
+    }
+    Result<Outcome, OutOfMemoryError>.Failure { .. } => embedder.STATUS_OUT_OF_MEMORY
+  }
+}
+
+/// A ui-js application in a started runtime: the bridge its `__ui` functions write to.
+pub struct NodeApp<'r, 'e, 'm> {
+  runtime: &'r mut Runtime<'e, 'm>,
+  bridge: Bridge,
+  openers: Openers,
+  /// The runtime finished (process.exit): the window closes.
+  finished: bool,
+  status: i32,
+}
+
+
+impl<'r, 'e, 'm> NodeApp<'r, 'e, 'm> {
+  /// Installs `__ui` and the prelude in `runtime`'s realm.
+  pub effect fn make(runtime: &'r mut Runtime<'e, 'm>) -> NodeApp<'r, 'e, 'm> ! OutOfMemoryError | JsException ? &mut Allocator {
+    let mut app = NodeApp { runtime: move runtime, bridge: Bridge.make(), openers: Openers.make(), finished: false, status: 0 }
+    app.lend()
+    run app.install()
+    run app.script(prelude(), b"ui-js:node-prelude")
+    return move app
+  }
+
+  /// Points the runtime's embedder at this app's bridge, which may have moved since.
+  fn lend(self: &mut Self) -> () {
+    self.runtime.setEmbedder(Embedder { state: embedder.erase<Bridge>(&mut self.bridge), native: uiNative })
+  }
+
+  effect fn install(self: &mut Self) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+    let context = self.runtime.rawContext()
+    let engine = self.runtime.rawEngine()
+    let memory = engine.memory
+    let realm = unsafe lendRealm(&context, context)
+    let ui = run objects.newObject(&mut engine.*, memory, realm)
+    let mut id: u32 = 1
+    while id <= bridge.LAST {
+      let function = run functions.newFunction(&mut engine.*, memory, realm, NativeFunctionId.Host { id: embedder.FIRST + id }, bridge.name(id), bridge.arity(id), NativeCallProtocol.Generic, 0)
+      run common.define(&mut engine.*, realm, ui.borrow(), bridge.name(id), unsafe Value.adoptBits(function), 7)
+      id = id + 1
+    }
+    run common.define(&mut engine.*, realm, realm.globalObject(), b"__ui", move ui, 7)
+  }
+
+  /// Runs `source` as a script named `name`.
+  effect fn script(self: &mut Self, source: &[u8], name: &[u8]) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+    let context = self.runtime.rawContext()
+    let engine = self.runtime.rawEngine()
+    let memory = engine.memory
+    let realm = unsafe lendRealm(&context, context)
+    let value = run evaluation.evaluate(&mut engine.*, memory, realm, source, name, flags.TYPE_GLOBAL)
+    realm.release(&mut engine.*, move value)
+  }
+
+  /// Makes `source` importable as `name` from every module (`import { x } from "name"`).
+  pub effect fn define(self: &mut Self, name: &[u8], source: &[u8]) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+    let first = run text(name)
+    let second = run text(source)
+    let defined = run self.callUi(b"defineModule", &[first.borrow().view(), second.borrow().view()])
+    self.release(move defined)
+    self.release(move first)
+    self.release(move second)
+  }
+
+  /// Runs the ES module `source` named `name`, an absolute path or a URL its relative imports
+  /// resolve from. Its errors are the runtime's, reported as uncaught.
+  pub effect fn entry(self: &mut Self, name: &[u8], source: &[u8]) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+    self.lend()
+    run self.runtime.evaluateModule(name, source)
+  }
+
+  fn release(self: &mut Self, value: Value) -> () {
+    let context = self.runtime.rawContext()
+    let realm = unsafe lendRealm(&context, context)
+    realm.release(&mut self.runtime.rawEngine().*, move value)
+  }
+
+  /// Calls `__ui.<name>(...arguments)` as a callback of the runtime's, and returns what it
+  /// returned. An exception it throws reaches the caller.
+  effect fn callUi(self: &mut Self, name: &[u8], arguments: &[ValueBits]) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+    self.lend()
+    let context = self.runtime.rawContext()
+    let realm = unsafe lendRealm(&context, context)
+    let ui = run common.get(&mut self.runtime.rawEngine().*, realm, realm.globalObject(), b"__ui")
+    let function = run common.get(&mut self.runtime.rawEngine().*, realm, ui.borrow(), name)
+    if !function.borrow().view().isObject() {
+      self.release(move function)
+      self.release(move ui)
+      return Value.immediate(ValueBits.Undefined)
+    }
+    let called = run Effect.result(self.runtime.callback(function.borrow().view(), ui.borrow().view(), arguments))
+    self.release(move function)
+    self.release(move ui)
+    return match move called {
+      Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => unsafe Value.adoptBits(value)
+      Result<ValueBits, OutOfMemoryError | JsException>.Failure { error } => { fail move error }
+    }
+  }
+
+  /// [`NodeApp.callUi`], with an exception it throws printed as uncaught (`__ui.report`).
+  effect fn callReporting(self: &mut Self, name: &[u8], arguments: &[ValueBits]) -> Value ! OutOfMemoryError ? &mut Allocator {
+    let called = run Effect.result(self.callUi(name, arguments))
+    return match move called {
+      Result<Value, OutOfMemoryError | JsException>.Success { value } => move value
+      Result<Value, OutOfMemoryError | JsException>.Failure { error } => match move error {
+        OutOfMemoryError allocation => { fail move allocation }
+        JsException _ => {
+          let context = self.runtime.rawContext()
+          let realm = unsafe lendRealm(&context, context)
+          let thrown = realm.takeException()
+          let reported = run Effect.result(self.callUi(b"report", &[thrown.borrow().view()]))
+          self.release(move thrown)
+          match move reported {
+            Result<Value, OutOfMemoryError | JsException>.Success { value } => { self.release(move value) }
+            Result<Value, OutOfMemoryError | JsException>.Failure { error: failure } => match move failure {
+              OutOfMemoryError allocation => { fail move allocation }
+              JsException _ => {
+                let again = realm.takeException()
+                self.release(move again)
+                write("Uncaught exception, and __ui.report threw too\n")
+              }
+            }
+          }
+          Value.immediate(ValueBits.Undefined)
+        }
+      }
+    }
+  }
+
+  /// Applies what JavaScript queued to `tree`, and opens the addresses it asked to open.
+  /// Says whether the tree changed.
+  pub effect fn flush(self: &mut Self, tree: &mut UiTree<'_>) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let opened = Intrinsic.replace(self.bridge.opened, List<String>.make())
+    let addresses = opened.asSlice()
+    let mut i: usize = 0
+    while i < addresses.length {
+      if !run self.openers.open(String.utf8Bytes(String.view(&addresses[i]))) {
+        write("Could not open ")
+        write(String.view(&addresses[i]))
+        write("\n")
+      }
+      i = i + 1
+    }
+    if self.bridge.batch.length() == 0 { return false }
+    run tree.apply(run self.bridge.batch.take())
+    return true
+  }
+
+  /// Hands the tree's queued event records to JavaScript, then applies what it queued. Says
+  /// whether a handler prevented a default.
+  pub effect fn handle(self: &mut Self, tree: &mut UiTree<'_>) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let mut raw = List<RawEvent>.make()
+    run tree.takeEvents(&mut raw)
+    let items = raw.asSlice()
+    let mut prevented = false
+    let mut i: usize = 0
+    while i < items.length {
+      let record = run EventRecord.lift(&items[i])
+      if run self.dispatch(&record) { prevented = true }
+      i = i + 1
+    }
+    let error = run self.callReporting(b"takeError", &[])
+    self.release(move error)
+    drop run self.flush(&mut tree)
+    return prevented
+  }
+
+  /// Calls `__ui.dispatch(kind, target, a, b, modifiers, d, e, first, second)` with `record`
+  /// (as the engine-only host does), and says whether it returned true.
+  effect fn dispatch(self: &mut Self, record: &EventRecord) -> bool ! OutOfMemoryError ? &mut Allocator {
+    let numbers = numbersOf(&record.event)
+    let first = run firstString(&record.event)
+    let second = run secondString(&record.event)
+    let arguments = [
+      ValueBits.number(u32.toF64(kindCode(record.event.kind()))),
+      ValueBits.number(u32.toF64(record.target.raw())),
+      ValueBits.number(numbers[0]),
+      ValueBits.number(numbers[1]),
+      ValueBits.number(numbers[2]),
+      ValueBits.number(numbers[3]),
+      ValueBits.number(numbers[4]),
+      first.borrow().view(),
+      second.borrow().view(),
+    ]
+    let returned = run self.callReporting(b"dispatch", &arguments)
+    let prevented = match returned.borrow().view() { ValueBits.Bool { value } => value _ => false }
+    self.release(move returned)
+    self.release(move first)
+    self.release(move second)
+    return prevented
+  }
+
+  /// Runs the animation frame callbacks when JavaScript asked for a frame.
+  pub effect fn frame(self: &mut Self, seconds: f64) -> () ! OutOfMemoryError ? &mut Allocator {
+    if !self.bridge.frame { return }
+    self.bridge.frame = false
+    let returned = run self.callReporting(b"frame", &[ValueBits.number(seconds * 1000.0)])
+    self.release(move returned)
+  }
+
+  /// One turn of the runtime's loop, waiting at most `seconds` (with no limit when negative)
+  /// for a timer, a completion or a window event. Says whether the turn left mutations for the tree.
+  pub effect fn turn(self: &mut Self, seconds: f64) -> () ! OutOfMemoryError ? &mut Allocator {
+    if self.finished { return }
+    self.lend()
+    let turned = run Effect.result(self.runtime.turn(if seconds < 0.0 { -1.0 } else { seconds * 1000.0 }))
+    match move turned {
+      Result<Turn, OutOfMemoryError | JsException>.Success { value } => match move value {
+        Turn.Running => ()
+        Turn.Finished { status } => {
+          self.finished = true
+          self.status = status
+        }
+      }
+      Result<Turn, OutOfMemoryError | JsException>.Failure { error } => match move error {
+        OutOfMemoryError allocation => { fail move allocation }
+        JsException _ => {
+          let context = self.runtime.rawContext()
+          let thrown = (unsafe lendRealm(&context, context)).takeException()
+          self.release(move thrown)
+          write("The JavaScript runtime's loop failed\n")
+        }
+      }
+    }
+  }
+
+  /// How many mutations JavaScript queued since the last flush.
+  pub fn pending(self: &Self) -> usize { return self.bridge.batch.length() }
+
+  /// Whether JavaScript asked for an animation frame.
+  pub fn wantsFrame(self: &Self) -> bool { return self.bridge.frame }
+
+  /// The runtime's exit status once it finished.
+  pub fn exitStatus(self: &Self) -> Option<i32> {
+    if self.finished { return Option<i32>.some(self.status) }
+    return Option<i32>.none()
+  }
+}
+
+/// A JavaScript string of `bytes`, which are UTF-8.
+effect fn text(bytes: &[u8]) -> Value ! OutOfMemoryError ? &mut Allocator {
+  let made = run Effect.result(Strings.fromUtf8(bytes))
+  return match move made {
+    Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value } => unsafe Value.adoptBits(value)
+    Result<ValueBits, OutOfMemoryError | StringLengthError>.Failure { error } => match move error {
+      OutOfMemoryError allocation => { fail move allocation }
+      StringLengthError _ => Value.immediate(ValueBits.Undefined)
+    }
+  }
+}
+
+/// The window client of a [`NodeApp`].
+pub struct NodeClient {
+  /// How the window's title bar is drawn (see `ui_js_window.lib.JsClient.titleBar`).
+  pub titleBar: TitleBar,
+  pub titleBarHeight: f64,
+  windowDrag: bool,
+}
+
+impl NodeClient {
+  pub fn make() -> NodeClient {
+    return NodeClient { titleBar: TitleBar.Standard, titleBarHeight: 0.0, windowDrag: false }
+  }
+}
+
+impl<'r, 'e, 'm> WindowClient<NodeApp<'r, 'e, 'm>, never, never> for NodeClient {
+  fn configure(self: &Self, state: &NodeApp<'r, 'e, 'm>, options: &mut WindowOptions<'_>) -> () {
+    options.titleBar = self.titleBar
+    options.titleBarHeight = self.titleBarHeight
+  }
+
+  effect fn event(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm>, tree: &mut UiTree<'_>, event: &Event) -> bool
+    ! WindowError | TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    static if Intrinsic.targetOperatingSystem() == "darwin" {
+      if let Event.MouseDown { button, position, .. } = &event.* {
+        if self.titleBar == TitleBar.Transparent && button == MouseButton.Left && position.y < self.titleBarHeight {
+          self.windowDrag = true
+          return true
+        }
+      }
+    }
+    return false
+  }
+
+  effect fn update(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm>, tree: &mut UiTree<'_>, platform: &mut HostPlatform, window: WindowId) -> bool
+    ! WindowError | TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if self.windowDrag {
+      self.windowDrag = false
+      Platform.startWindowDrag(&mut platform.*, window)
+    }
+    return false
+  }
+
+  effect fn start(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm>, tree: &mut UiTree<'_>) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    // The entry ran before the window opened; what it built is the first frame.
+    drop run state.flush(&mut tree)
+  }
+
+  effect fn opened(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm>, platform: &mut HostPlatform, window: WindowId) -> ()
+    ! WindowError | OutOfMemoryError
+    ? &mut Allocator {
+    platform.alsoWake(state.runtime.waker())
+  }
+
+  fn quitting(self: &Self, state: &NodeApp<'r, 'e, 'm>) -> bool {
+    return state.finished
+  }
+
+  fn waitsItself(self: &Self, state: &NodeApp<'r, 'e, 'm>) -> bool {
+    return true
+  }
+
+  effect fn wait(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm>, tree: &mut UiTree<'_>, seconds: f64) -> bool
+    ! WindowError | TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    run state.turn(seconds)
+    return run state.flush(&mut tree)
+  }
+
+  fn servesInspector(self: &Self) -> bool {
+    return false
+  }
+
+  effect fn pump(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm>, tree: &mut UiTree<'_>) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    drop run state.handle(&mut tree)
+  }
+
+  effect fn decide(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm>, tree: &mut UiTree<'_>) -> bool
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    return run state.handle(&mut tree)
+  }
+
+  effect fn tick(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm>, tree: &mut UiTree<'_>, time: f64, animation: bool) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    // Timers are the runtime's and run in `wait`; a frame runs the animation callbacks.
+    if animation { run state.frame(time) }
+    drop run state.flush(&mut tree)
+  }
+
+  fn wantsFrames(self: &Self, state: &NodeApp<'r, 'e, 'm>) -> bool {
+    return state.wantsFrame()
+  }
+}
+
+/// A module for [`NodeWindow.define`].
+struct Defined {
+  name: List<u8>,
+  source: List<u8>,
+}
+
+/// What [`NodeWindow.run`] starts: the runtime, the application's modules, then the window.
+pub struct NodeWindow<'f> {
+  fonts: &'f FontCollection,
+  options: Option<RunOptions>,
+  client: NodeClient,
+  modules: List<Defined>,
+  name: List<u8>,
+  source: List<u8>,
+  /// What failed in the window host, kept until `run` returns.
+  failure: Option<WindowError | GpuError | TreeError | AtlasError | GeometryError>,
+}
+
+impl<'f> NodeWindow<'f> {
+  pub fn make(fonts: &'f FontCollection, options: RunOptions, client: NodeClient) -> NodeWindow<'f> {
+    return NodeWindow {
+      fonts: fonts,
+      options: Option<RunOptions>.some(move options),
+      client: move client,
+      modules: List<Defined>.make(),
+      name: List<u8>.make(),
+      source: List<u8>.make(),
+      failure: Option<WindowError | GpuError | TreeError | AtlasError | GeometryError>.None,
+    }
+  }
+
+  /// Makes `source` importable as `name` (see [`NodeApp.define`]).
+  pub effect fn define(self: &mut Self, name: &[u8], source: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut nameCopy = List<u8>.make()
+    run nameCopy.appendSlice(name)
+    let mut sourceCopy = List<u8>.make()
+    run sourceCopy.appendSlice(source)
+    run self.modules.append(Defined { name: move nameCopy, source: move sourceCopy })
+  }
+
+  /// The ES module the window runs, named by an absolute path or a URL.
+  pub effect fn entry(self: &mut Self, name: &[u8], source: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+    self.name.clear()
+    run self.name.appendSlice(name)
+    self.source.clear()
+    run self.source.appendSlice(source)
+  }
+
+  /// Starts the runtime on this thread with `executable` as its `process.argv[0]`, runs the
+  /// entry and the window until it closes or the application calls `process.exit`, and
+  /// returns the exit status.
+  pub effect fn start(self: &mut Self, executable: &[u8]) -> i32
+    ! WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError | SynchronizationError
+    ? &mut Allocator {
+    let options = run Options.make(executable)
+    let status = run embed.start(move options, &mut self.*)
+    let failure = Intrinsic.replace(self.failure, Option<WindowError | GpuError | TreeError | AtlasError | GeometryError>.None)
+    match move failure {
+      Option<WindowError | GpuError | TreeError | AtlasError | GeometryError>.Some { value } => { fail move value }
+      Option<WindowError | GpuError | TreeError | AtlasError | GeometryError>.None => ()
+    }
+    return status
+  }
+}
+
+impl<'f> Host for NodeWindow<'f> {
+  effect fn drive<'e, 'm>(self: &mut Self, runtime: &mut Runtime<'e, 'm>) -> i32 ! OutOfMemoryError | JsException ? &mut Allocator {
+    let mut app = run NodeApp.make(&mut runtime.*)
+    let items = self.modules.asSlice()
+    let mut i: usize = 0
+    while i < items.length {
+      run app.define(items[i].name.asSlice(), items[i].source.asSlice())
+      i = i + 1
+    }
+    run app.entry(self.name.asSlice(), self.source.asSlice())
+    // The entry's first turn: its imports and top-level code run before the first frame.
+    run app.turn(0.0)
+    let options = match Intrinsic.replace(self.options, Option<RunOptions>.None) {
+      Option<RunOptions>.Some { value } => move value
+      Option<RunOptions>.None => { return 1 }
+    }
+    let ran = run Effect.result(runWindow(&mut app, self.fonts, List<Mutation>.make(), move options, Inspector.off(), &mut self.client))
+    let status = match move ran {
+      Result<i32, WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError>.Success { value } => value
+      Result<i32, WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError>.Failure { error } => match move error {
+        OutOfMemoryError allocation => { fail move allocation }
+        WindowError failure => { self.failure = Option<WindowError | GpuError | TreeError | AtlasError | GeometryError>.some(move failure) 1 }
+        GpuError failure => { self.failure = Option<WindowError | GpuError | TreeError | AtlasError | GeometryError>.some(move failure) 1 }
+        TreeError failure => { self.failure = Option<WindowError | GpuError | TreeError | AtlasError | GeometryError>.some(move failure) 1 }
+        AtlasError failure => { self.failure = Option<WindowError | GpuError | TreeError | AtlasError | GeometryError>.some(move failure) 1 }
+        GeometryError failure => { self.failure = Option<WindowError | GpuError | TreeError | AtlasError | GeometryError>.some(move failure) 1 }
+      }
+    }
+    return match app.exitStatus() {
+      Option<i32>.Some { value } => value
+      Option<i32>.None => status
+    }
+  }
+}
