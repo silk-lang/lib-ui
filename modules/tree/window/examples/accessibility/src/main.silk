@@ -1,0 +1,103 @@
+//! A tree published to the desktop's assistive technology through the window host's
+//! accessibility bridge, without a window: on Linux a screen reader (or `accerciser`) finds
+//! "Silk UI" on the accessibility bus with an "Inbox" heading, a "Save draft" button and a text
+//! field. Clicking the button through AT-SPI renames it "Saved". Exits 0 one second after the
+//! first click, or 1 after 30 seconds, so it can run as a test against a live registry.
+import ui_tree.lib { Tree, TreeError, Viewport, EventKind, Role }
+import ui_tree.css
+import ui_tree.css { px, Declaration }
+import ui_tree_window.accessibility { Bridge, Publisher, apply }
+import ui_fixtures.fixtures as fixtures
+import window.types { WindowId, RawSurface }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.host_input { HostInput }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
+
+fn viewport() -> Viewport {
+  return Viewport { width: 400.0, height: 300.0, scale: 1.0 }
+}
+
+fn sized(width: f32, height: f32) -> [Declaration; 2] {
+  return [css.width(px(width)), css.height(px(height))]
+}
+
+effect fn demo() -> i32
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock {
+  let fonts = run fixtures.fonts()
+  let mut tree = run Tree.make(&fonts)
+  let root = run tree.box(&[])
+  let heading = run tree.box(&[])
+  let title = run tree.text("Inbox")
+  run tree.append(heading, title)
+  run tree.setRole(heading, Role.Heading)
+  let save = run tree.box(&sized(120.0, 30.0))
+  let label = run tree.text("Save draft")
+  run tree.append(save, label)
+  run tree.setRole(save, Role.Button)
+  run tree.listen(save, &[EventKind.Click])
+  let field = run tree.input(&sized(200.0, 30.0))
+  run tree.setText(field, "hello")
+  run tree.append(root, heading)
+  run tree.append(root, save)
+  run tree.append(root, field)
+  run tree.setRoot(root)
+  drop run tree.frame(viewport(), 0.0)
+
+  let mut bridge = Bridge.make()
+  bridge.attach(WindowId { value: 1 }, RawSurface.None)
+  let mut publisher = Publisher.make()
+  let mut clicked = false
+  let mut left: u32 = 3000
+  while left > 0 {
+    let events = run tree.events()
+    let list = events.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      if list[i].event.kind() == EventKind.Click && !clicked {
+        clicked = true
+        left = 100
+        run tree.setText(label, "Saved")
+      }
+      i = i + 1
+    }
+    drop run tree.frame(viewport(), 0.0)
+    match run publisher.next(tree.engine(), bridge.wanted()) {
+      Option.Some { value } => {
+        run bridge.update(move value, true)
+      }
+      Option.None => {}
+    }
+    let mut requests = run bridge.takeRequests()
+    run apply(tree.engineMut(), &mut requests)
+    run Effect.sleep(10000000)
+    left = left - 1
+  }
+  return if clicked {
+    0
+  } else {
+    1
+  }
+}
+
+effect fn treeFailed(error: TreeError) -> i32 {
+  drop error
+  return 3
+}
+
+effect fn outOfMemory(error: OutOfMemoryError) -> i32 {
+  drop error
+  return 4
+}
+
+pub effect fn main() -> i32
+  ? &mut HostInput {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut clock = OsMonotonicClock.make()
+  return run Effect.catch<OutOfMemoryError>(Effect.catch<TreeError>(demo(), treeFailed), outOfMemory)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+    |> Effect.provideMut<MonotonicClock>(&mut clock)
+}

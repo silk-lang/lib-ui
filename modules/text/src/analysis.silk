@@ -22,7 +22,10 @@ import layout.lib {
 }
 import silk.text.bidi { BidiAnalysis, BidiRun, BidiParagraph, ParagraphDirection }
 import silk.text.line_break
-import silk.text.line_break { BreakKind, BreakOpportunity, LineOptions }
+import silk.text.line_break { BreakKind, BreakOpportunity, LineOptions, WordBreakMode }
+import silk.text.segmentation
+import fonts { FontState, Treatment }
+import properties.computed { WordBreak, OverflowWrap }
 import silk.text.string { String }
 import silk.collections.list { List }
 import silk.core.option { Option }
@@ -39,6 +42,9 @@ pub struct Analyzer {
   lineStarts: List<usize>,
   bidiStarts: List<usize>,
   opportunities: List<BreakOpportunity>,
+  // `word-break` tailoring: one mode's opportunities, and the merge of all of them.
+  tailored: List<BreakOpportunity>,
+  merged: List<BreakOpportunity>,
   bidi: BidiAnalysis,
   scopes: List<usize>,
 }
@@ -51,6 +57,8 @@ impl Analyzer {
       lineStarts: List<usize>.make(),
       bidiStarts: List<usize>.make(),
       opportunities: List<BreakOpportunity>.make(),
+      tailored: List<BreakOpportunity>.make(),
+      merged: List<BreakOpportunity>.make(),
       bidi: BidiAnalysis.make(),
       scopes: List<usize>.make(),
     }
@@ -305,9 +313,130 @@ effect fn appendBreak(output: &mut List<TextBreak>, at: TextCursor, kind: TextBr
   run output.append(TextBreak { at: at, kind: kind })
 }
 
+fn modeOf(treatment: Treatment) -> WordBreakMode {
+  if treatment.wordBreak == WordBreak.BreakAll {
+    return WordBreakMode.BreakAll
+  }
+  if treatment.wordBreak == WordBreak.KeepAll {
+    return WordBreakMode.KeepAll
+  }
+  return WordBreakMode.Normal
+}
+
+// The overflow-wrap break kind of a style, or Soft when it has none. `word-break: break-word`
+// is `overflow-wrap: anywhere` (CSS Text 3 §5.2).
+fn wrapOf(treatment: Treatment) -> TextBreakKind {
+  if treatment.overflowWrap == OverflowWrap.Anywhere || treatment.wordBreak == WordBreak.BreakWord {
+    return TextBreakKind.Anywhere
+  }
+  if treatment.overflowWrap == OverflowWrap.BreakWord {
+    return TextBreakKind.Emergency
+  }
+  return TextBreakKind.Soft
+}
+
+// The `word-break` mode of the character before flat offset `offset`.
+fn modeAt(tokens: &[TextToken<'_>], starts: &[usize], fonts: &FontState<'_>, offset: usize) -> WordBreakMode {
+  if offset == 0 {
+    return WordBreakMode.Normal
+  }
+  let at = cursorAt(tokens, starts, offset - 1)
+  if at.unit >= tokens.length {
+    return WordBreakMode.Normal
+  }
+  return modeOf(fonts.treatment(tokens[at.unit].fontKey))
+}
+
+// Opportunities where some text sets `word-break`: each comes from the rules of the mode of
+// the character before it. Mandatory breaks hold in every mode.
+effect fn tailor(state: &mut Analyzer, tokens: &[TextToken<'_>], fonts: &FontState<'_>, breakAll: bool, keepAll: bool) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let starts = state.lineStarts.asSlice()
+  state.merged.clear()
+  let mut index: usize = 0
+  while index < state.opportunities.length() {
+    let opportunity = state.opportunities.get(index)
+    if opportunity.kind == BreakKind.Mandatory || modeAt(tokens, starts, fonts, opportunity.offset) == WordBreakMode.Normal {
+      run state.merged.append(opportunity)
+    }
+    index = index + 1
+  }
+  let mut pass: usize = 0
+  while pass < 2 {
+    let mode = if pass == 0 { WordBreakMode.BreakAll } else { WordBreakMode.KeepAll }
+    if (pass == 0 && breakAll) || (pass == 1 && keepAll) {
+      state.tailored.clear()
+      let mut options = LineOptions.make()
+      options.wordBreak = mode
+      run line_break.breaks(state.lineText.view(), options, &mut state.tailored)
+      // Merge the ones of this mode into `merged`, in offset order.
+      state.opportunities.clear()
+      let mut left: usize = 0
+      let mut right: usize = 0
+      while left < state.merged.length() || right < state.tailored.length() {
+        if right < state.tailored.length() {
+          let candidate = state.tailored.get(right)
+          if candidate.kind == BreakKind.Mandatory || modeAt(tokens, starts, fonts, candidate.offset) != mode {
+            right = right + 1
+            continue
+          }
+          if left >= state.merged.length() || candidate.offset < state.merged.get(left).offset {
+            run state.opportunities.append(candidate)
+            right = right + 1
+            continue
+          }
+          if candidate.offset == state.merged.get(left).offset {
+            right = right + 1
+          }
+        }
+        run state.opportunities.append(state.merged.get(left))
+        left = left + 1
+      }
+      state.merged.clear()
+      run state.merged.appendSlice(state.opportunities.asSlice())
+    }
+    pass = pass + 1
+  }
+  state.opportunities.clear()
+  run state.opportunities.appendSlice(state.merged.asSlice())
+}
+
+// Appends the overflow-wrap breaks at grapheme boundaries inside text tokens, from token
+// `wrap.unit` byte `wrap.offset` up to (not at) flat offset `limit`.
+effect fn wrapsBefore(tokens: &[TextToken<'_>], starts: &[usize], fonts: &FontState<'_>, limit: usize, wrap: &mut TextCursor, output: &mut List<TextBreak>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  while wrap.unit < tokens.length && starts[wrap.unit] < limit {
+    let token = &tokens[wrap.unit]
+    let kind = wrapOf(fonts.treatment(token.fontKey))
+    if token.kind != TextTokenKind.Text || kind == TextBreakKind.Soft {
+      wrap.unit = wrap.unit + 1
+      wrap.offset = 0
+      continue
+    }
+    let text = token.text
+    let length = String.byteLength(text)
+    let mut current = wrap.offset
+    let mut next = segmentation.nextGrapheme(text, current)
+    while next < length && starts[wrap.unit] + next < limit {
+      run appendBreak(&mut output, TextCursor { unit: wrap.unit, offset: next }, kind)
+      current = next
+      next = segmentation.nextGrapheme(text, next)
+    }
+    if next < length {
+      wrap.offset = current
+      return
+    }
+    wrap.unit = wrap.unit + 1
+    wrap.offset = 0
+  }
+}
+
 effect fn breaks(
   state: &mut Analyzer,
   context: &TextContext<'_, '_>,
+  fonts: &FontState<'_>,
   output: &mut List<TextBreak>,
 ) -> ()
   ! OutOfMemoryError
@@ -315,13 +444,34 @@ effect fn breaks(
   let tokens = context.tokens
   state.opportunities.clear()
   run line_break.breaks(state.lineText.view(), LineOptions.make(), &mut state.opportunities)
+  let mut breakAll = false
+  let mut keepAll = false
+  let mut wraps = false
+  let mut scan: usize = 0
+  while scan < tokens.length {
+    if tokens[scan].kind == TextTokenKind.Text {
+      let treatment = fonts.treatment(tokens[scan].fontKey)
+      let mode = modeOf(treatment)
+      breakAll = breakAll || mode == WordBreakMode.BreakAll
+      keepAll = keepAll || mode == WordBreakMode.KeepAll
+      wraps = wraps || wrapOf(treatment) != TextBreakKind.Soft
+    }
+    scan = scan + 1
+  }
+  if breakAll || keepAll {
+    run tailor(&mut state, tokens, fonts, breakAll, keepAll)
+  }
   let starts = state.lineStarts.asSlice()
   let total = String.byteLength(state.lineText.view())
+  let mut wrap = TextCursor { unit: 0, offset: 0 }
   let mut unit: usize = 0
   let mut index: usize = 0
   while index < state.opportunities.length() {
     let opportunity = state.opportunities.get(index)
     let at = cursorAt(tokens, starts, opportunity.offset)
+    if wraps {
+      run wrapsBefore(tokens, starts, fonts, opportunity.offset, &mut wrap, &mut output)
+    }
 
     // Break-spaces opportunities before this one, in order.
     while unit < tokens.length && starts[unit + 1] < opportunity.offset {
@@ -499,11 +649,12 @@ effect fn levels(state: &mut Analyzer, context: &TextContext<'_, '_>) -> TextAna
 pub effect fn analyze(
   state: &mut Analyzer,
   context: TextContext<'_, '_>,
+  fonts: &FontState<'_>,
   output: &mut List<TextBreak>,
 ) -> TextAnalysis
   ! OutOfMemoryError | TextError
   ? &mut Allocator {
   run flatten(&mut state, &context)
-  run breaks(&mut state, &context, &mut output)
+  run breaks(&mut state, &context, fonts, &mut output)
   return run levels(&mut state, &context)
 }

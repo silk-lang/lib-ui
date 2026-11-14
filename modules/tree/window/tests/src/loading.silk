@@ -3,11 +3,16 @@
 import ui_fixtures.fixtures as fixtures
 import ui_assets.assets as assets
 import ui_tree.css
-import ui_tree.lib { FaceRule, Range }
+import ui_tree.lib { FaceRule, Range, FaceStyle }
 import ui_tree.legacy { UiTree, TreeError, Batch, Event, EventKind, NodeKind }
 import ui_tree.mutation { LISTEN_LOAD, LISTEN_ERROR, Mutation }
-import ui_tree_window.loader { Loader, schemeLength }
+import ui_tree_window.loader { Loader, schemeLength, faceRule }
+import ui_text.set { FaceState }
+import font_web.stylesheet { parse as parseSheet }
+import web_fonts
+import silk.url.url { Url }
 import silk.collections.list { List }
+import silk.core.option { Option }
 import silk.core.effect { Effect }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.testing.testing { AssertionError, Testing }
@@ -136,4 +141,110 @@ test effect fn loaderServesFontFaces() -> ()
   ! AssertionError<'static> | TreeError | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   run facesBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// The state of the face of `family` the tree's font set declared, or `Unloaded` if none.
+fn stateOf(tree: &UiTree<'_>, family: string) -> FaceState {
+  let set = &tree.provider.text.fonts.set
+  let mut i: usize = 0
+  while i < set.declaredCount() {
+    if String.utf8Bytes(family) == set.familyOf(i) {
+      return set.state(i)
+    }
+    i = i + 1
+  }
+  return FaceState.Unloaded
+}
+
+/// Whether a face of `family` was declared.
+fn declared(tree: &UiTree<'_>, family: string) -> bool {
+  let set = &tree.provider.text.fonts.set
+  let mut i: usize = 0
+  while i < set.declaredCount() {
+    if String.utf8Bytes(family) == set.familyOf(i) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+effect fn sheetsBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut loader = Loader.make()
+  run loader.file("fonts/brand.css", web_fonts.brandCss())
+  run loader.file("fonts/brand.woff2", web_fonts.brandWoff2())
+
+  let mut batch = Batch.make()
+  run batch.push(Mutation.LoadFontStylesheet { url: run String.copy("./fonts/brand.css") })
+  run tree.apply(run batch.take())
+  run Testing.expect(run loader.serve(&mut tree), "a stylesheet at hand declares its faces")
+  run Testing.expect(declared(&tree, "Sheet") && declared(&tree, "Inline"), "rules with a URL source are declared")
+  run Testing.expect(!declared(&tree, "Local"), "a rule with only local() sources is skipped")
+  run Testing.expect(stateOf(&tree, "Sheet") == FaceState.Unloaded, "a face loads only once text needs it")
+
+  run batch.fontFamily(1, "Sheet, Noto Sans")
+  run batch.fontFamily(2, "Inline, Noto Sans")
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.box(1, 2, &[css.fontFamily(1)])
+  run batch.text(2, 3, "iiii")
+  run batch.box(1, 4, &[css.fontFamily(2)])
+  run batch.text(4, 5, "iiii")
+  run tree.apply(run batch.take())
+  run tree.frame(fixtures.viewport(2))
+  run Testing.expect(run loader.serve(&mut tree), "the faces text needs are served")
+  run Testing.expect(stateOf(&tree, "Sheet") == FaceState.Ready, "a WOFF2 face beside the sheet loads")
+  run Testing.expect(stateOf(&tree, "Inline") == FaceState.Ready, "a WOFF face in a data: URL loads")
+  run Testing.expect(!loader.pending(), "nothing is left to load")
+}
+
+test effect fn loaderServesFontStylesheets() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run sheetsBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn rulesBody() -> ()
+  ! AssertionError<'static> | OutOfMemoryError
+  ? &mut Allocator {
+  let rules = run parseSheet(
+    b"@font-face { font-family: A; src: url(a.woff2); }\n@font-face { font-family: B; src: url(b.woff2); font-weight: 300 700; font-stretch: 75% 125%; font-style: oblique 10deg 20deg; unicode-range: U+0-7F, U+2000-206F; }",
+    Option<&'static Url>.None,
+  )
+  run Testing.expect(rules.length() == 2, "both rules parse")
+  let auto = run faceRule(&rules.asSlice()[0])
+  run Testing.expect(auto.weight.min == 400.0 && auto.weight.max == 400.0, "auto weight is 400")
+  run Testing.expect(auto.width.min == 100.0 && auto.width.max == 100.0, "auto width is 100%")
+  run Testing.expect(isNormal(auto.style), "auto style is upright")
+  run Testing.expect(auto.ranges.length() == 0, "no unicode-range covers every character")
+  let given = run faceRule(&rules.asSlice()[1])
+  run Testing.expect(given.weight.min == 300.0 && given.weight.max == 700.0, "a weight range carries over")
+  run Testing.expect(given.width.min == 75.0 && given.width.max == 125.0, "a width range carries over")
+  run Testing.expect(isOblique(given.style, 10.0, 20.0), "an oblique range carries over")
+  let ranges = given.ranges.asSlice()
+  run Testing.expect(ranges.length == 2 && ranges[1].first == 0x2000 && ranges[1].last == 0x206F, "unicode ranges carry over")
+}
+
+test effect fn stylesheetRulesBecomeTreeRules() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run rulesBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+fn isNormal(style: FaceStyle) -> bool {
+  return match style {
+    FaceStyle.Normal => true
+    _ => false
+  }
+}
+
+fn isOblique(style: FaceStyle, low: f64, high: f64) -> bool {
+  return match style {
+    FaceStyle.Oblique { min, max } => min == low && max == high
+    _ => false
+  }
 }

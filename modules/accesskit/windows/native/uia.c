@@ -929,6 +929,8 @@ typedef struct Adapter {
     size_t actionCapacity;
     uint8_t *actionText;
     size_t actionTextLength;
+    // Set once a UI Automation client has asked for the window's root.
+    volatile long requested;
 } Adapter;
 
 typedef struct Element {
@@ -2558,6 +2560,7 @@ static LRESULT subclass_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
     if (!adapter) return DefWindowProcW(hwnd, message, wParam, lParam);
     WNDPROC previous = adapter->previous;
     if (message == WM_GETOBJECT && (long)lParam == UIA_ROOT_OBJECT_ID) {
+        adapter->requested = 1;
         lock(adapter);
         Element *root = NULL;
         if (adapter->hasRoot && node_of(adapter, adapter->root)) root = element_of(adapter, adapter->root);
@@ -2756,6 +2759,10 @@ void silk_ak_win_raise_property(uint64_t handle, uint64_t id, int property, cons
     VariantClear(&before);
     VariantClear(&after);
     element_release(element);
+}
+
+uint32_t silk_ak_win_requested(uint64_t handle) {
+    return from_handle(handle)->requested ? 1 : 0;
 }
 
 uint32_t silk_ak_win_poll(uint64_t handle, uint64_t *id, double *number, uint32_t *start, uint32_t *end) {
