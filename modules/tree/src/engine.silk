@@ -18,6 +18,8 @@ import ui_protocol.root { RootEvent, RootEventKind, RootSupport, ExtraRoot }
 import mutation {
   Mutation,
   FIRST_ROOT,
+  FACE_ITALIC,
+  FACE_OBLIQUE,
   NodeKind,
   StyleState,
   Declaration,
@@ -63,7 +65,8 @@ import resources { Families, Resources, Resource, ResourceError }
 import provider { Provider }
 import ui_text.system { TextSystem }
 import ui_text.fonts { TextStyle as FontStyleRequest }
-import ui_text.set { FaceRule }
+import ui_text.set { FaceRule, UnicodeRange }
+import svg_fonts.database { FaceStyle as RuleStyle, Range as RuleRange }
 import svg_fonts.names { same as sameFamilyName }
 import font_collection.lib { FontCollection, Family, Request, Style as FaceStyle }
 import font_raster.cache { GlyphCache }
@@ -306,6 +309,17 @@ fn reachesEveryRoot(mutation: &Mutation) -> bool {
   }
 }
 
+/// Where the file of a face declared with a URL is, and whether the host was asked for it.
+struct FaceSource {
+  id: u32,
+  url: String,
+  asked: bool,
+}
+
+/// The first id of the faces a host declares (`declareHostFontFace`), above the ids clients
+/// choose.
+const FIRST_HOST_FACE: u32 = 0x80000000
+
 /// A font face a client declared, by the client's id.
 struct FontFaceEntry {
   id: u32,
@@ -425,8 +439,9 @@ pub struct UiTree<'a> {
   pub focused: u32,
   families: Families,
   pub resources: Resources,
-  /// `LoadImage` and `LoadIcon` mutations waiting for the host's loaders (`takeLoads`). The
-  /// tree does no I/O: a host reads, fetches or looks up the URL, then defines the resource.
+  /// `LoadImage`, `LoadIcon`, `LoadFontFace` and `LoadFontStylesheet` mutations waiting for
+  /// the host's loaders (`takeLoads`). The tree does no I/O: a host reads, fetches or looks up
+  /// the URL, then defines the resource or gives the face its file.
   pub loads: List<Mutation>,
   /// What became of each loaded resource, by id: `SOURCE_*`.
   sourceStates: List<u8>,
@@ -434,6 +449,9 @@ pub struct UiTree<'a> {
   sourceTells: List<u32>,
   fontKeys: List<FontKeyEntry>,
   fontFaces: List<FontFaceEntry>,
+  /// The files of faces declared with a URL (`Mutation.DeclareFontFace`).
+  faceSources: List<FaceSource>,
+  nextHostFace: u32,
   pub faces: List<FaceSlot<'a>>,
   pub atlas: Atlas,
   pub glyphs: GlyphCache,
@@ -600,6 +618,8 @@ impl<'a> UiTree<'a> {
       sourceTells: List<u32>.make(),
       fontKeys: List<FontKeyEntry>.make(),
       fontFaces: List<FontFaceEntry>.make(),
+      faceSources: List<FaceSource>.make(),
+      nextHostFace: FIRST_HOST_FACE,
       faces: List<FaceSlot<'a>>.make(),
       atlas: Atlas.make(AtlasOptions.default()),
       glyphs: GlyphCache.make(),
@@ -728,9 +748,14 @@ impl<'a> UiTree<'a> {
     run self.queueEvent(Event.make(kind, id, move path))
   }
 
-  /// The `LoadImage` and `LoadIcon` requests applied since the last call, for the host to
-  /// serve: it loads each URL and answers with `DefineImage` or `DefineIcon`.
-  pub fn takeLoads(self: &mut Self) -> List<Mutation> {
+  /// The `LoadImage`, `LoadIcon`, `LoadFontFace` and `LoadFontStylesheet` requests since the
+  /// last call, for the host to serve: it loads each URL and answers with `DefineImage` or
+  /// `DefineIcon`, `loadFontFace` or `failFontFace`, and `declareHostFontFace` for each rule
+  /// of a stylesheet. A face declared with a URL is asked for once text needs it.
+  pub effect fn takeLoads(self: &mut Self) -> List<Mutation>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.requestFontFaces()
     return Intrinsic.replace(self.loads, List<Mutation>.make())
   }
 
@@ -1279,7 +1304,78 @@ impl<'a> UiTree<'a> {
       Mutation.LoadIcon { resource, url } => {
         run self.loads.append(Mutation.LoadIcon { resource: resource, url: move url })
       }
+      Mutation.DeclareFontFace {
+        face,
+        family,
+        url,
+        weightMin,
+        weightMax,
+        widthMin,
+        widthMax,
+        style,
+        ranges,
+      } => {
+        let mut rule = run FaceRule.make(
+          String.utf8Bytes(String.view(&family)),
+          RuleRange { min: f32.toF64(weightMin), max: f32.toF64(weightMax) },
+        )
+        rule.width = RuleRange { min: f32.toF64(widthMin), max: f32.toF64(widthMax) }
+        rule.style = if style == FACE_ITALIC {
+          RuleStyle.Italic
+        } else if style == FACE_OBLIQUE {
+          RuleStyle.Oblique { min: 14.0, max: 14.0 }
+        } else {
+          RuleStyle.Normal
+        }
+        let pairs = ranges.asSlice()
+        let mut r: usize = 0
+        while r + 1 < pairs.length {
+          run rule.ranges.append(UnicodeRange { first: pairs[r], last: pairs[r + 1] })
+          r = r + 2
+        }
+        run self.declareFaceAt(face, move rule, move url)
+      }
+      Mutation.LoadFontFace { face, url } => {
+        let sources = self.faceSources.asMutSlice()
+        let mut f: usize = 0
+        while f < sources.length {
+          if sources[f].id == face {
+            sources[f].asked = true
+          }
+          f = f + 1
+        }
+        run self.loads.append(Mutation.LoadFontFace { face: face, url: move url })
+      }
+      Mutation.LoadFontStylesheet { url } => {
+        run self.loads.append(Mutation.LoadFontStylesheet { url: move url })
+      }
     }
+  }
+
+  /// Declares face `id` from `rule` with its file at `url` (none when empty).
+  effect fn declareFaceAt(self: &mut Self, id: u32, rule: FaceRule, url: String) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.fontFaceIndex(id) != usize.MAX {
+      return
+    }
+    if String.byteLength(String.view(&url)) > 0 {
+      run self.faceSources.append(FaceSource { id: id, url: move url, asked: false })
+    }
+    run self.declareFontFace(id, move rule)
+  }
+
+  /// Declares a face a host found, such as a rule of a stylesheet it loaded for
+  /// `LoadFontStylesheet`, with its file at `url` (resolved against the stylesheet). Its id,
+  /// returned, is above any a client chooses. The tree asks for the file in `takeLoads`, as a
+  /// `LoadFontFace`, once text needs one of its characters.
+  pub effect fn declareHostFontFace(self: &mut Self, rule: FaceRule, url: string) -> u32
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let id = self.nextHostFace
+    self.nextHostFace = id + 1
+    run self.declareFaceAt(id, move rule, run String.copy(url))
+    return id
   }
 
   effect fn require(self: &Self, index: usize, id: u32) -> u32
@@ -2830,7 +2926,25 @@ impl<'a> UiTree<'a> {
       let mut j: usize = 0
       while j < entries.length {
         if entries[j].declared == wanted.get(i) {
-          run self.requests.append(HostRequest.LoadFontFace { face: entries[j].id })
+          let id = entries[j].id
+          let sources = self.faceSources.asMutSlice()
+          let mut found = false
+          let mut f: usize = 0
+          while f < sources.length {
+            if sources[f].id == id {
+              found = true
+              if !sources[f].asked {
+                sources[f].asked = true
+                let url = run String.copy(String.view(&sources[f].url))
+                run self.loads.append(Mutation.LoadFontFace { face: id, url: move url })
+              }
+            }
+            f = f + 1
+          }
+          drop sources
+          if !found {
+            run self.requests.append(HostRequest.LoadFontFace { face: id })
+          }
         }
         j = j + 1
       }
