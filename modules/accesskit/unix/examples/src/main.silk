@@ -1,0 +1,128 @@
+//! A window with a button and a checkbox on the accessibility bus. A screen reader (or
+//! `accerciser`) sees "Silk demo" among the desktop's applications; clicking the button through
+//! AT-SPI renames it, and clicking the checkbox checks it. Exits 0 after 30 seconds, or 2 seconds
+//! after the first click, so it can run as a test against a live registry.
+import accesskit.lib { Node, NodeId, Role, Action, Toggled, TreeInfo, TreeUpdate, Rect }
+import accesskit_unix.lib { App, WindowBounds, accessibilityBusAddress }
+import dbus.lib { DBusError }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.host_input { HostInput }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
+
+effect fn button(label: string) -> Node
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut node = Node.make(Role.Button)
+  run node.setLabel(label)
+  run node.setBounds(Rect.make(20.0, 20.0, 140.0, 50.0))
+  node.addAction(Action.Click)
+  node.addAction(Action.Focus)
+  return move node
+}
+
+effect fn checkbox(checked: bool) -> Node
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut node = Node.make(Role.CheckBox)
+  run node.setLabel("Ready")
+  run node.setBounds(Rect.make(20.0, 70.0, 140.0, 90.0))
+  run node.setToggled(
+    if checked {
+      Toggled.True
+    } else {
+      Toggled.False
+    },
+  )
+  node.addAction(Action.Click)
+  node.addAction(Action.Focus)
+  return move node
+}
+
+effect fn initial() -> TreeUpdate
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut update = TreeUpdate.make(NodeId.of(1))
+  update.tree = Option.Some { value: TreeInfo.make(NodeId.of(0)) }
+  let mut window = Node.make(Role.Window)
+  run window.setLabel("Silk demo")
+  run window.pushChild(NodeId.of(1))
+  run window.pushChild(NodeId.of(2))
+  run update.push(NodeId.of(0), move window)
+  run update.push(NodeId.of(1), run button("Press me"))
+  run update.push(NodeId.of(2), run checkbox(false))
+  return move update
+}
+
+effect fn demo() -> i32
+  ! DBusError | OutOfMemoryError
+  ? &mut Allocator | &mut HostInput | &mut MonotonicClock {
+  let address = run accessibilityBusAddress(Option.None)
+  let mut app = run App.connect("Silk demo", address.view(), Option.None)
+  run app.setToolkit("Silk UI", "0.1.0")
+  run app.addWindow(1, run initial(), true, WindowBounds.zero())
+  let mut clicks: u32 = 0
+  let mut checked = false
+  let mut left: u32 = 600
+  while left > 0 {
+    run app.pump()
+    let requests = run app.takeRequests()
+    let all = requests.asSlice()
+    let mut i: usize = 0
+    while i < all.length {
+      let request = &all[i].request
+      if request.action == Action.Click {
+        let mut update = TreeUpdate.make(request.targetNode)
+        if request.targetNode.equals(NodeId.of(1)) {
+          clicks = clicks + 1
+          run update.push(NodeId.of(1), run button("Pressed"))
+        } else if request.targetNode.equals(NodeId.of(2)) {
+          checked = !checked
+          run update.push(NodeId.of(2), run checkbox(checked))
+        }
+        run app.updateWindow(1, move update)
+        if left > 40 {
+          left = 40
+        }
+      } else if request.action == Action.Focus {
+        run app.updateWindow(1, TreeUpdate.make(request.targetNode))
+      }
+      i = i + 1
+    }
+    run Effect.sleep(50000000)
+    left = left - 1
+  }
+  return if clicks > 0 || checked {
+    0
+  } else {
+    1
+  }
+}
+
+effect fn failed(error: DBusError) -> i32 {
+  return match error {
+    DBusError.Malformed { .. } => 10
+    DBusError.AuthFailed => 11
+    DBusError.Closed => 12
+    DBusError.Socket => 13
+    DBusError.NoAddress => 14
+    DBusError.Remote => 15
+    DBusError.Timeout => 16
+  }
+}
+
+effect fn outOfMemory(error: OutOfMemoryError) -> i32 {
+  drop error
+  return 4
+}
+
+pub effect fn main() -> i32
+  ? &mut HostInput {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut clock = OsMonotonicClock.make()
+  return run Effect.catch<OutOfMemoryError>(Effect.catch<DBusError>(demo(), failed), outOfMemory)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+    |> Effect.provideMut<MonotonicClock>(&mut clock)
+}

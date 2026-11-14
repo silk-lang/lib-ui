@@ -1,0 +1,279 @@
+//! The tree as an AccessKit tree: a first full update, diffs that carry only what changed,
+//! focus, removals, and actions coming back from an adapter.
+import ui_tree.css
+import ui_tree.css { px, Declaration }
+import ui_tree.lib { Tree, TreeError, Viewport, EventKind, Attribute, Role, Node }
+import ui_tree.access { AccessTree, ActionOutcome, accessId, windowId, doAction }
+import accesskit.lib {
+  Role as AccessRole,
+  Action,
+  ActionData,
+  ActionRequest,
+  TreeId,
+  TreeUpdate,
+  NodeEntry,
+  Toggled
+}
+import ui_fixtures.fixtures as fixtures
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+fn viewport() -> Viewport {
+  return Viewport { width: 400.0, height: 300.0, scale: 1.0 }
+}
+
+fn sized(width: f32, height: f32) -> [Declaration; 2] {
+  return [css.width(px(width)), css.height(px(height))]
+}
+
+/// The entry for tree node `id` in `update`, if it carries one.
+fn entryOf(update: &TreeUpdate, id: u32) -> Option<&NodeEntry> {
+  let nodes = update.nodes.asSlice()
+  let mut i: usize = 0
+  while i < nodes.length {
+    if nodes[i].id.equals(accessId(id)) {
+      return Option.Some { value: &nodes[i] }
+    }
+    i = i + 1
+  }
+  return Option.None
+}
+
+fn carries(update: &TreeUpdate, id: u32) -> bool {
+  return match entryOf(update, id) {
+    Option.Some { value: _ } => true
+    Option.None => false
+  }
+}
+
+effect fn accessUpdates() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run Tree.make(&fonts)
+  let root = run tree.box(&[])
+  let ok = run tree.box(&sized(100.0, 40.0))
+  let check = run tree.box(&sized(20.0, 20.0))
+  let field = run tree.input(&sized(200.0, 30.0))
+  run tree.append(root, ok)
+  run tree.append(root, check)
+  run tree.append(root, field)
+  run tree.setRoot(root)
+  run tree.setRole(ok, Role.Button)
+  run tree.setAttribute(ok, Attribute.Label { value: run String.copy("OK") })
+  run tree.setAttribute(ok, Attribute.TabIndex { value: 0 })
+  run tree.listen(ok, &[EventKind.Click])
+  run tree.setRole(check, Role.Checkbox)
+  run tree.setAttribute(check, Attribute.Checked { value: true })
+  drop run tree.frame(viewport(), 0.0)
+
+  let okId = ok.id().raw()
+  let checkId = check.id().raw()
+  let fieldId = field.id().raw()
+  let rootId = root.id().raw()
+  let mut access = AccessTree.make()
+  let first = run access.fullUpdate(tree.engine())
+  run Testing.expect(first.nodes.length() == 5, "the window, the root and its three children")
+  run Testing.expect(
+    match &first.tree {
+      Option.Some { value } => value.root.equals(windowId())
+      Option.None => false
+    },
+    "the first update names the window as the root",
+  )
+  run Testing.expect(first.focus.equals(windowId()), "with nothing focused, focus is on the window")
+  run Testing.expect(
+    match entryOf(&first, rootId) {
+      Option.Some { value } => value.node.children().length == 3
+        && value.node.accessRole() == AccessRole.GenericContainer
+      Option.None => false
+    },
+    "the root is a generic container with three children",
+  )
+  run Testing.expect(
+    match entryOf(&first, okId) {
+      Option.Some { value } => value.node.accessRole() == AccessRole.Button
+        && match value.node.label() {
+          Option.Some { value: name } => name == "OK"
+          Option.None => false
+        }
+        && value.node.supportsAction(Action.Click)
+        && value.node.supportsAction(Action.Focus)
+        && match value.node.bounds() {
+          Option.Some { value: b } => b.width() == 100.0 && b.height() == 40.0
+          Option.None => false
+        }
+      Option.None => false
+    },
+    "the button has its role, name, actions and bounds",
+  )
+  run Testing.expect(
+    match entryOf(&first, checkId) {
+      Option.Some { value } => value.node.accessRole() == AccessRole.CheckBox
+        && match value.node.toggled() {
+          Option.Some { value: state } => state == Toggled.True
+          Option.None => false
+        }
+      Option.None => false
+    },
+    "the checkbox is checked",
+  )
+  run Testing.expect(
+    match entryOf(&first, fieldId) {
+      Option.Some { value } => value.node.accessRole() == AccessRole.TextInput
+        && value.node.supportsAction(Action.SetValue)
+      Option.None => false
+    },
+    "the input is an editable text input",
+  )
+
+  // Nothing changed: no update.
+  drop run tree.frame(viewport(), 0.0)
+  run Testing.expect(
+    match run access.update(tree.engine()) {
+      Option.Some { value: _ } => false
+      Option.None => true
+    },
+    "an unchanged tree sends nothing",
+  )
+
+  // Focus and a state change: only the changed node, with the new focus.
+  run tree.focus(ok)
+  run tree.setAttribute(check, Attribute.Checked { value: false })
+  drop run tree.frame(viewport(), 0.0)
+  let second = match run access.update(tree.engine()) {
+    Option.Some { value } => move value
+    Option.None => Intrinsic.trap("test: expected an update")
+  }
+  run Testing.expect(second.focus.equals(accessId(okId)), "focus moved to the button")
+  run Testing.expect(carries(&second, checkId), "the checkbox changed")
+  run Testing.expect(!carries(&second, fieldId) && !carries(&second, rootId), "the others did not")
+  run Testing.expect(
+    match &second.tree {
+      Option.Some { value: _ } => false
+      Option.None => true
+    },
+    "later updates leave the tree info alone",
+  )
+
+  // Removal: the parent comes with its new children.
+  run tree.remove(field)
+  drop run tree.frame(viewport(), 0.0)
+  let third = match run access.update(tree.engine()) {
+    Option.Some { value } => move value
+    Option.None => Intrinsic.trap("test: expected an update")
+  }
+  run Testing.expect(
+    match entryOf(&third, rootId) {
+      Option.Some { value } => value.node.children().length == 2
+      Option.None => false
+    },
+    "the root now has two children",
+  )
+}
+
+test effect fn treeBecomesAnAccessKitTree() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run accessUpdates() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn accessActions() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run Tree.make(&fonts)
+  let root = run tree.box(&[])
+  let ok = run tree.box(&sized(100.0, 40.0))
+  let field = run tree.input(&sized(200.0, 30.0))
+  run tree.append(root, ok)
+  run tree.append(root, field)
+  run tree.setRoot(root)
+  run tree.setRole(ok, Role.Button)
+  run tree.setAttribute(ok, Attribute.TabIndex { value: 0 })
+  run tree.listen(ok, &[EventKind.Click])
+  drop run tree.frame(viewport(), 0.0)
+  drop run tree.events()
+
+  let click = ActionRequest {
+    action: Action.Click,
+    targetTree: TreeId.root(),
+    targetNode: accessId(ok.id().raw()),
+    data: Option.None,
+  }
+  run Testing.expect(
+    (run doAction(tree.engineMut(), &click)) == ActionOutcome.Done,
+    "a click is done",
+  )
+  let events = run tree.events()
+  run Testing.expect(
+    events.length() == 1 && events.asSlice()[0].event.kind() == EventKind.Click,
+    "the click reaches the listener",
+  )
+
+  let focus = ActionRequest {
+    action: Action.Focus,
+    targetTree: TreeId.root(),
+    targetNode: accessId(ok.id().raw()),
+    data: Option.None,
+  }
+  run Testing.expect(
+    (run doAction(tree.engineMut(), &focus)) == ActionOutcome.Done,
+    "focus is done",
+  )
+  run Testing.expect(
+    match tree.focused() {
+      Option.Some { value } => value.is(ok.id())
+      Option.None => false
+    },
+    "the button has focus",
+  )
+
+  let setValue = ActionRequest {
+    action: Action.SetValue,
+    targetTree: TreeId.root(),
+    targetNode: accessId(field.id().raw()),
+    data: Option.Some { value: ActionData.Value { value: run String.copy("hello") } },
+  }
+  run Testing.expect(
+    (run doAction(tree.engineMut(), &setValue)) == ActionOutcome.Done,
+    "set value is done",
+  )
+  drop run tree.frame(viewport(), 0.0)
+  let mut access = AccessTree.make()
+  let update = run access.fullUpdate(tree.engine())
+  run Testing.expect(
+    match entryOf(&update, field.id().raw()) {
+      Option.Some { value } => match value.node.value() {
+        Option.Some { value: text } => text == "hello"
+        Option.None => false
+      }
+      Option.None => false
+    },
+    "the input holds the new value",
+  )
+  run Testing.expect(
+    update.focus.equals(accessId(field.id().raw())),
+    "setting a value focuses the input",
+  )
+
+  let window = ActionRequest {
+    action: Action.Click,
+    targetTree: TreeId.root(),
+    targetNode: windowId(),
+    data: Option.None,
+  }
+  run Testing.expect(
+    (run doAction(tree.engineMut(), &window)) == ActionOutcome.Unsupported,
+    "the window node takes no actions",
+  )
+}
+
+test effect fn adapterActionsReachTheTree() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run accessActions() |> Effect.provideMut<Allocator>(&mut allocator)
+}
