@@ -1,0 +1,338 @@
+//! Stacking order: z-index, positioned boxes and stacking contexts paint in CSS 2 Appendix E
+//! order, hit testing walks the same order backwards, and replayed frames keep it.
+import ui_tree.css
+import ui_tree.css { px, Property, Keyword }
+import ui_tree.legacy {
+  UiTree,
+  TreeError,
+  Batch,
+  FrameInput,
+  CpuSnapshot,
+  NodeKind,
+  Position,
+  Overflow
+}
+import ui_tree.cssom_view as view
+import ui_fixtures.fixtures as fixtures
+import ui_tree.mutation { Declaration }
+import vector.geometry_error { GeometryError }
+import vector.pixmap { Pixmap }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.i32
+import silk.num.u32
+import silk.num.u8
+import silk.num.usize
+import silk.testing.testing { Testing, AssertionError }
+
+const RED: u32 = 0xff0000
+const GREEN: u32 = 0x00ff00
+const BLUE: u32 = 0x0000ff
+
+fn input() -> FrameInput {
+  return FrameInput { width: 300.0, height: 400.0, scale: 1.0, time: 0.0 }
+}
+
+fn z(value: i32) -> Declaration {
+  return css.declare(Property.ZIndex, css.number(i32.toF32(value)))
+}
+
+fn zAuto() -> Declaration {
+  return css.declare(Property.ZIndex, css.auto())
+}
+
+effect fn frame(tree: &mut UiTree<'_>, snapshot: &mut CpuSnapshot) -> Pixmap
+  ! TreeError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  run tree.frame(input())
+  run snapshot.sync(&mut tree)
+  return run snapshot.render(&tree)
+}
+
+/// Whether the paint order of the tree's nodes is `ids`.
+fn paintedInOrder(tree: &UiTree<'_>, ids: &[u32]) -> bool {
+  if tree.paintOrder.length() != ids.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < ids.length {
+    if tree.paintOrder.get(i) != ids[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+/// The color of pixel (`x`, `y`) as 0xrrggbb.
+fn pixel(image: &Pixmap, x: u32, y: u32) -> u32 {
+  let data = image.data()
+  let at = u32.toUsize((y * image.width() + x) * 4)
+  return u8.toU32(data[at]) * 65536 + u8.toU32(data[at + 1]) * 256 + u8.toU32(data[at + 2])
+}
+
+/// Root 1 (white) holds, in tree order: 2 relative z 2 (red), 3 in flow holding 6 absolute z
+/// auto (blue), 4 absolute z -1 (green), 5 relative z auto, 7 with opacity. 4 and 6 are laid
+/// out against the viewport: the root stacking context is the viewport's, and the root
+/// element's background paints first in it, so z -1 shows over it.
+effect fn stack(batch: &mut Batch) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.style(
+    1,
+    &[
+      css.width(px(300.0)),
+      css.height(px(400.0)),
+      css.backgroundColor(fixtures.rgb(0xffffff)),
+    ],
+  )
+  run batch.box(
+    1,
+    2,
+    &[
+      css.width(px(100.0)),
+      css.height(px(100.0)),
+      css.position(Position.Relative),
+      z(2),
+      css.backgroundColor(fixtures.rgb(RED)),
+    ],
+  )
+  run batch.box(1, 3, &[css.width(px(100.0)), css.height(px(100.0))])
+  run batch.box(
+    3,
+    6,
+    &[
+      css.width(px(40.0)),
+      css.height(px(40.0)),
+      css.position(Position.Absolute),
+      css.top(px(0.0)),
+      css.left(px(0.0)),
+      css.backgroundColor(fixtures.rgb(BLUE)),
+    ],
+  )
+  run batch.box(
+    1,
+    4,
+    &[
+      css.width(px(80.0)),
+      css.height(px(80.0)),
+      css.position(Position.Absolute),
+      css.top(px(0.0)),
+      css.left(px(0.0)),
+      z(-1),
+      css.backgroundColor(fixtures.rgb(GREEN)),
+    ],
+  )
+  run batch.box(
+    1,
+    5,
+    &[css.width(px(100.0)), css.height(px(50.0)), css.position(Position.Relative)],
+  )
+  run batch.box(1, 7, &[css.width(px(100.0)), css.height(px(50.0)), css.opacity(0.5)])
+}
+
+effect fn orderBody() -> ()
+  ! TreeError | GeometryError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run stack(&mut batch)
+  run tree.apply(run batch.take())
+  let mut snapshot = CpuSnapshot.make()
+  let first = run frame(&mut tree, &mut snapshot)
+  run Testing.expect(
+    paintedInOrder(&tree, &[4, 1, 3, 6, 5, 7, 2]),
+    "negative z, then in flow, then z auto in tree order, then positive z",
+  )
+  run Testing.expect(pixel(&first, 10, 10) == RED, "z-index 2 paints over everything")
+  run Testing.expect(tree.hitTest(10.0, 10.0) == 2, "and is hit first")
+  run Testing.expect(tree.hitTest(90.0, 90.0) == 2, "even over a later sibling's box")
+  let mut hits = List<u32>.make()
+  run view.elementsFromPoint(&tree, 10.0, 10.0, &mut hits)
+  run Testing.expect(
+    hits.length() == 4 && hits.get(0) == 2 && hits.get(1) == 6 && hits.get(2) == 1
+      && hits.get(3) == 4,
+    "the hit stack is the paint order reversed, with the root element in flow",
+  )
+
+  // Nothing changed: the root replays whole, in the same order.
+  let second = run frame(&mut tree, &mut snapshot)
+  run Testing.expect(tree.stats.repaintedSubtrees == 0, "an unchanged frame repaints nothing")
+  run Testing.expect(
+    paintedInOrder(&tree, &[4, 1, 3, 6, 5, 7, 2]),
+    "a replayed frame keeps the order",
+  )
+  run Testing.expect(pixel(&second, 10, 10) == RED, "and the pixels")
+
+  // A change inside: the root repaints, the rest replays.
+  let mut change = Batch.make()
+  run change.style(5, &[css.backgroundColor(fixtures.rgb(0x888888))])
+  run tree.apply(run change.take())
+  drop run frame(&mut tree, &mut snapshot)
+  run Testing.expect(
+    paintedInOrder(&tree, &[4, 1, 3, 6, 5, 7, 2]),
+    "a partly replayed frame keeps the order",
+  )
+
+  // Below the negative layer: the in-flow content and z auto boxes cover it.
+  let mut lower = Batch.make()
+  run lower.style(2, &[z(-2)])
+  run tree.apply(run lower.take())
+  let third = run frame(&mut tree, &mut snapshot)
+  run Testing.expect(
+    paintedInOrder(&tree, &[2, 4, 1, 3, 6, 5, 7]),
+    "a z-index change reorders the next frame",
+  )
+  run Testing.expect(pixel(&third, 10, 10) == BLUE, "the absolute box in flow content is on top")
+  run Testing.expect(tree.hitTest(10.0, 10.0) == 6, "and is hit")
+  run Testing.expect(pixel(&third, 60, 60) == GREEN, "z -1 covers z -2, and both the root element's background")
+  run Testing.expect(
+    tree.hitTest(60.0, 60.0) == 1,
+    "the root element is in flow, so it takes the pointer over both, as a page's body does",
+  )
+
+  // z-index: auto on a positioned box: the z auto layer, in tree order.
+  let mut back = Batch.make()
+  run back.style(2, &[zAuto()])
+  run tree.apply(run back.take())
+  drop run frame(&mut tree, &mut snapshot)
+  run Testing.expect(paintedInOrder(&tree, &[4, 1, 3, 2, 6, 5, 7]), "z auto paints in tree order")
+  run Testing.expect(tree.hitTest(10.0, 10.0) == 6, "a later z auto box is on top")
+  run Testing.expect(tree.hitTest(60.0, 60.0) == 2, "a z auto box covers a negative one")
+}
+
+test effect fn zIndexOrdersPaintAndHits() -> ()
+  ! TreeError | GeometryError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run orderBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// A stacking context keeps its positioned descendants: 2 (z 1) holds 3 (z 100), and 4 (z 2)
+/// covers both. A static box with z-index does not stack, a flex item does.
+effect fn contextBody() -> ()
+  ! TreeError | GeometryError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.style(1, &[css.width(px(300.0)), css.height(px(400.0))])
+  run batch.box(
+    1,
+    2,
+    &[
+      css.width(px(100.0)),
+      css.height(px(100.0)),
+      css.position(Position.Relative),
+      z(1),
+      css.backgroundColor(fixtures.rgb(RED)),
+    ],
+  )
+  run batch.box(
+    2,
+    3,
+    &[
+      css.width(px(50.0)),
+      css.height(px(50.0)),
+      css.position(Position.Relative),
+      z(100),
+      css.backgroundColor(fixtures.rgb(BLUE)),
+    ],
+  )
+  run batch.box(
+    1,
+    4,
+    &[
+      css.width(px(100.0)),
+      css.height(px(100.0)),
+      css.position(Position.Absolute),
+      css.top(px(20.0)),
+      css.left(px(20.0)),
+      z(2),
+      css.backgroundColor(fixtures.rgb(GREEN)),
+    ],
+  )
+  // Static with z-index: no effect, it paints in flow (before the positioned boxes).
+  run batch.box(1, 5, &[css.width(px(10.0)), css.height(px(10.0)), z(50)])
+  run tree.apply(run batch.take())
+  let mut snapshot = CpuSnapshot.make()
+  let image = run frame(&mut tree, &mut snapshot)
+  run Testing.expect(paintedInOrder(&tree, &[1, 5, 2, 3, 4]), "z 100 stays inside its context")
+  run Testing.expect(pixel(&image, 30, 30) == GREEN, "a sibling context of z 2 covers it")
+  run Testing.expect(tree.hitTest(30.0, 30.0) == 4, "and is hit")
+  run Testing.expect(tree.hitTest(10.0, 10.0) == 3, "outside it the inner box is on top")
+
+  // In a flex container, z-index stacks items without positioning.
+  let mut flex = Batch.make()
+  run flex.style(1, &[css.display(Keyword.Flex)])
+  run flex.style(5, &[css.width(px(400.0)), css.height(px(400.0))])
+  run tree.apply(run flex.take())
+  drop run frame(&mut tree, &mut snapshot)
+  run Testing.expect(paintedInOrder(&tree, &[1, 2, 3, 4, 5]), "a flex item with z 50 paints last")
+}
+
+test effect fn stackingContextsKeepTheirDescendants() -> ()
+  ! TreeError | GeometryError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run contextBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// A positioned box painted from its context's lists stays inside the clips and the scroll of
+/// the boxes it sits in.
+effect fn clipBody() -> ()
+  ! TreeError | GeometryError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.style(1, &[css.width(px(300.0)), css.height(px(400.0))])
+  run batch.box(
+    1,
+    2,
+    &[
+      css.width(px(100.0)),
+      css.height(px(100.0)),
+      css.overflowX(Overflow.Auto),
+      css.overflowY(Overflow.Auto),
+    ],
+  )
+  run batch.box(
+    2,
+    3,
+    &[
+      css.width(px(80.0)),
+      css.height(px(300.0)),
+      css.position(Position.Relative),
+      css.backgroundColor(fixtures.rgb(BLUE)),
+    ],
+  )
+  run batch.box(2, 4, &[css.width(px(80.0)), css.height(px(200.0))])
+  run tree.apply(run batch.take())
+  let mut snapshot = CpuSnapshot.make()
+  let image = run frame(&mut tree, &mut snapshot)
+  run Testing.expect(pixel(&image, 10, 150) != BLUE, "the scroller clips the positioned box")
+  run Testing.expect(tree.hitTest(10.0, 150.0) == 1, "for hits too")
+  run Testing.expect(tree.hitTest(10.0, 50.0) == 3, "inside the clip it is hit")
+
+  let mut scroll = Batch.make()
+  run scroll.scrollTo(2, 0.0, 250.0)
+  run tree.apply(run scroll.take())
+  let scrolled = run frame(&mut tree, &mut snapshot)
+  run Testing.expect(pixel(&scrolled, 10, 10) == BLUE, "it scrolls with its scroller")
+  run Testing.expect(pixel(&scrolled, 10, 70) != BLUE, "all the way")
+  run Testing.expect(tree.hitTest(10.0, 10.0) == 3, "hits follow the scroll")
+  run Testing.expect(tree.hitTest(10.0, 70.0) == 4, "past its end the next box is hit")
+}
+
+test effect fn hoistedBoxesKeepClipsAndScrolls() -> ()
+  ! TreeError | GeometryError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run clipBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
