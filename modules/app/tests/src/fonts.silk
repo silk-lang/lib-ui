@@ -1,0 +1,83 @@
+//! Fonts a program declares: the families its views name, and the faces it loads by URL.
+import ui_app.app { App, Context, NoCommand }
+import ui_app.css
+import ui_app.font { Font, Face, Fonts }
+import ui_app.runtime { Runtime }
+import ui_app.ui { Ui }
+import ui_tree.legacy { UiTree, TreeError, FrameInput, Mutation }
+import ui_fixtures.fixtures as fixtures
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+const BRAND: Font = Font.of("\"Brand Sans\", Noto Sans, sans-serif")
+
+const PLAIN: Font = Font.of("Noto Sans, sans-serif")
+
+struct Page {}
+
+enum Message {
+  Nothing
+}
+
+impl App<Message, NoCommand> for Page {
+  fn update(self: &mut Self, message: Message, cx: &mut Context<NoCommand>) -> () {}
+
+  fn view(self: &Self, ui: &mut Ui<Message>) -> () {
+    ui.style(&[css.fontFamily(BRAND)])
+    ui.text("Hello")
+    ui.box(|ui| {
+      ui.style(&[css.fontFamily(PLAIN)])
+      ui.text("Plain")
+    })
+  }
+
+  fn fonts(self: &Self, fonts: &mut Fonts) -> () {
+    fonts.face(BRAND, "fonts/brand.ttf", Face.weights(100.0, 900.0))
+    fonts.face(BRAND, "fonts/brand-italic.ttf", Face.weights(100.0, 900.0).italic())
+    fonts.family(PLAIN)
+    fonts.stylesheet("https://fonts.example/css?family=Other")
+  }
+}
+
+effect fn body() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  run Testing.expect(BRAND.first() == "Brand Sans", "a face is declared under the first family, unquoted")
+  run Testing.expect(
+    BRAND.family() != PLAIN.family() && BRAND.family() >= 0x800000 && BRAND.family() < 0x1000000,
+    "each list has its own number, exact in a float",
+  )
+
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut app = Runtime<Page, Message, NoCommand>.make(Page {})
+  run app.start(&mut tree, 0.0)
+  let sheets = run tree.takeLoads()
+  run Testing.expect(sheets.length() == 1, "the stylesheet loads at once, faces only when needed")
+  let sheet = match &sheets.asSlice()[0] {
+    Mutation.LoadFontStylesheet { url } => String.view(&url) == "https://fonts.example/css?family=Other"
+    _ => false
+  }
+  run Testing.expect(sheet, "the stylesheet's URL goes to the host")
+
+  run tree.frame(FrameInput { width: 200.0, height: 100.0, scale: 1.0, time: 0.0 })
+  let loads = run tree.takeLoads()
+  run Testing.expect(loads.length() == 1, "only the upright face is needed")
+  let upright = match &loads.asSlice()[0] {
+    Mutation.LoadFontFace { face, url } => face == 1 && String.view(&url) == "fonts/brand.ttf"
+    _ => false
+  }
+  run Testing.expect(upright, "the face text needs is loaded by its URL")
+
+  run app.render(&mut tree)
+  run tree.frame(FrameInput { width: 200.0, height: 100.0, scale: 1.0, time: 0.0 })
+  run Testing.expect((run tree.takeLoads()).length() == 0, "fonts are sent once")
+}
+
+test effect fn programFontsLoadByUrl() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run body() |> Effect.provideMut<Allocator>(&mut allocator)
+}

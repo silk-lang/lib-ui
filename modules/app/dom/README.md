@@ -41,7 +41,7 @@ import { mount } from "./silk-ui-dom.js";
 const page = await mount({
   wasm: "./app.wasm",
   root: document.getElementById("app"),
-  fonts: { 1: "Inter, system-ui, sans-serif" }, // css.fontFamily(1)
+  fonts: { 1: "Inter, system-ui, sans-serif" }, // css.fontFamilyNumber(1); Font constants need nothing here
   // h.image("logo.png") and h.icon("chevron.svg") load relative to the app's root;
   // loaders add schemes of the app's own.
   loaders: { db: async (url) => new Blob([await read(url)]) }, // h.image("db:42")
@@ -79,7 +79,6 @@ commands, the location and viewport subscriptions, then one render.
 
 ```silk
 let mut html = Html.make()
-run html.font(1, "Inter, system-ui, sans-serif") // the same maps `mount` gets
 run html.setBase("/docs")
 let markup = run render<App, Message, Command>(&mut html, "/guide")
   |> Effect.provideMut<Store>(&mut store) // what the commands require, on the server
