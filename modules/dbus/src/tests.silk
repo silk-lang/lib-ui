@@ -1,0 +1,164 @@
+//! Tests of the wire format and messages.
+import lib { Writer, Reader, Message, MessageType, DBusError, decode, socketPathOf }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.collections.slice { Slice }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+effect fn wireRoundTrip() -> ()
+  ! OutOfMemoryError | DBusError | AssertionError<'static>
+  ? &mut Allocator {
+  let mut w = Writer.make()
+  run w.byte(7)
+  run w.uint32(0x01020304)
+  run w.string("hi")
+  run w.int16(-2)
+  run w.double(1.5)
+  let array = run w.beginArray(8)
+  run w.beginStruct()
+  run w.int32(-5)
+  run w.string("a")
+  run w.beginStruct()
+  run w.int32(6)
+  run w.string("bc")
+  w.endArray(array)
+  run w.variant("u")
+  run w.uint32(42)
+  run w.boolean(true)
+  run w.signature("a(is)")
+
+  // Alignment: the u32 starts at 4, after three bytes of padding.
+  let bytes = w.asSlice()
+  run Testing.expect(
+    bytes[0] == 7 && bytes[1] == 0 && bytes[4] == 4 && bytes[7] == 1,
+    "u32 aligned to 4, little-endian",
+  )
+  run Testing.expect(
+    bytes[8] == 2 && bytes[12] == 104 && bytes[14] == 0,
+    "string length, bytes and NUL",
+  )
+  let mut r = Reader.make(bytes, false)
+  run Testing.expect((run r.byte()) == 7, "byte")
+  run Testing.expect((run r.uint32()) == 0x01020304, "u32")
+  run Testing.expect((run r.string()) == "hi", "string")
+  run Testing.expect((run r.int16()) == -2, "i16")
+  run Testing.expect((run r.double()) == 1.5, "f64")
+  let end = run r.beginArray(8)
+  run r.beginStruct()
+  run Testing.expect((run r.int32()) == -5, "first struct int")
+  run Testing.expect((run r.string()) == "a", "first struct string")
+  run r.beginStruct()
+  run Testing.expect((run r.int32()) == 6, "second struct int")
+  run Testing.expect((run r.string()) == "bc", "second struct string")
+  run Testing.expect(r.position == end, "the array length covers the elements")
+  run Testing.expect((run r.signature()) == "u", "variant signature")
+  run Testing.expect((run r.uint32()) == 42, "variant value")
+  run Testing.expect(run r.boolean(), "boolean")
+  run Testing.expect((run r.signature()) == "a(is)", "signature")
+  run Testing.expect(r.atEnd(), "everything read")
+
+  // Skipping by signature lands in the same place.
+  let mut s = Reader.make(bytes, false)
+  run s.skipAll("yusnda(is)vbg")
+  run Testing.expect(s.atEnd(), "skipAll steps over every value")
+}
+
+test effect fn wireValuesRoundTrip() -> ()
+  ! OutOfMemoryError | DBusError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run wireRoundTrip() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn messageRoundTrip() -> ()
+  ! OutOfMemoryError | DBusError | AssertionError<'static>
+  ? &mut Allocator {
+  let mut call = run Message.methodCall(
+    "org.freedesktop.DBus",
+    "/org/freedesktop/DBus",
+    "org.freedesktop.DBus",
+    "GetNameOwner",
+  )
+  let mut body = Writer.make()
+  run body.string("org.a11y.Bus")
+  run call.setBody("s", move body)
+  let bytes = run call.encode(9)
+  run Testing.expect(bytes.length() % 8 == 4 || bytes.length() > 0, "encoded")
+  let decoded = match run decode(bytes.asSlice()) {
+    Option.Some { value } => move value
+    Option.None => Intrinsic.trap("test: whole message not decoded")
+  }
+  run Testing.expect(decoded.length == bytes.length(), "the whole message is consumed")
+  let m = move decoded.message
+  run Testing.expect(m.kind == MessageType.MethodCall && m.serial == 9, "type and serial")
+  run Testing.expect(
+    String.view(&m.destination) == "org.freedesktop.DBus"
+      && String.view(&m.path) == "/org/freedesktop/DBus",
+    "destination and path",
+  )
+  run Testing.expect(
+    m.isCall("org.freedesktop.DBus", "GetNameOwner") && String.view(&m.signature) == "s",
+    "interface, member, signature",
+  )
+  let mut r = m.reader()
+  run Testing.expect((run r.string()) == "org.a11y.Bus", "body")
+
+  // A partial message waits for more bytes.
+  run Testing.expect(
+    match run decode(Slice.view<u8>(bytes.asSlice(), 0, bytes.length() - 1)) {
+      Option.Some { value: _ } => false
+      Option.None => true
+    },
+    "a truncated message is not decoded yet",
+  )
+
+  // Replies point back at the call.
+  let mut withSender = move m
+  withSender.sender = run String.copy(":1.5")
+  let reply = run Message.errorReply(&withSender, "org.freedesktop.DBus.Error.Failed", "nope")
+  run Testing.expect(
+    reply.kind == MessageType.Error && reply.replySerial == 9
+      && String.view(&reply.destination) == ":1.5",
+    "error reply header",
+  )
+}
+
+test effect fn messagesRoundTrip() -> ()
+  ! OutOfMemoryError | DBusError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run messageRoundTrip() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn addresses() -> ()
+  ! OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  run Testing.expect(
+    match run socketPathOf("unix:path=/run/user/1000/bus") {
+      Option.Some { value } => String.fromUtf8(value.asSlice()).unwrapOr("") == "/run/user/1000/bus"
+      Option.None => false
+    },
+    "a path address",
+  )
+  run Testing.expect(
+    match run socketPathOf("unix:abstract=/tmp/dbus-x%2cy,guid=1234") {
+      Option.Some { value } => value.asSlice()[0] == 0 && value.length() == 14
+        && value.asSlice()[12] == 44
+      Option.None => false
+    },
+    "an abstract address with an escape",
+  )
+  run Testing.expect(
+    match run socketPathOf("tcp:host=localhost,port=1") {
+      Option.Some { value: _ } => false
+      Option.None => true
+    },
+    "tcp is not supported",
+  )
+}
+
+test effect fn busAddressesParse() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run addresses() |> Effect.provideMut<Allocator>(&mut allocator)
+}

@@ -1,0 +1,614 @@
+//! Tests of the Linux adapter: object paths, the events tree updates cause (ported from the
+//! tests in AccessKit's `accesskit_atspi_common/src/adapter.rs`), and method calls answered by
+//! the object server.
+import accesskit.lib { Node, NodeId, Role, Action, Toggled, TreeInfo, TreeUpdate, Rect }
+import accesskit_consumer.lib { Tree, TreeIndex, FullNodeId }
+import lib {
+  AtspiRole,
+  WindowBounds,
+  Event,
+  EventKind,
+  EventData,
+  EventCollector,
+  Target,
+  AppState,
+  Window,
+  Resolved,
+  handle,
+  resolvePath,
+  nodePath,
+  ROOT_PATH,
+  CACHE_PATH,
+  number,
+  signalOf
+}
+import dbus.lib { Message, MessageType, Writer, DBusError }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.string { String }
+import silk.testing.testing { Testing, AssertionError }
+
+fn nid(value: u64) -> FullNodeId {
+  return FullNodeId.make(NodeId.of(value), TreeIndex { value: 0 })
+}
+
+effect fn withChildren(kind: Role, children: &[u64]) -> Node
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut node = Node.make(kind)
+  let mut i: usize = 0
+  while i < children.length {
+    run node.pushChild(NodeId.of(children[i]))
+    i = i + 1
+  }
+  return move node
+}
+
+effect fn initialTree() -> TreeUpdate
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut update = TreeUpdate.make(NodeId.of(0))
+  update.tree = Option.Some { value: TreeInfo.make(NodeId.of(0)) }
+  run update.push(NodeId.of(0), run withChildren(Role.Window, &[1]))
+  run update.push(NodeId.of(1), Node.make(Role.Button))
+  return move update
+}
+
+fn changes() -> TreeUpdate {
+  return TreeUpdate.make(NodeId.of(0))
+}
+
+fn count(events: &List<Event>, kind: EventKind) -> usize {
+  let all = events.asSlice()
+  let mut n: usize = 0
+  let mut i: usize = 0
+  while i < all.length {
+    if all[i].kind == kind {
+      n = n + 1
+    }
+    i = i + 1
+  }
+  return n
+}
+
+fn targets(event: &Event, id: u64) -> bool {
+  return match event.target {
+    Target.Node { window: _, id: given } => given.equals(nid(id))
+    Target.App => false
+  }
+}
+
+/// Whether `events` holds an object event `member` with `detail` and `detail1` on node `id`.
+fn holds(events: &List<Event>, id: u64, member: string, detail: string, detail1: i32) -> bool {
+  let all = events.asSlice()
+  let mut i: usize = 0
+  while i < all.length {
+    if targets(&all[i], id) && all[i].member == member && all[i].detail == detail
+      && all[i].detail1 == detail1 {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+fn carriesText(events: &List<Event>, detail: string, text: string) -> bool {
+  let all = events.asSlice()
+  let mut i: usize = 0
+  while i < all.length {
+    if all[i].detail == detail {
+      return match &all[i].data {
+        EventData.Text { value } => value.view() == text
+        _ => false
+      }
+    }
+    i = i + 1
+  }
+  return false
+}
+
+effect fn apply(tree: &mut Tree, update: TreeUpdate) -> List<Event>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut collector = EventCollector.make(0, 0, WindowBounds.zero())
+  run tree.update(move update, &mut collector)
+  run collector.finish()
+  return run collector.events.splitOff(0)
+}
+
+effect fn paths() -> ()
+  ! OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  run Testing.expect(
+    match resolvePath(ROOT_PATH) {
+      Resolved.App => true
+      _ => false
+    },
+    "the root path is the application",
+  )
+  run Testing.expect(
+    match resolvePath(CACHE_PATH) {
+      Resolved.Cache => true
+      _ => false
+    },
+    "the cache path is the cache",
+  )
+  let path = run nodePath(3, nid(42))
+  run Testing.expect(
+    path.view() == "/org/a11y/atspi/accessible/3/42",
+    "a node path names the window and node",
+  )
+  run Testing.expect(
+    match resolvePath(path.view()) {
+      Resolved.Node { window, id } => window == 3 && id.equals(nid(42))
+      _ => false
+    },
+    "a node path resolves back",
+  )
+  let subtree = FullNodeId.make(NodeId.of(7), TreeIndex { value: 2 })
+  let deep = run nodePath(1, subtree)
+  run Testing.expect(
+    match resolvePath(deep.view()) {
+      Resolved.Node { window: _, id } => id.equals(subtree)
+      _ => false
+    },
+    "a subtree node keeps its tree index",
+  )
+  run Testing.expect(
+    match resolvePath("/org/a11y/atspi/accessible/x/1") {
+      Resolved.Unknown => true
+      _ => false
+    },
+    "a malformed path names nothing",
+  )
+  let half = run number(16.5)
+  let whole = run number(700.0)
+  run Testing.expect(
+    half.view() == "16.5" && whole.view() == "700",
+    "numbers print like Rust floats",
+  )
+}
+
+test effect fn objectPaths() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run paths() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn cacheEvents() -> ()
+  ! OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  // A node added: one cache addition, and the window gains a child.
+  let mut tree = run Tree.make(run initialTree(), false)
+  let mut update = changes()
+  run update.push(NodeId.of(0), run withChildren(Role.Window, &[1, 2]))
+  run update.push(NodeId.of(2), Node.make(Role.Button))
+  let added = run apply(&mut tree, move update)
+  run Testing.expect(count(&added, EventKind.CacheAdd) == 1, "adding a node adds one cache item")
+  run Testing.expect(
+    holds(&added, 0, "ChildrenChanged", "add", 1),
+    "the window reports its new child at index 1",
+  )
+
+  // The same node removed: one cache removal for it, and it is defunct.
+  let mut back = changes()
+  run back.push(NodeId.of(0), run withChildren(Role.Window, &[1]))
+  let removed = run apply(&mut tree, move back)
+  run Testing.expect(
+    count(&removed, EventKind.CacheRemove) == 1,
+    "removing a node removes one cache item",
+  )
+  run Testing.expect(
+    holds(&removed, 2, "StateChanged", "defunct", 1),
+    "the removed node is defunct",
+  )
+  run Testing.expect(
+    holds(&removed, 0, "ChildrenChanged", "remove", -1),
+    "the window reports the removal",
+  )
+
+  // A subtree added and removed: one cache event per node.
+  let mut group = changes()
+  run group.push(NodeId.of(0), run withChildren(Role.Window, &[1, 2]))
+  run group.push(NodeId.of(2), run withChildren(Role.Group, &[3, 4]))
+  run group.push(NodeId.of(3), Node.make(Role.Button))
+  run group.push(NodeId.of(4), Node.make(Role.Button))
+  let grown = run apply(&mut tree, move group)
+  run Testing.expect(count(&grown, EventKind.CacheAdd) == 3, "a subtree adds a cache item per node")
+  let mut ungroup = changes()
+  run ungroup.push(NodeId.of(0), run withChildren(Role.Window, &[1]))
+  let shrunk = run apply(&mut tree, move ungroup)
+  run Testing.expect(
+    count(&shrunk, EventKind.CacheRemove) == 3,
+    "a subtree removes a cache item per node",
+  )
+
+  // Filter transitions.
+  let mut hidden = Node.make(Role.Button)
+  hidden.setHidden()
+  let mut hide = changes()
+  run hide.push(NodeId.of(1), move hidden)
+  let gone = run apply(&mut tree, move hide)
+  run Testing.expect(
+    count(&gone, EventKind.CacheRemove) == 1 && count(&gone, EventKind.CacheAdd) == 0,
+    "hiding a node removes it",
+  )
+  let mut show = changes()
+  run show.push(NodeId.of(1), Node.make(Role.Button))
+  let shown = run apply(&mut tree, move show)
+  run Testing.expect(
+    count(&shown, EventKind.CacheAdd) == 1 && count(&shown, EventKind.CacheRemove) == 0,
+    "showing it adds it back",
+  )
+}
+
+test effect fn treeChangesBecomeCacheEvents() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run cacheEvents() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn propertyEvents() -> ()
+  ! OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let mut first = TreeUpdate.make(NodeId.of(1))
+  first.tree = Option.Some { value: TreeInfo.make(NodeId.of(0)) }
+  run first.push(NodeId.of(0), run withChildren(Role.Window, &[1, 2]))
+  let mut button = Node.make(Role.Button)
+  run button.setLabel("OK")
+  button.addAction(Action.Focus)
+  run first.push(NodeId.of(1), move button)
+  let mut check = Node.make(Role.CheckBox)
+  run check.setToggled(Toggled.False)
+  check.addAction(Action.Focus)
+  run first.push(NodeId.of(2), move check)
+  let mut tree = run Tree.make(move first, true)
+
+  let mut update = TreeUpdate.make(NodeId.of(2))
+  let mut renamed = Node.make(Role.Button)
+  run renamed.setLabel("Done")
+  renamed.addAction(Action.Focus)
+  run update.push(NodeId.of(1), move renamed)
+  let mut checked = Node.make(Role.CheckBox)
+  run checked.setToggled(Toggled.True)
+  checked.addAction(Action.Focus)
+  run update.push(NodeId.of(2), move checked)
+  let events = run apply(&mut tree, move update)
+  run Testing.expect(
+    holds(&events, 1, "PropertyChange", "accessible-name", 0),
+    "a new label is a name change",
+  )
+  run Testing.expect(
+    carriesText(&events, "accessible-name", "Done"),
+    "the name change carries the new name",
+  )
+  run Testing.expect(holds(&events, 2, "StateChanged", "checked", 1), "checking is a state change")
+  run Testing.expect(holds(&events, 2, "StateChanged", "focused", 1), "focus moved to the checkbox")
+  run Testing.expect(holds(&events, 1, "StateChanged", "focused", 0), "and left the button")
+
+  let mut collector = EventCollector.make(0, 0, WindowBounds.zero())
+  run tree.updateHostFocusState(false, &mut collector)
+  run Testing.expect(
+    count(&collector.events, EventKind.Window) == 1,
+    "losing window focus deactivates the window",
+  )
+  run Testing.expect(
+    holds(&collector.events, 0, "StateChanged", "active", 0),
+    "the window is no longer active",
+  )
+}
+
+test effect fn nodeChangesBecomeObjectEvents() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run propertyEvents() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn textRun(value: string, lengths: &[u8]) -> Node
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut node = Node.make(Role.TextRun)
+  run node.setBounds(Rect.make(0.0, 0.0, 50.0, 10.0))
+  run node.setValue(value)
+  run node.setCharacterLengths(lengths)
+  run node.setWordStarts(&[0])
+  return move node
+}
+
+effect fn textTree() -> TreeUpdate
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut update = TreeUpdate.make(NodeId.of(1))
+  update.tree = Option.Some { value: TreeInfo.make(NodeId.of(0)) }
+  run update.push(NodeId.of(0), run withChildren(Role.Window, &[1, 3]))
+  let mut input = run withChildren(Role.TextInput, &[2])
+  run input.setBounds(Rect.make(0.0, 0.0, 100.0, 20.0))
+  input.addAction(Action.Focus)
+  run update.push(NodeId.of(1), move input)
+  run update.push(NodeId.of(2), run textRun("hello", &[1, 1, 1, 1, 1]))
+  let mut ok = Node.make(Role.Button)
+  run ok.setLabel("OK")
+  run ok.setBounds(Rect.make(0.0, 30.0, 40.0, 50.0))
+  ok.addAction(Action.Click)
+  ok.addAction(Action.Focus)
+  run update.push(NodeId.of(3), move ok)
+  return move update
+}
+
+effect fn textEvents() -> ()
+  ! OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let mut tree = run Tree.make(run textTree(), true)
+  let mut update = TreeUpdate.make(NodeId.of(1))
+  run update.push(NodeId.of(2), run textRun("help", &[1, 1, 1, 1]))
+  let events = run apply(&mut tree, move update)
+  run Testing.expect(
+    holds(&events, 1, "TextChanged", "delete", 3),
+    "the input reports the removed text",
+  )
+  run Testing.expect(holds(&events, 1, "TextChanged", "insert", 3), "and the inserted text")
+  let all = events.asSlice()
+  let mut found = false
+  let mut i: usize = 0
+  while i < all.length {
+    if all[i].detail == "delete" {
+      found = all[i].detail2 == 2
+        && match &all[i].data {
+          EventData.Text { value } => value.view() == "lo"
+          _ => false
+        }
+    }
+    i = i + 1
+  }
+  run Testing.expect(found, "two characters, \"lo\", went away")
+}
+
+test effect fn textChangesBecomeTextEvents() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run textEvents() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// The object server ----------------------------------------------------------------------------
+
+effect fn app() -> AppState
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut state = run AppState.make("Test")
+  run state.windows.append(
+    Window { id: 5, tree: run Tree.make(run textTree(), true), bounds: WindowBounds.zero() },
+  )
+  return move state
+}
+
+effect fn ask(
+  state: &mut AppState,
+  path: string,
+  iface: string,
+  member: string,
+  signature: string,
+  body: Writer,
+) -> Message
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut call = run Message.methodCall(":1.1", path, iface, member)
+  call.serial = 9
+  run call.setBody(signature, move body)
+  return match run handle(&mut state, &call, ":1.7") {
+    Option.Some { value } => move value
+    Option.None => Intrinsic.trap("test: expected a reply")
+  }
+}
+
+effect fn readTextBody(message: &Message) -> String
+  ! DBusError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut reader = message.reader()
+  return run String.copy(run reader.string())
+}
+
+effect fn textOf(message: &Message) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return run Effect.catch<DBusError>(readTextBody(message), noText)
+}
+
+effect fn noText(error: DBusError) -> String {
+  drop error
+  return String.make()
+}
+
+effect fn firstU32(message: &Message) -> u32 {
+  let mut reader = message.reader()
+  return run Effect.catch<DBusError>(reader.uint32(), noNumber)
+}
+
+effect fn noNumber(error: DBusError) -> u32 {
+  drop error
+  return 4294967295
+}
+
+effect fn firstBool(message: &Message) -> bool {
+  let mut reader = message.reader()
+  return run Effect.catch<DBusError>(reader.boolean(), noBool)
+}
+
+effect fn noBool(error: DBusError) -> bool {
+  drop error
+  return false
+}
+
+effect fn readPaths(message: &Message, out: &mut List<String>) -> ()
+  ! DBusError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut reader = message.reader()
+  let end = run reader.beginArray(8)
+  while reader.position < end {
+    run reader.beginStruct()
+    drop run reader.string()
+    run out.append(run String.copy(run reader.objectPath()))
+  }
+}
+
+effect fn arrayLength(message: &Message) -> u32 {
+  let mut reader = message.reader()
+  return run Effect.catch<DBusError>(reader.uint32(), noNumber)
+}
+
+effect fn serverCalls() -> ()
+  ! DBusError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let mut state = run app()
+  let accessible = "org.a11y.atspi.Accessible"
+  let button = run nodePath(5, nid(3))
+  let input = run nodePath(5, nid(1))
+
+  let children = run ask(&mut state, ROOT_PATH, accessible, "GetChildren", "", Writer.make())
+  let mut found = List<String>.make()
+  run readPaths(&children, &mut found)
+  let window = run nodePath(5, nid(0))
+  run Testing.expect(
+    found.length() == 1 && found.asSlice()[0].view() == window.view(),
+    "the application's child is the window",
+  )
+
+  let mut get = Writer.make()
+  run get.string(accessible)
+  run get.string("Name")
+  let named = run ask(
+    &mut state,
+    button.view(),
+    "org.freedesktop.DBus.Properties",
+    "Get",
+    "ss",
+    move get,
+  )
+  let mut reader = named.reader()
+  run Testing.expect(
+    (run reader.signature()) == "s" && (run reader.string()) == "OK",
+    "the button is named OK",
+  )
+
+  let kind = run ask(&mut state, button.view(), accessible, "GetRole", "", Writer.make())
+  run Testing.expect((run firstU32(&kind)) == AtspiRole.Button.number(), "the button is a button")
+
+  let mut index = Writer.make()
+  run index.int32(0)
+  let done = run ask(
+    &mut state,
+    button.view(),
+    "org.a11y.atspi.Action",
+    "DoAction",
+    "i",
+    move index,
+  )
+  run Testing.expect(run firstBool(&done), "the click is done")
+  run Testing.expect(
+    state.requests.length() == 1 && state.requests.asSlice()[0].window == 5
+      && state.requests.asSlice()[0].request.action == Action.Click
+      && state.requests.asSlice()[0].request.targetNode.equals(NodeId.of(3)),
+    "the click goes to the host",
+  )
+
+  let mut range = Writer.make()
+  run range.int32(0)
+  run range.int32(-1)
+  let content = run ask(
+    &mut state,
+    input.view(),
+    "org.a11y.atspi.Text",
+    "GetText",
+    "ii",
+    move range,
+  )
+  let typed = run textOf(&content)
+  run Testing.expect(typed.view() == "hello", "the input's text is hello")
+
+  let mut word = Writer.make()
+  run word.int32(1)
+  run word.uint32(0)
+  let character = run ask(
+    &mut state,
+    input.view(),
+    "org.a11y.atspi.Text",
+    "GetStringAtOffset",
+    "iu",
+    move word,
+  )
+  let mut at = character.reader()
+  run Testing.expect(
+    (run at.string()) == "e" && (run at.int32()) == 1 && (run at.int32()) == 2,
+    "the character at offset 1 is e",
+  )
+
+  let missing = run ask(
+    &mut state,
+    "/org/a11y/atspi/accessible/5/99",
+    accessible,
+    "GetRole",
+    "",
+    Writer.make(),
+  )
+  run Testing.expect(
+    missing.kind == MessageType.Error
+      && missing.errorName.view() == "org.freedesktop.DBus.Error.UnknownObject",
+    "a missing node is an unknown object",
+  )
+
+  let wrong = run ask(
+    &mut state,
+    button.view(),
+    "org.a11y.atspi.Text",
+    "GetText",
+    "",
+    Writer.make(),
+  )
+  run Testing.expect(
+    wrong.kind == MessageType.Error
+      && wrong.errorName.view() == "org.freedesktop.DBus.Error.UnknownInterface",
+    "a button has no text interface",
+  )
+
+  let items = run ask(&mut state, CACHE_PATH, "org.a11y.atspi.Cache", "GetItems", "", Writer.make())
+  run Testing.expect(
+    items.kind == MessageType.MethodReturn
+      && String.view(&items.signature) == "a((so)(so)(so)iiassusau)",
+    "the cache lists its items",
+  )
+
+  let mut set = Writer.make()
+  run set.string("org.a11y.atspi.Application")
+  run set.string("Id")
+  run set.variant("i")
+  run set.int32(42)
+  drop run ask(&mut state, ROOT_PATH, "org.freedesktop.DBus.Properties", "Set", "ssv", move set)
+  run Testing.expect(state.id == 42, "the registry can set the application id")
+
+  // An event becomes a signal from the node's path.
+  let event = Event.object(
+    Target.Node { window: 5, id: nid(3) },
+    "StateChanged",
+    "focused",
+    1,
+    EventData.Nothing,
+  )
+  match run signalOf(&state, ":1.7", &event) {
+    Option.Some { value: signal } => {
+      run Testing.expect(
+        signal.kind == MessageType.Signal && signal.path.view() == button.view()
+          && signal.interfaceName.view() == "org.a11y.atspi.Event.Object"
+          && signal.signature.view() == "siiva{sv}",
+        "a state change is an Object event from the node",
+      )
+    }
+    Option.None => run Testing.expect(false, "the event has a signal")
+  }
+}
+
+test effect fn objectServerAnswersCalls() -> ()
+  ! DBusError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run serverCalls() |> Effect.provideMut<Allocator>(&mut allocator)
+}

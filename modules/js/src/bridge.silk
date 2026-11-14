@@ -83,8 +83,14 @@ pub const DEV_RELOAD: u32 = 21
 pub const FONT_FAMILY: u32 = 22
 /// `__ui.open(url)`: asks the host to open an address outside the application.
 pub const OPEN: u32 = 23
+/// `__ui.defineIcon(resource, markup)`: parses SVG markup as icon resource `resource`.
+pub const DEFINE_ICON: u32 = 24
+/// `__ui.source(id, resource)`: points an image or icon node at a resource.
+pub const SOURCE: u32 = 25
+/// `__ui.release(resource)`: forgets a resource no node shows any more.
+pub const RELEASE: u32 = 26
 /// The number of native functions, for the installer.
-pub const LAST: u32 = 23
+pub const LAST: u32 = 26
 
 /// The runtime's module loader callback: [`Bridge`] answers it from the defined modules.
 pub const MODULE_LOAD: u32 = 100
@@ -203,6 +209,9 @@ pub fn name(id: u32) -> &'static [u8] {
   if id == DEV_RELOAD { return b"devReload" }
   if id == FONT_FAMILY { return b"fontFamily" }
   if id == OPEN { return b"open" }
+  if id == DEFINE_ICON { return b"defineIcon" }
+  if id == SOURCE { return b"source" }
+  if id == RELEASE { return b"release" }
   return b"requestFrame"
 }
 
@@ -210,7 +219,7 @@ pub fn name(id: u32) -> &'static [u8] {
 pub fn arity(id: u32) -> i32 {
   if id == NOW || id == REQUEST_FRAME || id == DEV_RELOAD { return 0 }
   if id == DEV_SEND || id == OPEN { return 1 }
-  if id == ROOT || id == FOCUS || id == REMOVE || id == DESTROY || id == CANCEL_TIMER { return 1 }
+  if id == ROOT || id == FOCUS || id == REMOVE || id == DESTROY || id == CANCEL_TIMER || id == RELEASE { return 1 }
   if id == INSERT_BEFORE || id == STYLE || id == ATTRIBUTE || id == SCROLL_TO || id == SELECT { return 3 }
   return 2
 }
@@ -372,6 +381,114 @@ effect fn declarationsOf(css: &String) -> List<Declaration> ! OutOfMemoryError ?
   }
 }
 
+/// What a `__ui` native function did: returned a value, or asked for a `TypeError`.
+pub union Outcome {
+  Returned { pub value: ValueBits },
+  TypeError { pub message: List<u8> },
+}
+
+/// Runs `__ui` native function `function` on `state`. A host whose engine services are not a
+/// `Bridge` (an embedded runtime's) calls it from its own native dispatch.
+pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) -> Outcome ! OutOfMemoryError ? &mut Allocator {
+  let first = id(argv.get(0).view())
+  if function == CREATE {
+    run bridge.batch.create(first, kind(id(argv.get(1).view())))
+  } else if function == APPEND {
+    run bridge.batch.append(first, id(argv.get(1).view()))
+  } else if function == INSERT_BEFORE {
+    run bridge.batch.insertBefore(first, id(argv.get(1).view()), id(argv.get(2).view()))
+  } else if function == ROOT {
+    run bridge.batch.root(first)
+  } else if function == SET_TEXT {
+    let value = run text(argv.get(1))
+    run bridge.batch.setText(first, String.view(&value))
+  } else if function == LISTEN {
+    run bridge.batch.listen(first, id(argv.get(1).view()))
+  } else if function == STYLE {
+    let css = run text(argv.get(1))
+    let declarations = run declarationsOf(&css)
+    run bridge.batch.push(Mutation.SetStyle { id: first, state: state(id(argv.get(2).view())), declarations: move declarations })
+  } else if function == CLEAR_STYLE {
+    run bridge.batch.push(Mutation.ClearStyle { id: first, state: state(id(argv.get(1).view())) })
+  } else if function == ATTRIBUTE {
+    let attribute = run text(argv.get(1))
+    if String.view(&attribute) == "valueRange" {
+      let range = if argv.get(2).view().isNumber() {
+        Attribute.ValueRange { min: f64.toF32(number(argv.get(2).view())), max: f64.toF32(number(argv.get(3).view())), value: f64.toF32(number(argv.get(4).view())) }
+      } else { Attribute.ClearValueRange }
+      run bridge.batch.attribute(first, move range)
+      return Outcome.Returned { value: ValueBits.Undefined }
+    }
+    if String.view(&attribute) == "role" {
+      let words = run text(argv.get(2))
+      let bytes = String.utf8Bytes(String.view(&words))
+      let mut known = bytes.length == 0
+      let mut value = Role.None
+      match roleOf(bytes) {
+        Option<Role>.Some { value: found } => {
+          known = true
+          value = found
+        }
+        Option<Role>.None => {}
+      }
+      run bridge.batch.attribute(first, Attribute.Role { value: value })
+      return Outcome.Returned { value: ValueBits.Bool { value: known } }
+    }
+    match run attributeOf(String.view(&attribute), argv.get(2)) {
+      Option<Attribute>.Some { value } => { run bridge.batch.attribute(first, move value) }
+      Option<Attribute>.None => {
+        let mut message = List<u8>.make()
+        run message.appendSlice(b"the tree has no attribute '")
+        run message.appendSlice(String.utf8Bytes(String.view(&attribute)))
+        run message.append(39)
+        return Outcome.TypeError { message: move message }
+      }
+    }
+  } else if function == FOCUS {
+    run bridge.batch.focus(first)
+  } else if function == REMOVE {
+    run bridge.batch.push(Mutation.Remove { id: first })
+  } else if function == DESTROY {
+    run bridge.batch.push(Mutation.Destroy { id: first })
+  } else if function == SCROLL_TO {
+    run bridge.batch.scrollTo(first, f64.toF32(number(argv.get(1).view())), f64.toF32(number(argv.get(2).view())))
+  } else if function == LOG {
+    let line = run text(argv.get(1))
+    run bridge.logs.append(LogEntry { level: first, text: move line })
+  } else if function == NOW {
+    return Outcome.Returned { value: ValueBits.number(bridge.now) }
+  } else if function == TIMER {
+    drop bridge.cancel(first)
+    let delay = number(argv.get(1).view())
+    run bridge.timers.append(Timer { id: first, due: bridge.now + if delay > 0.0 { delay } else { 0.0 } })
+  } else if function == CANCEL_TIMER {
+    drop bridge.cancel(first)
+  } else if function == REQUEST_FRAME {
+    bridge.frame = true
+  } else if function == DEV_SEND {
+    let line = run text(argv.get(0))
+    run bridge.outbox.append(move line)
+  } else if function == OPEN {
+    let address = run text(argv.get(0))
+    run bridge.opened.append(move address)
+  } else if function == DEV_RELOAD {
+    bridge.reload = true
+  } else if function == FONT_FAMILY {
+    let names = run text(argv.get(1))
+    run bridge.batch.fontFamily(first, String.view(&names))
+  } else if function == DEFINE_ICON {
+    let markup = run text(argv.get(1))
+    run bridge.batch.icon(first, String.utf8Bytes(String.view(&markup)))
+  } else if function == SOURCE {
+    run bridge.batch.source(first, id(argv.get(1).view()))
+  } else if function == RELEASE {
+    run bridge.batch.releaseResource(first)
+  } else if function == SELECT {
+    run bridge.batch.select(first, f64.toUsize(number(argv.get(1).view())), f64.toUsize(number(argv.get(2).view())))
+  }
+  return Outcome.Returned { value: ValueBits.Undefined }
+}
+
 impl EngineServices for Bridge {
   /// A realm here has ECMAScript without ECMA-402 or Temporal (the prelude installs neither),
   /// so their code and CLDR tables stay out of the program.
@@ -386,96 +503,11 @@ impl EngineServices for Bridge {
 
   effect fn nativeGeneric<'r, 'v, 'm, 'w>(engine: &mut Engine<'m, Self>, function: u32, realm: Realm<'r>,
     receiver: ValueRef<'v>, argc: i32, argv: Arguments<'w>) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
-    let first = id(argv.get(0).view())
-    if function == CREATE {
-      run engine.services.batch.create(first, kind(id(argv.get(1).view())))
-    } else if function == APPEND {
-      run engine.services.batch.append(first, id(argv.get(1).view()))
-    } else if function == INSERT_BEFORE {
-      run engine.services.batch.insertBefore(first, id(argv.get(1).view()), id(argv.get(2).view()))
-    } else if function == ROOT {
-      run engine.services.batch.root(first)
-    } else if function == SET_TEXT {
-      let value = run text(argv.get(1))
-      run engine.services.batch.setText(first, String.view(&value))
-    } else if function == LISTEN {
-      run engine.services.batch.listen(first, id(argv.get(1).view()))
-    } else if function == STYLE {
-      let css = run text(argv.get(1))
-      let declarations = run declarationsOf(&css)
-      run engine.services.batch.push(Mutation.SetStyle { id: first, state: state(id(argv.get(2).view())), declarations: move declarations })
-    } else if function == CLEAR_STYLE {
-      run engine.services.batch.push(Mutation.ClearStyle { id: first, state: state(id(argv.get(1).view())) })
-    } else if function == ATTRIBUTE {
-      let attribute = run text(argv.get(1))
-      if String.view(&attribute) == "valueRange" {
-        let range = if argv.get(2).view().isNumber() {
-          Attribute.ValueRange { min: f64.toF32(number(argv.get(2).view())), max: f64.toF32(number(argv.get(3).view())), value: f64.toF32(number(argv.get(4).view())) }
-        } else { Attribute.ClearValueRange }
-        run engine.services.batch.attribute(first, move range)
-        return ValueBits.Undefined
-      }
-      if String.view(&attribute) == "role" {
-        let words = run text(argv.get(2))
-        let bytes = String.utf8Bytes(String.view(&words))
-        let mut known = bytes.length == 0
-        let mut value = Role.None
-        match roleOf(bytes) {
-          Option<Role>.Some { value: found } => {
-            known = true
-            value = found
-          }
-          Option<Role>.None => {}
-        }
-        run engine.services.batch.attribute(first, Attribute.Role { value: value })
-        return ValueBits.Bool { value: known }
-      }
-      match run attributeOf(String.view(&attribute), argv.get(2)) {
-        Option<Attribute>.Some { value } => { run engine.services.batch.attribute(first, move value) }
-        Option<Attribute>.None => {
-          let mut message = List<u8>.make()
-          run message.appendSlice(b"the tree has no attribute '")
-          run message.appendSlice(String.utf8Bytes(String.view(&attribute)))
-          run message.append(39)
-          return run engine.throwError(realm, NativeErrorKind.Type, message.asSlice())
-        }
-      }
-    } else if function == FOCUS {
-      run engine.services.batch.focus(first)
-    } else if function == REMOVE {
-      run engine.services.batch.push(Mutation.Remove { id: first })
-    } else if function == DESTROY {
-      run engine.services.batch.push(Mutation.Destroy { id: first })
-    } else if function == SCROLL_TO {
-      run engine.services.batch.scrollTo(first, f64.toF32(number(argv.get(1).view())), f64.toF32(number(argv.get(2).view())))
-    } else if function == LOG {
-      let line = run text(argv.get(1))
-      run engine.services.logs.append(LogEntry { level: first, text: move line })
-    } else if function == NOW {
-      return ValueBits.number(engine.services.now)
-    } else if function == TIMER {
-      drop engine.services.cancel(first)
-      let delay = number(argv.get(1).view())
-      run engine.services.timers.append(Timer { id: first, due: engine.services.now + if delay > 0.0 { delay } else { 0.0 } })
-    } else if function == CANCEL_TIMER {
-      drop engine.services.cancel(first)
-    } else if function == REQUEST_FRAME {
-      engine.services.frame = true
-    } else if function == DEV_SEND {
-      let line = run text(argv.get(0))
-      run engine.services.outbox.append(move line)
-    } else if function == OPEN {
-      let address = run text(argv.get(0))
-      run engine.services.opened.append(move address)
-    } else if function == DEV_RELOAD {
-      engine.services.reload = true
-    } else if function == FONT_FAMILY {
-      let names = run text(argv.get(1))
-      run engine.services.batch.fontFamily(first, String.view(&names))
-    } else if function == SELECT {
-      run engine.services.batch.select(first, f64.toUsize(number(argv.get(1).view())), f64.toUsize(number(argv.get(2).view())))
+    let outcome = run call(&mut engine.services, function, argv)
+    return match move outcome {
+      Outcome.Returned { value } => value
+      Outcome.TypeError { message } => run engine.throwError(realm, NativeErrorKind.Type, message.asSlice())
     }
-    return ValueBits.Undefined
   }
 
   /// A module the application defined, compiled when something first imports it.
