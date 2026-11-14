@@ -383,6 +383,13 @@ boundary on the nearest line by the same positions. Nothing is shaped outside la
   span split across lines gets one background per line with the outer edges only on its first
   and last pieces. Underline, overline and line-through follow the text color or a decoration
   color, wavy or straight. Glyphs, icons and images go through the shared atlas as sprites.
+- **Stacking** follows CSS 2 Appendix E (`src/stacking.silk`). The viewport makes the root
+  stacking context, and so do boxes with a `z-index` other than `auto` (positioned boxes and
+  flex or grid items), `opacity` below 1, a backdrop blur, `position: fixed` or `sticky`. The
+  root context paints the root element's background first. Each context paints negative
+  `z-index`, then its in-flow content, `z-index: auto` and 0 in document order, then positive `z-index`. Positioned boxes
+  paint from their context inside the clips and scroll groups of the boxes they sit in. Hit
+  testing walks the same order backwards. A snapshot of one node paints in tree order.
 - **Replay.** Each fragment gets a hash of everything that affects its subtree's paint. When a
   subtree's hash, clip and scale match the previous frame, its operations are copied with
   `Scene.replay` instead of being painted again. `tree.stats` (`FrameStats`) counts replayed and
@@ -482,7 +489,8 @@ the wasm build draw the same bytes.
 
 ## Limits
 
-- Paint follows tree order: no `z-index` stacking contexts yet.
+- In-flow content of a stacking context paints in tree order, without CSS's split into block
+  backgrounds, floats and inline content; positioned inline boxes paint in flow.
 - One box shadow per box, and the `overflow: hidden` clip is the padding box rectangle, not
   rounded.
 - Styles are resolved for the whole tree whenever any style changes (cheap next to layout, but
