@@ -8,6 +8,7 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
   import ui_tree.legacy { UiTree, TreeError, Batch, Mutation }
   import codec.image { Image }
   import codec.decode
+  import font_web.lib { decode as decodeFont, WebFontError }
   import silk.collections.bytes { Bytes }
   import silk.collections.list { List }
   import silk.concurrency.thread { Transferable }
@@ -40,6 +41,8 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
   struct LoadInput {
     source: Source,
     icon: bool,
+    /// Whether the file is a font: WOFF and WOFF2 are decoded to sfnt on the worker.
+    font: bool,
     cancel: Cancellation
   }
 
@@ -49,6 +52,8 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
     Ready { image: Image },
     /// An icon's SVG bytes, parsed by the tree when installed.
     Svg { data: Bytes },
+    /// A font file as TrueType or OpenType (WOFF and WOFF2 decoded), for `loadFontFace`.
+    Font { data: Bytes },
     Failed { error: ImageError },
     Cancelled
   }
@@ -290,7 +295,7 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
                   run tree.apply(run batch.take())
                   drop entries[j].load.finish(job.generation, ImageError.None)
                 }
-                Loaded.Svg { data } => if fonts {
+                Loaded.Font { data } => {
                   let loaded = run tree.loadFontFace(job.resource, move data, 0)
                   let error = if loaded {
                     ImageError.None
@@ -298,7 +303,8 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
                     ImageError.Decode
                   }
                   drop entries[j].load.finish(job.generation, error)
-                } else {
+                }
+                Loaded.Svg { data } => {
                   let mut batch = Batch.make()
                   run batch.icon(job.resource, data.asSlice())
                   let installed = run Effect.catch<TreeError>(applyIcon(&mut tree, run batch.take()), badIcon)
@@ -332,11 +338,16 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
         ) {
           let mut allocator = Allocator.systemAllocatorProvider()
           let cancel = run Cancellation.make() |> Effect.provideMut<Allocator>(&mut allocator)
-          let input = LoadInput { source: move source, icon: entries[i].icon, cancel: cancel.clone() }
+          let input = LoadInput {
+            source: move source,
+            icon: entries[i].icon,
+            font: fonts,
+            cancel: cancel.clone(),
+          }
           let start = run Effect.result(
             Background<LoadOutput>.start(
               fn() -> LoadOutput {
-                return LoadOutput { value: load(move input.source, input.icon, move input.cancel) }
+                return LoadOutput { value: load(move input.source, input.icon, input.font, move input.cancel) }
               },
             ),
           )
@@ -433,7 +444,7 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
     return false
   }
 
-  effect fn decodeSource(source: Source, icon: bool, cancel: Cancellation) -> Loaded
+  effect fn decodeSource(source: Source, icon: bool, font: bool, cancel: Cancellation) -> Loaded
     ! ImageError | OutOfMemoryError
     ? &mut Allocator {
     if cancel.cancelled() {
@@ -442,6 +453,20 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
     let bytes = run read(&source)
     if bytes.length() > 16777216 {
       fail ImageError.TooLarge
+    }
+    if font {
+      return match move run Effect.result(decodeFont(bytes.asSlice())) {
+        Result.Success { value: data } => Loaded.Font { data: move data }
+        Result.Failure { error } => match move error {
+          WebFontError failure => {
+            drop failure
+            Loaded.Failed { error: ImageError.Decode }
+          }
+          OutOfMemoryError failure => {
+          fail move failure
+        }
+        }
+      }
     }
     if icon {
       return Loaded.Svg { data: move bytes }
@@ -462,9 +487,9 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
     }
   }
 
-  fn load(source: Source, icon: bool, cancel: Cancellation) -> Loaded {
+  fn load(source: Source, icon: bool, font: bool, cancel: Cancellation) -> Loaded {
     let mut allocator = Allocator.systemAllocatorProvider()
-    let result = run Effect.result(decodeSource(move source, icon, move cancel))
+    let result = run Effect.result(decodeSource(move source, icon, font, move cancel))
       |> Effect.provideMut<Allocator>(&mut allocator)
     return match move result {
       Result.Success { value } => move value
@@ -479,7 +504,7 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
   }
 
   // Resolve relative paths at submission time, before a worker can observe a changed cwd.
-  effect fn resolveFile(value: string) -> String
+  pub effect fn resolveFile(value: string) -> String
     ! FileError | HostInputError | OutOfMemoryError
     ? &mut Allocator {
     static if Intrinsic.targetOperatingSystem() == "windows" {
