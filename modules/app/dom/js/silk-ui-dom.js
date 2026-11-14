@@ -203,9 +203,10 @@ class Writer {
 /**
  * Runs the program in `wasm` (a URL, a Response, bytes or a compiled module) inside `root`.
  *
- * `fonts` names the font families the program's `css.fontFamily(n)` numbers stand for, as CSS
- * `font-family` values: `{ 1: "Inter, sans-serif" }`. Images and icons are named by URL in the
- * program (`h.image("photos/a.png")`): the page loads them, relative ones from the app's root.
+ * `fonts` names the font families the program's `css.fontFamilyNumber(n)` numbers stand for,
+ * as CSS `font-family` values: `{ 1: "Inter, sans-serif" }`; a program's own `Font`s need
+ * nothing here. Images, icons and font faces are named by URL in the program
+ * (`h.image("photos/a.png")`): the page loads them, relative ones from the app's root.
  * `loaders` adds schemes of the app's own, `{ db: async (url) => blob }`, each answering with a
  * Blob or an address. `base` is what comes before a link's path
  * in its address when the site is not at the root of its origin (`"/docs"`). `imports` adds

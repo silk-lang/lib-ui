@@ -37,8 +37,7 @@ sudo apt-get install libx11-dev libxkbcommon-dev libwayland-dev wayland-protocol
 ::source examples/apps/hello/src/main.silk "effect fn counter"
 
 - `Window.make(title, width, height)` describes the window. Nothing opens yet.
-- `window.font(1, "system-ui, sans-serif")` says what font family number 1 means here. Styles name families by number, as in `css.fontFamily(1)`, and each host decides which fonts that is. A list of names works as in CSS: the first one that is installed wins.
-- `systemFonts()` loads the fonts installed on the machine. An app that ships its own fonts makes a `FontCollection` from those instead.
+- `systemFonts()` loads the fonts installed on the machine: the ones text uses unless the program declares its own (see [Images and fonts](/core/images-and-fonts/#fonts)).
 - `show` opens the window and runs the program in it. It returns when the window closes, with the exit code.
 
 The four type arguments of `show` are the model, the message type, the command type, and what the commands need. The counter has no commands, so those are `NoCommand` and `never`.
