@@ -13,7 +13,7 @@ import layout.lib {
   Visibility,
 }
 pub import properties.computed { Text as TextStyle, Paint, Fill, DisplayOutside, DisplayInside }
-import properties.computed { BorderStyle, DecorationLine, WhiteSpace, ObjectFit }
+import properties.computed { BorderStyle, DecorationLine, WhiteSpace, ObjectFit, WritingMode, Direction }
 import properties.convert { Context }
 import properties.values { Unit }
 import properties.convert
@@ -22,7 +22,9 @@ import silk.collections.hash { Hash, HashSeed }
 import silk.color.rgba { Rgba }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
+import silk.core.equal { Equal }
 import silk.geometry.insets { Insets }
+import silk.geometry.rect { Rect }
 import silk.num.f32
 import silk.num.u8
 import silk.num.u32
@@ -37,9 +39,165 @@ pub struct Computed {
   /// lays out as zero.
   pub paint: Paint,
   pub text: TextStyle,
+  pub outline: Outline,
+  pub scroll: ScrollStyle,
 }
 
 impl Copy for Computed {}
+
+/// `outline`: a ring `offset` outside the border box, drawn over the content.
+pub struct Outline {
+  pub width: f32,
+  pub style: BorderStyle,
+  /// `outline-style: auto`, the platform focus ring.
+  pub auto: bool,
+  pub color: Rgba<f32>,
+  /// `outline-color: auto`: the focus ring color for an `auto` ring, the text color otherwise.
+  pub colorAuto: bool,
+  pub offset: f32,
+}
+
+impl Copy for Outline {}
+
+impl Outline {
+  pub fn initial() -> Outline {
+    return Outline {
+      width: 3.0,
+      style: BorderStyle.None,
+      auto: false,
+      color: Rgba<f32> { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+      colorAuto: true,
+      offset: 0.0,
+    }
+  }
+
+  /// Whether the ring draws: it has a style and a width.
+  pub fn drawn(self: &Self) -> bool {
+    return (self.auto || self.style != BorderStyle.None) && self.width > 0.0
+  }
+}
+
+/// `overscroll-behavior` per axis.
+pub enum Overscroll {
+  Auto,
+  Contain,
+  None,
+}
+
+impl Equal for Overscroll {
+  fn equals(left: &Overscroll, right: &Overscroll) -> bool {
+    return left.* == right.*
+  }
+}
+
+/// What a scroll container does with scrolls: chaining, smooth programmatic scrolls, and the
+/// scroll margin and padding `scrollIntoView` keeps clear.
+pub struct ScrollStyle {
+  pub overscrollX: Overscroll,
+  pub overscrollY: Overscroll,
+  /// `scroll-behavior: smooth`.
+  pub smooth: bool,
+  /// `scroll-margin` of the box, in pixels.
+  pub margin: Insets<f32>,
+  /// `scroll-padding` of the scroll container; `auto` is zero.
+  pub padding: Edges,
+}
+
+impl Copy for ScrollStyle {}
+
+impl ScrollStyle {
+  pub fn initial() -> ScrollStyle {
+    return ScrollStyle {
+      overscrollX: Overscroll.Auto,
+      overscrollY: Overscroll.Auto,
+      smooth: false,
+      margin: Insets<f32>.zero(),
+      padding: Edges.all(Dimension.px(0.0)),
+    }
+  }
+}
+
+impl ScrollStyle {
+  /// The part of scrollport `rect` that `scroll-padding` leaves for revealed boxes.
+  pub fn port(self: &Self, rect: Rect<f32>) -> Rect<f32> {
+    let w = rect.width()
+    let h = rect.height()
+    let p = self.padding
+    let x0 = rect.xMin + p.left.value + p.left.percent * w
+    let x1 = rect.xMax - p.right.value - p.right.percent * w
+    let y0 = rect.yMin + p.top.value + p.top.percent * h
+    let y1 = rect.yMax - p.bottom.value - p.bottom.percent * h
+    return Rect<f32>.new(x0, y0, f32.max(x0, x1), f32.max(y0, y1))
+  }
+
+  /// Border box `rect` grown by `scroll-margin`: what revealing the box brings into view.
+  pub fn target(self: &Self, rect: Rect<f32>) -> Rect<f32> {
+    let m = self.margin
+    return Rect<f32>.new(rect.xMin - m.left, rect.yMin - m.top, rect.xMax + m.right, rect.yMax + m.bottom)
+  }
+}
+
+fn overscrollOf(value: &Value) -> Option<Overscroll> {
+  return match convert.keywordOf(value) {
+    Option.Some { value: word } => {
+      if word == Keyword.Auto {
+        Option<Overscroll>.some(Overscroll.Auto)
+      } else if word == Keyword.Contain {
+        Option<Overscroll>.some(Overscroll.Contain)
+      } else if word == Keyword.None {
+        Option<Overscroll>.some(Overscroll.None)
+      } else {
+        Option<Overscroll>.None
+      }
+    }
+    Option.None => Option<Overscroll>.None
+  }
+}
+
+fn setOverscroll(target: &mut Overscroll, value: &Value) -> () {
+  match overscrollOf(value) {
+    Option.Some { value: found } => {
+      target.* = found
+    }
+    Option.None => {}
+  }
+}
+
+/// The physical side (0 top, 1 right, 2 bottom, 3 left) of a logical one, as css-logical maps
+/// it for the box's writing mode and direction.
+fn physicalSide(mode: WritingMode, direction: Direction, block: bool, end: bool) -> usize {
+  let rtl = direction == Direction.Rtl
+  if mode == WritingMode.HorizontalTb {
+    if block {
+      return if end { 2 } else { 0 }
+    }
+    return if end != rtl { 1 } else { 3 }
+  }
+  if block {
+    let rightFirst = mode == WritingMode.VerticalRl || mode == WritingMode.SidewaysRl
+    return if end == rightFirst { 3 } else { 1 }
+  }
+  let bottomFirst = mode == WritingMode.SidewaysLr
+  return if (end != rtl) != bottomFirst { 2 } else { 0 }
+}
+
+fn pickSide(side: usize, top: CssProperty, right: CssProperty, bottom: CssProperty, left: CssProperty) -> CssProperty {
+  return if side == 0 { top } else if side == 1 { right } else if side == 2 { bottom } else { left }
+}
+
+/// The outline style keyword: the border styles, with the line styles the tree does not draw
+/// painted as the nearest one it does.
+fn outlineStyleOf(word: Keyword) -> Option<BorderStyle> {
+  if word == Keyword.Dotted {
+    return Option<BorderStyle>.some(BorderStyle.Dashed)
+  }
+  if word == Keyword.Double || word == Keyword.Groove || word == Keyword.Ridge
+    || word == Keyword.Inset
+    || word == Keyword.Outset {
+    return Option<BorderStyle>.some(BorderStyle.Solid)
+  }
+  return keyword_enums.borderStyleOf(word)
+}
 
 fn setDimension(target: &mut Dimension, value: &Value, context: &Context) -> () {
   match convert.dimension(value, context) {
@@ -58,6 +216,16 @@ fn setGap(target: &mut Dimension, value: &Value, context: &Context) -> () {
       } else {
         found
       }
+    }
+    Option.None => {}
+  }
+}
+
+/// A `scroll-padding` side: `auto` is zero, a length or a percentage of the scrollport.
+fn setScrollPadding(target: &mut Dimension, value: &Value, context: &Context) -> () {
+  match convert.dimension(value, context) {
+    Option.Some { value: found } => {
+      target.* = if found.kind == DimensionKind.Auto { Dimension.px(0.0) } else { found }
     }
     Option.None => {}
   }
@@ -105,7 +273,13 @@ fn setColor(target: &mut Rgba<f32>, value: &Value) -> bool {
 impl Computed {
   /// The initial style of an element whose parent's text style is `text`.
   pub fn inheriting(text: TextStyle) -> Computed {
-    return Computed { layout: CssStyle.make(), paint: Paint.initial(), text: text }
+    return Computed {
+      layout: CssStyle.make(),
+      paint: Paint.initial(),
+      text: text,
+      outline: Outline.initial(),
+      scroll: ScrollStyle.initial(),
+    }
   }
 
   /// Applies one declaration. A value that does not fit its property is ignored, as an
@@ -153,6 +327,39 @@ impl Computed {
         self.set(b, value)
       }
     }
+  }
+
+  /// Applies a logical longhand as the physical one it maps to now: the box's own writing mode
+  /// and direction, inherited or declared before it.
+  fn logical(self: &mut Self, value: &Value, block: bool, end: bool, top: CssProperty, right: CssProperty, bottom: CssProperty, left: CssProperty) -> () {
+    let side = physicalSide(self.text.writingMode, self.text.direction, block, end)
+    self.set(pickSide(side, top, right, bottom, left), value)
+  }
+
+  /// A logical corner radius: the corner between a block side and an inline side.
+  fn logicalCorner(self: &mut Self, value: &Value, blockEnd: bool, inlineEnd: bool) -> () {
+    let block = physicalSide(self.text.writingMode, self.text.direction, true, blockEnd)
+    let inline = physicalSide(self.text.writingMode, self.text.direction, false, inlineEnd)
+    let top = block == 0 || inline == 0
+    let left = block == 3 || inline == 3
+    self.set(
+      if top && left {
+        CssProperty.BorderTopLeftRadius
+      } else if top {
+        CssProperty.BorderTopRightRadius
+      } else if left {
+        CssProperty.BorderBottomLeftRadius
+      } else {
+        CssProperty.BorderBottomRightRadius
+      },
+      value,
+    )
+  }
+
+  /// A logical size: `inline` sizes are widths in horizontal writing and heights in vertical.
+  fn logicalSize(self: &mut Self, value: &Value, inline: bool, width: CssProperty, height: CssProperty) -> () {
+    let horizontal = self.text.writingMode == WritingMode.HorizontalTb
+    self.set(if inline == horizontal { width } else { height }, value)
   }
 
   fn set(self: &mut Self, property: CssProperty, value: &Value) -> () {
@@ -227,6 +434,208 @@ impl Computed {
         }
       }
 
+      // Logical properties, mapped to the physical ones.
+      CssProperty.MarginBlockStart => {
+        self.logical(value, true, false, CssProperty.MarginTop, CssProperty.MarginRight, CssProperty.MarginBottom, CssProperty.MarginLeft)
+      }
+      CssProperty.MarginBlockEnd => {
+        self.logical(value, true, true, CssProperty.MarginTop, CssProperty.MarginRight, CssProperty.MarginBottom, CssProperty.MarginLeft)
+      }
+      CssProperty.MarginInlineStart => {
+        self.logical(value, false, false, CssProperty.MarginTop, CssProperty.MarginRight, CssProperty.MarginBottom, CssProperty.MarginLeft)
+      }
+      CssProperty.MarginInlineEnd => {
+        self.logical(value, false, true, CssProperty.MarginTop, CssProperty.MarginRight, CssProperty.MarginBottom, CssProperty.MarginLeft)
+      }
+      CssProperty.PaddingBlockStart => {
+        self.logical(value, true, false, CssProperty.PaddingTop, CssProperty.PaddingRight, CssProperty.PaddingBottom, CssProperty.PaddingLeft)
+      }
+      CssProperty.PaddingBlockEnd => {
+        self.logical(value, true, true, CssProperty.PaddingTop, CssProperty.PaddingRight, CssProperty.PaddingBottom, CssProperty.PaddingLeft)
+      }
+      CssProperty.PaddingInlineStart => {
+        self.logical(value, false, false, CssProperty.PaddingTop, CssProperty.PaddingRight, CssProperty.PaddingBottom, CssProperty.PaddingLeft)
+      }
+      CssProperty.PaddingInlineEnd => {
+        self.logical(value, false, true, CssProperty.PaddingTop, CssProperty.PaddingRight, CssProperty.PaddingBottom, CssProperty.PaddingLeft)
+      }
+      CssProperty.InsetBlockStart => {
+        self.logical(value, true, false, CssProperty.Top, CssProperty.Right, CssProperty.Bottom, CssProperty.Left)
+      }
+      CssProperty.InsetBlockEnd => {
+        self.logical(value, true, true, CssProperty.Top, CssProperty.Right, CssProperty.Bottom, CssProperty.Left)
+      }
+      CssProperty.InsetInlineStart => {
+        self.logical(value, false, false, CssProperty.Top, CssProperty.Right, CssProperty.Bottom, CssProperty.Left)
+      }
+      CssProperty.InsetInlineEnd => {
+        self.logical(value, false, true, CssProperty.Top, CssProperty.Right, CssProperty.Bottom, CssProperty.Left)
+      }
+      CssProperty.BorderBlockStartWidth => {
+        self.logical(value, true, false, CssProperty.BorderTopWidth, CssProperty.BorderRightWidth, CssProperty.BorderBottomWidth, CssProperty.BorderLeftWidth)
+      }
+      CssProperty.BorderBlockEndWidth => {
+        self.logical(value, true, true, CssProperty.BorderTopWidth, CssProperty.BorderRightWidth, CssProperty.BorderBottomWidth, CssProperty.BorderLeftWidth)
+      }
+      CssProperty.BorderInlineStartWidth => {
+        self.logical(value, false, false, CssProperty.BorderTopWidth, CssProperty.BorderRightWidth, CssProperty.BorderBottomWidth, CssProperty.BorderLeftWidth)
+      }
+      CssProperty.BorderInlineEndWidth => {
+        self.logical(value, false, true, CssProperty.BorderTopWidth, CssProperty.BorderRightWidth, CssProperty.BorderBottomWidth, CssProperty.BorderLeftWidth)
+      }
+      // The tree paints one border style and color, so every side sets them.
+      CssProperty.BorderBlockStartStyle => {
+        self.setBorderStyle(value)
+      }
+      CssProperty.BorderBlockEndStyle => {
+        self.setBorderStyle(value)
+      }
+      CssProperty.BorderInlineStartStyle => {
+        self.setBorderStyle(value)
+      }
+      CssProperty.BorderInlineEndStyle => {
+        self.setBorderStyle(value)
+      }
+      CssProperty.BorderBlockStartColor => {
+        drop setColor(&mut self.paint.borderColor, value)
+      }
+      CssProperty.BorderBlockEndColor => {
+        drop setColor(&mut self.paint.borderColor, value)
+      }
+      CssProperty.BorderInlineStartColor => {
+        drop setColor(&mut self.paint.borderColor, value)
+      }
+      CssProperty.BorderInlineEndColor => {
+        drop setColor(&mut self.paint.borderColor, value)
+      }
+      CssProperty.BorderStartStartRadius => {
+        self.logicalCorner(value, false, false)
+      }
+      CssProperty.BorderStartEndRadius => {
+        self.logicalCorner(value, false, true)
+      }
+      CssProperty.BorderEndStartRadius => {
+        self.logicalCorner(value, true, false)
+      }
+      CssProperty.BorderEndEndRadius => {
+        self.logicalCorner(value, true, true)
+      }
+      CssProperty.InlineSize => {
+        self.logicalSize(value, true, CssProperty.Width, CssProperty.Height)
+      }
+      CssProperty.BlockSize => {
+        self.logicalSize(value, false, CssProperty.Width, CssProperty.Height)
+      }
+      CssProperty.MinInlineSize => {
+        self.logicalSize(value, true, CssProperty.MinWidth, CssProperty.MinHeight)
+      }
+      CssProperty.MinBlockSize => {
+        self.logicalSize(value, false, CssProperty.MinWidth, CssProperty.MinHeight)
+      }
+      CssProperty.MaxInlineSize => {
+        self.logicalSize(value, true, CssProperty.MaxWidth, CssProperty.MaxHeight)
+      }
+      CssProperty.MaxBlockSize => {
+        self.logicalSize(value, false, CssProperty.MaxWidth, CssProperty.MaxHeight)
+      }
+      CssProperty.OverflowInline => {
+        self.logicalSize(value, true, CssProperty.OverflowX, CssProperty.OverflowY)
+      }
+      CssProperty.OverflowBlock => {
+        self.logicalSize(value, false, CssProperty.OverflowX, CssProperty.OverflowY)
+      }
+      CssProperty.OverscrollBehaviorInline => {
+        self.logicalSize(value, true, CssProperty.OverscrollBehaviorX, CssProperty.OverscrollBehaviorY)
+      }
+      CssProperty.OverscrollBehaviorBlock => {
+        self.logicalSize(value, false, CssProperty.OverscrollBehaviorX, CssProperty.OverscrollBehaviorY)
+      }
+      CssProperty.ScrollMarginBlockStart => {
+        self.logical(value, true, false, CssProperty.ScrollMarginTop, CssProperty.ScrollMarginRight, CssProperty.ScrollMarginBottom, CssProperty.ScrollMarginLeft)
+      }
+      CssProperty.ScrollMarginBlockEnd => {
+        self.logical(value, true, true, CssProperty.ScrollMarginTop, CssProperty.ScrollMarginRight, CssProperty.ScrollMarginBottom, CssProperty.ScrollMarginLeft)
+      }
+      CssProperty.ScrollMarginInlineStart => {
+        self.logical(value, false, false, CssProperty.ScrollMarginTop, CssProperty.ScrollMarginRight, CssProperty.ScrollMarginBottom, CssProperty.ScrollMarginLeft)
+      }
+      CssProperty.ScrollMarginInlineEnd => {
+        self.logical(value, false, true, CssProperty.ScrollMarginTop, CssProperty.ScrollMarginRight, CssProperty.ScrollMarginBottom, CssProperty.ScrollMarginLeft)
+      }
+      CssProperty.ScrollPaddingBlockStart => {
+        self.logical(value, true, false, CssProperty.ScrollPaddingTop, CssProperty.ScrollPaddingRight, CssProperty.ScrollPaddingBottom, CssProperty.ScrollPaddingLeft)
+      }
+      CssProperty.ScrollPaddingBlockEnd => {
+        self.logical(value, true, true, CssProperty.ScrollPaddingTop, CssProperty.ScrollPaddingRight, CssProperty.ScrollPaddingBottom, CssProperty.ScrollPaddingLeft)
+      }
+      CssProperty.ScrollPaddingInlineStart => {
+        self.logical(value, false, false, CssProperty.ScrollPaddingTop, CssProperty.ScrollPaddingRight, CssProperty.ScrollPaddingBottom, CssProperty.ScrollPaddingLeft)
+      }
+      CssProperty.ScrollPaddingInlineEnd => {
+        self.logical(value, false, true, CssProperty.ScrollPaddingTop, CssProperty.ScrollPaddingRight, CssProperty.ScrollPaddingBottom, CssProperty.ScrollPaddingLeft)
+      }
+      // Outline.
+      CssProperty.OutlineWidth => {
+        setBorderWidth(&mut self.outline.width, value, &context)
+      }
+      CssProperty.OutlineStyle => {
+        if convert.isKeyword(value, Keyword.Auto) {
+          self.outline.auto = true
+        } else if let Option.Some { value: word } = convert.keywordOf(value) {
+          if let Option.Some { value: found } = outlineStyleOf(word) {
+            self.outline.style = found
+            self.outline.auto = false
+          }
+        }
+      }
+      CssProperty.OutlineColor => {
+        if convert.isKeyword(value, Keyword.Auto) {
+          self.outline.colorAuto = true
+        } else if setColor(&mut self.outline.color, value) {
+          self.outline.colorAuto = false
+        }
+      }
+      CssProperty.OutlineOffset => {
+        setPixels(&mut self.outline.offset, value, &context)
+      }
+      // Scrolling.
+      CssProperty.OverscrollBehaviorX => {
+        setOverscroll(&mut self.scroll.overscrollX, value)
+      }
+      CssProperty.OverscrollBehaviorY => {
+        setOverscroll(&mut self.scroll.overscrollY, value)
+      }
+      CssProperty.ScrollBehavior => {
+        if convert.isKeyword(value, Keyword.Smooth) {
+          self.scroll.smooth = true
+        } else if convert.isKeyword(value, Keyword.Auto) {
+          self.scroll.smooth = false
+        }
+      }
+      CssProperty.ScrollMarginTop => {
+        setPixels(&mut self.scroll.margin.top, value, &context)
+      }
+      CssProperty.ScrollMarginRight => {
+        setPixels(&mut self.scroll.margin.right, value, &context)
+      }
+      CssProperty.ScrollMarginBottom => {
+        setPixels(&mut self.scroll.margin.bottom, value, &context)
+      }
+      CssProperty.ScrollMarginLeft => {
+        setPixels(&mut self.scroll.margin.left, value, &context)
+      }
+      CssProperty.ScrollPaddingTop => {
+        setScrollPadding(&mut self.scroll.padding.top, value, &context)
+      }
+      CssProperty.ScrollPaddingRight => {
+        setScrollPadding(&mut self.scroll.padding.right, value, &context)
+      }
+      CssProperty.ScrollPaddingBottom => {
+        setScrollPadding(&mut self.scroll.padding.bottom, value, &context)
+      }
+      CssProperty.ScrollPaddingLeft => {
+        setScrollPadding(&mut self.scroll.padding.left, value, &context)
+      }
       CssProperty.Width => {
         setDimension(&mut self.layout.width, value, &context)
       }
@@ -814,6 +1223,30 @@ impl Computed {
           Option.None => {}
         }
       }
+      // line-clamp's longhands and text-overflow (CSS Overflow 3 and 4).
+      CssProperty.MaxLines => {
+        if convert.isKeyword(value, Keyword.None) {
+          self.layout.maxLines = 0
+        } else if let Option.Some { value: found } = convert.number(value) {
+          if found >= 1.0 {
+            self.layout.maxLines = f32.toUsize(found)
+          }
+        }
+      }
+      CssProperty.BlockEllipsis => {
+        self.layout.blockEllipsis = !convert.isKeyword(value, Keyword.NoEllipsis) && !convert.isKeyword(value, Keyword.None)
+      }
+      CssProperty.TextOverflow => {
+        // With two values the second is the inline end's.
+        let mut last = value
+        if let Value.Sequence { separator: _, values } = &value.* {
+          let items = values.asSlice()
+          if items.length != 0 {
+            last = &items[items.length - 1]
+          }
+        }
+        self.layout.textOverflowEllipsis = convert.isKeyword(last, Keyword.Ellipsis)
+      }
       CssProperty.AspectRatio => {
         // `auto`, `<ratio>`, or `auto <ratio>`.
         match &value.* {
@@ -1089,6 +1522,11 @@ impl Computed {
           2
         },
       )
+    }
+    if self.outline.drawn() {
+      h = floatHash(floatHash(h, self.outline.width), self.outline.offset)
+      h = Hash.combine(Hash.combine(h, borderStyleIndex(self.outline.style)), if self.outline.auto { 1 } else { 0 })
+      h = if self.outline.colorAuto { Hash.combine(h, 5) } else { colorHash(h, self.outline.color) }
     }
     h = floatHash(h, self.paint.opacity)
     h = floatHash(h, self.paint.backdropBlur)
