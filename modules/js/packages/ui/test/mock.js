@@ -4,6 +4,8 @@ export function installMock() {
   const calls = [];
   const record = (name) => (...args) => {
     calls.push([name, ...args]);
+    // The host says whether a role is one the tree has.
+    if (name === "attribute" && args[1] === "role") return !/\bunknown\b/.test(args[2]);
   };
   const native = {};
   for (const name of [

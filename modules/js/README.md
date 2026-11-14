@@ -52,7 +52,13 @@ mount(createBox({ width: 400, height: 300 }, button));
   `disabled`, `label`, `testId`, `placeholder`, `multiline`, `readOnly`, `checked`,
   `selected`, `expanded`, `focusTrap`, `href`, `cursor`, `transition`). A name the tree does
   not have throws a `TypeError`. `cursor` takes the CSS keywords (`pointer`, `text`, `grab`,
-  `not-allowed` and the resize ones).
+  `not-allowed` and the resize ones); the `cursor` style property does the same, and a node
+  without one shows its nearest ancestor's.
+- **Accessibility.** `role` and `aria-*` work as in the DOM, as `aria-label` or `ariaLabel`.
+  `role` takes the first word that names a role the tree has (`"switch checkbox"`), and
+  `aria-label`, `aria-checked`, `aria-selected`, `aria-expanded` and `aria-valuemin`,
+  `aria-valuemax`, `aria-valuenow` set the tree's attributes. Other roles and ARIA names are
+  ignored with one console warning each, until the tree has them.
 - **Links.** A node with an `href` is a link, as an `<a>` is: a click on it or inside it that
   no listener prevented calls `open(href)`, which hands the address to the host.
 - **Errors.** A listener that throws does not stop the dispatch. `setErrorHandler` receives
@@ -89,7 +95,7 @@ createRoot().render(<Counter />);
   first shows (CSS `@starting-style`). `onClick`, `onPointerDown`, `onKeyDown`, `onInput` and so
   on for every event of the tree, with a `Capture` suffix for the capture phase. Listeners
   receive the `@silk/ui` event. Every other prop is a tree attribute (`tabIndex`, `testId`,
-  `label`, `disabled`, `placeholder`).
+  `label`, `disabled`, `placeholder`), and `role` and `aria-*` work as in React DOM.
 - **Inputs.** `value` on `<input>` is controlled as in React DOM: the field shows what the
   component keeps, whatever was typed.
 - **Timing.** `root.render` commits before it returns, so the first frame of a window has

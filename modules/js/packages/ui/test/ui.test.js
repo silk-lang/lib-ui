@@ -186,3 +186,50 @@ test("a click inside a link opens its address unless a listener prevents it", ()
   assert.deepEqual(mock.take(), [["listen", link.id, 0], ["attribute", link.id, "href", ""]]);
   delete globalThis.open;
 });
+
+test("role and aria-* reach the tree under its own names", () => {
+  const box = createBox();
+  mock.take();
+  box.setAttribute("role", "button");
+  box.setAttribute("aria-label", "Save");
+  box.setAttribute("ariaExpanded", true);
+  box.setAttribute("aria-checked", "false");
+  box.setAttribute("aria-selected", "true");
+  assert.deepEqual(mock.take(), [
+    ["attribute", box.id, "role", "button"],
+    ["attribute", box.id, "label", "Save"],
+    ["attribute", box.id, "expanded", true],
+    ["attribute", box.id, "checked", false],
+    ["attribute", box.id, "selected", true],
+  ]);
+});
+
+test("aria-value* make one range, and it clears without a value", () => {
+  const box = createBox();
+  mock.take();
+  box.setAttribute("aria-valuenow", "30");
+  box.setAttribute("ariaValueMax", 50);
+  box.setAttribute("aria-valuenow", null);
+  assert.deepEqual(mock.take(), [
+    ["attribute", box.id, "valueRange", 0, 100, 30],
+    ["attribute", box.id, "valueRange", 0, 50, 30],
+    ["attribute", box.id, "valueRange"],
+  ]);
+});
+
+test("an unknown role or ARIA name warns once and throws nothing", () => {
+  const box = createBox();
+  const warnings = [];
+  const warn = console.warn;
+  console.warn = (message) => warnings.push(message);
+  try {
+    mock.take();
+    box.setAttribute("role", "unknown");
+    box.setAttribute("role", "unknown");
+    box.setAttribute("aria-describedby", "x");
+    assert.deepEqual(mock.take(), [["attribute", box.id, "role", "unknown"], ["attribute", box.id, "role", "unknown"]]);
+    assert.deepEqual(warnings, ["the tree has no role 'unknown': it is ignored", "the tree has no 'aria-describedby' yet: it is ignored"]);
+  } finally {
+    console.warn = warn;
+  }
+});

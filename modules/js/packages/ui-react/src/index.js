@@ -11,7 +11,7 @@
 //   event, which has the DOM members.
 // - `value` on <input>: a controlled value, as in React DOM.
 // - Everything else is a tree attribute: `tabIndex`, `testId`, `label`, `disabled`,
-//   `placeholder` and so on.
+//   `placeholder` and so on, and `role` and `aria-*` as in React DOM.
 import Reconciler from "react-reconciler";
 import {
   ConcurrentRoot,
