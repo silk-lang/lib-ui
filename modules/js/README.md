@@ -50,7 +50,8 @@ mount(createBox({ width: 400, height: 300 }, button));
   `disabled`, `label`, `testId`, `placeholder`, `multiline`, `readOnly`, `checked`,
   `selected`, `expanded`, `focusTrap`, `href`, `cursor`, `transition`). A name the tree does
   not have throws a `TypeError`. `cursor` takes the CSS keywords (`pointer`, `text`, `grab`,
-  `not-allowed` and the resize ones).
+  `not-allowed` and the resize ones); the `cursor` style property does the same, and a node
+  without one shows its nearest ancestor's.
 - **Accessibility.** `role` and `aria-*` work as in the DOM, as `aria-label` or `ariaLabel`.
   `role` takes the first word that names a role the tree has (`"switch checkbox"`). The
   tree has the ARIA states and properties for names, values, levels, sets, toggles, validity
@@ -110,6 +111,10 @@ ref. It is bundled with Vite into one ES module. From `modules/js`, `npm ci && n
 ```sh
 silk run --manifest-path modules/js/demo/silk.toml modules/js/examples/react-counter/dist/app.js
 ```
+
+[examples/text-showcase](examples/text-showcase) is a magazine in five spreads that shows the
+tree's text layout (scripts, bidi, vertical writing modes, floats), each feature labelled, and
+runs in a browser from the same files for comparison.
 
 React 19.3 with react-reconciler 0.34 runs on the engine as it is: the bundle needs only
 the web globals below.

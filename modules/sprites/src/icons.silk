@@ -15,6 +15,7 @@ import atlas.atlas { Atlas, AtlasTile, AtlasError, Kind }
 import svg_render.lib { Animated, RenderOptions, RenderError, Pixmap, Environment }
 import svg_render.lib as renderer
 import svg_core.resources { Resolver }
+import svg_css.colors { Color }
 import silk.collections.hash { Hash, HashKey, HashSeed }
 import silk.collections.hash_map { HashMap }
 import silk.collections.list { List }
@@ -91,6 +92,8 @@ struct IconKey {
   height: u32,
   frame: u32,
   color: bool,
+  /// The host's `currentColor` as RGBA8 for a color tile; zero for a mask.
+  tint: u32,
 }
 
 impl Copy for IconKey {}
@@ -100,6 +103,7 @@ impl HashKey for IconKey {
     return left.icon == right.icon && left.width == right.width && left.height == right.height
       && left.frame == right.frame
       && left.color == right.color
+      && left.tint == right.tint
   }
 
   fn hash(value: &Self, seed: &HashSeed) -> u64 {
@@ -107,6 +111,7 @@ impl HashKey for IconKey {
     hashed = Hash.combine(hashed, u32.toU64(value.width))
     hashed = Hash.combine(hashed, u32.toU64(value.height))
     hashed = Hash.combine(hashed, u32.toU64(value.frame))
+    hashed = Hash.combine(hashed, u32.toU64(value.tint))
     return Hash.combine(
       hashed,
       if value.color {
@@ -121,6 +126,8 @@ impl HashKey for IconKey {
 struct Source {
   document: Animated,
   moves: bool,
+  /// Whether every painted pixel is `currentColor`, once [`IconCache.classify`] has looked.
+  tinted: bool,
 }
 
 pub struct IconCache {
@@ -151,6 +158,32 @@ fn contains(data: &[u8], needle: &[u8]) -> bool {
   return false
 }
 
+fn near(a: u8, b: u8) -> bool {
+  return if a > b {
+    a - b <= 1
+  } else {
+    b - a <= 1
+  }
+}
+
+fn channel(value: f64) -> u32 {
+  if !(value > 0.0) {
+    return 0
+  }
+  if value >= 1.0 {
+    return 255
+  }
+  return f64.toU32(value * 255.0 + 0.5)
+}
+
+/// `color` as RGBA8 with a set low bit, so that no color keys like a mask.
+fn tintOf(color: &Color) -> u32 {
+  return channel(color.channels[0]) * 16777216 + channel(color.channels[1]) * 65536
+    + channel(color.channels[2]) * 256
+    + (channel(color.alpha) & 254)
+    + 1
+}
+
 impl IconCache {
   pub fn make(options: IconOptions) -> IconCache {
     return IconCache {
@@ -172,8 +205,61 @@ impl IconCache {
     let document = run renderer.parseAnimated(data, host)
     let moves = document.animated() || contains(data, b"@keyframes")
     let id = IconId { index: u64.toU32(usize.toU64(self.sources.length())) }
-    run self.sources.append(Option<Source>.some(Source { document: move document, moves: moves }))
+    run self.sources.append(Option<Source>.some(Source { document: move document, moves: moves, tinted: true }))
     return id
+  }
+
+  /// Decides whether `icon` paints only with `currentColor`, by rendering it at `size` pixels
+  /// under two hosts that differ only in `currentColor`: `black` and `white`. Such an icon is
+  /// [`IconCache.tinted`] and draws as a mask in the text color; any other is drawn in color.
+  /// Icons are taken as tinted until classified.
+  pub effect fn classify(
+    self: &mut Self,
+    icon: IconId,
+    size: u32,
+    black: &Environment<'_, '_>,
+    white: &Environment<'_, '_>,
+  ) -> bool
+    ! RenderError | OutOfMemoryError
+    ? &mut Resolver | &mut Allocator {
+    if u32.toUsize(icon.index) >= self.sources.length()
+      || self.sources.asSlice()[u32.toUsize(icon.index)].isNone() {
+      return true
+    }
+    let key = IconKey { icon: icon.index, width: size, height: size, frame: 0, color: true, tint: 0 }
+    let dark = run self.render(black, key)
+    let light = run self.render(white, key)
+    let a = dark.data()
+    let b = light.data()
+    let mut tinted = a.length == b.length
+    let mut i: usize = 0
+    while tinted && i + 3 < a.length {
+      // Premultiplied: black paint has no color, white paint has as much color as coverage.
+      tinted = a[i] <= 1 && a[i + 1] <= 1 && a[i + 2] <= 1 && near(b[i], b[i + 3])
+        && near(b[i + 1], b[i + 3])
+        && near(b[i + 2], b[i + 3])
+        && near(a[i + 3], b[i + 3])
+      i = i + 4
+    }
+    let source = &mut self.sources.asMutSlice()[u32.toUsize(icon.index)]
+    match &mut source.* {
+      Option<Source>.Some { value } => {
+        value.tinted = tinted
+      }
+      Option<Source>.None => {}
+    }
+    return tinted
+  }
+
+  /// Whether `icon` paints only with `currentColor` (see [`IconCache.classify`]).
+  pub fn tinted(self: &Self, icon: IconId) -> bool {
+    if u32.toUsize(icon.index) >= self.sources.length() {
+      return true
+    }
+    return match &self.sources.asSlice()[u32.toUsize(icon.index)] {
+      Option<Source>.Some { value } => value.tinted
+      Option<Source>.None => true
+    }
   }
 
   /// The number of registered icons.
@@ -223,7 +309,7 @@ impl IconCache {
   }
 
   /// The tile of `icon` rendered at `width` x `height` device pixels in `style`, at `time`
-  /// seconds for an animated icon. A hit touches the tile so the atlas keeps it; a miss
+  /// seconds for an animated icon. A color tile is kept per `currentColor` of `host`. A hit touches the tile so the atlas keeps it; a miss
   /// renders the icon with svg_render (the same pixels as `svg_render.lib.render` at that size
   /// and the rounded time) and queues them in [`IconCache.uploads`].
   ///
@@ -251,6 +337,11 @@ impl IconCache {
       height: height,
       frame: self.frameOf(icon, time),
       color: style.color(),
+      tint: if style.color() {
+        tintOf(&host.colors.currentColor)
+      } else {
+        0
+      },
     }
     if let Option<AtlasTile>.Some { value } = self.entries.get(key) {
       if atlas.touch(value.id) {

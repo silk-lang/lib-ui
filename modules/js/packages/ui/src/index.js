@@ -438,8 +438,65 @@ export class Input extends Node {
   }
 }
 
+// Inline SVG markup as icon resources: identical markup shares one, freed when no icon shows
+// it. The ids start high, clear of resources a host or a URL table numbers from 1.
+const ICONS = new Map();
+let nextIcon = 0x40000000;
+
+function holdIcon(markup) {
+  let entry = ICONS.get(markup);
+  if (!entry) {
+    entry = { id: nextIcon++, count: 0 };
+    ICONS.set(markup, entry);
+    native.defineIcon(entry.id, markup);
+  }
+  entry.count++;
+  return entry.id;
+}
+
+function dropIcon(markup) {
+  const entry = ICONS.get(markup);
+  if (entry && --entry.count === 0) {
+    ICONS.delete(markup);
+    native.release(entry.id);
+  }
+}
+
+/**
+ * An icon: SVG drawn at the node's CSS size, as an inline `<svg>` is. Its `currentColor` is
+ * the node's `color`, so an icon that paints only with it (Lucide's, for example) takes the
+ * text color, and any other keeps its own colors.
+ */
+export class Icon extends Node {
+  #svg = "";
+
+  constructor(svg = "") {
+    super("icon");
+    this.svg = svg;
+  }
+
+  /** The SVG markup, as `outerHTML` of an `<svg>` element would give it. */
+  get svg() {
+    return this.#svg;
+  }
+
+  set svg(markup) {
+    markup = markup == null ? "" : String(markup);
+    if (markup === this.#svg) return;
+    if (this.#svg) dropIcon(this.#svg);
+    this.#svg = markup;
+    native.source(this.id, markup ? holdIcon(markup) : 0);
+  }
+
+  _forget() {
+    if (this.#svg) dropIcon(this.#svg);
+    this.#svg = "";
+  }
+}
+
 function forget(node) {
   nodes.delete(node.id);
+  node._forget?.();
   for (const child of node.childNodes) {
     child.parentNode = null;
     forget(child);
@@ -451,6 +508,7 @@ export function createNode(kind) {
   if (!(kind in KINDS)) throw new TypeError("the tree has no node kind '" + kind + "'");
   if (kind === "text") return new Text();
   if (kind === "input") return new Input();
+  if (kind === "icon") return new Icon();
   return new Node(kind);
 }
 
@@ -464,6 +522,13 @@ export function createBox(style, ...children) {
 
 export function createText(data = "") {
   return new Text(data);
+}
+
+/** An icon showing `svg` markup, with `style` as its base look. */
+export function createIcon(svg, style) {
+  const icon = new Icon(svg);
+  if (style) icon.style.set(style);
+  return icon;
 }
 
 export function createInput(style) {
