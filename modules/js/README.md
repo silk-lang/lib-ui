@@ -112,6 +112,10 @@ ref. It is bundled with Vite into one ES module. From `modules/js`, `npm ci && n
 silk run --manifest-path modules/js/demo/silk.toml modules/js/examples/react-counter/dist/app.js
 ```
 
+[examples/text-showcase](examples/text-showcase) is a magazine in five spreads that shows the
+tree's text layout (scripts, bidi, vertical writing modes, floats), each feature labelled, and
+runs in a browser from the same files for comparison.
+
 React 19.3 with react-reconciler 0.34 runs on the engine as it is: the bundle needs only
 the web globals below.
 
