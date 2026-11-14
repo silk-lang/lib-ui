@@ -120,10 +120,65 @@ typedef struct {
 void *GetProcessHeap(void);
 void *HeapAlloc(void *heap, uint32_t flags, size_t size);
 BOOL HeapFree(void *heap, uint32_t flags, void *memory);
-void AcquireSRWLockExclusive(SRWLOCK *lock);
-void ReleaseSRWLockExclusive(SRWLOCK *lock);
-int LocaleNameToLCID(const WCHAR *name, uint32_t flags);
-HINSTANCE GetModuleHandleW(const WCHAR *name);
+// The Silk toolchain links only the few kernel32 functions its runtime uses, so this file
+// avoids the others: a spin lock stands in for SRW locks, `__ImageBase` for
+// `GetModuleHandleW(NULL)`, and a table for `LocaleNameToLCID`.
+extern char __ImageBase;
+
+static void AcquireSRWLockExclusive(SRWLOCK *lock) {
+    while (__atomic_exchange_n((volatile long *)&lock->ptr, 1, __ATOMIC_ACQUIRE)) {
+        while (__atomic_load_n((volatile long *)&lock->ptr, __ATOMIC_RELAXED)) __builtin_ia32_pause();
+    }
+}
+
+static void ReleaseSRWLockExclusive(SRWLOCK *lock) {
+    __atomic_store_n((volatile long *)&lock->ptr, 0, __ATOMIC_RELEASE);
+}
+
+// The LCID of BCP 47 tag `name` (UTF-16): its language with the default region, or the
+// region given for a few common pairs; 0 when unknown.
+static int LocaleNameToLCID(const WCHAR *name, uint32_t flags) {
+    (void)flags;
+    static const struct { char tag[8]; int lcid; } table[] = {
+        {"en-gb", 0x0809}, {"en-au", 0x0c09}, {"en-ca", 0x1009}, {"pt-pt", 0x0816},
+        {"zh-cn", 0x0804}, {"zh-hans", 0x0804}, {"zh-sg", 0x1004}, {"zh-hk", 0x0c04},
+        {"fr-ca", 0x0c0c}, {"es-mx", 0x080a}, {"de-at", 0x0c07}, {"de-ch", 0x0807},
+        {"en", 0x0409}, {"fr", 0x040c}, {"de", 0x0407}, {"es", 0x0c0a}, {"it", 0x0410},
+        {"pt", 0x0416}, {"nl", 0x0413}, {"sv", 0x041d}, {"da", 0x0406}, {"nb", 0x0414},
+        {"no", 0x0414}, {"nn", 0x0814}, {"fi", 0x040b}, {"pl", 0x0415}, {"cs", 0x0405},
+        {"sk", 0x041b}, {"hu", 0x040e}, {"ro", 0x0418}, {"ru", 0x0419}, {"uk", 0x0422},
+        {"el", 0x0408}, {"tr", 0x041f}, {"he", 0x040d}, {"ar", 0x0401}, {"fa", 0x0429},
+        {"hi", 0x0439}, {"th", 0x041e}, {"vi", 0x042a}, {"id", 0x0421}, {"ms", 0x043e},
+        {"zh", 0x0404}, {"ja", 0x0411}, {"ko", 0x0412}, {"bg", 0x0402}, {"hr", 0x041a},
+        {"sr", 0x081a}, {"sl", 0x0424}, {"lt", 0x0427}, {"lv", 0x0426}, {"et", 0x0425},
+        {"ca", 0x0403}, {"eu", 0x042d}, {"gl", 0x0456}, {"is", 0x040f}, {"ga", 0x083c},
+        {"cy", 0x0452}, {"af", 0x0436}, {"sw", 0x0441}, {"bn", 0x0445}, {"ta", 0x0449},
+        {"te", 0x044a}, {"mr", 0x044e}, {"ur", 0x0420}, {"ka", 0x0437}, {"hy", 0x042b},
+        {"kk", 0x043f}, {"uz", 0x0443}, {"az", 0x042c}, {"mk", 0x042f}, {"sq", 0x041c},
+    };
+    char lower[16];
+    size_t n = 0;
+    while (name[n] && n < sizeof lower - 1) {
+        WCHAR c = name[n];
+        if (c >= 'A' && c <= 'Z') c = (WCHAR)(c - 'A' + 'a');
+        if (c == '_') c = '-';
+        if (c > 127) return 0;
+        lower[n++] = (char)c;
+    }
+    lower[n] = 0;
+    // The longest entry that is the tag or a prefix of it ending at a '-'.
+    for (size_t pass = 0; pass < 2; pass++) {
+        for (size_t i = 0; i < sizeof table / sizeof table[0]; i++) {
+            const char *tag = table[i].tag;
+            size_t k = 0;
+            while (tag[k] && tag[k] == lower[k]) k++;
+            if (tag[k]) continue;
+            int whole = lower[k] == 0;
+            if ((pass == 0 && whole) || (pass == 1 && lower[k] == '-')) return table[i].lcid;
+        }
+    }
+    return 0;
+}
 
 LONG_PTR SetWindowLongPtrW(HWND hwnd, int index, LONG_PTR value);
 LONG_PTR GetWindowLongPtrW(HWND hwnd, int index);
@@ -2562,7 +2617,7 @@ static const WCHAR test_title[] = {'S', 'i', 'l', 'k', ' ', 'A', 'c', 'c', 'e', 
 
 uint64_t silk_ak_win_attach_test(void) {
     static int registered;
-    HINSTANCE instance = GetModuleHandleW(NULL);
+    HINSTANCE instance = (HINSTANCE)&__ImageBase;
     if (!registered) {
         WNDCLASSW windowClass = {0};
         windowClass.proc = DefWindowProcW;
