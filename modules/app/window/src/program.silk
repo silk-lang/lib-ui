@@ -32,7 +32,7 @@
 //!
 //! A worker thread reaches the program through a [`Poster`]: `poster.post(name, text)` is
 //! heard by `subs.port(key, name, …)` on the UI thread.
-import lib { WindowContent, runWindowHosted }
+import lib { WindowContent, runWindowHosted, Loader }
 import ui_app.app { App }
 import ui_app.program { Program, CommandSet, Hosted, Run, make }
 import ui_app.runtime { Runtime }
@@ -135,6 +135,7 @@ pub struct Window {
   width: f64,
   height: f64,
   resources: Batch,
+  files: List<CarriedFile>,
   inspect: bool,
   check: bool,
   checkClick: string<'static>,
@@ -162,6 +163,7 @@ impl Window {
       width: width,
       height: height,
       resources: Batch.make(),
+      files: List<CarriedFile>.make(),
       inspect: true,
       check: false,
       checkClick: "",
@@ -179,18 +181,14 @@ impl Window {
     run self.resources.fontFamily(family, names)
   }
 
-  /// The image `h.image(resource)` shows, from an encoded file's bytes.
-  pub effect fn image(self: &mut Self, resource: u32, data: &[u8]) -> ()
+  /// Serves the relative URL `path` from `data`, bytes the program carries, so
+  /// `h.image("photos/dusk.png")` needs no file beside the program:
+  /// `window.file("photos/dusk.png", Source.read("assets/photos/dusk.png"))`. A relative URL
+  /// the program does not carry is read from the working directory.
+  pub effect fn file(self: &mut Self, path: string<'static>, data: &'static [u8]) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
-    run self.resources.image(resource, data)
-  }
-
-  /// The icon `h.icon(resource)` shows, from an SVG's bytes.
-  pub effect fn icon(self: &mut Self, resource: u32, data: &[u8]) -> ()
-    ! OutOfMemoryError
-    ? &mut Allocator {
-    run self.resources.icon(resource, data)
+    run self.files.append(CarriedFile { path: path, data: data })
   }
 
   /// Does not serve the inspector, even in a debug build with `SILK_UI_INSPECT` set.
@@ -452,10 +450,17 @@ struct Asked {
 }
 
 /// The window's side of the shell: does what was asked, and posts what the window says.
+/// A file a program carries, for a relative URL.
+struct CarriedFile {
+  path: string<'static>,
+  data: &'static [u8],
+}
+
 struct ShellContent<A, M, C> {
   desk: Arc<Mutex<Desk>>,
   dialogs: List<Asked>,
   greeted: bool,
+  files: List<CarriedFile>,
 }
 
 impl<A, M, C> ShellContent<A, M, C> {
@@ -514,6 +519,17 @@ impl<A, M, C> ShellContent<A, M, C> {
 }
 
 impl<A: App<M, C>, M, C> WindowContent<A, M, C> for ShellContent<A, M, C> {
+  effect fn files(self: &mut Self, loader: &mut Loader) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let files = self.files.asSlice()
+    let mut i: usize = 0
+    while i < files.length {
+      run loader.file(files[i].path, files[i].data)
+      i = i + 1
+    }
+  }
+
   effect fn opened(self: &mut Self, platform: &mut HostPlatform, window: WindowId) -> ()
     ! WindowError | OutOfMemoryError
     ? &mut Allocator {
@@ -701,6 +717,7 @@ pub effect fn open<P: Program<M, C>, M, C: CommandSet<M, R>, ? R>(
     desk: window.desk.clone(),
     dialogs: List<Asked>.make(),
     greeted: false,
+    files: Intrinsic.replace(window.files, List<CarriedFile>.make()),
   }
   let code = run runWindowHosted<
     ShellContent<Hosted<P>, M, Run<C>>,

@@ -9,14 +9,14 @@ import silk from "../src/index.js";
 
 const root = fileURLToPath(new URL("./fixture", import.meta.url));
 
-async function bundle(mode) {
+async function bundle(mode, entry = "src/main.js") {
   const outDir = mkdtempSync(join(tmpdir(), "silk-vite-"));
   await build({
     root,
     mode,
     configFile: false,
     logLevel: "silent",
-    plugins: [silk({ entry: "src/main.js" })],
+    plugins: [silk({ entry })],
     build: { outDir },
   });
   return outDir;
@@ -34,4 +34,10 @@ test("development mode defines NODE_ENV for development builds", async () => {
   const outDir = await bundle("development");
   assert.ok(existsSync(join(outDir, "app.js.stamp")));
   assert.match(readFileSync(join(outDir, "app.js"), "utf8"), /mode development/);
+});
+
+test("takes a package's portable build, not its browser or Node one", async () => {
+  // A ui-js realm has neither a DOM nor Node APIs: `browser` builds reach for `document`.
+  const outDir = await bundle("production", "src/conditional.js");
+  assert.match(readFileSync(join(outDir, "app.js"), "utf8"), /portable build/);
 });
