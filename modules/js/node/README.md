@@ -31,8 +31,13 @@ python3 modules/js/node/scripts/prepare
 ```
 
 It needs pkg-config to find static libuv 1.50 or newer, OpenSSL 3.2 or newer, nghttp2, zstd
-and Brotli (lib-silkjs's `modules/runtime/README.md` says how to build them). The runtime does
-not build for Windows yet.
+and Brotli (lib-silkjs's `modules/runtime/README.md` says how to build them; nghttp2 wants
+`-DENABLE_LIB_ONLY=ON -DBUILD_TESTING=OFF`). The runtime does not build for Windows yet.
+
+The script downloads the runtime's vendored sources from codeload.github.com. Where a proxy
+refuses that, put `git archive` tarballs of the pinned commits in the runtime's `build/deps`
+(the checksums match). The first link of a program takes a while and needs memory: allow
+about 9 GB for silkc.
 
 ## Checking
 
