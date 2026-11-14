@@ -64,7 +64,7 @@ const counterTargets = [
     cwd: repo,
     env: { SILK_UI_TRACE_FRAMES: "1" },
     gpuCache: true,
-    title: "JavaScript on the tree",
+    title: "Silk UI",
     ships: [["binary", silkBuild("production", "ui-js-demo")], ["bundle", silkBundle], ["@silk/ui", join(repo, "modules/js/packages/ui/src/index.js")]],
     debugBinary: silkBuild("debug", "ui-js-demo"),
     bundle: silkBundle,
