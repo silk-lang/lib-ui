@@ -39,6 +39,10 @@ import ui_scene.primitives {
 import ui_scene.scene { Scene }
 import ui_scene.scroll { ScrollAxis, ScrollLink, ScrollPosition }
 import ui_scene.effects { LayerEffects }
+import paint_effects
+import paint_css { Effects, TextShadow }
+import svg_css.effect_values { GeometryBox }
+import silk.mem.box { Box }
 import ui_scene.path_cache { PathCache }
 import vector.geometry { Affine }
 import vector.path { Path as VectorPath }
@@ -160,13 +164,13 @@ pub fn styleSlot(slots: &List<u32>, css: &Tree, nodes: &List<Node>, source: usiz
   return NONE
 }
 
-fn device(rect: Rect<f32>, scale: f32) -> Rect<f32> {
+pub fn device(rect: Rect<f32>, scale: f32) -> Rect<f32> {
   return Rect<f32>.new(rect.xMin * scale, rect.yMin * scale, rect.xMax * scale, rect.yMax * scale)
 }
 
 /// `rect` with its edges on whole device pixels, as browsers paint box decorations: a
 /// one-pixel border at y = 10.5 stays one crisp pixel instead of two half-covered ones.
-fn snapped(rect: Rect<f32>) -> Rect<f32> {
+pub fn snapped(rect: Rect<f32>) -> Rect<f32> {
   return Rect<f32>.new(f32.round(rect.xMin), f32.round(rect.yMin), f32.round(rect.xMax), f32.round(rect.yMax))
 }
 
@@ -229,7 +233,7 @@ pub fn contentBox(f: &Fragment) -> Rect<f32> {
   return Rect<f32>.new(x, y, x + f.contentRect.width, y + f.contentRect.height)
 }
 
-fn scaledCorners(radii: Corners<f32>, scale: f32) -> Corners<f32> {
+pub fn scaledCorners(radii: Corners<f32>, scale: f32) -> Corners<f32> {
   return Corners<f32>.new(
     radii.topLeft * scale,
     radii.topRight * scale,
@@ -253,17 +257,29 @@ fn hasEdge(edges: u8, bit: u8) -> bool {
 /// Draws the shadow, background and border of a box with computed style `c` over `rect`
 /// (CSS pixels). `edges` says which edges are drawn (bits top 1, right 2, bottom 4, left 8),
 /// as a span split across lines draws only some.
+/// Whether node `slot` has background image layers to paint.
+fn hasBackgrounds(p: &Painter<'_, '_>, slot: u32) -> bool {
+  if slot == NONE {
+    return false
+  }
+  return match p.nodes.asSlice()[u32.toUsize(slot)].paintEffects() {
+    Option<&Effects>.Some { value } => value.backgrounds.painted()
+    Option<&Effects>.None => false
+  }
+}
+
 effect fn decorate(
   p: &mut Painter<'_, '_>,
+  slot: u32,
   c: &Computed,
-  rect: Rect<f32>,
+  f: &Fragment,
   edges: u8,
   mask: ContentMask,
 ) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   let s = p.scale
-  let bounds = snapped(device(rect, s))
+  let bounds = snapped(device(borderBox(f), s))
   let mut radii = scaledCorners(c.paint.radii, s)
   if !hasEdge(edges, 1) {
     radii.topLeft = 0.0
@@ -314,8 +330,25 @@ effect fn decorate(
   let bordered = (widths.top > 0.0 || widths.right > 0.0 || widths.bottom > 0.0
     || widths.left > 0.0)
     && c.paint.borderColor.a > 0.0
-  if !background.isTransparent() || bordered {
-    let mut quad = Quad.fill(bounds, mask, background)
+  let images = hasBackgrounds(&p.*, slot)
+  if images {
+    if !background.isTransparent() {
+      let mut quad = Quad.fill(bounds, mask, background)
+      quad.cornerRadii = radii
+      drop run p.scene.quad(quad)
+    }
+    let taken = paint_effects.takeEffects(&mut p, slot)
+    match &taken {
+      Option<Box<Effects>>.Some { value } => {
+        let effects = &value.get()[0]
+        run paint_effects.paintLayers(&mut p, effects, &effects.backgrounds, f, radii, mask, GeometryBox.Padding)
+      }
+      Option<Box<Effects>>.None => {}
+    }
+    paint_effects.putEffects(&mut p, slot, move taken)
+  }
+  if (!images && !background.isTransparent()) || bordered {
+    let mut quad = Quad.fill(bounds, mask, if images { Background.solid(Rgba<f32>.new(0.0, 0.0, 0.0, 0.0)) } else { background })
     quad.cornerRadii = radii
     if bordered {
       quad.borderWidths = widths
@@ -403,8 +436,52 @@ effect fn noPath<E>(error: E) -> u32 {
   return 0
 }
 
-/// Paints a text fragment: its glyph run, as shaped during layout, and its decorations.
+/// Paints a text fragment's text shadows, then the fragment.
 effect fn paintText(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: ContentMask) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let slot = styleSlot(&p.slotOfCss.*, &p.css.*, &p.nodes.*, f.source)
+  if slot != NONE {
+    if p.nodes.asSlice()[u32.toUsize(slot)].computed.effects.shadowFrom != NONE {
+      let c = p.nodes.asSlice()[u32.toUsize(slot)].computed
+      let mut shadows = List<TextShadow>.make()
+      run paint_effects.shadowsOf(&p.*, &c, &mut shadows)
+      let mut k = shadows.length()
+      while k > 0 {
+        k = k - 1
+        let shadow = shadows.get(k)
+        if shadow.color.a <= 0.0 {
+          continue
+        }
+        let mut shifted = f
+        shifted.worldLocation.x = f.worldLocation.x + shadow.x
+        shifted.worldLocation.y = f.worldLocation.y + shadow.y
+        let blurred = shadow.blur > 0.0
+        if blurred {
+          let mut effects = LayerEffects.none()
+          effects.blur = shadow.blur * 0.5 * p.scale
+          drop run p.scene.pushEffectLayer(mask.bounds, mask, Isolation { opacity: 1.0, blend: 0 }, effects)
+        }
+        run paintTextAs(&mut p, index, slot, shifted, mask, Option<Rgba<f32>>.some(shadow.color))
+        if blurred {
+          run p.scene.popLayer()
+        }
+      }
+    }
+  }
+  run paintTextAs(&mut p, index, slot, f, mask, Option<Rgba<f32>>.None)
+}
+
+/// Paints a text fragment: its glyph run, as shaped during layout, and its decorations, all in
+/// `shadow` when set (a text shadow's pass).
+effect fn paintTextAs(
+  p: &mut Painter<'_, '_>,
+  index: usize,
+  slot: u32,
+  f: Fragment,
+  mask: ContentMask,
+  shadow: Option<Rgba<f32>>,
+) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   if f.textData == NO_INDEX {
@@ -414,7 +491,6 @@ effect fn paintText(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Co
   if t.kind != TextFragmentKind.Glyphs {
     return ()
   }
-  let slot = styleSlot(&p.slotOfCss.*, &p.css.*, &p.nodes.*, f.source)
   if slot == NONE {
     return ()
   }
@@ -439,6 +515,11 @@ effect fn paintText(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Co
     } else if e.filler {
       limit = String.byteLength(String.view(&e.display)) - 3
     }
+  }
+  let mut shadowed = false
+  if let Option<Rgba<f32>>.Some { value } = shadow {
+    color = value
+    shadowed = true
   }
   if !c.text.visible || color.a <= 0.0 && !c.text.decoration.underline {
     return ()
@@ -613,7 +694,7 @@ effect fn paintText(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Co
             } else {
               Rect<f32>.new(px + left, py + top, px + left + w, py + top + h)
             }
-            if &value.kind == &Kind.Polychrome {
+            if shadowed && &value.kind == &Kind.Polychrome {} else if &value.kind == &Kind.Polychrome {
               drop run p.scene.image(
                 ImageSprite {
                   quarterTurns: turn,
@@ -637,7 +718,7 @@ effect fn paintText(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Co
           }
           i = i + 1
         }
-        if cacheable {
+        if cacheable && !shadowed {
           while p.textInk.length() <= t.shapeKey {
             run p.textInk.append(TextInk.empty())
           }
@@ -652,7 +733,7 @@ effect fn paintText(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Co
     let thickness = f32.max(1.0, size / 16.0 * s)
     let x0 = f.worldLocation.x * s
     let x1 = (f.worldLocation.x + f.size.width) * s
-    let color = c.text.lineColor()
+    let color = if shadowed { color } else { c.text.lineColor() }
     if vertical {
       let y0 = f.worldLocation.y * s
       let y1 = (f.worldLocation.y + f.size.height) * s
@@ -1048,8 +1129,9 @@ effect fn paintRootElements(p: &mut Painter<'_, '_>, root: usize, mask: ContentM
     let f = p.output.fragments.values.asSlice()[index]
     let slot = slotIn(p.slotOfCss, f.source)
     let c = p.nodes.asSlice()[u32.toUsize(slot)].computed
-    if c.paint.opacity > 0.0 && c.text.visible && !f.nonpainting && c.decorated() {
-      run decorate(&mut p, &c, borderBox(&f), f.decorationEdges, mask)
+    if c.paint.opacity > 0.0 && c.text.visible && !f.nonpainting
+      && (c.decorated() || hasBackgrounds(&p.*, slot)) {
+      run decorate(&mut p, slot, &c, &f, f.decorationEdges, mask)
     }
   }
 }
@@ -1182,7 +1264,17 @@ fn ownInk(
   let f = output.fragments.values.asSlice()[index]
   let box = borderBox(&f)
   if f.kind == FragmentKind.Text {
-    return grow(box, f32.max(f.size.height, 16.0))
+    let mut reach = f32.max(f.size.height, 16.0)
+    let owner = styleSlot(slots, css, nodes, f.source)
+    if owner != NONE {
+      let from = nodes.asSlice()[u32.toUsize(owner)].computed.effects.shadowFrom
+      if from != NONE && u32.toUsize(from) < nodes.length() {
+        if let Option<&Effects>.Some { value } = nodes.asSlice()[u32.toUsize(from)].paintEffects() {
+          reach = reach + paint_effects.shadowReach(value.shadows.asSlice())
+        }
+      }
+    }
+    return grow(box, reach)
   }
   let slot = styleSlot(slots, css, nodes, f.source)
   if slot == NONE {
@@ -1287,6 +1379,16 @@ pub effect fn inkFragments(
           total.xMax + reach.xMax,
           total.yMax + reach.yMax,
         )
+      }
+    }
+    if (f.kind == FragmentKind.Box || f.kind == FragmentKind.Inline) && !f.positioningShell {
+      let slot = slotIn(slots, f.source)
+      if slot != NONE {
+        if let Option<&Effects>.Some { value } = nodes.asSlice()[u32.toUsize(slot)].paintEffects() {
+          if value.filters.length() != 0 {
+            total = grow(total, paint_effects.filterReach(value))
+          }
+        }
       }
     }
     out.set(index, total)
@@ -1555,7 +1657,7 @@ effect fn paintFragmentIn(p: &mut Painter<'_, '_>, index: usize, mask: ContentMa
       if slot != NONE && !f.nonpainting {
         let c = p.nodes.asSlice()[u32.toUsize(slot)].computed
         if c.text.visible && c.decorated() {
-          run decorate(&mut p, &c, borderBox(&f), f.decorationEdges, mask)
+          run decorate(&mut p, slot, &c, &f, f.decorationEdges, mask)
         }
       } else if slot == NONE && !f.nonpainting {
         run decorateRun(&mut p, &f, mask)
@@ -1669,7 +1771,7 @@ effect fn decorateRun(p: &mut Painter<'_, '_>, f: &Fragment, mask: ContentMask) 
   }
   let c = e.runs.get(r).computed
   if c.text.visible && c.decorated() {
-    run decorate(&mut p, &c, borderBox(f), f.decorationEdges, mask)
+    run decorate(&mut p, NONE, &c, f, f.decorationEdges, mask)
   }
 }
 
@@ -1724,22 +1826,11 @@ effect fn paintBox(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Con
   let c = p.nodes.asSlice()[u32.toUsize(slot)].computed
   let kind = p.nodes.asSlice()[u32.toUsize(slot)].kind
   if c.paint.opacity > 0.0 {
-    let layered = c.paint.opacity < 1.0 || c.paint.backdropBlur > 0.0
-    if layered {
-      let mut effects = LayerEffects.none()
-      effects.backdropBlur = c.paint.backdropBlur * p.scale
-      effects.clip = device(borderBox(&f), p.scale)
-      drop run p.scene.pushEffectLayer(
-        mask.bounds,
-        mask,
-        Isolation { opacity: c.paint.opacity, blend: 0 },
-        effects,
-      )
-    }
+    let opened = run paint_effects.pushEffects(&mut p, slot, &c, &f, mask.bounds, mask)
     if c.text.visible && !f.nonpainting {
       let rootPaints = p.only == NONE && p.stacking.rootElement(index)
-      if c.decorated() && !rootPaints {
-        run decorate(&mut p, &c, borderBox(&f), f.decorationEdges, mask)
+      if (c.decorated() || hasBackgrounds(&p.*, slot)) && !rootPaints {
+        run decorate(&mut p, slot, &c, &f, f.decorationEdges, mask)
       }
       if kind == NodeKind.Image || kind == NodeKind.Icon || kind == NodeKind.Canvas {
         run paintContent(&mut p, slot, &f, mask)
@@ -1775,9 +1866,7 @@ effect fn paintBox(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Con
     if c.text.visible && !f.nonpainting {
       run paintOutline(&mut p, &c, borderBox(&f), mask)
     }
-    if layered {
-      run p.scene.popLayer()
-    }
+    run paint_effects.popEffects(&mut p, opened)
   }
   let end = p.scene.operationCount()
   if cacheable {

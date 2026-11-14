@@ -47,7 +47,9 @@ import layers
 import edit
 import rich
 import edit { EditState, HostRequest, Keymap, ImeArea, NATIVE_KEYMAP }
-import style { Computed, TextStyle }
+import style { Computed, TextStyle, NO_SHADOW }
+import paint_css { Effects, Basis }
+import paint_css
 import motion
 import motion { Running }
 import animation
@@ -1716,6 +1718,7 @@ impl<'a> UiTree<'a> {
       canvas: List<CanvasCommand>.make(),
       content: 1,
       editing: move editing,
+      effects: Option<Box<Effects>>.None,
       semantics: Option<Box<Semantics>>.None,
       cache: PaintCache.empty(),
     }
@@ -3266,11 +3269,14 @@ impl<'a> UiTree<'a> {
       if own {
         let before = node.computed.text
         let events = node.computed.paint.pointerEvents
+        let shadow = node.computed.effects
         let wasRendered = node.rendered
         run self.resolve(slot)
         let after = &self.node(slot).computed
         changed = full || !sameText(&before, &after.text) || events != after.paint.pointerEvents
           || wasRendered != self.node(slot).rendered
+          || shadow.shadowFrom != after.effects.shadowFrom
+          || shadow.shadowHash != after.effects.shadowHash
       }
       let cleared = self.nodeMut(slot)
       cleared.styleDirty = false
@@ -3393,6 +3399,12 @@ impl<'a> UiTree<'a> {
     }
     let css = self.node(slot).css
     let sizeChanged = self.node(slot).computed.text.size != computed.text.size
+    if parent != NONE {
+      let above = self.node(parent).computed.effects
+      computed.effects.shadowFrom = above.shadowFrom
+      computed.effects.shadowHash = above.shadowHash
+    }
+    run self.resolveEffects(slot, &mut computed)
     let fontKey = run self.fontKeyOf(computed.text)
     computed.finish(fontKey)
     let paintHash = computed.paintHash(&self.seed)
@@ -3414,6 +3426,53 @@ impl<'a> UiTree<'a> {
     if kind == NodeKind.Input && self.node(slot).edit().runs.length() != 0 {
       run rich.styleRuns(&mut self, slot)
     }
+  }
+
+  /// Reads the effect properties of node `slot`'s active looks into its `Effects`, after the
+  /// rest of its style is in `computed`, so `em` and `currentColor` see its font and color.
+  effect fn resolveEffects(self: &mut Self, slot: u32, computed: &mut Computed) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !computed.effects.declared {
+      match &self.node(slot).effects {
+        Option<Box<Effects>>.Some { .. } => {
+          let target = self.nodeMut(slot)
+          target.effects = Option<Box<Effects>>.None
+        }
+        Option<Box<Effects>>.None => {}
+      }
+      return ()
+    }
+    let basis = Basis { fontSize: computed.text.size, color: computed.text.color }
+    let mut effects = Effects.make()
+    let node = self.node(slot)
+    run paint_css.applyAll(&mut effects, node.base.asSlice(), basis)
+    if node.hovered {
+      run paint_css.applyAll(&mut effects, node.hover.asSlice(), basis)
+    }
+    if node.pressed {
+      run paint_css.applyAll(&mut effects, node.active.asSlice(), basis)
+    }
+    if self.focused == slot {
+      run paint_css.applyAll(&mut effects, node.focus.asSlice(), basis)
+      if self.focusVisible || node.kind == NodeKind.Input {
+        run paint_css.applyAll(&mut effects, node.focusVisible.asSlice(), basis)
+      }
+    }
+    computed.effects.hash = effects.hash
+    computed.effects.layered = effects.layered()
+    if effects.hasShadows {
+      if effects.shadows.length() == 0 {
+        computed.effects.shadowFrom = NO_SHADOW
+        computed.effects.shadowHash = 0
+      } else {
+        computed.effects.shadowFrom = slot
+        computed.effects.shadowHash = effects.hash
+      }
+    }
+    let boxed = run Box<Effects>.make(move effects)
+    let target = self.nodeMut(slot)
+    target.effects = Option<Box<Effects>>.Some { value: move boxed }
   }
 
   // Style overrides.

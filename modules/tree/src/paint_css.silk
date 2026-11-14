@@ -1,0 +1,635 @@
+//! The paint effects of a node: `filter`, `clip-path`, `mask` and its longhands,
+//! `mix-blend-mode`, `text-shadow`, and the background image layers with their size, position,
+//! repeat, origin and clip. Each declaration is parsed with css-style's grammars (Filter Effects
+//! 1, Masking 1, Shapes 1, Images 3, Text Decoration 3) and computed against the node's font size
+//! and color, keeping percentages for paint to resolve against the box. As in CSS, a value that
+//! does not parse is dropped and the earlier one stays.
+import mutation { Declaration, CssProperty }
+import properties.values
+import properties.catalog
+import svg_css.lexer
+import svg_css.tokens { Limits, CssError }
+import svg_css.input { Input }
+import svg_css.value_cursor { Cursor }
+import svg_css.dimensions
+import svg_css.dimensions { ExprId, Store, Context as LengthContext }
+import svg_css.colors
+import svg_css.colors { Color, Context as ColorContext }
+import svg_css.effect_values
+import svg_css.effect_values {
+  EffectValue,
+  Filter,
+  Image,
+  MaskLayer,
+  ClipSource,
+  GeometryBox,
+  Size,
+  RepeatPair,
+  Repeat,
+  Composite,
+  MaskMode,
+}
+import svg_css.transform_values { Position }
+import svg_css.text_values
+import svg_css.text_values { Atom }
+import vector.layer {
+  BLEND_NORMAL,
+  BLEND_MULTIPLY,
+  BLEND_SCREEN,
+  BLEND_OVERLAY,
+  BLEND_DARKEN,
+  BLEND_LIGHTEN,
+  BLEND_COLOR_DODGE,
+  BLEND_COLOR_BURN,
+  BLEND_HARD_LIGHT,
+  BLEND_SOFT_LIGHT,
+  BLEND_DIFFERENCE,
+  BLEND_EXCLUSION,
+  BLEND_HUE,
+  BLEND_SATURATION,
+  BLEND_COLOR,
+  BLEND_LUMINOSITY,
+}
+import silk.collections.bytes { Bytes }
+import silk.collections.hash { Hash }
+import silk.collections.list { List }
+import silk.color.rgba { Rgba }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+
+/// Whether the tree reads `property` here rather than in `Computed`.
+pub fn handles(property: CssProperty) -> bool {
+  return property == CssProperty.Filter || property == CssProperty.ClipPath
+    || property == CssProperty.MixBlendMode
+    || property == CssProperty.TextShadow
+    || isMask(property)
+    || isBackgroundLayer(property)
+}
+
+fn isMask(property: CssProperty) -> bool {
+  return property == CssProperty.Mask || property == CssProperty.MaskImage
+    || property == CssProperty.MaskMode
+    || property == CssProperty.MaskRepeat
+    || property == CssProperty.MaskPosition
+    || property == CssProperty.MaskClip
+    || property == CssProperty.MaskOrigin
+    || property == CssProperty.MaskSize
+    || property == CssProperty.MaskComposite
+}
+
+fn isBackgroundLayer(property: CssProperty) -> bool {
+  return property == CssProperty.BackgroundImage || property == CssProperty.BackgroundPosition
+    || property == CssProperty.BackgroundSize
+    || property == CssProperty.BackgroundRepeat
+    || property == CssProperty.BackgroundOrigin
+    || property == CssProperty.BackgroundClip
+}
+
+/// One computed `text-shadow`, in CSS pixels.
+pub struct TextShadow {
+  pub x: f32,
+  pub y: f32,
+  pub blur: f32,
+  pub color: Rgba<f32>,
+}
+
+impl Copy for TextShadow {}
+
+/// `background-clip`, with `text` beside the boxes.
+pub enum Clip { Border, Padding, Content, Text }
+
+/// A list of image layers with their longhands, as `background-*` and `mask-*` keep them: each
+/// longhand list repeats to the number of images.
+pub struct Layers {
+  pub images: List<Image>,
+  pub positions: List<Position>,
+  pub sizes: List<Size>,
+  pub repeats: List<RepeatPair>,
+  pub origins: List<GeometryBox>,
+  pub clips: List<Clip>,
+  pub composites: List<Composite>,
+  pub modes: List<MaskMode>,
+}
+
+impl Layers {
+  pub fn make() -> Layers {
+    return Layers {
+      images: List<Image>.make(),
+      positions: List<Position>.make(),
+      sizes: List<Size>.make(),
+      repeats: List<RepeatPair>.make(),
+      origins: List<GeometryBox>.make(),
+      clips: List<Clip>.make(),
+      composites: List<Composite>.make(),
+      modes: List<MaskMode>.make(),
+    }
+  }
+
+  /// Whether any layer has an image.
+  pub fn painted(self: &Self) -> bool {
+    let images = self.images.asSlice()
+    let mut i: usize = 0
+    while i < images.length {
+      match &images[i] {
+        Image.Linear { .. } => {
+          return true
+        }
+        _ => {}
+      }
+      i = i + 1
+    }
+    return false
+  }
+
+  pub fn count(self: &Self) -> usize {
+    return self.images.length()
+  }
+
+  /// `None` for the initial `0% 0%`.
+  pub fn position(self: &Self, layer: usize) -> Option<Position> {
+    let n = self.positions.length()
+    return if n == 0 { Option<Position>.None } else { Option<Position>.some(self.positions.get(layer % n)) }
+  }
+
+  pub fn size(self: &Self, layer: usize) -> Size {
+    let n = self.sizes.length()
+    return if n == 0 {
+      Size.Explicit { x: Option<ExprId>.None, y: Option<ExprId>.None }
+    } else {
+      self.sizes.get(layer % n)
+    }
+  }
+
+  pub fn repeat(self: &Self, layer: usize) -> RepeatPair {
+    let n = self.repeats.length()
+    return if n == 0 {
+      RepeatPair { x: Repeat.Repeat, y: Repeat.Repeat }
+    } else {
+      self.repeats.get(layer % n)
+    }
+  }
+
+  pub fn origin(self: &Self, layer: usize, initial: GeometryBox) -> GeometryBox {
+    let n = self.origins.length()
+    return if n == 0 { initial } else { self.origins.get(layer % n) }
+  }
+
+  pub fn clip(self: &Self, layer: usize) -> Clip {
+    let n = self.clips.length()
+    return if n == 0 { Clip.Border } else { self.clips.get(layer % n) }
+  }
+
+  pub fn composite(self: &Self, layer: usize) -> Composite {
+    let n = self.composites.length()
+    return if n == 0 { Composite.Add } else { self.composites.get(layer % n) }
+  }
+}
+
+/// The paint effects one node declares, computed.
+pub struct Effects {
+  /// The numeric expressions the values below refer to.
+  pub numerics: Store<'static>,
+  pub filters: List<Filter>,
+  /// Zero or one `clip-path`.
+  pub clip: List<ClipSource>,
+  pub masks: Layers,
+  pub backgrounds: Layers,
+  /// `text-shadow`, first painted on top. `hasShadows` says the node sets it (`none` included),
+  /// so it does not inherit its parent's.
+  pub shadows: List<TextShadow>,
+  pub hasShadows: bool,
+  /// A `vector.layer` blend mode.
+  pub blend: u8,
+  /// Same declarations at the same font size and color hash alike.
+  pub hash: u64,
+}
+
+impl Effects {
+  pub fn make() -> Effects {
+    return Effects {
+      numerics: Store<'static>.make(),
+      filters: List<Filter>.make(),
+      clip: List<ClipSource>.make(),
+      masks: Layers.make(),
+      backgrounds: Layers.make(),
+      shadows: List<TextShadow>.make(),
+      hasShadows: false,
+      blend: BLEND_NORMAL,
+      hash: 0,
+    }
+  }
+
+  /// Whether paint needs an isolated layer for this node's own effects.
+  pub fn layered(self: &Self) -> bool {
+    return self.filters.length() != 0 || self.clip.length() != 0 || self.masks.painted()
+      || self.blend != BLEND_NORMAL
+  }
+
+  /// `length` or `percentage` `id` in CSS pixels, percentages of `basis`.
+  pub fn pixels(self: &Self, id: ExprId, basis: f32) -> f32 {
+    return f64.toF32(dimensions.evaluate(&self.numerics, id, f32.toF64(basis)))
+  }
+
+  /// A number, angle in degrees, or `amount` in CSS pixels, as computed.
+  pub fn number(self: &Self, id: ExprId) -> f32 {
+    return f64.toF32(dimensions.evaluate(&self.numerics, id, 1.0))
+  }
+}
+
+/// What lengths and `currentColor` compute against.
+pub struct Basis {
+  pub fontSize: f32,
+  pub color: Rgba<f32>,
+}
+
+impl Copy for Basis {}
+
+fn colorOf(color: Color, context: &ColorContext) -> Rgba<f32> {
+  let c = colors.toSrgb(colors.compute(color, context))
+  return Rgba<f32> { r: f64.toF32(c.r), g: f64.toF32(c.g), b: f64.toF32(c.b), a: f64.toF32(c.a) }
+}
+
+/// `declarations`' effect properties over `effects`, in order.
+pub effect fn applyAll(effects: &mut Effects, declarations: &[Declaration], basis: Basis) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut i: usize = 0
+  while i < declarations.length {
+    if handles(declarations[i].property) {
+      run apply(&mut effects.*, &declarations[i], basis)
+    }
+    i = i + 1
+  }
+}
+
+/// Applies one effect declaration. A value that does not parse is ignored.
+pub effect fn apply(effects: &mut Effects, declaration: &Declaration, basis: Basis) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let text = run values.cssText(&declaration.value)
+  let seed = Hash.seed(0x9e3779b97f4a7c15)
+  let mut h = Hash.combine(effects.hash, Hash.mix(&seed, usize.toU64(catalog.index(declaration.property))))
+  let bytes = Bytes.asSlice(&text)
+  let mut b: usize = 0
+  while b < bytes.length {
+    h = Hash.combine(h, u8.toU64(bytes[b]))
+    b = b + 1
+  }
+  h = Hash.combine(h, u32.toU64(f32.toBits(basis.fontSize)))
+  h = Hash.combine(h, u32.toU64(f32.toBits(basis.color.r)))
+  h = Hash.combine(h, u32.toU64(f32.toBits(basis.color.g)))
+  h = Hash.combine(h, u32.toU64(f32.toBits(basis.color.b)))
+  h = Hash.combine(h, u32.toU64(f32.toBits(basis.color.a)))
+  effects.hash = h
+  drop run Effect.catch<CssError>(applyText(&mut effects.*, declaration.property, bytes, basis), ignored)
+}
+
+effect fn ignored(error: CssError) -> () {
+  drop error
+}
+
+effect fn applyText(effects: &mut Effects, property: CssProperty, css: &[u8], basis: Basis) -> ()
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let buffer = run lexer.tokenize(css, &Limits.make())
+  let source = Input.Contiguous { buffer: &buffer, range: buffer.all() }
+  let mut cursor = Cursor.make(&source)
+  let size = f32.toF64(basis.fontSize)
+  let context = LengthContext.make(0.0, 0.0, size)
+  let current = Color.srgb(
+    f32.toF64(basis.color.r),
+    f32.toF64(basis.color.g),
+    f32.toF64(basis.color.b),
+    f32.toF64(basis.color.a),
+  )
+  let black = Color.srgb(0.0, 0.0, 0.0, 1.0)
+  let colorContext = ColorContext.make(current, [black; 19])
+  if property == CssProperty.MixBlendMode {
+    let mode = blendOf(&source, &mut cursor)
+    if mode != 255 && cursor.done(&source) {
+      effects.blend = mode
+    }
+    return
+  }
+  if property == CssProperty.TextShadow {
+    run applyShadows(&mut effects.*, &source, &mut cursor, &context, &colorContext)
+    return
+  }
+  if property == CssProperty.BackgroundImage {
+    run applyImages(&mut effects.*, &source, &mut cursor, &context, &colorContext)
+    return
+  }
+  if property == CssProperty.BackgroundClip {
+    run applyClips(&mut effects.*, &source, &mut cursor)
+    return
+  }
+  // The background longhands share the mask longhands' grammar.
+  let parsed = if property == CssProperty.BackgroundPosition {
+    CssProperty.MaskPosition
+  } else if property == CssProperty.BackgroundSize {
+    CssProperty.MaskSize
+  } else if property == CssProperty.BackgroundRepeat {
+    CssProperty.MaskRepeat
+  } else if property == CssProperty.BackgroundOrigin {
+    CssProperty.MaskOrigin
+  } else {
+    property
+  }
+  let value = match run effect_values.parse(&mut effects.numerics, parsed, &source, &mut cursor, false) {
+    Option<EffectValue>.Some { value } => move value
+    _ => {
+      return
+    }
+  }
+  if !cursor.done(&source) {
+    return
+  }
+  let computed = run effect_values.compute(&value, &mut effects.numerics, &context, &colorContext)
+  match move computed {
+    EffectValue.None => {
+      if property == CssProperty.Filter {
+        effects.filters.clear()
+      } else if property == CssProperty.ClipPath {
+        effects.clip.clear()
+      }
+    }
+    EffectValue.Filters { items } => {
+      effects.filters = move items
+    }
+    EffectValue.ClipPath { source: clip } => {
+      effects.clip.clear()
+      run effects.clip.append(move clip)
+    }
+    EffectValue.Masks { layers, resetBorder } => {
+      drop resetBorder
+      if isBackgroundLayer(property) {
+        run assignLayers(&mut effects.backgrounds, property, move layers)
+      } else {
+        run assignLayers(&mut effects.masks, property, move layers)
+      }
+    }
+    EffectValue other => {
+      drop other
+    }
+  }
+}
+
+/// Sets the longhand lists of `target` that `property` names from parsed `layers`.
+effect fn assignLayers(target: &mut Layers, property: CssProperty, layers: List<MaskLayer>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let all = property == CssProperty.Mask
+  let mut owned = move layers
+  let items = owned.asSlice()
+  if all || property == CssProperty.MaskPosition || property == CssProperty.BackgroundPosition {
+    target.positions.clear()
+    let mut i: usize = 0
+    while i < items.length {
+      run target.positions.append(items[i].position)
+      i = i + 1
+    }
+  }
+  if all || property == CssProperty.MaskSize || property == CssProperty.BackgroundSize {
+    target.sizes.clear()
+    let mut i: usize = 0
+    while i < items.length {
+      run target.sizes.append(items[i].size)
+      i = i + 1
+    }
+  }
+  if all || property == CssProperty.MaskRepeat || property == CssProperty.BackgroundRepeat {
+    target.repeats.clear()
+    let mut i: usize = 0
+    while i < items.length {
+      run target.repeats.append(items[i].repeat)
+      i = i + 1
+    }
+  }
+  if all || property == CssProperty.MaskOrigin || property == CssProperty.BackgroundOrigin {
+    target.origins.clear()
+    let mut i: usize = 0
+    while i < items.length {
+      run target.origins.append(items[i].origin)
+      i = i + 1
+    }
+  }
+  if all || property == CssProperty.MaskClip {
+    target.clips.clear()
+    let mut i: usize = 0
+    while i < items.length {
+      run target.clips.append(clipOfBox(items[i].clip))
+      i = i + 1
+    }
+  }
+  if all || property == CssProperty.MaskComposite {
+    target.composites.clear()
+    let mut i: usize = 0
+    while i < items.length {
+      run target.composites.append(items[i].composite)
+      i = i + 1
+    }
+  }
+  if all || property == CssProperty.MaskMode {
+    target.modes.clear()
+    let mut i: usize = 0
+    while i < items.length {
+      run target.modes.append(items[i].mode)
+      i = i + 1
+    }
+  }
+  if all || property == CssProperty.MaskImage {
+    let mut reversed = List<Image>.make()
+    while true {
+      match owned.pop() {
+        Option<MaskLayer>.Some { value } => {
+          run reversed.append(move value.image)
+        }
+        Option<MaskLayer>.None => {
+          break
+        }
+      }
+    }
+    target.images.clear()
+    while true {
+      match reversed.pop() {
+        Option<Image>.Some { value } => {
+          run target.images.append(move value)
+        }
+        Option<Image>.None => {
+          break
+        }
+      }
+    }
+  }
+}
+
+fn clipOfBox(value: GeometryBox) -> Clip {
+  return match value {
+    GeometryBox.Content => Clip.Content
+    GeometryBox.Padding => Clip.Padding
+    _ => Clip.Border
+  }
+}
+
+/// `background-image`: a comma-separated list of images or `none`.
+effect fn applyImages(
+  effects: &mut Effects,
+  source: &Input<'_>,
+  cursor: &mut Cursor,
+  context: &LengthContext,
+  colorContext: &ColorContext,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut images = List<Image>.make()
+  while true {
+    if cursor.ident(source, b"none") {
+      run images.append(Image.None)
+    } else {
+      match run effect_values.parseImage(&mut effects.numerics, source, &mut cursor.*) {
+        Option<Image>.Some { value } => {
+          run images.append(
+            run effect_values.computeImage(&value, &mut effects.numerics, context, colorContext),
+          )
+        }
+        _ => {
+          return
+        }
+      }
+    }
+    if !cursor.comma(source) {
+      break
+    }
+  }
+  if !cursor.done(source) {
+    return
+  }
+  effects.backgrounds.images = move images
+}
+
+/// `background-clip`: boxes or `text`, comma separated.
+effect fn applyClips(effects: &mut Effects, source: &Input<'_>, cursor: &mut Cursor) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut clips = List<Clip>.make()
+  while true {
+    if cursor.ident(source, b"border-box") {
+      run clips.append(Clip.Border)
+    } else if cursor.ident(source, b"padding-box") {
+      run clips.append(Clip.Padding)
+    } else if cursor.ident(source, b"content-box") {
+      run clips.append(Clip.Content)
+    } else if cursor.ident(source, b"text") {
+      run clips.append(Clip.Text)
+    } else {
+      return
+    }
+    if !cursor.comma(source) {
+      break
+    }
+  }
+  if !cursor.done(source) {
+    return
+  }
+  effects.backgrounds.clips = move clips
+}
+
+effect fn applyShadows(
+  effects: &mut Effects,
+  source: &Input<'_>,
+  cursor: &mut Cursor,
+  context: &LengthContext,
+  colorContext: &ColorContext,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let value = match run text_values.parse(&mut effects.numerics, CssProperty.TextShadow, source, &mut cursor.*, false) {
+    Option<text_values.TextValue>.Some { value } => move value
+    _ => {
+      return
+    }
+  }
+  if !cursor.done(source) {
+    return
+  }
+  let mut shadows = List<TextShadow>.make()
+  let items = value.items.asSlice()
+  let mut i: usize = 0
+  while i < items.length {
+    match items[i].atom {
+      Atom.Shadow { x, y, blur, color } => {
+        let cx = run dimensions.compute(&mut effects.numerics, x, context)
+        let cy = run dimensions.compute(&mut effects.numerics, y, context)
+        let cb = run dimensions.compute(&mut effects.numerics, blur, context)
+        run shadows.append(
+          TextShadow {
+            x: effects.pixels(cx, 0.0),
+            y: effects.pixels(cy, 0.0),
+            blur: f32.max(0.0, effects.pixels(cb, 0.0)),
+            color: colorOf(color, colorContext),
+          },
+        )
+      }
+      _ => {}
+    }
+    i = i + 1
+  }
+  effects.shadows = move shadows
+  effects.hasShadows = true
+}
+
+/// The `vector.layer` blend mode a `mix-blend-mode` keyword names, or 255.
+fn blendOf(source: &Input<'_>, cursor: &mut Cursor) -> u8 {
+  let names: [&[u8]; 16] = [
+    b"normal",
+    b"multiply",
+    b"screen",
+    b"overlay",
+    b"darken",
+    b"lighten",
+    b"color-dodge",
+    b"color-burn",
+    b"hard-light",
+    b"soft-light",
+    b"difference",
+    b"exclusion",
+    b"hue",
+    b"saturation",
+    b"color",
+    b"luminosity",
+  ]
+  let modes: [u8; 16] = [
+    BLEND_NORMAL,
+    BLEND_MULTIPLY,
+    BLEND_SCREEN,
+    BLEND_OVERLAY,
+    BLEND_DARKEN,
+    BLEND_LIGHTEN,
+    BLEND_COLOR_DODGE,
+    BLEND_COLOR_BURN,
+    BLEND_HARD_LIGHT,
+    BLEND_SOFT_LIGHT,
+    BLEND_DIFFERENCE,
+    BLEND_EXCLUSION,
+    BLEND_HUE,
+    BLEND_SATURATION,
+    BLEND_COLOR,
+    BLEND_LUMINOSITY,
+  ]
+  let mut i: usize = 0
+  while i < 16 {
+    if cursor.ident(source, names[i]) {
+      return modes[i]
+    }
+    i = i + 1
+  }
+  return 255
+}

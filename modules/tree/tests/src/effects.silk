@@ -1,0 +1,341 @@
+//! Paint effects from CSS text: background image layers (size, position, repeat), filters,
+//! drop shadows, mix-blend-mode, clip-path shapes, mask images and text shadows, read back from
+//! the CPU renderer's pixels.
+//!
+//! Root box 1 fills a 100 by 100 viewport in white; box 2 inside it takes the styles under test.
+import ui_tree.css
+import ui_tree.css { px, Declaration, Property }
+import ui_fixtures.fixtures as fixtures
+import ui_tree.legacy { UiTree, TreeError, Batch, FrameInput, CpuSnapshot, NodeKind }
+import font_collection.lib { FontCollection }
+import vector.pixmap { Pixmap }
+import vector.geometry_error { GeometryError }
+import silk.color.rgba { Rgba }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.i32
+import silk.num.u8
+import silk.testing.testing { Testing, AssertionError }
+
+fn viewport() -> FrameInput {
+  return FrameInput { width: 100.0, height: 100.0, scale: 1.0, time: 0.0 }
+}
+
+fn red() -> Rgba<f32> {
+  return Rgba<f32>.new(1.0, 0.0, 0.0, 1.0)
+}
+
+effect fn declared(property: Property, value: &[u8]) -> Declaration
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return css.declare(property, run css.text(value))
+}
+
+/// Draws box 2 with `styles` (after a 100 by 100 size) over the white root.
+effect fn paint(collection: &FontCollection, styles: &[Declaration]) -> Pixmap
+  ! TreeError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut tree = run UiTree.make(collection)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.style(
+    1,
+    &[css.width(px(100.0)), css.height(px(100.0)), css.backgroundColor(Rgba<f32>.new(1.0, 1.0, 1.0, 1.0))],
+  )
+  run batch.box(1, 2, &[css.width(px(100.0)), css.height(px(100.0))])
+  run batch.style(2, styles)
+  run batch.root(1)
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  let mut snapshot = CpuSnapshot.make()
+  run snapshot.sync(&mut tree)
+  return run snapshot.render(&tree)
+}
+
+fn close(a: u8, b: i32) -> bool {
+  let d = u8.toI32(a) - b
+  return d <= 10 && d >= -10
+}
+
+/// Whether the pixel at (`x`, `y`) is near `r`, `g`, `b` (0 to 255).
+fn at(pixels: &Pixmap, x: u32, y: u32, r: i32, g: i32, b: i32) -> bool {
+  let c = pixels.pixel(x, y)
+  return close(c.r, r) && close(c.g, g) && close(c.b, b)
+}
+
+effect fn backgroundsBody() -> ()
+  ! AssertionError<'static> | TreeError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+
+  // One 20 by 20 tile at (10, 10).
+  let single = run paint(
+    &collection,
+    &[
+      run declared(Property.BackgroundImage, b"linear-gradient(red, red)"),
+      run declared(Property.BackgroundSize, b"20px 20px"),
+      run declared(Property.BackgroundPosition, b"10px 10px"),
+      run declared(Property.BackgroundRepeat, b"no-repeat"),
+    ],
+  )
+  run Testing.expect(at(&single, 15, 15, 255, 0, 0), "the tile sits at its position")
+  run Testing.expect(at(&single, 5, 5, 255, 255, 255), "nothing before it")
+  run Testing.expect(at(&single, 35, 15, 255, 255, 255), "no-repeat paints one tile")
+
+  // Repeated tiles, each half red and half blue.
+  let tiled = run paint(
+    &collection,
+    &[
+      run declared(Property.BackgroundImage, b"linear-gradient(to right, red 50%, blue 50%)"),
+      run declared(Property.BackgroundSize, b"20px 20px"),
+    ],
+  )
+  run Testing.expect(at(&tiled, 5, 5, 255, 0, 0), "the first tile's left half")
+  run Testing.expect(at(&tiled, 15, 5, 0, 0, 255), "its right half")
+  run Testing.expect(at(&tiled, 45, 85, 255, 0, 0), "a later tile repeats it")
+
+  // Layers stack, the first on top, over the background color.
+  let layered = run paint(
+    &collection,
+    &[
+      css.backgroundColor(red()),
+      run declared(
+        Property.BackgroundImage,
+        b"linear-gradient(blue, blue), linear-gradient(lime, lime)",
+      ),
+      run declared(Property.BackgroundSize, b"50px 50px, 100px 100px"),
+      run declared(Property.BackgroundRepeat, b"no-repeat"),
+    ],
+  )
+  run Testing.expect(at(&layered, 25, 25, 0, 0, 255), "the first layer on top")
+  run Testing.expect(at(&layered, 75, 75, 0, 255, 0), "the second under it")
+
+  // Angled gradients go from one color to the other along their line.
+  let angled = run paint(
+    &collection,
+    &[run declared(Property.BackgroundImage, b"linear-gradient(45deg, red, red 40%, blue 60%, blue)")],
+  )
+  run Testing.expect(at(&angled, 10, 90, 255, 0, 0), "red at the start corner")
+  run Testing.expect(at(&angled, 90, 10, 0, 0, 255), "blue at the end corner")
+}
+
+test effect fn backgroundLayersSizePositionAndRepeat() -> ()
+  ! AssertionError<'static> | TreeError | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run backgroundsBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn filtersBody() -> ()
+  ! AssertionError<'static> | TreeError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let inverted = run paint(
+    &collection,
+    &[css.backgroundColor(red()), run declared(Property.Filter, b"invert(1)")],
+  )
+  run Testing.expect(at(&inverted, 50, 50, 0, 255, 255), "invert turns red cyan")
+
+  let gray = run paint(
+    &collection,
+    &[css.backgroundColor(red()), run declared(Property.Filter, b"grayscale(100%)")],
+  )
+  run Testing.expect(at(&gray, 50, 50, 54, 54, 54), "grayscale keeps red's luminance")
+
+  let chained = run paint(
+    &collection,
+    &[css.backgroundColor(red()), run declared(Property.Filter, b"invert(1) brightness(0.5)")],
+  )
+  run Testing.expect(at(&chained, 50, 50, 0, 128, 128), "functions apply in order")
+
+  let shadowed = run paint(
+    &collection,
+    &[
+      css.width(px(50.0)),
+      css.height(px(50.0)),
+      css.backgroundColor(red()),
+      run declared(Property.Filter, b"drop-shadow(20px 20px 0 blue)"),
+    ],
+  )
+  run Testing.expect(at(&shadowed, 25, 25, 255, 0, 0), "the box itself")
+  run Testing.expect(at(&shadowed, 60, 60, 0, 0, 255), "its drop shadow")
+  run Testing.expect(at(&shadowed, 90, 90, 255, 255, 255), "nothing past the shadow")
+
+  let blurred = run paint(
+    &collection,
+    &[
+      css.width(px(50.0)),
+      css.height(px(50.0)),
+      css.backgroundColor(red()),
+      run declared(Property.Filter, b"blur(4px)"),
+    ],
+  )
+  let edge = blurred.pixel(50, 25)
+  run Testing.expect(edge.g > 40 && edge.g < 215, "blur softens the edge")
+  run Testing.expect(at(&blurred, 25, 25, 255, 0, 0), "and keeps the middle")
+}
+
+test effect fn filtersAndDropShadows() -> ()
+  ! AssertionError<'static> | TreeError | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run filtersBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn blendBody() -> ()
+  ! AssertionError<'static> | TreeError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let multiplied = run paint(
+    &collection,
+    &[
+      css.backgroundColor(Rgba<f32>.new(1.0, 1.0, 0.0, 1.0)),
+      run declared(Property.MixBlendMode, b"multiply"),
+    ],
+  )
+  run Testing.expect(at(&multiplied, 50, 50, 255, 255, 0), "yellow multiplied with white")
+  let differenced = run paint(
+    &collection,
+    &[css.backgroundColor(red()), run declared(Property.MixBlendMode, b"difference")],
+  )
+  run Testing.expect(at(&differenced, 50, 50, 0, 255, 255), "red against white by difference")
+}
+
+test effect fn mixBlendModes() -> ()
+  ! AssertionError<'static> | TreeError | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run blendBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn clipBody() -> ()
+  ! AssertionError<'static> | TreeError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let circle = run paint(
+    &collection,
+    &[css.backgroundColor(red()), run declared(Property.ClipPath, b"circle(50%)")],
+  )
+  run Testing.expect(at(&circle, 50, 50, 255, 0, 0), "inside the circle")
+  run Testing.expect(at(&circle, 5, 5, 255, 255, 255), "the corner is clipped")
+
+  let inset = run paint(
+    &collection,
+    &[css.backgroundColor(red()), run declared(Property.ClipPath, b"inset(10px 20px)")],
+  )
+  run Testing.expect(at(&inset, 50, 5, 255, 255, 255), "the top inset")
+  run Testing.expect(at(&inset, 15, 50, 255, 255, 255), "the left inset")
+  run Testing.expect(at(&inset, 25, 15, 255, 0, 0), "what the inset keeps")
+
+  let polygon = run paint(
+    &collection,
+    &[css.backgroundColor(red()), run declared(Property.ClipPath, b"polygon(0 0, 100% 0, 0 100%)")],
+  )
+  run Testing.expect(at(&polygon, 20, 20, 255, 0, 0), "inside the triangle")
+  run Testing.expect(at(&polygon, 80, 80, 255, 255, 255), "outside it")
+
+  let path = run paint(
+    &collection,
+    &[css.backgroundColor(red()), run declared(Property.ClipPath, b"path('M0 0 H50 V50 H0 Z')")],
+  )
+  run Testing.expect(at(&path, 25, 25, 255, 0, 0), "inside the path")
+  run Testing.expect(at(&path, 75, 75, 255, 255, 255), "outside it")
+}
+
+test effect fn clipPathShapes() -> ()
+  ! AssertionError<'static> | TreeError | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run clipBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn maskBody() -> ()
+  ! AssertionError<'static> | TreeError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let masked = run paint(
+    &collection,
+    &[
+      css.backgroundColor(red()),
+      run declared(Property.MaskImage, b"linear-gradient(to right, black 50%, transparent 50%)"),
+    ],
+  )
+  run Testing.expect(at(&masked, 25, 50, 255, 0, 0), "the opaque half of the mask")
+  run Testing.expect(at(&masked, 75, 50, 255, 255, 255), "the transparent half")
+
+  // Clip and mask together keep only where both do.
+  let both = run paint(
+    &collection,
+    &[
+      css.backgroundColor(red()),
+      run declared(Property.MaskImage, b"linear-gradient(to right, black 50%, transparent 50%)"),
+      run declared(Property.ClipPath, b"inset(50px 0 0 0)"),
+    ],
+  )
+  run Testing.expect(at(&both, 25, 75, 255, 0, 0), "kept by both")
+  run Testing.expect(at(&both, 25, 25, 255, 255, 255), "clipped")
+  run Testing.expect(at(&both, 75, 75, 255, 255, 255), "masked")
+}
+
+test effect fn maskImages() -> ()
+  ! AssertionError<'static> | TreeError | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run maskBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// How many pixels are mostly red.
+fn reds(pixels: &Pixmap) -> u32 {
+  let mut count: u32 = 0
+  let mut y: u32 = 0
+  while y < pixels.height() {
+    let mut x: u32 = 0
+    while x < pixels.width() {
+      let c = pixels.pixel(x, y)
+      if c.r > 200 && c.g < 80 && c.b < 80 {
+        count = count + 1
+      }
+      x = x + 1
+    }
+    y = y + 1
+  }
+  return count
+}
+
+effect fn textBody() -> ()
+  ! AssertionError<'static> | TreeError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.style(
+    1,
+    &[
+      css.width(px(100.0)),
+      css.height(px(100.0)),
+      css.backgroundColor(Rgba<f32>.new(1.0, 1.0, 1.0, 1.0)),
+      css.color(Rgba<f32>.new(0.0, 0.0, 0.0, 1.0)),
+      css.fontSize(px(30.0)),
+      run declared(Property.TextShadow, b"30px 0 red"),
+    ],
+  )
+  run batch.box(1, 2, &[])
+  run batch.text(2, 3, "Mm")
+  run batch.root(1)
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  let mut snapshot = CpuSnapshot.make()
+  run snapshot.sync(&mut tree)
+  let shadowed = run snapshot.render(&tree)
+  run Testing.expect(reds(&shadowed) > 30, "the inherited text shadow paints in red")
+
+  let mut none = Batch.make()
+  run none.style(2, &[run declared(Property.TextShadow, b"none")])
+  run tree.apply(run none.take())
+  run tree.frame(viewport())
+  run snapshot.sync(&mut tree)
+  let plain = run snapshot.render(&tree)
+  run Testing.expect(reds(&plain) == 0, "text-shadow: none on the child stops it")
+}
+
+test effect fn textShadowsInherit() -> ()
+  ! AssertionError<'static> | TreeError | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run textBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
