@@ -70,6 +70,26 @@ function cssValue(name, value) {
   return typeof value === "number" && !UNITLESS.has(name) ? value + "px" : String(value);
 }
 
+// ARIA states the tree has, by the name after `aria-`, and the tree attribute each sets. Other
+// ARIA names are accepted and ignored until the tree has them, with one warning each.
+const ARIA_STATES = { checked: "checked", selected: "selected", expanded: "expanded" };
+const ARIA_RANGE = { valuemin: 0, valuemax: 1, valuenow: 2 };
+const warned = new Set();
+
+function warnOnce(message) {
+  if (warned.has(message)) return;
+  warned.add(message);
+  console.warn(message);
+}
+
+// The part of an ARIA attribute name after `aria`, lowercase: `aria-valuenow` (the DOM
+// attribute) and `ariaValueNow` (the DOM property) are both `valuenow`. Null for other names.
+function ariaName(name) {
+  if (name.startsWith("aria-")) return name.slice(5).toLowerCase();
+  if (name.length > 4 && name.startsWith("aria") && name[4] >= "A" && name[4] <= "Z") return name.slice(4).toLowerCase();
+  return null;
+}
+
 /** The declarations of one look of a node: the base look, or what a state lays over it. */
 class Look {
   #node;
@@ -138,6 +158,8 @@ export class Node {
   #base = null;
   #looks = null;
   #flags = 0;
+  // aria-valuemin, aria-valuemax and aria-valuenow, which the tree takes as one range.
+  #range = null;
 
   constructor(kind) {
     this.id = ++nextId;
@@ -248,13 +270,46 @@ export class Node {
    * Sets a tree attribute: tabIndex, disabled, label, testId, placeholder and so on. A node
    * with an `href` is a link: a click on it or inside it that no listener prevented opens
    * the address with `open`, as a click on an `<a>` follows it.
+   *
+   * `role` and `aria-*` work as in the DOM, spelled `aria-checked` or `ariaChecked`:
+   * aria-label, aria-checked, aria-selected, aria-expanded, aria-valuemin, aria-valuemax and
+   * aria-valuenow reach the tree. A role the tree does not know, and other ARIA names, are
+   * ignored with a warning.
    */
   setAttribute(name, value) {
+    if (name === "role") {
+      const words = value == null ? "" : String(value);
+      if (!native.attribute(this.id, "role", words)) warnOnce("the tree has no role '" + words + "': it is ignored");
+      return;
+    }
+    const aria = ariaName(name);
+    if (aria !== null) {
+      this.#aria(aria, value);
+      return;
+    }
     if (name === "href") {
       this._href = value ? String(value) : null;
       this.#want(KIND_OF.get("click"));
     }
     native.attribute(this.id, name, value);
+  }
+
+  #aria(name, value) {
+    if (name === "label") {
+      native.attribute(this.id, "label", value == null ? "" : String(value));
+    } else if (name in ARIA_STATES) {
+      // ARIA states are the words "true" and "false"; anything else is false.
+      if (name === "checked" && value === "mixed") warnOnce("the tree has no mixed checked state yet: aria-checked='mixed' is false");
+      native.attribute(this.id, ARIA_STATES[name], value === true || value === "true");
+    } else if (name in ARIA_RANGE) {
+      const range = (this.#range ??= [undefined, undefined, undefined]);
+      range[ARIA_RANGE[name]] = value == null || value === "" ? undefined : Number(value);
+      const [min = 0, max = 100, now] = range;
+      if (now === undefined || Number.isNaN(now)) native.attribute(this.id, "valueRange");
+      else native.attribute(this.id, "valueRange", min, max, now);
+    } else {
+      warnOnce("the tree has no 'aria-" + name + "' yet: it is ignored");
+    }
   }
 
   // Tells the tree which events this node wants: its listeners', and clicks on a link.
@@ -385,8 +440,65 @@ export class Input extends Node {
   }
 }
 
+// Inline SVG markup as icon resources: identical markup shares one, freed when no icon shows
+// it. The ids start high, clear of resources a host or a URL table numbers from 1.
+const ICONS = new Map();
+let nextIcon = 0x40000000;
+
+function holdIcon(markup) {
+  let entry = ICONS.get(markup);
+  if (!entry) {
+    entry = { id: nextIcon++, count: 0 };
+    ICONS.set(markup, entry);
+    native.defineIcon(entry.id, markup);
+  }
+  entry.count++;
+  return entry.id;
+}
+
+function dropIcon(markup) {
+  const entry = ICONS.get(markup);
+  if (entry && --entry.count === 0) {
+    ICONS.delete(markup);
+    native.release(entry.id);
+  }
+}
+
+/**
+ * An icon: SVG drawn at the node's CSS size, as an inline `<svg>` is. Its `currentColor` is
+ * the node's `color`, so an icon that paints only with it (Lucide's, for example) takes the
+ * text color, and any other keeps its own colors.
+ */
+export class Icon extends Node {
+  #svg = "";
+
+  constructor(svg = "") {
+    super("icon");
+    this.svg = svg;
+  }
+
+  /** The SVG markup, as `outerHTML` of an `<svg>` element would give it. */
+  get svg() {
+    return this.#svg;
+  }
+
+  set svg(markup) {
+    markup = markup == null ? "" : String(markup);
+    if (markup === this.#svg) return;
+    if (this.#svg) dropIcon(this.#svg);
+    this.#svg = markup;
+    native.source(this.id, markup ? holdIcon(markup) : 0);
+  }
+
+  _forget() {
+    if (this.#svg) dropIcon(this.#svg);
+    this.#svg = "";
+  }
+}
+
 function forget(node) {
   nodes.delete(node.id);
+  node._forget?.();
   for (const child of node.childNodes) {
     child.parentNode = null;
     forget(child);
@@ -398,6 +510,7 @@ export function createNode(kind) {
   if (!(kind in KINDS)) throw new TypeError("the tree has no node kind '" + kind + "'");
   if (kind === "text") return new Text();
   if (kind === "input") return new Input();
+  if (kind === "icon") return new Icon();
   return new Node(kind);
 }
 
@@ -411,6 +524,13 @@ export function createBox(style, ...children) {
 
 export function createText(data = "") {
   return new Text(data);
+}
+
+/** An icon showing `svg` markup, with `style` as its base look. */
+export function createIcon(svg, style) {
+  const icon = new Icon(svg);
+  if (style) icon.style.set(style);
+  return icon;
 }
 
 export function createInput(style) {
