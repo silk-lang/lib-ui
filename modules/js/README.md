@@ -34,7 +34,10 @@ mount(createBox({ width: 400, height: 300 }, button));
 - **Style.** `node.style.set({ ... })` sets properties by their camel case names. Numbers are
   CSS pixels, except for unitless properties such as `opacity` and `flexGrow`. `null` takes a
   property out. `fontFamily` takes CSS `font-family` text (`"monospace"`, `"Noto Sans, sans-serif"`),
-  resolved in the host's font collection. `node.look("hover")` (also `active`, `focus`, `focusVisible`) is the look the
+  resolved in the host's font collection. Grid layouts take the CSS grid properties
+  (`gridTemplateColumns: "auto 1fr"`, `repeat()`, `minmax()`, named lines and
+  `gridTemplateAreas`, `gridArea`, `gridColumn: "span 2"`); numbers for the placement
+  properties are line numbers. Grid properties apply from the base look only. `node.look("hover")` (also `active`, `focus`, `focusVisible`) is the look the
   tree lays over the base in that state.
 - **Events.** `addEventListener(type, listener, options)` with `capture` and `once`. An event
   runs the capture phase from the root down, the target, then bubbles, with
