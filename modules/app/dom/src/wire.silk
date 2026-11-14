@@ -16,6 +16,7 @@ import ui_protocol.mutation {
   NOT_FOCUSABLE
 }
 import ui_protocol.record { Event, EventKind }
+import ui_protocol.aria { ariaText }
 import silk.collections.bytes { Bytes }
 import silk.collections.list { List }
 import silk.collections.slice { Slice }
@@ -111,6 +112,21 @@ pub const OP_LOAD_IMAGE: u8 = 31
 /// Load icon `resource` from a URL.
 pub const OP_LOAD_ICON: u8 = 32
 
+/// Declare font face `face`: its family and URL as text, its weight and width ranges as four
+/// floats, its style as a byte, then a count and that many code points, pairs of first and
+/// last (`Mutation.DeclareFontFace`). The page adds a `FontFace` to `document.fonts`.
+pub const OP_FONT_FACE: u8 = 33
+
+/// Load font face `face` now (`FontFace.load()`). Its URL follows, as text.
+pub const OP_LOAD_FONT_FACE: u8 = 34
+
+/// Load a stylesheet of `@font-face` rules from a URL: the page links it.
+pub const OP_FONT_STYLESHEET: u8 = 35
+
+/// Defines `@keyframes`: its name, a count of frames, and for each its offset (0 to 1), a
+/// count of declarations and those declarations as text. No frames removes the rule.
+pub const OP_KEYFRAMES: u8 = 36
+
 pub effect fn byte(out: &mut Bytes, value: u8) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
@@ -179,6 +195,7 @@ fn stateCode(state: StyleState) -> u8 {
     StyleState.Active => 2
     StyleState.Focus => 3
     StyleState.FocusVisible => 4
+    StyleState.Starting => 5
   }
 }
 
@@ -213,6 +230,41 @@ pub fn roleName(value: Role) -> string<'static> {
     Role.ListBox => "listbox"
     Role.Option => "option"
     Role.Tooltip => "tooltip"
+    Role.Alert => "alert"
+    Role.AlertDialog => "alertdialog"
+    Role.Status => "status"
+    Role.Log => "log"
+    Role.Timer => "timer"
+    Role.ProgressBar => "progressbar"
+    Role.Separator => "separator"
+    Role.ComboBox => "combobox"
+    Role.SearchBox => "searchbox"
+    Role.SpinButton => "spinbutton"
+    Role.Table => "table"
+    Role.RowGroup => "rowgroup"
+    Role.Row => "row"
+    Role.Cell => "cell"
+    Role.ColumnHeader => "columnheader"
+    Role.RowHeader => "rowheader"
+    Role.Grid => "grid"
+    Role.GridCell => "gridcell"
+    Role.Tree => "tree"
+    Role.TreeGrid => "treegrid"
+    Role.TreeItem => "treeitem"
+    Role.MenuBar => "menubar"
+    Role.MenuItemCheckbox => "menuitemcheckbox"
+    Role.MenuItemRadio => "menuitemradio"
+    Role.RadioGroup => "radiogroup"
+    Role.Region => "region"
+    Role.Banner => "banner"
+    Role.ContentInfo => "contentinfo"
+    Role.Complementary => "complementary"
+    Role.Search => "search"
+    Role.Article => "article"
+    Role.Figure => "figure"
+    Role.Document => "document"
+    Role.Application => "application"
+    Role.Note => "note"
   }
 }
 
@@ -272,6 +324,12 @@ const ATTR_HREF: u8 = 16
 const ATTR_TRANSITION: u8 = 17
 
 const ATTR_CLASS: u8 = 18
+
+/// An ARIA attribute by name and value text, an empty value taking it out (`aria.silk`).
+const ATTR_ARIA: u8 = 20
+
+/// `aria-checked="mixed"` while on, the checked state again when off.
+const ATTR_INDETERMINATE: u8 = 21
 
 const ATTR_ID: u8 = 19
 
@@ -435,6 +493,18 @@ effect fn writeAttribute(out: &mut Bytes, entry: &Attribute) -> ()
     Attribute.ElementId { value } => {
       run byte(&mut out, ATTR_ID)
       run text(&mut out, value.ownedUtf8Bytes())
+    }
+    Attribute.Indeterminate { value } => {
+      run byte(&mut out, ATTR_INDETERMINATE)
+      run flag(&mut out, value)
+    }
+    _ => {
+      let mut value = Bytes.make()
+      if let Option<string<'static>>.Some { value: name } = run ariaText(&entry.*, &mut value) {
+        run byte(&mut out, ATTR_ARIA)
+        run text(&mut out, String.utf8Bytes(name))
+        run text(&mut out, value.asSlice())
+      }
     }
   }
 }
@@ -612,6 +682,64 @@ pub effect fn writeMutation(out: &mut Bytes, mutation: &Mutation) -> bool
       run word(&mut out, resource)
       run text(&mut out, url.ownedUtf8Bytes())
     }
+    Mutation.DeclareFontFace {
+      face,
+      family,
+      url,
+      weightMin,
+      weightMax,
+      widthMin,
+      widthMax,
+      style,
+      ranges,
+    } => {
+      run byte(&mut out, OP_FONT_FACE)
+      run word(&mut out, face)
+      run text(&mut out, family.ownedUtf8Bytes())
+      run text(&mut out, url.ownedUtf8Bytes())
+      run float(&mut out, weightMin)
+      run float(&mut out, weightMax)
+      run float(&mut out, widthMin)
+      run float(&mut out, widthMax)
+      run byte(&mut out, style)
+      let points = ranges.asSlice()
+      run word(&mut out, usize.toU32(points.length))
+      let mut i: usize = 0
+      while i < points.length {
+        run word(&mut out, points[i])
+        i = i + 1
+      }
+    }
+    Mutation.LoadFontFace { face, url } => {
+      run byte(&mut out, OP_LOAD_FONT_FACE)
+      run word(&mut out, face)
+      run text(&mut out, url.ownedUtf8Bytes())
+    }
+    Mutation.LoadFontStylesheet { url } => {
+      run byte(&mut out, OP_FONT_STYLESHEET)
+      run text(&mut out, url.ownedUtf8Bytes())
+    }
+    Mutation.DefineKeyframes { name, frames } => {
+      run byte(&mut out, OP_KEYFRAMES)
+      run text(&mut out, name.ownedUtf8Bytes())
+      let items = frames.asSlice()
+      run word(&mut out, usize.toU32(items.length))
+      let mut line = Bytes.make()
+      let mut i: usize = 0
+      while i < items.length {
+        run float(&mut out, items[i].offset)
+        let list = items[i].declarations.asSlice()
+        run word(&mut out, usize.toU32(list.length))
+        let mut k: usize = 0
+        while k < list.length {
+          line.clear()
+          run writeDeclaration(&mut line, &list[k])
+          run text(&mut out, line.asSlice())
+          k = k + 1
+        }
+        i = i + 1
+      }
+    }
     _ => {
       return false
     }
@@ -670,9 +798,17 @@ fn eventKind(code: u8) -> EventKind {
     13 => EventKind.Layout
     14 => EventKind.PointerCancel
     15 => EventKind.GotPointerCapture
+    16 => EventKind.LostPointerCapture
     17 => EventKind.Load
     18 => EventKind.Error
-    _ => EventKind.LostPointerCapture
+    19 => EventKind.TransitionRun
+    20 => EventKind.TransitionStart
+    21 => EventKind.TransitionEnd
+    22 => EventKind.TransitionCancel
+    23 => EventKind.AnimationStart
+    24 => EventKind.AnimationIteration
+    25 => EventKind.AnimationEnd
+    _ => EventKind.AnimationCancel
   }
 }
 
@@ -681,7 +817,8 @@ pub effect fn readEvent(bytes: &[u8]) -> Event
   ! OutOfMemoryError
   ? &mut Allocator {
   let mut at: usize = 0
-  let kind = eventKind(readByte(bytes, &mut at))
+  let kindCode = readByte(bytes, &mut at)
+  let kind = eventKind(kindCode)
   let target = readWord(bytes, &mut at)
   let count = readWord(bytes, &mut at)
   let mut path = List<u32>.make()
@@ -711,5 +848,12 @@ pub effect fn readEvent(bytes: &[u8]) -> Event
   event.code = run readText(bytes, &mut at)
   event.value = run readText(bytes, &mut at)
   event.inputType = run readText(bytes, &mut at)
+  if u8.toU32(kindCode) >= 19 {
+    // Transition and animation records: the name travels as the value, the elapsed time as x.
+    event.name = move event.value
+    event.value = String.make()
+    event.elapsedTime = event.x
+    event.x = 0.0
+  }
   return move event
 }

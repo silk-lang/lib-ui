@@ -1,0 +1,433 @@
+//! Viewport units, CSS transitions and keyframe animations: values that depend on the
+//! viewport or on the frame clock.
+import ui_tree.css
+import ui_tree.css { px, Unit, Property, Keyword }
+import ui_fixtures.fixtures as fixtures
+import ui_tree.legacy {
+  UiTree,
+  TreeError,
+  Batch,
+  FrameInput,
+  NodeInfo,
+  NodeKind,
+  Event,
+  EventKind,
+  StyleState,
+  Input,
+  Keyframe,
+  Declaration,
+  LISTEN_ALL,
+  info
+}
+import silk.collections.list { List }
+import silk.color.rgba { Rgba }
+import silk.core.effect { Effect }
+import silk.text.string { String }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+
+fn sized(width: f32, height: f32, time: f64) -> FrameInput {
+  return FrameInput { width: width, height: height, scale: 1.0, time: time }
+}
+
+effect fn widthOf(tree: &UiTree<'_>, id: u32) -> f32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match run info(tree, id) {
+    Option<NodeInfo>.Some { value } => value.bounds.width()
+    Option<NodeInfo>.None => -1.0
+  }
+}
+
+effect fn heightOf(tree: &UiTree<'_>, id: u32) -> f32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match run info(tree, id) {
+    Option<NodeInfo>.Some { value } => value.bounds.height()
+    Option<NodeInfo>.None => -1.0
+  }
+}
+
+effect fn viewportBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.style(1, &[css.width(css.unit(100.0, Unit.Vw)), css.height(css.unit(100.0, Unit.Dvh))])
+  run batch.box(1, 2, &[css.width(css.unit(50.0, Unit.Vmin)), css.height(px(10.0))])
+  run batch.box(1, 3, &[css.width(px(30.0)), css.height(px(10.0))])
+  run batch.root(1)
+  run tree.apply(run batch.take())
+  run tree.frame(sized(800.0, 600.0, 0.0))
+  run Testing.expect((run widthOf(&tree, 1)) == 800.0 && (run heightOf(&tree, 1)) == 600.0, "100vw by 100dvh fills the viewport")
+  run Testing.expect((run widthOf(&tree, 2)) == 300.0, "50vmin is half the smaller side")
+
+  // A resize restyles the nodes that use viewport units, and only those.
+  run tree.frame(sized(400.0, 1000.0, 0.0))
+  run Testing.expect((run widthOf(&tree, 1)) == 400.0 && (run heightOf(&tree, 1)) == 1000.0, "the units follow a resize")
+  run Testing.expect((run widthOf(&tree, 2)) == 200.0, "vmin follows the smaller side")
+  run Testing.expect((run widthOf(&tree, 3)) == 30.0, "other nodes keep their style")
+  run Testing.expect(!tree.needsFrame(), "a resized frame leaves nothing to draw")
+}
+
+test effect fn viewportUnitsFollowTheViewport() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run viewportBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+fn at(time: f64) -> FrameInput {
+  return sized(400.0, 300.0, time)
+}
+
+fn opacityOf(tree: &UiTree<'_>, id: u32) -> f32 {
+  return tree.node(tree.slotOf(id)).computed.paint.opacity
+}
+
+fn near(a: f32, b: f32) -> bool {
+  return a - b < 0.001 && b - a < 0.001
+}
+
+/// The kinds and names of the transition records, as `run:opacity end:opacity`.
+effect fn records(tree: &mut UiTree<'_>) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut events = List<Event>.make()
+  run tree.takeEvents(&mut events)
+  let mut out = String.make()
+  let items = events.asSlice()
+  let mut i: usize = 0
+  while i < items.length {
+    let kind = match items[i].kind {
+      EventKind.TransitionRun => "run:"
+      EventKind.TransitionStart => "start:"
+      EventKind.TransitionEnd => "end:"
+      EventKind.TransitionCancel => "cancel:"
+      EventKind.AnimationStart => "astart:"
+      EventKind.AnimationIteration => "aiter:"
+      EventKind.AnimationEnd => "aend:"
+      EventKind.AnimationCancel => "acancel:"
+      _ => ""
+    }
+    if String.byteLength(kind) != 0 {
+      if out.ownedByteLength() != 0 {
+        run out.append(" ")
+      }
+      run out.append(kind)
+      run out.append(String.view(&items[i].name))
+    }
+    i = i + 1
+  }
+  return move out
+}
+
+effect fn opacityBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.box(1, 2, &[
+    css.width(px(10.0)),
+    css.height(px(10.0)),
+    css.declare(Property.Transition, run css.text(b"opacity 1s linear")),
+  ])
+  run batch.listen(2, LISTEN_ALL)
+  run batch.root(1)
+  run tree.apply(run batch.take())
+  run tree.frame(at(0.0))
+  run Testing.expect((run records(&mut tree)).ownedByteLength() == 0, "a new node does not transition")
+
+  let mut fade = Batch.make()
+  run fade.style(2, &[css.opacity(0.0)])
+  run tree.apply(run fade.take())
+  run tree.frame(at(10.0))
+  run Testing.expect(near(opacityOf(&tree, 2), 1.0), "the transition starts from the old value")
+  run Testing.expect(String.view(&run records(&mut tree)) == "run:opacity start:opacity", "run and start records")
+  run tree.frame(at(10.25))
+  run Testing.expect(near(opacityOf(&tree, 2), 0.75), "a quarter of the way at a quarter of the time")
+  run Testing.expect(tree.needsFrame(), "a running transition asks for frames")
+  run tree.frame(at(10.5))
+  run Testing.expect(near(opacityOf(&tree, 2), 0.5), "half way")
+  run tree.frame(at(11.0))
+  run Testing.expect(opacityOf(&tree, 2) == 0.0, "the end value at the end")
+  run Testing.expect(String.view(&run records(&mut tree)) == "end:opacity", "an end record")
+  run tree.frame(at(11.1))
+  run Testing.expect(!tree.needsFrame(), "nothing to draw after it ended")
+  run Testing.expect(opacityOf(&tree, 2) == 0.0, "the end value stays")
+}
+
+test effect fn opacityTransitionsOverTheFrameClock() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run opacityBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn reverseBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.box(1, 2, &[
+    css.width(px(100.0)),
+    css.height(px(10.0)),
+    css.declare(Property.Transition, run css.text(b"width 1s linear, height 200ms 300ms")),
+  ])
+  run batch.listen(2, LISTEN_ALL)
+  run batch.root(1)
+  run tree.apply(run batch.take())
+  run tree.frame(at(0.0))
+
+  let mut grow = Batch.make()
+  run grow.style(2, &[css.width(px(200.0))])
+  run tree.apply(run grow.take())
+  run tree.frame(at(1.0))
+  run tree.frame(at(1.5))
+  run Testing.expect((run widthOf(&tree, 2)) == 150.0, "layout follows the transition")
+  drop run records(&mut tree)
+
+  // Going back half way takes half the time, from where it is.
+  let mut shrink = Batch.make()
+  run shrink.style(2, &[css.width(px(100.0))])
+  run tree.apply(run shrink.take())
+  run tree.frame(at(1.5))
+  run Testing.expect(String.view(&run records(&mut tree)) == "cancel:width run:width start:width", "the old one is cancelled")
+  run tree.frame(at(1.75))
+  run Testing.expect((run widthOf(&tree, 2)) == 125.0, "the reversed transition is shortened")
+  run tree.frame(at(2.0))
+  run Testing.expect((run widthOf(&tree, 2)) == 100.0, "and ends at half the duration")
+
+  // A delay holds the start value; display none cancels.
+  let mut tall = Batch.make()
+  run tall.style(2, &[css.height(px(20.0))])
+  run tree.apply(run tall.take())
+  run tree.frame(at(3.0))
+  run Testing.expect(String.view(&run records(&mut tree)) == "end:width run:height", "no start record during the delay")
+  run tree.frame(at(3.2))
+  run Testing.expect((run heightOf(&tree, 2)) == 10.0, "the delay shows the start value")
+  run tree.frame(at(3.4))
+  run Testing.expect(String.view(&run records(&mut tree)) == "start:height", "start after the delay")
+  let mut hide = Batch.make()
+  run hide.style(2, &[css.display(Keyword.None)])
+  run tree.apply(run hide.take())
+  run tree.frame(at(3.45))
+  run Testing.expect(String.view(&run records(&mut tree)) == "cancel:height", "display none cancels")
+  run Testing.expect(!tree.needsFrame(), "nothing runs on a hidden node")
+}
+
+test effect fn transitionsReverseDelayAndCancel() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run reverseBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+fn rgb(r: f32, g: f32, b: f32) -> Rgba<f32> {
+  return Rgba<f32> { r: r, g: g, b: b, a: 1.0 }
+}
+
+effect fn hoverBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.box(1, 2, &[
+    css.width(px(100.0)),
+    css.height(px(100.0)),
+    css.color(rgb(1.0, 0.0, 0.0)),
+    css.declare(Property.Transition, run css.text(b"color 100ms linear")),
+  ])
+  run batch.styleFor(2, StyleState.Hover, &[css.color(rgb(0.0, 0.0, 1.0))])
+  run batch.text(2, 3, "label")
+  run batch.root(1)
+  run tree.apply(run batch.take())
+  run tree.frame(at(0.0))
+  run tree.dispatch(Input.PointerMove { x: 10.0, y: 10.0, modifiers: 0 })
+  run tree.frame(at(1.0))
+  run tree.frame(at(1.05))
+  let own = tree.node(tree.slotOf(2)).computed.text.color
+  let inherited = tree.node(tree.slotOf(3)).computed.text.color
+  run Testing.expect(near(own.r, 0.5) && near(own.b, 0.5), "hovering eases to the hover color")
+  run Testing.expect(near(inherited.r, 0.5) && near(inherited.b, 0.5), "the text inherits the eased color")
+  run tree.dispatch(Input.PointerMove { x: 300.0, y: 200.0, modifiers: 0 })
+  run tree.frame(at(1.05))
+  run tree.frame(at(1.075))
+  let back = tree.node(tree.slotOf(2)).computed.text.color
+  run Testing.expect(near(back.r, 0.75), "leaving reverses from where it was, in half the time")
+  run tree.frame(at(1.1))
+  run Testing.expect(tree.node(tree.slotOf(3)).computed.text.color.r == 1.0, "and ends on the base color")
+}
+
+test effect fn hoverTransitionsAndInheritance() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run hoverBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn frameOf(offset: f32, declarations: &[Declaration]) -> Keyframe
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut list = List<Declaration>.make()
+  let mut i: usize = 0
+  while i < declarations.length {
+    run list.append(run css.cloneDeclaration(&declarations[i]))
+    i = i + 1
+  }
+  return Keyframe { offset: offset, declarations: move list }
+}
+
+effect fn animationBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  let mut batch = Batch.make()
+  let mut frames = List<Keyframe>.make()
+  run frames.append(run frameOf(1.0, &[css.opacity(1.0)]))
+  run frames.append(run frameOf(0.0, &[css.opacity(0.0)]))
+  run batch.keyframes("fade", move frames)
+  run batch.create(1, NodeKind.Box)
+  run batch.box(1, 2, &[
+    css.width(px(10.0)),
+    css.height(px(10.0)),
+    css.opacity(0.5),
+    css.declare(Property.Animation, run css.text(b"fade 1s linear 2 alternate")),
+  ])
+  run batch.listen(2, LISTEN_ALL)
+  run batch.root(1)
+  run tree.apply(run batch.take())
+  run tree.frame(at(0.0))
+  run Testing.expect(near(opacityOf(&tree, 2), 0.0), "an animation starts at its first frame")
+  run Testing.expect(String.view(&run records(&mut tree)) == "astart:fade", "animationstart names the rule")
+  run Testing.expect(tree.needsFrame(), "a playing animation asks for frames")
+
+  run tree.frame(at(0.25))
+  run Testing.expect(near(opacityOf(&tree, 2), 0.25), "it moves with the frame clock")
+  run tree.frame(at(1.25))
+  run Testing.expect(near(opacityOf(&tree, 2), 0.75), "alternate plays the second iteration backwards")
+  run Testing.expect(String.view(&run records(&mut tree)) == "aiter:fade", "animationiteration at the iteration boundary")
+  run tree.frame(at(2.5))
+  run Testing.expect(near(opacityOf(&tree, 2), 0.5), "without a fill the end shows the underlying style")
+  run Testing.expect(String.view(&run records(&mut tree)) == "aend:fade", "animationend at the end")
+  run tree.frame(at(3.0))
+  run Testing.expect(!tree.needsFrame(), "an ended animation leaves nothing to draw")
+
+  // Fill forwards keeps the end; changing the name cancels nothing that ended, then restarts.
+  let mut fill = Batch.make()
+  run fill.style(2, &[css.declare(Property.Animation, run css.text(b"fade 1s linear forwards"))])
+  run tree.apply(run fill.take())
+  run tree.frame(at(3.0))
+  run tree.frame(at(4.5))
+  run Testing.expect(near(opacityOf(&tree, 2), 1.0), "fill forwards holds the last frame")
+
+  // A delay without a backwards fill shows the underlying style; renaming cancels.
+  let mut none = Batch.make()
+  run none.style(2, &[css.declare(Property.Animation, run css.text(b"none"))])
+  run tree.apply(run none.take())
+  run tree.frame(at(5.0))
+  run Testing.expect((run records(&mut tree)).ownedByteLength() == 0, "removing an ended animation cancels nothing")
+  let mut again = Batch.make()
+  run again.style(2, &[css.declare(Property.Animation, run css.text(b"fade 2s linear 1s infinite"))])
+  run tree.apply(run again.take())
+  run tree.frame(at(5.0))
+  run Testing.expect(near(opacityOf(&tree, 2), 0.5), "a delay without a backwards fill shows the underlying style")
+  run tree.frame(at(6.5))
+  run Testing.expect(near(opacityOf(&tree, 2), 0.25), "it starts after its delay")
+  drop run records(&mut tree)
+  let mut renamed = Batch.make()
+  run renamed.style(2, &[css.declare(Property.Animation, run css.text(b"slide 2s linear 1s infinite"))])
+  run tree.apply(run renamed.take())
+  run tree.frame(at(7.0))
+  run Testing.expect(String.view(&run records(&mut tree)) == "acancel:fade", "a renamed animation cancels the old one")
+  run Testing.expect(near(opacityOf(&tree, 2), 0.5), "an unknown name plays nothing")
+  run Testing.expect(!tree.needsFrame(), "an unknown name asks for no frames")
+
+  // Pausing holds the clock and running again picks up where it paused.
+  let mut back = Batch.make()
+  run back.style(2, &[css.declare(Property.Animation, run css.text(b"fade 2s linear"))])
+  run tree.apply(run back.take())
+  run tree.frame(at(8.0))
+  run tree.frame(at(8.5))
+  run Testing.expect(near(opacityOf(&tree, 2), 0.25), "a returning name starts again")
+  let mut pause = Batch.make()
+  run pause.style(2, &[css.declare(Property.AnimationPlayState, run css.text(b"paused"))])
+  run tree.apply(run pause.take())
+  run tree.frame(at(8.5))
+  run tree.frame(at(15.0))
+  run Testing.expect(near(opacityOf(&tree, 2), 0.25), "a paused animation holds its place")
+  run Testing.expect(!tree.needsFrame(), "a paused animation asks for no frames")
+  let mut play = Batch.make()
+  run play.style(2, &[css.declare(Property.AnimationPlayState, run css.text(b"running"))])
+  run tree.apply(run play.take())
+  run tree.frame(at(15.0))
+  run tree.frame(at(15.5))
+  run Testing.expect(near(opacityOf(&tree, 2), 0.5), "running again picks up where it paused")
+  drop run records(&mut tree)
+  let mut hide = Batch.make()
+  run hide.style(2, &[css.display(Keyword.None)])
+  run tree.apply(run hide.take())
+  run tree.frame(at(15.6))
+  run Testing.expect(String.view(&run records(&mut tree)) == "acancel:fade", "display none cancels the animation")
+}
+
+test effect fn keyframeAnimationsPlayOnTheFrameClock() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run animationBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn startingBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.box(1, 2, &[
+    css.width(px(10.0)),
+    css.height(px(10.0)),
+    css.declare(Property.Transition, run css.text(b"opacity 1s linear")),
+  ])
+  run batch.styleFor(2, StyleState.Starting, &[css.opacity(0.0)])
+  run batch.listen(2, LISTEN_ALL)
+  run batch.root(1)
+  run tree.apply(run batch.take())
+  run tree.frame(at(0.0))
+  run Testing.expect(near(opacityOf(&tree, 2), 0.0), "a new node starts from its starting style")
+  run Testing.expect(String.view(&run records(&mut tree)) == "run:opacity start:opacity", "and transitions from it")
+  run tree.frame(at(0.5))
+  run Testing.expect(near(opacityOf(&tree, 2), 0.5), "toward its style")
+  run tree.frame(at(1.0))
+  run Testing.expect(near(opacityOf(&tree, 2), 1.0), "the starting style never shows by itself")
+
+  // Shown again after display none, it starts over; a restyle while shown does not.
+  let mut hide = Batch.make()
+  run hide.style(2, &[css.display(Keyword.None)])
+  run tree.apply(run hide.take())
+  run tree.frame(at(2.0))
+  drop run records(&mut tree)
+  let mut show = Batch.make()
+  run show.style(2, &[css.display(Keyword.Block)])
+  run tree.apply(run show.take())
+  run tree.frame(at(3.0))
+  run Testing.expect(near(opacityOf(&tree, 2), 0.0), "showing again starts from the starting style")
+  run tree.frame(at(4.0))
+  let mut wide = Batch.make()
+  run wide.style(2, &[css.width(px(20.0))])
+  run tree.apply(run wide.take())
+  run tree.frame(at(4.0))
+  run Testing.expect(near(opacityOf(&tree, 2), 1.0), "a restyle of a shown node does not start over")
+}
+
+test effect fn startingStyleIsWhereTransitionsBegin() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run startingBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}

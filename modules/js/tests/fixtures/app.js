@@ -41,4 +41,4 @@ field.addEventListener("keydown", (event) => {
 
 globalThis.keepFocus = true;
 globalThis.log = log;
-globalThis.app = { root, field, button, label };
+globalThis.app = { root, field, button, label, createBox };

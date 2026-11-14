@@ -1,0 +1,376 @@
+//! CSS transforms: reading the properties, their matrices, and interpolation.
+import ui_tree.css
+import ui_tree.css { px, Property }
+import ui_tree.cssom_view as view
+import ui_tree.legacy { UiTree, TreeError, Batch, FrameInput, NodeKind, Position, CpuSnapshot, Keyframe, Declaration }
+import silk.collections.list { List }
+import ui_tree.transform
+import ui_fixtures.fixtures as fixtures
+import svg_css.cssom_error { CssomError }
+import silk.color.rgba { Rgba }
+import vector.pixmap { Pixmap }
+import vector.geometry_error { GeometryError }
+import silk.num.f64
+import ui_tree.transform { Transform, TransformList, Units }
+import silk.core.effect { Effect }
+import silk.geometry.matrix { Matrix4 }
+import silk.geometry.point { Point2 }
+import silk.geometry.rect { Rect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.testing.testing { Testing, AssertionError }
+
+fn units() -> Units {
+  return Units { fontSize: 10.0, rootFontSize: 16.0, viewportWidth: 800.0, viewportHeight: 600.0 }
+}
+
+fn near(a: f32, b: f32) -> bool {
+  return f32.abs(a - b) < 0.001
+}
+
+fn near64(a: f64, b: f64) -> bool {
+  return near(f64.toF32(a), f64.toF32(b))
+}
+
+fn sameMatrix(a: Matrix4<f32>, b: Matrix4<f32>) -> bool {
+  let mut i: usize = 0
+  while i < 16 {
+    if f32.abs(a.values[i] - b.values[i]) > 0.0005 {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn styled(css: &[u8], which: u32) -> Transform {
+  let mut t = Transform.initial()
+  transform.declare(&mut t, which, css, &units())
+  return t
+}
+
+// Where (x, y) of a 100 by 50 box at (10, 20) lands.
+fn lands(t: &Transform, x: f32, y: f32) -> Point2<f32> {
+  let m = transform.flatten(transform.matrix(t, Rect<f32>.new(10.0, 20.0, 110.0, 70.0)))
+  return transform.map(&m, x, y).unwrapOr(Point2<f32> { x: -1.0, y: -1.0 })
+}
+
+effect fn readingAndMatrices() -> ()
+  ! AssertionError<'static>
+  ? &mut Allocator {
+  let moved = styled(b"translate(10px, 50%) translateX(1em)", transform.TRANSFORM_LIST)
+  let p = lands(&moved, 10.0, 20.0)
+  run Testing.expect(near(p.x, 30.0) && near(p.y, 45.0), "translate takes px, % of the box and em")
+
+  // The origin is the box center: a half turn maps a corner to the opposite one.
+  let turned = styled(b"rotate(0.5turn)", transform.TRANSFORM_LIST)
+  let q = lands(&turned, 10.0, 20.0)
+  run Testing.expect(near(q.x, 110.0) && near(q.y, 70.0), "rotate turns about the center")
+  let quarter = styled(b"rotate(90deg)", transform.TRANSFORM_LIST)
+  let r = lands(&quarter, 110.0, 45.0)
+  run Testing.expect(near(r.x, 60.0) && near(r.y, 95.0), "positive angles turn clockwise")
+
+  let mut origin = styled(b"scale(2)", transform.TRANSFORM_LIST)
+  transform.declare(&mut origin, transform.ORIGIN_PROPERTY, b"left top", &units())
+  let s = lands(&origin, 60.0, 45.0)
+  run Testing.expect(near(s.x, 110.0) && near(s.y, 70.0), "scale(2) from the top left corner")
+
+  // Individual properties apply translate, rotate, scale, then transform.
+  let mut both = styled(b"translateX(100px)", transform.TRANSFORM_LIST)
+  transform.declare(&mut both, transform.SCALE_PROPERTY, b"2 1", &units())
+  transform.declare(&mut both, transform.TRANSLATE_PROPERTY, b"5px", &units())
+  let b = lands(&both, 60.0, 45.0)
+  run Testing.expect(near(b.x, 265.0) && near(b.y, 45.0), "translate, scale, then transform")
+
+  let matrix = styled(b"matrix(1, 0, 0, 1, 7, -3)", transform.TRANSFORM_LIST)
+  let m = lands(&matrix, 10.0, 20.0)
+  run Testing.expect(near(m.x, 17.0) && near(m.y, 17.0), "matrix() moves by e and f")
+  let three = styled(b"matrix3d(1,0,0,0, 0,1,0,0, 0,0,1,0, 4,5,0,1)", transform.TRANSFORM_LIST)
+  let n = lands(&three, 10.0, 20.0)
+  run Testing.expect(near(n.x, 14.0) && near(n.y, 25.0), "matrix3d() too")
+
+  let invalid = styled(b"rotate(10px)", transform.TRANSFORM_LIST)
+  run Testing.expect(!invalid.any(), "an invalid list is ignored")
+  let none = styled(b"none", transform.TRANSFORM_LIST)
+  run Testing.expect(!none.any(), "none is no transform")
+  let rotated = styled(b"y 90deg", transform.ROTATE_PROPERTY)
+  run Testing.expect(rotated.rotate.y == 1.0 && near(rotated.rotate.w, 1.5707964), "rotate: y 90deg")
+  let axis = styled(b"45deg 1 1 0", transform.ROTATE_PROPERTY)
+  run Testing.expect(axis.rotate.x == 1.0 && axis.rotate.y == 1.0, "rotate: an angle then an axis")
+
+  // A quarter turn about y shows the box edge on, and past it the back.
+  let edge = styled(b"rotateY(180deg)", transform.TRANSFORM_LIST)
+  run Testing.expect(
+    transform.backFacing(&transform.matrix(&edge, Rect<f32>.new(0.0, 0.0, 10.0, 10.0))),
+    "a half turn about y shows the back",
+  )
+  let mirror = styled(b"scaleX(-1)", transform.TRANSFORM_LIST)
+  run Testing.expect(
+    !transform.backFacing(&transform.matrix(&mirror, Rect<f32>.new(0.0, 0.0, 10.0, 10.0))),
+    "a mirror does not",
+  )
+
+  // Perspective: a box pushed away shrinks toward the perspective origin.
+  let mut parent = Transform.initial()
+  transform.declare(&mut parent, transform.PERSPECTIVE_PROPERTY, b"100px", &units())
+  let far = styled(b"translateZ(-100px)", transform.TRANSFORM_LIST)
+  let box = Rect<f32>.new(0.0, 0.0, 200.0, 200.0)
+  let seen = transform.flatten(transform.perspectiveOf(&parent, box) * transform.matrix(&far, box))
+  let corner = transform.map(&seen, 0.0, 0.0).unwrapOr(Point2<f32> { x: -1.0, y: -1.0 })
+  run Testing.expect(near(corner.x, 50.0) && near(corner.y, 50.0), "twice as far is half as big")
+}
+
+test effect fn transformsReadAndMap() -> ()
+  ! AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run readingAndMatrices() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn interpolation() -> ()
+  ! AssertionError<'static>
+  ? &mut Allocator {
+  let box = Rect<f32>.new(0.0, 0.0, 100.0, 100.0)
+  // Matching lists ease function by function: a turn passes through its middle.
+  let a = styled(b"rotate(0deg)", transform.TRANSFORM_LIST).list
+  let b = styled(b"rotate(270deg)", transform.TRANSFORM_LIST).list
+  let half = transform.mixList(&a, &b, 0.5)
+  run Testing.expect(near(half.op(0).w, 2.3561945), "rotate eases by angle, past 180 degrees")
+
+  // A missing function eases from its identity.
+  let none = TransformList.none()
+  let grow = styled(b"scale(3)", transform.TRANSFORM_LIST).list
+  let mid = transform.mixList(&none, &grow, 0.5)
+  run Testing.expect(mid.count == 1 && near(mid.op(0).x, 2.0), "none eases as scale(1)")
+
+  // Lists that differ ease through matrices.
+  let c = styled(b"translateX(100px) rotate(90deg)", transform.TRANSFORM_LIST).list
+  let d = styled(b"scale(2)", transform.TRANSFORM_LIST).list
+  let pair = transform.prepare(&c, &d, 100.0, 100.0)
+  run Testing.expect(transform.matched(&pair[0], &pair[1]), "prepared lists match")
+  let start = transform.mixList(&pair[0], &pair[1], 0.0)
+  let end = transform.mixList(&pair[0], &pair[1], 1.0)
+  let mut atStart = Transform.initial()
+  atStart.list = start
+  let mut atEnd = Transform.initial()
+  atEnd.list = end
+  let mut written = Transform.initial()
+  written.list = c
+  let mut target = Transform.initial()
+  target.list = d
+  run Testing.expect(
+    sameMatrix(transform.matrix(&atStart, box), transform.matrix(&written, box)),
+    "matrix interpolation starts at the first list",
+  )
+  run Testing.expect(
+    sameMatrix(transform.matrix(&atEnd, box), transform.matrix(&target, box)),
+    "and ends at the second",
+  )
+
+  // Decomposing a turn and composing it again gives the turn back, and halfway is half a turn.
+  let m0 = Matrix4<f32>.identity()
+  let m1 = transform.matrix(&styled(b"rotate(90deg)", transform.TRANSFORM_LIST), Rect<f32>.new(0.0, 0.0, 0.0, 0.0))
+  run Testing.expect(sameMatrix(transform.mixMatrix(m0, m1, 1.0), m1), "a decomposed turn composes back")
+  let m45 = transform.matrix(&styled(b"rotate(45deg)", transform.TRANSFORM_LIST), Rect<f32>.new(0.0, 0.0, 0.0, 0.0))
+  run Testing.expect(sameMatrix(transform.mixMatrix(m0, m1, 0.5), m45), "halfway through a matrix turn")
+  let skewed = transform.matrix(
+    &styled(b"translate(5px, 6px) scale(2, 3) skewX(20deg) rotate(30deg)", transform.TRANSFORM_LIST),
+    Rect<f32>.new(0.0, 0.0, 0.0, 0.0),
+  )
+  run Testing.expect(sameMatrix(transform.mixMatrix(m0, skewed, 1.0), skewed), "so does a mix of all")
+
+  // rotate with different axes slerps.
+  let x = styled(b"x 90deg", transform.ROTATE_PROPERTY).rotate
+  let y = styled(b"y 90deg", transform.ROTATE_PROPERTY).rotate
+  let between = transform.mixOp(x, y, 0.5)
+  run Testing.expect(near(between.x, between.y) && between.z == 0.0, "the axis swings between")
+}
+
+test effect fn transformsInterpolate() -> ()
+  ! AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run interpolation() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+fn color(r: f32, g: f32, b: f32) -> Rgba<f32> {
+  return Rgba<f32> { r: r, g: g, b: b, a: 1.0 }
+}
+
+fn red(image: &Pixmap, x: u32, y: u32) -> bool {
+  let p = image.pixel(x, y)
+  return p.r > 200 && p.g < 60 && p.b < 60
+}
+
+fn white(image: &Pixmap, x: u32, y: u32) -> bool {
+  let p = image.pixel(x, y)
+  return p.r > 200 && p.g > 200 && p.b > 200
+}
+
+effect fn placed(batch: &mut Batch, parent: u32, id: u32, x: f32, y: f32, w: f32, h: f32, transform: &[u8]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run batch.box(parent, id, &[
+    css.position(Position.Absolute),
+    css.left(px(x)),
+    css.top(px(y)),
+    css.width(px(w)),
+    css.height(px(h)),
+    css.backgroundColor(color(1.0, 0.0, 0.0)),
+    css.declare(Property.Transform, run css.text(transform)),
+  ])
+}
+
+effect fn drawn(tree: &mut UiTree<'_>) -> Pixmap
+  ! TreeError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  run tree.frame(FrameInput { width: 300.0, height: 200.0, scale: 1.0, time: 0.0 })
+  let mut snapshot = CpuSnapshot.make()
+  run snapshot.sync(&mut tree)
+  return run snapshot.render(&tree)
+}
+
+effect fn treeBody() -> ()
+  ! AssertionError<'static> | TreeError | CssomError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.style(1, &[
+    css.width(px(300.0)),
+    css.height(px(200.0)),
+    css.position(Position.Relative),
+    css.backgroundColor(color(1.0, 1.0, 1.0)),
+  ])
+  // 40 by 20 at (50, 50), a quarter turn about its center (70, 60): x 60 to 80, y 40 to 80.
+  run placed(&mut batch, 1, 2, 50.0, 50.0, 40.0, 20.0, b"rotate(90deg)")
+  // Moved 100px right: x 200 to 220.
+  run placed(&mut batch, 1, 3, 100.0, 150.0, 20.0, 20.0, b"translate(100px)")
+  // A child of the turned box: its layout box is the turned box's left half.
+  run placed(&mut batch, 2, 4, 0.0, 0.0, 20.0, 20.0, b"none")
+  run batch.root(1)
+  run tree.apply(run batch.take())
+  let image = run drawn(&mut tree)
+  run Testing.expect(red(&image, 70, 43) && red(&image, 70, 77), "the turned box stands upright")
+  run Testing.expect(white(&image, 53, 60) && white(&image, 87, 60), "where it lay is empty")
+  run Testing.expect(red(&image, 210, 160) && white(&image, 110, 160), "the moved box moved")
+  run Testing.expect(tree.hitTest(70.0, 77.0) == 2, "pointers find the turned box where it shows")
+  run Testing.expect(tree.hitTest(53.0, 60.0) == 1, "and not where it was laid out")
+  run Testing.expect(tree.hitTest(70.0, 43.0) == 4, "its child turns with it")
+  run Testing.expect(tree.hitTest(210.0, 160.0) == 3 && tree.hitTest(110.0, 160.0) == 1, "the moved box is hit where it shows")
+  let rect = run view.getBoundingClientRect(&tree, 2)
+  run Testing.expect(near64(rect.x, 60.0) && near64(rect.y, 40.0) && near64(rect.width, 20.0) && near64(rect.height, 40.0), "the client rect bounds the turned box")
+  let child = run view.getBoundingClientRect(&tree, 4)
+  run Testing.expect(near64(child.x, 60.0) && near64(child.y, 40.0) && near64(child.height, 20.0), "and its child")
+
+  let mut change = Batch.make()
+  run change.style(2, &[css.declare(Property.Transform, run css.text(b"rotate(0deg)"))])
+  run tree.apply(run change.take())
+  let again = run drawn(&mut tree)
+  run Testing.expect(red(&again, 55, 60), "turning it back lays it flat")
+  run Testing.expect(white(&again, 70, 43), "and clears where it stood")
+  run Testing.expect(tree.stats.replayedSubtrees != 0, "what it holds replays inside the new transform")
+
+  // A hidden back face draws nothing and takes no pointer.
+  let mut flip = Batch.make()
+  run flip.style(3, &[
+    css.declare(Property.Transform, run css.text(b"rotateY(180deg)")),
+    css.declare(Property.BackfaceVisibility, run css.text(b"hidden")),
+  ])
+  run tree.apply(run flip.take())
+  let flipped = run drawn(&mut tree)
+  run Testing.expect(white(&flipped, 110, 160) && tree.hitTest(110.0, 160.0) == 1, "its back is hidden")
+}
+
+test effect fn transformsPaintHitAndMeasure() -> ()
+  ! AssertionError<'static> | TreeError | CssomError | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run treeBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+fn transformOf(tree: &UiTree<'_>, id: u32) -> Transform {
+  return tree.node(tree.slotOf(id)).computed.transform
+}
+
+fn moment(time: f64) -> FrameInput {
+  return FrameInput { width: 300.0, height: 200.0, scale: 1.0, time: time }
+}
+
+effect fn motionBody() -> ()
+  ! AssertionError<'static> | TreeError | CssomError | OutOfMemoryError
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut frames = List<Keyframe>.make()
+  run frames.append(run frameOf(0.0, b"0px"))
+  run frames.append(run frameOf(1.0, b"100px 50%"))
+  let mut batch = Batch.make()
+  run batch.keyframes("slide", move frames)
+  run batch.create(1, NodeKind.Box)
+  run batch.style(1, &[css.width(px(300.0)), css.height(px(200.0))])
+  run batch.box(1, 2, &[
+    css.width(px(40.0)),
+    css.height(px(20.0)),
+    css.declare(Property.Transform, run css.text(b"rotate(0deg)")),
+    css.declare(Property.Transition, run css.text(b"transform 1s linear, scale 1s linear(0, 0.25 50%, 1), opacity 1s linear(0, 1 25% 75%, 0)")),
+  ])
+  run batch.box(1, 3, &[
+    css.width(px(40.0)),
+    css.height(px(20.0)),
+    css.declare(Property.Animation, run css.text(b"slide 2s linear")),
+  ])
+  run batch.root(1)
+  run tree.apply(run batch.take())
+  run tree.frame(moment(0.0))
+
+  // Keyframes move `translate`, percentages kept for the border box.
+  run tree.frame(moment(1.0))
+  let slid = transformOf(&tree, 3).translate
+  run Testing.expect(slid.kind == transform.TRANSLATE && near(slid.x, 50.0) && near(slid.yp, 0.25), "keyframes ease translate")
+
+  // A matching list eases function by function.
+  let mut turn = Batch.make()
+  run turn.style(2, &[
+    css.declare(Property.Transform, run css.text(b"rotate(90deg)")),
+    css.declare(Property.Scale, run css.text(b"3")),
+    css.opacity(0.0),
+  ])
+  run tree.apply(run turn.take())
+  run tree.frame(moment(10.0))
+  run tree.frame(moment(10.5))
+  let half = transformOf(&tree, 2)
+  run Testing.expect(half.list.count == 1 && near(half.list.op(0).w, 0.7853982), "rotate eases half way")
+  // linear(0, 0.25 50%, 1) at 0.5 is 0.25: scale 1 + 2 * 0.25.
+  run Testing.expect(near(half.scale.x, 1.5), "scale follows its linear() stops")
+  run Testing.expect(near(tree.node(tree.slotOf(2)).computed.paint.opacity, 0.0), "a linear() plateau holds")
+  run tree.frame(moment(10.875))
+  run Testing.expect(near(tree.node(tree.slotOf(2)).computed.paint.opacity, 0.5), "and ramps after it")
+  run tree.frame(moment(11.5))
+  run Testing.expect(near(transformOf(&tree, 2).list.op(0).w, 1.5707964), "the end value at the end")
+
+  // Lists that do not match ease through matrices: a translation eases toward a quarter turn.
+  let mut swap = Batch.make()
+  run swap.style(2, &[css.declare(Property.Transform, run css.text(b"translateX(10px)"))])
+  run tree.apply(run swap.take())
+  run tree.frame(moment(20.0))
+  run tree.frame(moment(20.5))
+  let blend = transformOf(&tree, 2)
+  run Testing.expect(blend.list.count == 1 && blend.list.op(0).kind == transform.MATRIX, "mismatched lists ease as a matrix")
+  run tree.frame(moment(21.5))
+  let done = transformOf(&tree, 2)
+  run Testing.expect(done.list.count == 1 && done.list.op(0).kind == transform.TRANSLATE, "and end on the declared list")
+
+}
+
+effect fn frameOf(offset: f32, translate: &[u8]) -> Keyframe
+  ! CssomError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut list = List<Declaration>.make()
+  run list.append(css.declare(Property.Translate, run css.text(translate)))
+  return Keyframe { offset: offset, declarations: move list }
+}
+
+test effect fn transformsTransitionAndAnimate() -> ()
+  ! AssertionError<'static> | TreeError | CssomError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run motionBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}

@@ -1,0 +1,2051 @@
+//! [`NodeRef`]: a node of a [`TreeState`] with its place in the tree, and what adapters ask of
+//! it (names, values, states, navigation, hit testing).
+//!
+//! Ported from AccessKit (`accesskit_consumer/src/node.rs` and `iterators.rs`), Copyright 2021
+//! The AccessKit Authors, under the MIT or Apache-2.0 license (see LICENSE-MIT and
+//! LICENSE-APACHE).
+import accesskit.lib {
+  Action,
+  Affine,
+  AriaCurrent,
+  HasPopup,
+  Live,
+  Node,
+  NodeId,
+  Orientation,
+  Point,
+  Rect,
+  Role,
+  SortDirection,
+  TextSelection,
+  Toggled,
+  Color,
+  TextAlign,
+  TextDecoration,
+  TextDirection,
+  VerticalOffset,
+}
+import filters { FilterResult, NodeFilter, TextRunFilter }
+import tree { TreeState, NodeState, FullNodeId, LocatedNode }
+import text { InnerPosition, Position, Range, characterIndexAtPoint, unitCount }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.string { String }
+import silk.num.u8
+
+/// U+2022 BULLET, which password inputs show for each character.
+pub const PASSWORD_MASKING_CHARACTER: string<'static> = "\u{2022}"
+
+/// A node of a tree state, valid while the state is borrowed.
+pub struct NodeRef<'a> {
+  pub treeState: &'a TreeState,
+  pub id: FullNodeId,
+  pub state: &'a NodeState,
+}
+
+impl<'a> Copy for NodeRef<'a> {}
+
+/// A filtered walk over children or siblings, from both ends, as AccessKit's filtered
+/// iterators. Call `next` or `nextBack` with the same filter until they return `None`.
+pub struct FilteredCursor<'a> {
+  front: Option<NodeRef<'a>>,
+  back: Option<NodeRef<'a>>,
+  done: bool,
+  forward: bool,
+}
+
+impl<'a> Copy for FilteredCursor<'a> {}
+
+impl<'a> FilteredCursor<'a> {
+  fn make(front: Option<NodeRef<'a>>, back: Option<NodeRef<'a>>, forward: bool) -> FilteredCursor<
+    'a
+  > {
+    return FilteredCursor {
+      front: front,
+      back: back,
+      done: front.isNone() || back.isNone(),
+      forward: forward,
+    }
+  }
+
+  fn meet(self: &Self) -> bool {
+    return match self.front {
+      Option.Some { value: f } => match self.back {
+        Option.Some { value: b } => f.id.equals(b.id)
+        Option.None => true
+      }
+      Option.None => true
+    }
+  }
+
+  /// The next node from the front.
+  pub fn next<F: NodeFilter>(self: &mut Self, filter: &F) -> Option<NodeRef<'a>> {
+    if self.done {
+      return Option.None
+    }
+    self.done = self.meet()
+    let current = self.front
+    self.front = match current {
+      Option.Some { value } => if self.forward {
+        value.nextFilteredSibling(filter)
+      } else {
+        value.previousFilteredSibling(filter)
+      }
+      Option.None => Option.None
+    }
+    return current
+  }
+
+  /// The next node from the back.
+  pub fn nextBack<F: NodeFilter>(self: &mut Self, filter: &F) -> Option<NodeRef<'a>> {
+    if self.done {
+      return Option.None
+    }
+    self.done = self.meet()
+    let current = self.back
+    self.back = match current {
+      Option.Some { value } => if self.forward {
+        value.previousFilteredSibling(filter)
+      } else {
+        value.nextFilteredSibling(filter)
+      }
+      Option.None => Option.None
+    }
+    return current
+  }
+}
+
+impl<'a> NodeRef<'a> {
+  /// The node's data, as the application last sent it.
+  pub fn data(self: &Self) -> &'a Node {
+    return &self.state.data
+  }
+
+  pub fn locate(self: &Self) -> LocatedNode {
+    return match self.treeState.locateNode(self.id) {
+      Option.Some { value } => value
+      Option.None => Intrinsic.trap("accesskit: a node of the tree cannot be located")
+    }
+  }
+
+  /// Whether this node has focus: the focused node without an active descendant, or the active
+  /// descendant of the focused node. False while the host window does not have focus.
+  pub fn isFocused(self: &Self) -> bool {
+    return match self.treeState.focusId() {
+      Option.Some { value: focusId } => {
+        if focusId.equals(self.id) {
+          match self.treeState.nodeById(focusId) {
+            Option.Some { value: node } => node.activeDescendant().isNone()
+            Option.None => true
+          }
+        } else {
+          match self.treeState.nodeById(focusId) {
+            Option.Some { value: focused } => match focused.activeDescendant() {
+              Option.Some { value: active } => active.id.equals(self.id)
+              Option.None => false
+            }
+            Option.None => false
+          }
+        }
+      }
+      Option.None => false
+    }
+  }
+
+  /// Whether this is the node that has focus within the tree, whether or not the host does.
+  pub fn isFocusedInTree(self: &Self) -> bool {
+    return self.treeState.focusIdInTree().equals(self.id)
+  }
+
+  pub fn isFocusable<F: NodeFilter>(self: &Self, parentFilter: &F) -> bool {
+    return self.supportsAction(Action.Focus, parentFilter) || self.isFocusedInTree()
+  }
+
+  pub fn isRoot(self: &Self) -> bool {
+    return self.id.equals(self.treeState.rootId())
+  }
+
+  /// Whether this node hosts a subtree.
+  pub fn isGraft(self: &Self) -> bool {
+    return self.state.data.treeId().isSome()
+  }
+
+  pub fn parentId(self: &Self) -> Option<FullNodeId> {
+    return match self.state.parent {
+      Option.Some { value } => Option.Some { value: value.parent }
+      Option.None => Option.None
+    }
+  }
+
+  pub fn parent(self: &Self) -> Option<NodeRef<'a>> {
+    return match self.state.parent {
+      Option.Some { value } => self.treeState.nodeById(value.parent)
+      Option.None => Option.None
+    }
+  }
+
+  /// The index of this node among its parent's children.
+  pub fn indexInParent(self: &Self) -> Option<usize> {
+    return match self.state.parent {
+      Option.Some { value } => Option.Some { value: value.index }
+      Option.None => Option.None
+    }
+  }
+
+  /// The nearest ancestor that `filter` includes.
+  pub fn filteredParent<F: NodeFilter>(self: &Self, filter: &F) -> Option<NodeRef<'a>> {
+    let mut current = self.parent()
+    while let Option.Some { value: node } = current {
+      if filter.filter(&node) == FilterResult.Include {
+        return Option.Some { value: node }
+      }
+      current = node.parent()
+    }
+    return Option.None
+  }
+
+  fn graftChildId(self: &Self) -> Option<FullNodeId> {
+    return match self.state.data.treeId() {
+      Option.Some { value } => self.treeState.subtreeRoot(value)
+      Option.None => Option.None
+    }
+  }
+
+  /// The number of children: the subtree's root for a graft node.
+  pub fn childCount(self: &Self) -> usize {
+    if self.isGraft() {
+      return if self.graftChildId().isSome() {
+        1
+      } else {
+        0
+      }
+    }
+    return self.state.data.children().length
+  }
+
+  /// The id of child `index`.
+  pub fn childIdAt(self: &Self, index: usize) -> Option<FullNodeId> {
+    if self.isGraft() {
+      if index == 0 {
+        return self.graftChildId()
+      }
+      return Option.None
+    }
+    let children = self.state.data.children()
+    if index >= children.length {
+      return Option.None
+    }
+    return Option.Some { value: self.id.withSameTree(children[index]) }
+  }
+
+  /// Child `index`.
+  pub fn childAt(self: &Self, index: usize) -> Option<NodeRef<'a>> {
+    return match self.childIdAt(index) {
+      Option.Some { value } => self.treeState.nodeById(value)
+      Option.None => Option.None
+    }
+  }
+
+  pub fn firstChild(self: &Self) -> Option<NodeRef<'a>> {
+    return self.childAt(0)
+  }
+
+  pub fn lastChild(self: &Self) -> Option<NodeRef<'a>> {
+    let count = self.childCount()
+    if count == 0 {
+      return Option.None
+    }
+    return self.childAt(count - 1)
+  }
+
+  /// Appends the children to `out`.
+  pub effect fn children(self: &Self, out: &mut List<NodeRef<'a>>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let count = self.childCount()
+    let mut i: usize = 0
+    while i < count {
+      match self.childAt(i) {
+        Option.Some { value } => run out.append(value)
+        Option.None => {}
+      }
+      i = i + 1
+    }
+  }
+
+  /// The next sibling, unfiltered. Subtree roots have none.
+  pub fn followingSibling(self: &Self) -> Option<NodeRef<'a>> {
+    return match self.state.parent {
+      Option.Some { value: pi } => match self.treeState.nodeById(pi.parent) {
+        Option.Some { value: parent } => if !parent.isGraft() {
+          parent.childAt(pi.index + 1)
+        } else {
+          Option.None
+        }
+        Option.None => Option.None
+      }
+      Option.None => Option.None
+    }
+  }
+
+  /// The previous sibling, unfiltered.
+  pub fn precedingSibling(self: &Self) -> Option<NodeRef<'a>> {
+    return match self.state.parent {
+      Option.Some { value: pi } => match self.treeState.nodeById(pi.parent) {
+        Option.Some { value: parent } => if !parent.isGraft() && pi.index > 0 {
+          parent.childAt(pi.index - 1)
+        } else {
+          Option.None
+        }
+        Option.None => Option.None
+      }
+      Option.None => Option.None
+    }
+  }
+
+  /// The next node after this one in a filtered walk of the same parent: it goes into excluded
+  /// nodes and back out of excluded parents.
+  pub fn nextFilteredSibling<F: NodeFilter>(self: &Self, filter: &F) -> Option<NodeRef<'a>> {
+    let mut current: NodeRef<'a> = self.*
+    let mut considerChildren = false
+    while true {
+      let child: Option<NodeRef<'a>> = if considerChildren {
+        current.firstChild()
+      } else {
+        Option.None
+      }
+      match child {
+        Option.Some { value: c } => {
+          let result = filter.filter(&c)
+          current = c
+          if result == FilterResult.Include {
+            return Option.Some { value: c }
+          }
+          considerChildren = result == FilterResult.ExcludeNode
+        }
+        Option.None => match current.followingSibling() {
+          Option.Some { value: sibling } => {
+            let result = filter.filter(&sibling)
+            current = sibling
+            if result == FilterResult.Include {
+              return Option.Some { value: sibling }
+            }
+            considerChildren = result == FilterResult.ExcludeNode
+          }
+          Option.None => {
+            let parent = match current.parent() {
+              Option.Some { value } => value
+              Option.None => {
+                return Option.None
+              }
+            }
+            if filter.filter(&parent) != FilterResult.ExcludeNode {
+              return Option.None
+            }
+            current = parent
+            considerChildren = false
+          }
+        }
+      }
+    }
+    return Option.None
+  }
+
+  /// The node before this one in a filtered walk of the same parent.
+  pub fn previousFilteredSibling<F: NodeFilter>(self: &Self, filter: &F) -> Option<NodeRef<'a>> {
+    let mut current: NodeRef<'a> = self.*
+    let mut considerChildren = false
+    while true {
+      let child: Option<NodeRef<'a>> = if considerChildren {
+        current.lastChild()
+      } else {
+        Option.None
+      }
+      match child {
+        Option.Some { value: c } => {
+          let result = filter.filter(&c)
+          current = c
+          if result == FilterResult.Include {
+            return Option.Some { value: c }
+          }
+          considerChildren = result == FilterResult.ExcludeNode
+        }
+        Option.None => match current.precedingSibling() {
+          Option.Some { value: sibling } => {
+            let result = filter.filter(&sibling)
+            current = sibling
+            if result == FilterResult.Include {
+              return Option.Some { value: sibling }
+            }
+            considerChildren = result == FilterResult.ExcludeNode
+          }
+          Option.None => {
+            let parent = match current.parent() {
+              Option.Some { value } => value
+              Option.None => {
+                return Option.None
+              }
+            }
+            if filter.filter(&parent) != FilterResult.ExcludeNode {
+              return Option.None
+            }
+            current = parent
+            considerChildren = false
+          }
+        }
+      }
+    }
+    return Option.None
+  }
+
+  /// The first descendant `filter` includes, looking into excluded nodes.
+  pub fn firstFilteredChild<F: NodeFilter>(self: &Self, filter: &F) -> Option<NodeRef<'a>> {
+    let count = self.childCount()
+    let mut i: usize = 0
+    while i < count {
+      match self.childAt(i) {
+        Option.Some { value: child } => {
+          let result = filter.filter(&child)
+          if result == FilterResult.Include {
+            return Option.Some { value: child }
+          }
+          if result == FilterResult.ExcludeNode {
+            match child.firstFilteredChild(filter) {
+              Option.Some { value } => {
+                return Option.Some { value: value }
+              }
+              Option.None => {}
+            }
+          }
+        }
+        Option.None => {}
+      }
+      i = i + 1
+    }
+    return Option.None
+  }
+
+  /// The last descendant `filter` includes, looking into excluded nodes.
+  pub fn lastFilteredChild<F: NodeFilter>(self: &Self, filter: &F) -> Option<NodeRef<'a>> {
+    let mut i = self.childCount()
+    while i > 0 {
+      i = i - 1
+      match self.childAt(i) {
+        Option.Some { value: child } => {
+          let result = filter.filter(&child)
+          if result == FilterResult.Include {
+            return Option.Some { value: child }
+          }
+          if result == FilterResult.ExcludeNode {
+            match child.lastFilteredChild(filter) {
+              Option.Some { value } => {
+                return Option.Some { value: value }
+              }
+              Option.None => {}
+            }
+          }
+        }
+        Option.None => {}
+      }
+    }
+    return Option.None
+  }
+
+  /// A walk over the children `filter` includes.
+  pub fn filteredChildren<F: NodeFilter>(self: &Self, filter: &F) -> FilteredCursor<'a> {
+    return FilteredCursor.make(
+      self.firstFilteredChild(filter),
+      self.lastFilteredChild(filter),
+      true,
+    )
+  }
+
+  /// Appends the children `filter` includes to `out`.
+  pub effect fn collectFilteredChildren<F: NodeFilter>(
+    self: &Self,
+    filter: &F,
+    out: &mut List<NodeRef<'a>>,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut cursor = self.filteredChildren(filter)
+    while let Option.Some { value } = cursor.next(filter) {
+      run out.append(value)
+    }
+  }
+
+  /// A walk over the following siblings `filter` includes, nearest first.
+  pub fn followingFilteredSiblings<F: NodeFilter>(self: &Self, filter: &F) -> FilteredCursor<'a> {
+    let front = self.nextFilteredSibling(filter)
+    let back: Option<NodeRef<'a>> = match self.filteredParent(filter) {
+      Option.Some { value: parent } => parent.lastFilteredChild(filter)
+      Option.None => Option.None
+    }
+    return FilteredCursor.make(front, back, true)
+  }
+
+  /// A walk over the preceding siblings `filter` includes, nearest first.
+  pub fn precedingFilteredSiblings<F: NodeFilter>(self: &Self, filter: &F) -> FilteredCursor<'a> {
+    let front = self.previousFilteredSibling(filter)
+    let back: Option<NodeRef<'a>> = match self.filteredParent(filter) {
+      Option.Some { value: parent } => parent.firstFilteredChild(filter)
+      Option.None => Option.None
+    }
+    return FilteredCursor.make(front, back, false)
+  }
+
+  pub fn deepestFirstChild(self: &Self) -> Option<NodeRef<'a>> {
+    let mut deepest = match self.firstChild() {
+      Option.Some { value } => value
+      Option.None => {
+        return Option.None
+      }
+    }
+    while let Option.Some { value: child } = deepest.firstChild() {
+      deepest = child
+    }
+    return Option.Some { value: deepest }
+  }
+
+  pub fn deepestFirstFilteredChild<F: NodeFilter>(self: &Self, filter: &F) -> Option<NodeRef<'a>> {
+    let mut deepest = match self.firstFilteredChild(filter) {
+      Option.Some { value } => value
+      Option.None => {
+        return Option.None
+      }
+    }
+    while let Option.Some { value: child } = deepest.firstFilteredChild(filter) {
+      deepest = child
+    }
+    return Option.Some { value: deepest }
+  }
+
+  pub fn deepestLastChild(self: &Self) -> Option<NodeRef<'a>> {
+    let mut deepest = match self.lastChild() {
+      Option.Some { value } => value
+      Option.None => {
+        return Option.None
+      }
+    }
+    while let Option.Some { value: child } = deepest.lastChild() {
+      deepest = child
+    }
+    return Option.Some { value: deepest }
+  }
+
+  pub fn deepestLastFilteredChild<F: NodeFilter>(self: &Self, filter: &F) -> Option<NodeRef<'a>> {
+    let mut deepest = match self.lastFilteredChild(filter) {
+      Option.Some { value } => value
+      Option.None => {
+        return Option.None
+      }
+    }
+    while let Option.Some { value: child } = deepest.lastFilteredChild(filter) {
+      deepest = child
+    }
+    return Option.Some { value: deepest }
+  }
+
+  pub fn isDescendantOf(self: &Self, ancestor: &NodeRef<'_>) -> bool {
+    let mut current: Option<NodeRef<'a>> = Option.Some { value: self.* }
+    while let Option.Some { value: node } = current {
+      if node.id.equals(ancestor.id) {
+        return true
+      }
+      current = node.parent()
+    }
+    return false
+  }
+
+  /// The node's own transform, or the identity.
+  pub fn directTransform(self: &Self) -> Affine {
+    return self.data().transform().unwrapOr(Affine.identity())
+  }
+
+  /// The transform from this node's coordinates to the tree's.
+  pub fn transform(self: &Self) -> Affine {
+    let mut acc = self.directTransform()
+    let mut current = self.parent()
+    while let Option.Some { value: parent } = current {
+      acc = parent.directTransform().multiply(acc)
+      current = parent.parent()
+    }
+    return acc
+  }
+
+  /// The transform from this node's coordinates to `stopAt`'s.
+  pub fn relativeTransform(self: &Self, stopAt: &NodeRef<'_>) -> Affine {
+    let mut acc = self.directTransform()
+    let mut current = self.parent()
+    while let Option.Some { value: parent } = current {
+      if parent.id.equals(stopAt.id) {
+        break
+      }
+      acc = parent.directTransform().multiply(acc)
+      current = parent.parent()
+    }
+    return acc
+  }
+
+  pub fn rawBounds(self: &Self) -> Option<Rect> {
+    return self.data().bounds()
+  }
+
+  pub fn hasBounds(self: &Self) -> bool {
+    return self.rawBounds().isSome()
+  }
+
+  /// The bounds in the tree's coordinates.
+  pub fn boundingBox(self: &Self) -> Option<Rect> {
+    return match self.rawBounds() {
+      Option.Some { value } => Option.Some { value: self.transform().transformRectBbox(value) }
+      Option.None => Option.None
+    }
+  }
+
+  /// The bounds in `other`'s coordinates, for an ancestor `other`.
+  pub fn boundingBoxInCoordinateSpace(self: &Self, other: &NodeRef<'_>) -> Option<Rect> {
+    return match self.rawBounds() {
+      Option.Some { value } => Option.Some {
+        value: self.relativeTransform(other).transformRectBbox(value),
+      }
+      Option.None => Option.None
+    }
+  }
+
+  /// The deepest, last-drawn node `filter` includes whose bounds hold `point` (in this node's
+  /// coordinates), with the point in that node's coordinates.
+  pub fn hitTest<F: NodeFilter>(self: &Self, point: Point, filter: &F) -> Option<HitTest<'a>> {
+    let result = filter.filter(self)
+    if result == FilterResult.ExcludeSubtree {
+      return Option.None
+    }
+    let mut i = self.childCount()
+    while i > 0 {
+      i = i - 1
+      match self.childAt(i) {
+        Option.Some { value: child } => {
+          let childPoint = child.directTransform().inverse().apply(point)
+          match child.hitTest(childPoint, filter) {
+            Option.Some { value } => {
+              return Option.Some { value: value }
+            }
+            Option.None => {}
+          }
+        }
+        Option.None => {}
+      }
+    }
+    if result == FilterResult.Include {
+      match self.rawBounds() {
+        Option.Some { value: rect } => {
+          if rect.contains(point) {
+            return Option.Some { value: HitTest { node: self.*, point: point } }
+          }
+        }
+        Option.None => {}
+      }
+    }
+    return Option.None
+  }
+
+  pub fn nodeAtPoint<F: NodeFilter>(self: &Self, point: Point, filter: &F) -> Option<NodeRef<'a>> {
+    return match self.hitTest(point, filter) {
+      Option.Some { value } => Option.Some { value: value.node }
+      Option.None => Option.None
+    }
+  }
+
+  pub fn accessRole(self: &Self) -> Role {
+    return self.data().accessRole()
+  }
+
+  pub fn roleDescription(self: &Self) -> Option<string> {
+    return self.data().roleDescription()
+  }
+
+  pub fn hasRoleDescription(self: &Self) -> bool {
+    return self.data().roleDescription().isSome()
+  }
+
+  pub fn isLiveAtomic(self: &Self) -> bool {
+    return self.data().isLiveAtomic()
+  }
+
+  pub fn isBusy(self: &Self) -> bool {
+    return self.data().isBusy()
+  }
+
+  pub fn columnIndexText(self: &Self) -> Option<string> {
+    return self.data().columnIndexText()
+  }
+
+  pub fn rowIndexText(self: &Self) -> Option<string> {
+    return self.data().rowIndexText()
+  }
+
+  pub fn brailleLabel(self: &Self) -> Option<string> {
+    return self.data().brailleLabel()
+  }
+
+  pub fn hasBrailleLabel(self: &Self) -> bool {
+    return self.data().brailleLabel().isSome()
+  }
+
+  pub fn brailleRoleDescription(self: &Self) -> Option<string> {
+    return self.data().brailleRoleDescription()
+  }
+
+  pub fn hasBrailleRoleDescription(self: &Self) -> bool {
+    return self.data().brailleRoleDescription().isSome()
+  }
+
+  pub fn ariaCurrent(self: &Self) -> Option<AriaCurrent> {
+    return self.data().ariaCurrent()
+  }
+
+  pub fn hasPopup(self: &Self) -> Option<HasPopup> {
+    return self.data().hasPopup()
+  }
+
+  /// Whether this node or an ancestor is hidden.
+  pub fn isHidden(self: &Self) -> bool {
+    let mut current: Option<NodeRef<'a>> = Option.Some { value: self.* }
+    while let Option.Some { value: node } = current {
+      if node.data().isHidden() {
+        return true
+      }
+      current = node.parent()
+    }
+    return false
+  }
+
+  pub fn level(self: &Self) -> Option<usize> {
+    return self.data().level()
+  }
+
+  pub fn isDisabled(self: &Self) -> bool {
+    return self.data().isDisabled()
+  }
+
+  pub fn isReadOnly(self: &Self) -> bool {
+    if self.data().isReadOnly() {
+      return true
+    }
+    return self.shouldHaveReadOnlyStateByDefault() || !self.isReadOnlySupported()
+  }
+
+  pub fn isReadOnlyOrDisabled(self: &Self) -> bool {
+    return self.isReadOnly() || self.isDisabled()
+  }
+
+  pub fn toggled(self: &Self) -> Option<Toggled> {
+    return self.data().toggled()
+  }
+
+  pub fn numericValue(self: &Self) -> Option<f64> {
+    return self.data().numericValue()
+  }
+
+  pub fn minNumericValue(self: &Self) -> Option<f64> {
+    return self.data().minNumericValue()
+  }
+
+  pub fn maxNumericValue(self: &Self) -> Option<f64> {
+    return self.data().maxNumericValue()
+  }
+
+  pub fn numericValueStep(self: &Self) -> Option<f64> {
+    return self.data().numericValueStep()
+  }
+
+  pub fn numericValueJump(self: &Self) -> Option<f64> {
+    return self.data().numericValueJump()
+  }
+
+  pub fn clipsChildren(self: &Self) -> bool {
+    return self.data().clipsChildren()
+  }
+
+  pub fn scrollX(self: &Self) -> Option<f64> {
+    return self.data().scrollX()
+  }
+
+  pub fn scrollXMin(self: &Self) -> Option<f64> {
+    return self.data().scrollXMin()
+  }
+
+  pub fn scrollXMax(self: &Self) -> Option<f64> {
+    return self.data().scrollXMax()
+  }
+
+  pub fn scrollY(self: &Self) -> Option<f64> {
+    return self.data().scrollY()
+  }
+
+  pub fn scrollYMin(self: &Self) -> Option<f64> {
+    return self.data().scrollYMin()
+  }
+
+  pub fn scrollYMax(self: &Self) -> Option<f64> {
+    return self.data().scrollYMax()
+  }
+
+  pub fn isTextInput(self: &Self) -> bool {
+    return match self.accessRole() {
+      Role.TextInput => true
+      Role.MultilineTextInput => true
+      Role.SearchInput => true
+      Role.DateInput => true
+      Role.DateTimeInput => true
+      Role.WeekInput => true
+      Role.MonthInput => true
+      Role.TimeInput => true
+      Role.EmailInput => true
+      Role.NumberInput => true
+      Role.PasswordInput => true
+      Role.PhoneNumberInput => true
+      Role.UrlInput => true
+      Role.EditableComboBox => true
+      Role.SpinButton => true
+      _ => false
+    }
+  }
+
+  pub fn isMultiline(self: &Self) -> bool {
+    return self.accessRole() == Role.MultilineTextInput
+  }
+
+  pub fn isPasswordInput(self: &Self) -> bool {
+    return self.accessRole() == Role.PasswordInput
+  }
+
+  /// The orientation, defaulting to vertical for list boxes and horizontal for tab lists.
+  pub fn orientation(self: &Self) -> Option<Orientation> {
+    match self.data().orientation() {
+      Option.Some { value } => {
+        return Option.Some { value: value }
+      }
+      Option.None => {}
+    }
+    if self.accessRole() == Role.ListBox {
+      return Option.Some { value: Orientation.Vertical }
+    }
+    if self.accessRole() == Role.TabList {
+      return Option.Some { value: Orientation.Horizontal }
+    }
+    return Option.None
+  }
+
+  pub fn isDialog(self: &Self) -> bool {
+    return self.accessRole() == Role.AlertDialog || self.accessRole() == Role.Dialog
+  }
+
+  pub fn isModal(self: &Self) -> bool {
+    return self.data().isModal()
+  }
+
+  pub fn isClickable<F: NodeFilter>(self: &Self, parentFilter: &F) -> bool {
+    return self.supportsAction(Action.Click, parentFilter)
+  }
+
+  pub fn isSelectable(self: &Self) -> bool {
+    return self.isSelected().isSome() && !self.isDisabled()
+  }
+
+  pub fn isMultiselectable(self: &Self) -> bool {
+    return self.data().isMultiselectable()
+  }
+
+  /// The set size from the nearest filtered ancestor that has one.
+  pub fn sizeOfSetFromContainer<F: NodeFilter>(self: &Self, filter: &F) -> Option<usize> {
+    let mut parent = self.filteredParent(filter)
+    while let Option.Some { value: node } = parent {
+      match node.sizeOfSet() {
+        Option.Some { value } => {
+          return Option.Some { value: value }
+        }
+        Option.None => {}
+      }
+      parent = node.filteredParent(filter)
+    }
+    return Option.None
+  }
+
+  pub fn sizeOfSet(self: &Self) -> Option<usize> {
+    return self.data().sizeOfSet()
+  }
+
+  pub fn positionInSet(self: &Self) -> Option<usize> {
+    return self.data().positionInSet()
+  }
+
+  pub fn sortDirection(self: &Self) -> Option<SortDirection> {
+    return self.data().sortDirection()
+  }
+
+  pub fn supportsToggle(self: &Self) -> bool {
+    return self.toggled().isSome()
+  }
+
+  pub fn supportsExpandCollapse(self: &Self) -> bool {
+    if self.hasPopup().isSome() || self.data().isExpanded().isSome() {
+      return true
+    }
+    return match self.accessRole() {
+      Role.ComboBox => true
+      Role.EditableComboBox => true
+      Role.DisclosureTriangle => true
+      Role.TreeItem => true
+      _ => false
+    }
+  }
+
+  /// Whether a plain invoke (a button press) fits this node.
+  pub fn isInvocable<F: NodeFilter>(self: &Self, parentFilter: &F) -> bool {
+    return self.isClickable(parentFilter) && !self.isTextInput()
+      && self.accessRole() != Role.Document
+      && self.accessRole() != Role.Terminal
+      && !self.supportsToggle()
+      && !self.supportsExpandCollapse()
+      && self.isSelected().isNone()
+  }
+
+  /// Whether this node supports `action`, itself or through its filtered parent's child actions.
+  pub fn supportsAction<F: NodeFilter>(self: &Self, action: Action, parentFilter: &F) -> bool {
+    if self.data().supportsAction(action) {
+      return true
+    }
+    return match self.filteredParent(parentFilter) {
+      Option.Some { value: parent } => parent.data().childSupportsAction(action)
+      Option.None => false
+    }
+  }
+
+  pub fn supportsIncrement<F: NodeFilter>(self: &Self, parentFilter: &F) -> bool {
+    return self.supportsAction(Action.Increment, parentFilter)
+  }
+
+  pub fn supportsDecrement<F: NodeFilter>(self: &Self, parentFilter: &F) -> bool {
+    return self.supportsAction(Action.Decrement, parentFilter)
+  }
+
+  fn takesLabelFromDescendants(self: &Self) -> bool {
+    if self.state.data.labelledBy().length != 0 {
+      return false
+    }
+    return match self.accessRole() {
+      Role.Button => true
+      Role.CheckBox => true
+      Role.DefaultButton => true
+      Role.Link => true
+      Role.MenuItem => true
+      Role.MenuItemCheckBox => true
+      Role.MenuItemRadio => true
+      Role.RadioButton => true
+      _ => false
+    }
+  }
+
+  /// The nodes that label this one: `labelledBy`, or for buttons, links and similar roles
+  /// without it, their label and image descendants.
+  pub effect fn labelledBy(self: &Self, out: &mut List<NodeRef<'a>>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.takesLabelFromDescendants() {
+      run self.collectFilteredChildren(&DescendantLabelFilter {}, &mut out)
+      return ()
+    }
+    let ids = self.state.data.labelledBy()
+    let mut i: usize = 0
+    while i < ids.length {
+      match self.treeState.nodeById(self.id.withSameTree(ids[i])) {
+        Option.Some { value } => run out.append(value)
+        Option.None => {}
+      }
+      i = i + 1
+    }
+  }
+
+  pub fn labelComesFromValue(self: &Self) -> bool {
+    return self.accessRole() == Role.Label
+  }
+
+  /// The accessible name: the label, or the text of the labelling nodes joined by spaces.
+  pub effect fn label(self: &Self) -> Option<String>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut result = String.make()
+    if run self.writeLabel(&mut result) {
+      return Option.Some { value: move result }
+    }
+    return Option.None
+  }
+
+  pub effect fn hasLabel(self: &Self) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.data().label().isSome() {
+      return true
+    }
+    let mut labels = List<NodeRef<'a>>.make()
+    run self.labelledBy(&mut labels)
+    let mut i: usize = 0
+    while i < labels.length() {
+      let node = labels.get(i)
+      if node.labelComesFromValue() {
+        if node.hasValue() {
+          return true
+        }
+      } else if node.data().label().isSome() {
+        return true
+      }
+      i = i + 1
+    }
+    return false
+  }
+
+  effect fn writeLabelDirect(self: &Self, out: &mut String) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match self.data().label() {
+      Option.Some { value } => {
+        run out.append(value)
+        true
+      }
+      Option.None => false
+    }
+  }
+
+  /// Appends the accessible name to `out`; false when there is none.
+  pub effect fn writeLabel(self: &Self, out: &mut String) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if run self.writeLabelDirect(&mut out) {
+      return true
+    }
+    let mut labels = List<NodeRef<'a>>.make()
+    run self.labelledBy(&mut labels)
+    let mut wroteOne = false
+    let mut i: usize = 0
+    while i < labels.length() {
+      let node = labels.get(i)
+      let mut part = String.make()
+      let wrote = if node.labelComesFromValue() {
+        run node.writeValue(&mut part)
+      } else {
+        run node.writeLabelDirect(&mut part)
+      }
+      if wrote {
+        if wroteOne && String.byteLength(part.view()) != 0 {
+          run out.append(" ")
+        }
+        run out.append(part.view())
+        wroteOne = true
+      }
+      i = i + 1
+    }
+    return wroteOne
+  }
+
+  pub effect fn description(self: &Self) -> Option<String>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match self.data().description() {
+      Option.Some { value } => Option.Some { value: run String.copy(value) }
+      Option.None => Option.None
+    }
+  }
+
+  pub fn hasDescription(self: &Self) -> bool {
+    return self.data().description().isSome()
+  }
+
+  pub fn url(self: &Self) -> Option<string> {
+    return self.data().url()
+  }
+
+  pub fn supportsUrl(self: &Self) -> bool {
+    let linkLike = match self.accessRole() {
+      Role.Link => true
+      Role.DocBackLink => true
+      Role.DocBiblioRef => true
+      Role.DocGlossRef => true
+      Role.DocNoteRef => true
+      _ => false
+    }
+    return linkLike && self.url().isSome()
+  }
+
+  fn isEmptyTextInput(self: &Self) -> bool {
+    let mut runs = self.textRuns()
+    let filter = TextRunFilter { root: self.id }
+    return match runs.next(&filter) {
+      Option.Some { value: first } => {
+        let empty = match first.data().value() {
+          Option.Some { value } => String.byteLength(value) == 0
+          Option.None => true
+        }
+        empty && runs.next(&filter).isNone()
+      }
+      Option.None => true
+    }
+  }
+
+  /// The placeholder, while the text input is empty.
+  pub fn placeholder(self: &Self) -> Option<string> {
+    return match self.data().placeholder() {
+      Option.Some { value } => if self.isTextInput() && self.isEmptyTextInput() {
+        Option.Some { value: value }
+      } else {
+        Option.None
+      }
+      Option.None => Option.None
+    }
+  }
+
+  /// The value, masked for password inputs, or the text of a one-line text input.
+  pub effect fn value(self: &Self) -> Option<String>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut result = String.make()
+    if run self.writeValue(&mut result) {
+      return Option.Some { value: move result }
+    }
+    return Option.None
+  }
+
+  /// Appends the value to `out`; false when there is none.
+  pub effect fn writeValue(self: &Self, out: &mut String) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match self.data().value() {
+      Option.Some { value } => {
+        if self.isPasswordInput() {
+          run self.writePasswordValue(value, &mut out)
+        } else {
+          run out.append(value)
+        }
+        return true
+      }
+      Option.None => {}
+    }
+    if self.supportsTextRanges() && !self.isMultiline() {
+      run self.documentRange().writeText(&mut out)
+      return true
+    }
+    return false
+  }
+
+  effect fn writePasswordValue(self: &Self, value: string, out: &mut String) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut count: usize = 0
+    if self.supportsTextRanges() {
+      if !self.textRunsNeedMasking() {
+        run out.append(value)
+        return ()
+      }
+      let filter = TextRunFilter { root: self.id }
+      let mut runs = self.textRuns()
+      while let Option.Some { value: node } = runs.next(&filter) {
+        count = count + node.data().characterLengths().length
+      }
+    } else {
+      if !hasDistinctCharacters(value) {
+        run out.append(value)
+        return ()
+      }
+      count = characterCount(value)
+    }
+    let mut i: usize = 0
+    while i < count {
+      run out.append(PASSWORD_MASKING_CHARACTER)
+      i = i + 1
+    }
+  }
+
+  pub fn hasValue(self: &Self) -> bool {
+    return self.data().value().isSome() || (self.supportsTextRanges() && !self.isMultiline())
+  }
+
+  pub fn isReadOnlySupported(self: &Self) -> bool {
+    if self.isTextInput() {
+      return true
+    }
+    return match self.accessRole() {
+      Role.CheckBox => true
+      Role.ColorWell => true
+      Role.ComboBox => true
+      Role.Grid => true
+      Role.ListBox => true
+      Role.MenuItemCheckBox => true
+      Role.MenuItemRadio => true
+      Role.MenuListPopup => true
+      Role.RadioButton => true
+      Role.RadioGroup => true
+      Role.Slider => true
+      Role.Switch => true
+      Role.TreeGrid => true
+      _ => false
+    }
+  }
+
+  pub fn shouldHaveReadOnlyStateByDefault(self: &Self) -> bool {
+    return match self.accessRole() {
+      Role.Article => true
+      Role.Definition => true
+      Role.DescriptionList => true
+      Role.Document => true
+      Role.GraphicsDocument => true
+      Role.Image => true
+      Role.List => true
+      Role.ListItem => true
+      Role.PdfRoot => true
+      Role.ProgressIndicator => true
+      Role.RootWebArea => true
+      Role.Term => true
+      Role.Timer => true
+      Role.Toolbar => true
+      Role.Tooltip => true
+      _ => false
+    }
+  }
+
+  pub fn isRequired(self: &Self) -> bool {
+    return self.data().isRequired()
+  }
+
+  /// The live setting, inherited from the nearest ancestor that has one.
+  pub fn live(self: &Self) -> Live {
+    let mut current: Option<NodeRef<'a>> = Option.Some { value: self.* }
+    while let Option.Some { value: node } = current {
+      match node.data().live() {
+        Option.Some { value } => {
+          return value
+        }
+        Option.None => {}
+      }
+      current = node.parent()
+    }
+    return Live.Off
+  }
+
+  pub fn isSelected(self: &Self) -> Option<bool> {
+    return self.data().isSelected()
+  }
+
+  pub fn isTouchTransparent(self: &Self) -> bool {
+    return self.data().isTouchTransparent()
+  }
+
+  pub fn isItemLike(self: &Self) -> bool {
+    return match self.accessRole() {
+      Role.Article => true
+      Role.Comment => true
+      Role.ListItem => true
+      Role.MenuItem => true
+      Role.MenuItemRadio => true
+      Role.Tab => true
+      Role.MenuItemCheckBox => true
+      Role.TreeItem => true
+      Role.ListBoxOption => true
+      Role.MenuListOption => true
+      Role.RadioButton => true
+      Role.Term => true
+      _ => false
+    }
+  }
+
+  pub fn isContainerWithSelectableChildren(self: &Self) -> bool {
+    return match self.accessRole() {
+      Role.ComboBox => true
+      Role.EditableComboBox => true
+      Role.Grid => true
+      Role.ListBox => true
+      Role.ListGrid => true
+      Role.Menu => true
+      Role.MenuBar => true
+      Role.MenuListPopup => true
+      Role.RadioGroup => true
+      Role.TabList => true
+      Role.Toolbar => true
+      Role.Tree => true
+      Role.TreeGrid => true
+      _ => false
+    }
+  }
+
+  /// The nodes this one controls.
+  pub effect fn controls(self: &Self, out: &mut List<NodeRef<'a>>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let ids = self.state.data.controls()
+    let mut i: usize = 0
+    while i < ids.length {
+      match self.treeState.nodeById(self.id.withSameTree(ids[i])) {
+        Option.Some { value } => run out.append(value)
+        Option.None => {}
+      }
+      i = i + 1
+    }
+  }
+
+  /// Node `local` of the same tree.
+  pub fn sameTreeNode(self: &Self, local: NodeId) -> Option<NodeRef<'a>> {
+    return self.treeState.nodeById(self.id.withSameTree(local))
+  }
+
+  pub fn activeDescendant(self: &Self) -> Option<NodeRef<'a>> {
+    return match self.state.data.activeDescendant() {
+      Option.Some { value } => self.treeState.nodeById(self.id.withSameTree(value))
+      Option.None => Option.None
+    }
+  }
+
+  pub fn rawTextSelection(self: &Self) -> Option<TextSelection> {
+    return self.data().textSelection()
+  }
+
+  pub fn rawValue(self: &Self) -> Option<string> {
+    return self.data().value()
+  }
+
+  pub fn authorId(self: &Self) -> Option<string> {
+    return self.data().authorId()
+  }
+
+  pub fn htmlId(self: &Self) -> Option<string> {
+    return self.data().htmlId()
+  }
+
+  pub fn hasHtmlId(self: &Self) -> bool {
+    return self.data().htmlId().isSome()
+  }
+
+  pub fn className(self: &Self) -> Option<string> {
+    return self.data().className()
+  }
+
+  /// The child indices from the root to this node.
+  pub effect fn indexPath(self: &Self, out: &mut List<usize>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.relativeIndexPath(self.treeState.rootId(), &mut out)
+  }
+
+  /// The child indices from `ancestor` to this node.
+  pub effect fn relativeIndexPath(self: &Self, ancestor: FullNodeId, out: &mut List<usize>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let start = out.length()
+    let mut current: NodeRef<'a> = self.*
+    while !current.id.equals(ancestor) {
+      match current.state.parent {
+        Option.Some { value: pi } => {
+          run out.append(pi.index)
+          current = match current.parent() {
+            Option.Some { value } => value
+            Option.None => Intrinsic.trap("accesskit: a parent is missing")
+          }
+        }
+        Option.None => Intrinsic.trap("accesskit: the ancestor is not an ancestor")
+      }
+    }
+    let mut a = start
+    let mut b = out.length()
+    while b > a + 1 {
+      b = b - 1
+      let x = out.get(a)
+      let y = out.get(b)
+      out.set(a, y)
+      out.set(b, x)
+      a = a + 1
+    }
+  }
+
+  /// `textDirection` of this node or the nearest ancestor that sets it.
+  pub fn textDirection(self: &Self) -> Option<TextDirection> {
+    let mut current: Option<NodeRef<'a>> = Option.Some { value: self.* }
+    while let Option.Some { value: node } = current {
+      match node.data().textDirection() {
+        Option.Some { value } => {
+          return Option.Some { value: value }
+        }
+        Option.None => {}
+      }
+      current = node.parent()
+    }
+    return Option.None
+  }
+
+  /// `fontFamily` of this node or the nearest ancestor that sets it.
+  pub fn fontFamily(self: &Self) -> Option<string<'a>> {
+    let mut current: Option<NodeRef<'a>> = Option.Some { value: self.* }
+    while let Option.Some { value: node } = current {
+      match node.data().fontFamily() {
+        Option.Some { value } => {
+          return Option.Some { value: value }
+        }
+        Option.None => {}
+      }
+      current = node.parent()
+    }
+    return Option.None
+  }
+
+  /// `language` of this node or the nearest ancestor that sets it.
+  pub fn language(self: &Self) -> Option<string<'a>> {
+    let mut current: Option<NodeRef<'a>> = Option.Some { value: self.* }
+    while let Option.Some { value: node } = current {
+      match node.data().language() {
+        Option.Some { value } => {
+          return Option.Some { value: value }
+        }
+        Option.None => {}
+      }
+      current = node.parent()
+    }
+    return Option.None
+  }
+
+  /// `fontSize` of this node or the nearest ancestor that sets it.
+  pub fn fontSize(self: &Self) -> Option<f32> {
+    let mut current: Option<NodeRef<'a>> = Option.Some { value: self.* }
+    while let Option.Some { value: node } = current {
+      match node.data().fontSize() {
+        Option.Some { value } => {
+          return Option.Some { value: value }
+        }
+        Option.None => {}
+      }
+      current = node.parent()
+    }
+    return Option.None
+  }
+
+  /// `fontWeight` of this node or the nearest ancestor that sets it.
+  pub fn fontWeight(self: &Self) -> Option<f32> {
+    let mut current: Option<NodeRef<'a>> = Option.Some { value: self.* }
+    while let Option.Some { value: node } = current {
+      match node.data().fontWeight() {
+        Option.Some { value } => {
+          return Option.Some { value: value }
+        }
+        Option.None => {}
+      }
+      current = node.parent()
+    }
+    return Option.None
+  }
+
+  /// `backgroundColor` of this node or the nearest ancestor that sets it.
+  pub fn backgroundColor(self: &Self) -> Option<Color> {
+    let mut current: Option<NodeRef<'a>> = Option.Some { value: self.* }
+    while let Option.Some { value: node } = current {
+      match node.data().backgroundColor() {
+        Option.Some { value } => {
+          return Option.Some { value: value }
+        }
+        Option.None => {}
+      }
+      current = node.parent()
+    }
+    return Option.None
+  }
+
+  /// `foregroundColor` of this node or the nearest ancestor that sets it.
+  pub fn foregroundColor(self: &Self) -> Option<Color> {
+    let mut current: Option<NodeRef<'a>> = Option.Some { value: self.* }
+    while let Option.Some { value: node } = current {
+      match node.data().foregroundColor() {
+        Option.Some { value } => {
+          return Option.Some { value: value }
+        }
+        Option.None => {}
+      }
+      current = node.parent()
+    }
+    return Option.None
+  }
+
+  /// `overline` of this node or the nearest ancestor that sets it.
+  pub fn overline(self: &Self) -> Option<TextDecoration> {
+    let mut current: Option<NodeRef<'a>> = Option.Some { value: self.* }
+    while let Option.Some { value: node } = current {
+      match node.data().overline() {
+        Option.Some { value } => {
+          return Option.Some { value: value }
+        }
+        Option.None => {}
+      }
+      current = node.parent()
+    }
+    return Option.None
+  }
+
+  /// `strikethrough` of this node or the nearest ancestor that sets it.
+  pub fn strikethrough(self: &Self) -> Option<TextDecoration> {
+    let mut current: Option<NodeRef<'a>> = Option.Some { value: self.* }
+    while let Option.Some { value: node } = current {
+      match node.data().strikethrough() {
+        Option.Some { value } => {
+          return Option.Some { value: value }
+        }
+        Option.None => {}
+      }
+      current = node.parent()
+    }
+    return Option.None
+  }
+
+  /// `underline` of this node or the nearest ancestor that sets it.
+  pub fn underline(self: &Self) -> Option<TextDecoration> {
+    let mut current: Option<NodeRef<'a>> = Option.Some { value: self.* }
+    while let Option.Some { value: node } = current {
+      match node.data().underline() {
+        Option.Some { value } => {
+          return Option.Some { value: value }
+        }
+        Option.None => {}
+      }
+      current = node.parent()
+    }
+    return Option.None
+  }
+
+  /// `textAlign` of this node or the nearest ancestor that sets it.
+  pub fn textAlign(self: &Self) -> Option<TextAlign> {
+    let mut current: Option<NodeRef<'a>> = Option.Some { value: self.* }
+    while let Option.Some { value: node } = current {
+      match node.data().textAlign() {
+        Option.Some { value } => {
+          return Option.Some { value: value }
+        }
+        Option.None => {}
+      }
+      current = node.parent()
+    }
+    return Option.None
+  }
+
+  /// `verticalOffset` of this node or the nearest ancestor that sets it.
+  pub fn verticalOffset(self: &Self) -> Option<VerticalOffset> {
+    let mut current: Option<NodeRef<'a>> = Option.Some { value: self.* }
+    while let Option.Some { value: node } = current {
+      match node.data().verticalOffset() {
+        Option.Some { value } => {
+          return Option.Some { value: value }
+        }
+        Option.None => {}
+      }
+      current = node.parent()
+    }
+    return Option.None
+  }
+
+  /// Whether this node or an ancestor is italic.
+  pub fn isItalic(self: &Self) -> bool {
+    let mut current: Option<NodeRef<'a>> = Option.Some { value: self.* }
+    while let Option.Some { value: node } = current {
+      if node.data().isItalic() {
+        return true
+      }
+      current = node.parent()
+    }
+    return false
+  }
+
+  pub fn textAttributesDiffer(self: &Self, other: &NodeRef<'_>) -> bool {
+    if !sameOption(
+      match self.fontFamily() {
+        Option.Some { value: x } => match other.fontFamily() {
+          Option.Some { value: y } => x == y
+          Option.None => false
+        }
+        Option.None => other.fontFamily().isNone()
+      },
+    ) {
+      return true
+    }
+    if !sameOption(
+      match self.language() {
+        Option.Some { value: x } => match other.language() {
+          Option.Some { value: y } => x == y
+          Option.None => false
+        }
+        Option.None => other.language().isNone()
+      },
+    ) {
+      return true
+    }
+    if !sameOption(
+      match self.fontSize() {
+        Option.Some { value: x } => match other.fontSize() {
+          Option.Some { value: y } => x == y
+          Option.None => false
+        }
+        Option.None => other.fontSize().isNone()
+      },
+    ) {
+      return true
+    }
+    if !sameOption(
+      match self.fontWeight() {
+        Option.Some { value: x } => match other.fontWeight() {
+          Option.Some { value: y } => x == y
+          Option.None => false
+        }
+        Option.None => other.fontWeight().isNone()
+      },
+    ) {
+      return true
+    }
+    if !sameOption(
+      match self.backgroundColor() {
+        Option.Some { value: x } => match other.backgroundColor() {
+          Option.Some { value: y } => x.equals(y)
+          Option.None => false
+        }
+        Option.None => other.backgroundColor().isNone()
+      },
+    ) {
+      return true
+    }
+    if !sameOption(
+      match self.foregroundColor() {
+        Option.Some { value: x } => match other.foregroundColor() {
+          Option.Some { value: y } => x.equals(y)
+          Option.None => false
+        }
+        Option.None => other.foregroundColor().isNone()
+      },
+    ) {
+      return true
+    }
+    if !sameOption(
+      match self.overline() {
+        Option.Some { value: x } => match other.overline() {
+          Option.Some { value: y } => x.equals(y)
+          Option.None => false
+        }
+        Option.None => other.overline().isNone()
+      },
+    ) {
+      return true
+    }
+    if !sameOption(
+      match self.strikethrough() {
+        Option.Some { value: x } => match other.strikethrough() {
+          Option.Some { value: y } => x.equals(y)
+          Option.None => false
+        }
+        Option.None => other.strikethrough().isNone()
+      },
+    ) {
+      return true
+    }
+    if !sameOption(
+      match self.underline() {
+        Option.Some { value: x } => match other.underline() {
+          Option.Some { value: y } => x.equals(y)
+          Option.None => false
+        }
+        Option.None => other.underline().isNone()
+      },
+    ) {
+      return true
+    }
+    if !sameOption(
+      match self.textAlign() {
+        Option.Some { value: x } => match other.textAlign() {
+          Option.Some { value: y } => x == y
+          Option.None => false
+        }
+        Option.None => other.textAlign().isNone()
+      },
+    ) {
+      return true
+    }
+    if !sameOption(
+      match self.verticalOffset() {
+        Option.Some { value: x } => match other.verticalOffset() {
+          Option.Some { value: y } => x == y
+          Option.None => false
+        }
+        Option.None => other.verticalOffset().isNone()
+      },
+    ) {
+      return true
+    }
+    return false
+  }
+
+  /// A walk over this text node's text runs.
+  pub fn textRuns(self: &Self) -> FilteredCursor<'a> {
+    return self.filteredChildren(&TextRunFilter { root: self.id })
+  }
+
+  /// Whether a password input's text must be masked: its runs hold real characters, not
+  /// bullets already.
+  pub fn textRunsNeedMasking(self: &Self) -> bool {
+    if !self.isPasswordInput() {
+      return false
+    }
+    let filter = TextRunFilter { root: self.id }
+    let mut runs = self.textRuns()
+    let mut first: Option<char> = Option.None
+    while let Option.Some { value: node } = runs.next(&filter) {
+      let value = node.data().value().unwrapOr("")
+      let mut cursor = String.scalarCursor()
+      while let Option.Some { value: step } = String.nextScalar(value, move cursor) {
+        let c = String.scalarValue(&step)
+        match first {
+          Option.Some { value: f } => {
+            if f != c {
+              return true
+            }
+          }
+          Option.None => {
+            first = Option.Some { value: c }
+          }
+        }
+        cursor = String.nextCursor(move step)
+      }
+    }
+    return false
+  }
+
+  /// Whether this node's text can be navigated by position: a text input, label, document or
+  /// terminal with at least one text run.
+  pub fn supportsTextRanges(self: &Self) -> bool {
+    let kind = self.isTextInput() || self.accessRole() == Role.Label
+      || self.accessRole() == Role.Document
+      || self.accessRole() == Role.Terminal
+    if !kind {
+      return false
+    }
+    let filter = TextRunFilter { root: self.id }
+    let mut runs = self.textRuns()
+    return runs.next(&filter).isSome()
+  }
+
+  fn documentStartInner(self: &Self) -> InnerPosition<'a> {
+    let filter = TextRunFilter { root: self.id }
+    let mut runs = self.textRuns()
+    return match runs.next(&filter) {
+      Option.Some { value: node } => InnerPosition { node: node, characterIndex: 0 }
+      Option.None => Intrinsic.trap("accesskit: the node has no text runs")
+    }
+  }
+
+  fn documentEndInner(self: &Self) -> InnerPosition<'a> {
+    let filter = TextRunFilter { root: self.id }
+    let mut runs = self.textRuns()
+    return match runs.nextBack(&filter) {
+      Option.Some { value: node } => InnerPosition {
+        node: node,
+        characterIndex: node.data().characterLengths().length,
+      }
+      Option.None => Intrinsic.trap("accesskit: the node has no text runs")
+    }
+  }
+
+  pub fn documentStart(self: &Self) -> Position<'a> {
+    return Position { root: self.*, inner: self.documentStartInner() }
+  }
+
+  pub fn documentEnd(self: &Self) -> Position<'a> {
+    return Position { root: self.*, inner: self.documentEndInner() }
+  }
+
+  pub fn documentRange(self: &Self) -> Range<'a> {
+    return Range.make(self.*, self.documentStartInner(), self.documentEndInner())
+  }
+
+  pub fn hasTextSelection(self: &Self) -> bool {
+    return self.data().textSelection().isSome()
+  }
+
+  pub fn textSelection(self: &Self) -> Option<Range<'a>> {
+    return match self.data().textSelection() {
+      Option.Some { value: selection } => {
+        let anchor = InnerPosition.clampedUpgradePublic(self.treeState, selection.anchor, self.id)
+        let focus = InnerPosition.clampedUpgradePublic(self.treeState, selection.focus, self.id)
+        Option.Some { value: Range.make(self.*, anchor, focus) }
+      }
+      Option.None => Option.None
+    }
+  }
+
+  pub fn textSelectionAnchor(self: &Self) -> Option<Position<'a>> {
+    return match self.data().textSelection() {
+      Option.Some { value: selection } => Option.Some {
+        value: Position {
+          root: self.*,
+          inner: InnerPosition.clampedUpgradePublic(self.treeState, selection.anchor, self.id),
+        },
+      }
+      Option.None => Option.None
+    }
+  }
+
+  pub fn textSelectionFocus(self: &Self) -> Option<Position<'a>> {
+    return match self.data().textSelection() {
+      Option.Some { value: selection } => Option.Some {
+        value: Position {
+          root: self.*,
+          inner: InnerPosition.clampedUpgradePublic(self.treeState, selection.focus, self.id),
+        },
+      }
+      Option.None => Option.None
+    }
+  }
+
+  /// The text position at `point`, in this node's coordinates.
+  pub fn textPositionAtPoint(self: &Self, point: Point) -> Position<'a> {
+    let filter = TextRunFilter { root: self.id }
+    match self.hitTest(point, &filter) {
+      Option.Some { value: hit } => {
+        if hit.node.accessRole() == Role.TextRun {
+          return Position {
+            root: self.*,
+            inner: InnerPosition {
+              node: hit.node,
+              characterIndex: characterIndexAtPoint(&hit.node, self, hit.point),
+            },
+          }
+        }
+      }
+      Option.None => {}
+    }
+    let mut runs = self.textRuns()
+    match runs.next(&filter) {
+      Option.Some { value: node } => match node.boundingBoxInCoordinateSpace(self) {
+        Option.Some { value: rect } => {
+          if point.x < rect.x0 || point.y < rect.y0 {
+            return self.documentStart()
+          }
+        }
+        Option.None => {}
+      }
+      Option.None => {}
+    }
+    let mut back = self.textRuns()
+    while let Option.Some { value: node } = back.nextBack(&filter) {
+      match node.boundingBoxInCoordinateSpace(self) {
+        Option.Some { value: rect } => match node.textDirection() {
+          Option.Some { value: direction } => {
+            let pastEnd = match direction {
+              TextDirection.LeftToRight => point.y >= rect.y0 && point.y < rect.y1
+                && point.x >= rect.x1
+              TextDirection.RightToLeft => point.y >= rect.y0 && point.y < rect.y1
+                && point.x < rect.x0
+              TextDirection.TopToBottom => point.x >= rect.x0 && point.x < rect.x1
+                && point.y >= rect.y1
+              TextDirection.BottomToTop => point.x >= rect.x0 && point.x < rect.x1
+                && point.y < rect.y0
+            }
+            if pastEnd {
+              return Position {
+                root: self.*,
+                inner: InnerPosition {
+                  node: node,
+                  characterIndex: node.data().characterLengths().length,
+                },
+              }
+            }
+          }
+          Option.None => {}
+        }
+        Option.None => {}
+      }
+    }
+    return self.documentEnd()
+  }
+
+  /// The range of line `lineIndex`, counting from 0.
+  pub fn lineRangeFromIndex(self: &Self, lineIndex: usize) -> Option<Range<'a>> {
+    let mut pos = self.documentStart()
+    if lineIndex > 0 {
+      if pos.isDocumentEnd() || pos.forwardToLineEnd().isDocumentEnd() {
+        return Option.None
+      }
+      let mut i: usize = 0
+      while i < lineIndex {
+        if pos.isDocumentEnd() {
+          return Option.None
+        }
+        pos = pos.forwardToLineStart()
+        i = i + 1
+      }
+    }
+    let end = if pos.isDocumentEnd() {
+      pos
+    } else {
+      pos.forwardToLineEnd()
+    }
+    return Option.Some { value: Range.make(self.*, pos.inner, end.inner) }
+  }
+
+  /// The position at offset `index` in Unicode scalar values.
+  pub fn textPositionFromGlobalUsvIndex(self: &Self, index: usize) -> Option<Position<'a>> {
+    return self.positionFromGlobalIndex(index, false)
+  }
+
+  /// The position at offset `index` in UTF-16 code units.
+  pub fn textPositionFromGlobalUtf16Index(self: &Self, index: usize) -> Option<Position<'a>> {
+    return self.positionFromGlobalIndex(index, true)
+  }
+
+  fn positionFromGlobalIndex(self: &Self, index: usize, utf16: bool) -> Option<Position<'a>> {
+    let masked = self.textRunsNeedMasking()
+    let filter = TextRunFilter { root: self.id }
+    let mut total: usize = 0
+    let mut runs = self.textRuns()
+    while let Option.Some { value: node } = runs.next(&filter) {
+      let lengths = node.data().characterLengths()
+      if masked {
+        let next = total + lengths.length
+        if index >= total && index < next {
+          return Option.Some {
+            value: Position {
+              root: self.*,
+              inner: InnerPosition { node: node, characterIndex: index - total },
+            },
+          }
+        }
+        total = next
+        continue
+      }
+      let text = node.data().value().unwrapOr("")
+      let next = total + unitCount(text, utf16)
+      if index >= total && index < next {
+        let local = index - total
+        let mut bytes: usize = 0
+        let mut units: usize = 0
+        let mut c: usize = 0
+        while c < lengths.length {
+          let charBytes = u8.toUsize(lengths[c])
+          let charUnits = unitCount(String.slice(text, bytes, charBytes), utf16)
+          if local >= units && local < units + charUnits {
+            return Option.Some {
+              value: Position {
+                root: self.*,
+                inner: InnerPosition { node: node, characterIndex: c },
+              },
+            }
+          }
+          bytes = bytes + charBytes
+          units = units + charUnits
+          c = c + 1
+        }
+        return Intrinsic.trap("accesskit: index out of range")
+      }
+      total = next
+    }
+    if index == total {
+      return Option.Some { value: self.documentEnd() }
+    }
+    return Option.None
+  }
+
+  /// The nearest filtered ancestor that holds selectable children.
+  pub fn selectionContainer<F: NodeFilter>(self: &Self, filter: &F) -> Option<NodeRef<'a>> {
+    let mut current = self.parent()
+    while let Option.Some { value: parent } = current {
+      let result = filter.filter(&parent)
+      if result == FilterResult.Include && parent.isContainerWithSelectableChildren() {
+        return Option.Some { value: parent }
+      }
+      current = parent.parent()
+    }
+    return Option.None
+  }
+
+  /// Appends the item-like children (options, tabs, list items and so on) to `out`, looking
+  /// through other included children.
+  pub effect fn items<F: NodeFilter>(self: &Self, filter: &F, out: &mut List<NodeRef<'a>>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let itemFilter = ItemFilter<F> { inner: filter }
+    run self.collectFilteredChildren(&itemFilter, &mut out)
+  }
+}
+
+/// The node a hit test found, and the point in its coordinates.
+pub struct HitTest<'a> {
+  pub node: NodeRef<'a>,
+  pub point: Point,
+}
+
+impl<'a> Copy for HitTest<'a> {}
+
+struct DescendantLabelFilter {}
+
+impl NodeFilter for DescendantLabelFilter {
+  fn filter(self: &Self, node: &NodeRef<'_>) -> FilterResult {
+    return match node.accessRole() {
+      Role.Label => FilterResult.Include
+      Role.Image => FilterResult.Include
+      Role.GenericContainer => FilterResult.ExcludeNode
+      _ => FilterResult.ExcludeSubtree
+    }
+  }
+}
+
+struct ItemFilter<'f, F> {
+  inner: &'f F,
+}
+
+impl<'f, F: NodeFilter> NodeFilter for ItemFilter<'f, F> {
+  fn filter(self: &Self, child: &NodeRef<'_>) -> FilterResult {
+    let result = self.inner.filter(child)
+    if result == FilterResult.Include {
+      if child.isItemLike() {
+        return FilterResult.Include
+      }
+      return FilterResult.ExcludeNode
+    }
+    return result
+  }
+}
+
+/// The number of Unicode scalar values in `value`.
+pub fn characterCount(value: string) -> usize {
+  let mut count: usize = 0
+  let mut cursor = String.scalarCursor()
+  while let Option.Some { value: step } = String.nextScalar(value, move cursor) {
+    count = count + 1
+    cursor = String.nextCursor(move step)
+  }
+  return count
+}
+
+/// Whether `value` has at least two different characters.
+pub fn hasDistinctCharacters(value: string) -> bool {
+  let mut cursor = String.scalarCursor()
+  let first = match String.nextScalar(value, move cursor) {
+    Option.Some { value: step } => {
+      let c = String.scalarValue(&step)
+      cursor = String.nextCursor(move step)
+      c
+    }
+    Option.None => {
+      return false
+    }
+  }
+  while let Option.Some { value: step } = String.nextScalar(value, move cursor) {
+    if String.scalarValue(&step) != first {
+      return true
+    }
+    cursor = String.nextCursor(move step)
+  }
+  return false
+}
+
+fn sameOption(value: bool) -> bool {
+  return value
+}

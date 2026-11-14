@@ -3,18 +3,18 @@ import { test } from "node:test";
 import { installMock } from "./mock.js";
 
 const mock = installMock();
-const { createBox, createText, createInput, mount, nodeById, setErrorHandler } = await import("../src/index.js");
+const { createBox, createText, createInput, createIcon, mount, nodeById, setErrorHandler, parseMarkdown, defineKeyframes } = await import("../src/index.js");
 
 test("nodes queue their mutations", () => {
   mock.take();
   const label = createText("hi");
-  const box = createBox({ width: 10, opacity: 0.5, backgroundColor: "red" }, label);
+  const box = createBox({ width: 10, opacity: 0.5, backgroundColor: "red", gridColumn: 2 }, label);
   mount(box);
   assert.deepEqual(mock.take(), [
     ["create", label.id, 1],
     ["setText", label.id, "hi"],
     ["create", box.id, 0],
-    ["style", box.id, "width:10px;opacity:0.5;background-color:red;", 0],
+    ["style", box.id, "width:10px;opacity:0.5;background-color:red;grid-column:2;", 0],
     ["append", box.id, label.id],
     ["root", box.id],
   ]);
@@ -85,6 +85,18 @@ test("preventDefault reaches the host for cancelable events only", () => {
   assert.equal(mock.native.dispatch(9, box.id, 0, 0, 0, 0, 0), false);
 });
 
+test("transition events bubble with their property and elapsed time", () => {
+  const outer = createBox();
+  const inner = createBox();
+  outer.append(inner);
+  mock.take();
+  let seen;
+  outer.addEventListener("transitionend", (event) => (seen = [event.propertyName, event.elapsedTime, event.target]));
+  assert.deepEqual(mock.take(), [["listen", outer.id, 1 << 21]]);
+  mock.native.dispatch(21, inner.id, 0.25, 0, 0, 0, 0, "opacity");
+  assert.deepEqual(seen, ["opacity", 0.25, inner]);
+});
+
 test("an input follows what the user types", () => {
   const input = createInput();
   let seen;
@@ -138,6 +150,41 @@ test("a font family list is defined once and named by number", () => {
   ]);
 });
 
+test("keyframes are defined frame by frame, with CSS selectors", () => {
+  mock.take();
+  defineKeyframes("pulse", { "0%, 100%": { opacity: 1 }, "50%": { opacity: 0.5, width: 10 } });
+  assert.deepEqual(mock.take(), [
+    ["keyframe", 0, "opacity:1;"],
+    ["keyframe", 1, "opacity:1;"],
+    ["keyframe", 0.5, "opacity:0.5;width:10px;"],
+    ["keyframes", "pulse"],
+  ]);
+  defineKeyframes("pulse", null);
+  assert.deepEqual(mock.take(), [["keyframes", "pulse"]]);
+});
+
+test("identical icon markup shares one resource, released when no icon shows it", () => {
+  mock.take();
+  const check = "<svg viewBox='0 0 24 24'><path d='M20 6 9 17l-5-5'/></svg>";
+  const x = "<svg viewBox='0 0 24 24'><path d='M18 6 6 18'/></svg>";
+  const a = createIcon(check);
+  const b = createIcon(check);
+  let calls = mock.take();
+  const defined = calls.filter((call) => call[0] === "defineIcon");
+  assert.deepEqual(defined.map((call) => call[2]), [check]);
+  const id = defined[0][1];
+  assert.deepEqual(calls.filter((call) => call[0] === "source"), [["source", a.id, id], ["source", b.id, id]]);
+  a.svg = x;
+  b.svg = check;
+  calls = mock.take();
+  assert.equal(calls.filter((call) => call[0] === "release").length, 0, "b still shows the check");
+  b.destroy();
+  a.svg = "";
+  calls = mock.take();
+  assert.deepEqual(calls.filter((call) => call[0] === "release").map((call) => call[1]).length, 2, "both released");
+  assert.deepEqual(calls.find((call) => call[0] === "source"), ["source", a.id, 0]);
+});
+
 test("a click inside a link opens its address unless a listener prevents it", () => {
   const opened = [];
   globalThis.open = (url) => opened.push(url);
@@ -160,4 +207,68 @@ test("a click inside a link opens its address unless a listener prevents it", ()
   link.setAttribute("href", "");
   assert.deepEqual(mock.take(), [["listen", link.id, 0], ["attribute", link.id, "href", ""]]);
   delete globalThis.open;
+});
+
+test("role and aria-* reach the tree under its own names", () => {
+  const box = createBox();
+  mock.take();
+  box.setAttribute("role", "button");
+  box.setAttribute("aria-label", "Save");
+  box.setAttribute("ariaExpanded", true);
+  box.setAttribute("aria-checked", "mixed");
+  box.setAttribute("aria-selected", "true");
+  box.setAttribute("ariaLevel", 2);
+  box.setAttribute("aria-live", "polite");
+  assert.deepEqual(mock.take(), [
+    ["attribute", box.id, "role", "button"],
+    ["attribute", box.id, "label", "Save"],
+    ["attribute", box.id, "expanded", true],
+    ["attribute", box.id, "indeterminate", true],
+    ["attribute", box.id, "checked", false],
+    ["attribute", box.id, "selected", true],
+    ["attribute", box.id, "aria-level", "2"],
+    ["attribute", box.id, "aria-live", "polite"],
+  ]);
+});
+
+test("aria-value* make one range, and it clears without a value", () => {
+  const box = createBox();
+  mock.take();
+  box.setAttribute("aria-valuenow", "30");
+  box.setAttribute("ariaValueMax", 50);
+  box.setAttribute("aria-valuenow", null);
+  assert.deepEqual(mock.take(), [
+    ["attribute", box.id, "valueRange", 0, 100, 30],
+    ["attribute", box.id, "valueRange", 0, 50, 30],
+    ["attribute", box.id, "valueRange"],
+  ]);
+});
+
+test("an unknown role or ARIA name warns once and throws nothing", () => {
+  const box = createBox();
+  const warnings = [];
+  const warn = console.warn;
+  console.warn = (message) => warnings.push(message);
+  try {
+    mock.take();
+    box.setAttribute("role", "unknown");
+    box.setAttribute("role", "unknown");
+    box.setAttribute("aria-describedby", "x");
+    assert.deepEqual(mock.take(), [
+      ["attribute", box.id, "role", "unknown"],
+      ["attribute", box.id, "role", "unknown"],
+      ["attribute", box.id, "aria-describedby", "x"],
+    ]);
+    assert.deepEqual(warnings, ["the tree has no role 'unknown': it is ignored", "the tree has no 'aria-describedby' yet: it is ignored"]);
+  } finally {
+    console.warn = warn;
+  }
+});
+
+test("parseMarkdown turns GFM on unless told otherwise", () => {
+  mock.take();
+  assert.deepEqual(parseMarkdown("# hi"), { type: "root", children: [] });
+  parseMarkdown("x", { gfm: false, footnotes: true });
+  parseMarkdown("x", { tables: false, alerts: true });
+  assert.deepEqual(mock.take().map((call) => call[2]), [15, 16, 78]);
 });

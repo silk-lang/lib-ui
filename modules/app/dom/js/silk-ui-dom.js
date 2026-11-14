@@ -38,6 +38,14 @@ const EVENT = {
   lostPointerCapture: 16,
   load: 17,
   error: 18,
+  transitionRun: 19,
+  transitionStart: 20,
+  transitionEnd: 21,
+  transitionCancel: 22,
+  animationStart: 23,
+  animationIteration: 24,
+  animationEnd: 25,
+  animationCancel: 26,
 };
 
 // The listener flag of event kind `k` is `1 << k`.
@@ -46,8 +54,10 @@ const PREVENT_SCROLL = 2;
 const PREVENT_KEYS = 4;
 
 // Later sheets win: a pressed node shows its active look over its hover look.
-const STATES = [null, ":hover", ":active", ":focus", ":focus-visible"];
-const STATE_ORDER = [1, 3, 4, 2];
+// The starting look (5) is an `@starting-style` block holding the node's rule.
+const STATES = [null, ":hover", ":active", ":focus", ":focus-visible", ""];
+const STATE_ORDER = [5, 1, 3, 4, 2];
+const STARTING = 5;
 
 // The same rules as `RESET` in `src/html.silk`, which a server render carries. `:where` gives
 // them no specificity, so the page's own stylesheets win. A pseudo-element rule that matches
@@ -99,6 +109,9 @@ class IdTable {
     for (let id = 0; id < values.length; id++) if (values[id] != null) yield [id, values[id]];
   }
 }
+
+// `Mutation.DeclareFontFace` styles, by number.
+const FACE_STYLES = ["normal", "italic", "oblique"];
 
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
@@ -190,9 +203,10 @@ class Writer {
 /**
  * Runs the program in `wasm` (a URL, a Response, bytes or a compiled module) inside `root`.
  *
- * `fonts` names the font families the program's `css.fontFamily(n)` numbers stand for, as CSS
- * `font-family` values: `{ 1: "Inter, sans-serif" }`. Images and icons are named by URL in the
- * program (`h.image("photos/a.png")`): the page loads them, relative ones from the app's root.
+ * `fonts` names the font families the program's `css.fontFamilyNumber(n)` numbers stand for,
+ * as CSS `font-family` values: `{ 1: "Inter, sans-serif" }`; a program's own `Font`s need
+ * nothing here. Images, icons and font faces are named by URL in the program
+ * (`h.image("photos/a.png")`): the page loads them, relative ones from the app's root.
  * `loaders` adds schemes of the app's own, `{ db: async (url) => blob }`, each answering with a
  * Blob or an address. `base` is what comes before a link's path
  * in its address when the site is not at the root of its origin (`"/docs"`). `imports` adds
@@ -259,6 +273,10 @@ class Page {
     // The address of each image and icon resource, by number.
     this.images = new Map();
     this.icons = new Map();
+    // Font faces the program declared, by number, as promises of their `FontFace`.
+    this.faces = new Map();
+    // The stylesheets of font rules linked so far.
+    this.stylesheets = new Set();
     // Addresses this page made for resources the program defined, to revoke.
     this.made = new Map();
     this.anchored = new Set();
@@ -298,6 +316,9 @@ class Page {
       document.head.append(style);
       this.sheets[state] = { sheet: style.sheet, rules: new Map() };
     }
+    const keyframes = document.createElement("style");
+    document.head.append(keyframes);
+    this.keyframes = { sheet: keyframes.sheet, rules: new Map() };
     this.layout = new ResizeObserver((entries) => {
       for (const entry of entries) {
         const id = this.idOf(entry.target);
@@ -687,6 +708,40 @@ class Page {
         case 32:
           this.load(this.icons, r.u32(), r.text());
           break;
+        case 33: {
+          const face = r.u32();
+          const family = r.text();
+          const url = r.text();
+          const weight = [r.f32(), r.f32()];
+          const width = [r.f32(), r.f32()];
+          const style = FACE_STYLES[r.u8()] ?? "normal";
+          const ranges = [];
+          for (let count = r.u32(); count >= 2; count -= 2) ranges.push([r.u32(), r.u32()]);
+          this.declareFace(face, family, url, weight, width, style, ranges);
+          break;
+        }
+        case 34: {
+          const face = r.u32();
+          r.text();
+          this.faces.get(face)?.then((found) => found?.load()).catch(() => {});
+          break;
+        }
+        case 35:
+          this.linkFonts(r.text());
+          break;
+        case 36: {
+          // `@keyframes`, in a sheet of their own, one rule per name.
+          const name = r.text();
+          const frames = [];
+          for (let count = r.u32(); count > 0; count--) {
+            const offset = r.f32();
+            const declarations = [];
+            for (let n = r.u32(); n > 0; n--) declarations.push(r.text());
+            frames.push(`${+(offset * 100).toFixed(4)}% { ${declarations.join("; ")} }`);
+          }
+          this.defineKeyframes(name, frames);
+          break;
+        }
         case 27: {
           // The first root closes: the mounted element shows nothing.
           if (r.u32() !== 0) break;
@@ -751,6 +806,60 @@ class Page {
   // loader, which answers with a Blob or an address; any other URL is the browser's to load.
   // A relative URL is one of the app's own files, so it resolves against the app's root (the
   // origin and `base`), not against the current route.
+  // An address the page can fetch for `url`, as `load` resolves image and icon URLs: a
+  // scheme with a loader goes through it (to a Blob or an address), any other scheme is
+  // fetched as it is, and a relative URL is the app's own file.
+  async resolve(url) {
+    const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(url)?.[1]?.toLowerCase();
+    const loader = scheme ? this.loaders[scheme] : undefined;
+    if (loader) return await loader(url);
+    return scheme ? url : new URL(url, `${location.origin}${this.base}/`).href;
+  }
+
+  // An `@font-face` rule: the browser fetches the file when text first needs the face, and
+  // swaps it in, as for a page's own rule. A face from a loader's Blob loads at once.
+  declareFace(face, family, url, weight, width, style, ranges) {
+    const range = (n) => n.toString(16).toUpperCase();
+    const descriptors = {
+      weight: weight[0] === weight[1] ? `${weight[0]}` : `${weight[0]} ${weight[1]}`,
+      stretch: width[0] === width[1] ? `${width[0]}%` : `${width[0]}% ${width[1]}%`,
+      style,
+      display: "swap",
+    };
+    if (ranges.length > 0) {
+      descriptors.unicodeRange = ranges.map(([first, last]) => `U+${range(first)}-${range(last)}`).join(", ");
+    }
+    const made = this.resolve(url).then(
+      async (found) => {
+        const source = found instanceof Blob ? await found.arrayBuffer() : `url(${JSON.stringify(String(found))})`;
+        const font = new FontFace(family, source, descriptors);
+        document.fonts.add(font);
+        return font;
+      },
+      (error) => {
+        console.error(`silk-ui: could not load font ${url}`, error);
+        return undefined;
+      },
+    );
+    this.faces.set(face, made);
+  }
+
+  // A stylesheet of `@font-face` rules (Google Fonts and the like), linked once.
+  linkFonts(url) {
+    this.resolve(url).then(
+      (found) => {
+        const href = found instanceof Blob ? URL.createObjectURL(found) : String(found);
+        if (this.stylesheets.has(href)) return;
+        this.stylesheets.add(href);
+        const link = document.createElement("link");
+        link.rel = "stylesheet";
+        link.href = href;
+        document.head.append(link);
+      },
+      (error) => console.error(`silk-ui: could not load fonts ${url}`, error),
+    );
+  }
+
   load(map, resource, url) {
     const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(url)?.[1]?.toLowerCase();
     const loader = scheme ? this.loaders[scheme] : undefined;
@@ -891,6 +1000,18 @@ class Page {
   // document order, as the program handed them out; then come the texts that differ. Only the
   // top node goes in the tables now: most rows of a long list are never named again, so the
   // others wait until one of them is (`fill`, `reveal`).
+  defineKeyframes(name, frames) {
+    const { sheet, rules } = this.keyframes;
+    const old = rules.get(name);
+    if (old) {
+      sheet.deleteRule(Array.prototype.indexOf.call(sheet.cssRules, old));
+      rules.delete(name);
+    }
+    if (!frames.length) return;
+    const at = sheet.insertRule(`@keyframes ${CSS.escape(name)} { ${frames.join(" ")} }`, sheet.cssRules.length);
+    rules.set(name, sheet.cssRules[at]);
+  }
+
   clone(r) {
     const template = this.templates[r.u32()];
     const top = r.u32();
@@ -1030,11 +1151,12 @@ class Page {
         attribute = "data-silk-html";
         node.setAttribute(attribute, id);
       }
-      const at = sheet.insertRule(`[${attribute}="${id}"]${STATES[state]} {}`, sheet.cssRules.length);
+      const selector = `[${attribute}="${id}"]${STATES[state]} {}`;
+      const at = sheet.insertRule(state === STARTING ? `@starting-style { ${selector} }` : selector, sheet.cssRules.length);
       rule = sheet.cssRules[at];
       rules.set(id, rule);
     }
-    return rule?.style;
+    return state === STARTING ? rule?.cssRules[0]?.style : rule?.style;
   }
 
   dropRule(id, state) {
@@ -1126,7 +1248,8 @@ class Page {
         set("placeholder", r.text());
         break;
       case 12:
-        set("aria-checked", r.u8() === 1 ? "true" : "false");
+        meta.checked = r.u8() === 1;
+        set("aria-checked", meta.mixed ? "mixed" : meta.checked ? "true" : "false");
         break;
       case 13:
         set("aria-selected", r.u8() === 1 ? "true" : "false");
@@ -1159,6 +1282,16 @@ class Page {
       }
       case 19:
         set("id", r.text());
+        break;
+      case 20: {
+        const name = r.text();
+        set(name, r.text() || null);
+        break;
+      }
+      case 21:
+        meta.mixed = r.u8() === 1;
+        if (meta.mixed) set("aria-checked", "mixed");
+        else set("aria-checked", meta.checked === undefined ? null : meta.checked ? "true" : "false");
         break;
       default:
         throw new Error(`silk-ui: unknown attribute ${code}`);
@@ -1280,19 +1413,20 @@ class Page {
     w.u32(editable ? target.selectionEnd : 0);
     w.text(event.key ?? "");
     w.text(event.code ?? "");
-    w.text("value" in target && typeof target.value === "string" ? target.value : "");
+    // Transition and animation records carry their property or @keyframes name here.
+    w.text(extra.text ?? ("value" in target && typeof target.value === "string" ? target.value : ""));
     w.text(event.inputType ?? "");
     return w;
   }
 
   // Sends `event` as a record of `kind` when a node on its path listens for it.
-  forward(kind, event, target = event.target) {
+  forward(kind, event, target = event.target, extra = {}) {
     const path = this.pathTo(target);
     if (!path.length || !(this.hears(path, kind) || (kind === EVENT.click && this.links(path)))) {
       return { path, prevented: false };
     }
     const element = path[path.length - 1];
-    const prevented = this.send(this.record(kind, element, path, event));
+    const prevented = this.send(this.record(kind, element, path, event, extra));
     if (prevented && event.cancelable) event.preventDefault();
     return { path, prevented };
   }
@@ -1328,6 +1462,17 @@ class Page {
     // An image's load and error do not bubble; the root hears them while capturing.
     on("load", (event) => event.target instanceof HTMLImageElement && this.direct(EVENT.load, event.target, event), true);
     on("error", (event) => event.target instanceof HTMLImageElement && this.direct(EVENT.error, event.target, event), true);
+    // The elapsed time travels as x and the property or animation name as the value.
+    const motion = (kind, name) => (event) =>
+      this.forward(kind, event, event.target, { x: event.elapsedTime, y: 0, text: event[name] });
+    on("transitionrun", motion(EVENT.transitionRun, "propertyName"));
+    on("transitionstart", motion(EVENT.transitionStart, "propertyName"));
+    on("transitionend", motion(EVENT.transitionEnd, "propertyName"));
+    on("transitioncancel", motion(EVENT.transitionCancel, "propertyName"));
+    on("animationstart", motion(EVENT.animationStart, "animationName"));
+    on("animationiteration", motion(EVENT.animationIteration, "animationName"));
+    on("animationend", motion(EVENT.animationEnd, "animationName"));
+    on("animationcancel", motion(EVENT.animationCancel, "animationName"));
     on("input", (event) => this.forward(EVENT.input, event));
     on(
       "wheel",

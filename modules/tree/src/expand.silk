@@ -1,0 +1,81 @@
+//! What a node's look stores for a set of declarations: shorthands the computed style does not
+//! read itself (`flex`, `border`, `background`, `place-items`, ...) become their longhands, as
+//! in a CSSOM declaration block, and values CSS would drop at parse time are left out.
+import mutation { Declaration, CssProperty }
+import properties.shorthands
+import properties.catalog
+import properties.values
+import grid_css
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+
+/// Whether the look stores `property` as its longhands.
+pub fn byLonghands(property: CssProperty) -> bool {
+  return shorthands.expands(property) && property != CssProperty.Margin
+    && property != CssProperty.Padding
+    && property != CssProperty.Inset
+    && property != CssProperty.Gap
+    && property != CssProperty.BorderRadius
+    && property != CssProperty.BorderWidth
+    && property != CssProperty.BorderStyle
+    && property != CssProperty.BorderColor
+    && !grid_css.isGridProperty(property)
+}
+
+fn changes(declarations: &[Declaration]) -> bool {
+  let mut i: usize = 0
+  while i < declarations.length {
+    if byLonghands(declarations[i].property) || grid_css.isGridProperty(declarations[i].property) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+/// The declarations to store for `declarations`, or None when they are stored as they are.
+/// A shorthand whose value has no expansion is dropped whole, as CSS drops it.
+pub effect fn prepared(declarations: &[Declaration]) -> Option<List<Declaration>>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !changes(declarations) {
+    return Option<List<Declaration>>.None
+  }
+  let mut out = List<Declaration>.make()
+  let mut i: usize = 0
+  while i < declarations.length {
+    let declaration = &declarations[i]
+    let property = declaration.property
+    if run grid_css.rejects(declaration) {
+      // Dropped.
+    } else if byLonghands(property) {
+      let mut parts = List<Declaration>.make()
+      let count = catalog.longhandCount(property)
+      let mut whole = true
+      let mut j: usize = 0
+      while j < count {
+        let target = catalog.longhandAt(property, j)
+        match run shorthands.longhand(property, &declaration.value, target) {
+          Option.Some { value } => {
+            run parts.append(Declaration { property: target, value: move value, important: declaration.important })
+          }
+          Option.None => {
+            whole = false
+            break
+          }
+        }
+        j = j + 1
+      }
+      if whole {
+        while parts.length() > 0 {
+          run out.append(parts.remove(0))
+        }
+      }
+    } else {
+      run out.append(run values.cloneDeclaration(declaration))
+    }
+    i = i + 1
+  }
+  return Option<List<Declaration>>.Some { value: move out }
+}

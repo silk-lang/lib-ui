@@ -14,11 +14,13 @@ import layout.lib { Dimension, DimensionKind, Fragment, FragmentKind, LayoutTree
 import mutation { NodeKind, Position }
 import node { NONE, NO_INDEX, Node }
 import style { Computed }
+import transform
 import scrollbar { scrolls, usedOverflow }
 import ui_scene.scroll { ScrollAxis, UNBOUNDED }
 import silk.collections.list { List }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
+import silk.geometry.matrix { Matrix3, Matrix4 }
 import silk.geometry.rect { Rect }
 import silk.geometry.vector { Vector2 }
 import silk.num.f32
@@ -263,6 +265,119 @@ pub fn ownShift(
     dy = dy + o.y
   }
   return Vector2<f32> { x: dx, y: dy }
+}
+
+fn borderOf(f: &Fragment) -> Rect<f32> {
+  return Rect<f32>.new(
+    f.worldLocation.x,
+    f.worldLocation.y,
+    f.worldLocation.x + f.size.width,
+    f.worldLocation.y + f.size.height,
+  )
+}
+
+/// The element box of fragment `index`: its style's slot, or NONE for a shell, a line, text
+/// or an anonymous box.
+fn elementSlot(output: &LayoutTree, slots: &List<u32>, nodes: &List<Node>, index: usize) -> u32 {
+  let f = &output.fragments.values.asSlice()[index]
+  if f.kind != FragmentKind.Box || f.positioningShell {
+    return NONE
+  }
+  let slot = slotIn(slots, f.source)
+  if slot == NONE || nodes.asSlice()[u32.toUsize(slot)].kind == NodeKind.Text {
+    return NONE
+  }
+  return slot
+}
+
+/// The transform of fragment `index` in its layout space, its parent's `perspective` in front,
+/// or None when it has none (see `transform.matrix`).
+pub fn transformOf(output: &LayoutTree, slots: &List<u32>, nodes: &List<Node>, index: usize) -> Option<Matrix4<f32>> {
+  let slot = elementSlot(output, slots, nodes, index)
+  if slot == NONE {
+    return Option<Matrix4<f32>>.None
+  }
+  let c = &nodes.asSlice()[u32.toUsize(slot)].computed
+  if !c.transform.any() {
+    return Option<Matrix4<f32>>.None
+  }
+  let values = output.fragments.values.asSlice()
+  let mut m = transform.matrix(&c.transform, borderOf(&values[index]))
+  let mut at = values[index].parent
+  while at != NO_INDEX {
+    let parent = elementSlot(output, slots, nodes, at)
+    if parent != NONE {
+      let pc = &nodes.asSlice()[u32.toUsize(parent)].computed
+      if pc.transform.deep() {
+        m = transform.perspectiveOf(&pc.transform, borderOf(&values[at])) * m
+      }
+      break
+    }
+    at = values[at].parent
+  }
+  return Option<Matrix4<f32>>.some(m)
+}
+
+/// `transformOf` flattened onto the plane.
+pub fn flatOf(output: &LayoutTree, slots: &List<u32>, nodes: &List<Node>, index: usize) -> Option<Matrix3<f32>> {
+  return match transformOf(output, slots, nodes, index) {
+    Option.Some { value } => Option<Matrix3<f32>>.some(transform.flatten(value))
+    Option.None => Option<Matrix3<f32>>.None
+  }
+}
+
+/// Whether fragment `index` is a transformed box showing its back with `backface-visibility:
+/// hidden`: it and its subtree draw nothing and take no pointer input.
+pub fn hiddenBack(output: &LayoutTree, slots: &List<u32>, nodes: &List<Node>, index: usize) -> bool {
+  let slot = elementSlot(output, slots, nodes, index)
+  if slot == NONE || !nodes.asSlice()[u32.toUsize(slot)].computed.transform.hideBackface {
+    return false
+  }
+  return match transformOf(output, slots, nodes, index) {
+    Option.Some { value } => transform.backFacing(&value)
+    Option.None => false
+  }
+}
+
+/// The bounding box of `rect`, in the layout space of fragment `index`, where it draws: through
+/// the transforms, scroll and sticky offsets of the fragment and every ancestor.
+pub fn visualRect(
+  output: &LayoutTree,
+  slots: &List<u32>,
+  css: &Tree,
+  nodes: &List<Node>,
+  index: usize,
+  rect: Rect<f32>,
+  width: f32,
+  height: f32,
+) -> Rect<f32> {
+  let mut out = rect
+  let mut at = index
+  while at != NO_INDEX {
+    match flatOf(output, slots, nodes, at) {
+      Option.Some { value } => {
+        out = transform.mapRect(&value, out)
+      }
+      Option.None => {}
+    }
+    let own = ownShift(output, slots, css, nodes, at, width, height)
+    out = moved(out, own)
+    at = output.fragments.values.asSlice()[at].parent
+  }
+  return out
+}
+
+/// Whether any fragment at or above `index` is transformed.
+pub fn underTransform(output: &LayoutTree, slots: &List<u32>, nodes: &List<Node>, index: usize) -> bool {
+  let mut at = index
+  while at != NO_INDEX {
+    let slot = elementSlot(output, slots, nodes, at)
+    if slot != NONE && nodes.asSlice()[u32.toUsize(slot)].computed.transform.any() {
+      return true
+    }
+    at = output.fragments.values.asSlice()[at].parent
+  }
+  return false
 }
 
 /// Where fragment `index` draws against where the layout put it, in CSS pixels.

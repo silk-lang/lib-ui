@@ -1,0 +1,441 @@
+//! Stacking: the order CSS 2 Appendix E paints in, and hit testing reverses.
+//!
+//! A stacking context paints its own background and border, then its child stacking contexts
+//! with negative `z-index`, then its in-flow content in tree order, then its positioned
+//! descendants and child stacking contexts with `z-index: auto` or 0 in tree order, then those
+//! with positive `z-index`. Its positioned descendants and child contexts are hoisted out of
+//! wherever they are in its subtree into those lists, down to the next stacking context, which
+//! keeps its own. A positioned box with `z-index: auto` paints as if it made a context, but its
+//! positioned descendants stay in the enclosing one's lists.
+//!
+//! A context's entries are the hoisted fragments it is the nearest context above in the
+//! fragment tree. css-layout puts an absolutely positioned box below its containing block, so
+//! that is where it stacks and clips. Within a stack level entries keep document order.
+//!
+//! [`Stacking.update`] works this out once per layout: flags for every fragment, and every
+//! context's entries sorted into one list. Not modelled: the split of in-flow content into
+//! block backgrounds, floats and inline content, and positioned inline boxes, which paint in
+//! flow.
+import layout.lib { FragmentKind, LayoutTree, Tree }
+import mutation { NodeKind, Position }
+import node { NONE, NO_INDEX, Node }
+import style { Computed, DisplayInside }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.order { Order, Ordering }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.usize
+
+/// Painted from its stacking context's lists, not in flow.
+pub const HOISTED: u8 = 1
+/// Makes a stacking context. Roots of the fragment tree do too.
+pub const CONTEXT: u8 = 2
+/// A root element: the first element box below a root of the fragment tree that only the tree
+/// itself makes (the viewport and its wrappers). The root makes the root stacking context, and
+/// paints this element's background and border first, below everything else, as CSS paints
+/// the root element's. Boxes whose containing block is the viewport sit beside it.
+pub const ROOT: u8 = 4
+
+/// What stacking says of one fragment.
+pub struct Layer {
+  pub flags: u8,
+  /// The stack level in the enclosing context's lists: `z-index`, 0 for `auto`.
+  pub z: i32,
+  /// For a context: where its entries start in [`Stacking.entries`], how many there are, and
+  /// how many of those have a negative stack level.
+  pub first: u32,
+  pub count: u32,
+  pub negative: u32,
+}
+
+impl Copy for Layer {}
+
+impl Layer {
+  pub fn none() -> Layer {
+    return Layer { flags: 0, z: 0, first: 0, count: 0, negative: 0 }
+  }
+}
+
+/// One entry of a stacking context's lists.
+pub struct Entry {
+  pub context: usize,
+  pub z: i32,
+  /// Document order of the entry's node.
+  pub doc: u32,
+  pub fragment: usize,
+}
+
+impl Copy for Entry {}
+
+impl Order for Entry {
+  fn compare(a: &Self, b: &Self) -> Ordering {
+    if a.context != b.context {
+      return if a.context < b.context {
+        Ordering.Less
+      } else {
+        Ordering.Greater
+      }
+    }
+    if a.z != b.z {
+      return if a.z < b.z {
+        Ordering.Less
+      } else {
+        Ordering.Greater
+      }
+    }
+    if a.doc != b.doc {
+      return if a.doc < b.doc {
+        Ordering.Less
+      } else {
+        Ordering.Greater
+      }
+    }
+    if a.fragment < b.fragment {
+      return Ordering.Less
+    }
+    if a.fragment > b.fragment {
+      return Ordering.Greater
+    }
+    return Ordering.Equal
+  }
+}
+
+/// Whether `z-index` applies to a box styled `c`: positioned boxes, and flex and grid items.
+fn zApplies(c: &Computed, item: bool) -> bool {
+  return c.layout.position != Position.Static || item
+}
+
+/// Whether a box styled `c` makes a stacking context. `item`: whether it is a flex or grid item.
+pub fn createsContext(c: &Computed, item: bool) -> bool {
+  if c.layout.position == Position.Fixed || c.layout.position == Position.Sticky {
+    return true
+  }
+  if !c.zAuto && zApplies(c, item) {
+    return true
+  }
+  return c.paint.opacity < 1.0 || c.paint.backdropBlur > 0.0 || c.transform.any() || c.effects.layered
+}
+
+fn slotIn(slots: &List<u32>, index: usize) -> u32 {
+  if index < slots.length() {
+    return slots.get(index)
+  }
+  return NONE
+}
+
+/// The computed style of the element box fragment `index` paints, if it is one.
+fn boxStyle(
+  output: &LayoutTree,
+  slots: &List<u32>,
+  nodes: &List<Node>,
+  index: usize,
+) -> Option<Computed> {
+  let f = &output.fragments.values.asSlice()[index]
+  if f.kind != FragmentKind.Box || f.positioningShell {
+    return Option<Computed>.None
+  }
+  let slot = slotIn(slots, f.source)
+  if slot == NONE {
+    return Option<Computed>.None
+  }
+  let node = &nodes.asSlice()[u32.toUsize(slot)]
+  if node.kind == NodeKind.Text {
+    return Option<Computed>.None
+  }
+  return Option<Computed>.Some { value: node.computed }
+}
+
+/// Whether the box fragment `index` is a flex or grid item: the box above lays out flex or
+/// grid.
+fn isItem(output: &LayoutTree, slots: &List<u32>, nodes: &List<Node>, index: usize) -> bool {
+  let parent = output.fragments.values.asSlice()[index].parent
+  if parent == NO_INDEX {
+    return false
+  }
+  if let Option<Computed>.Some { value } = boxStyle(output, slots, nodes, parent) {
+    let display = value.layout.display
+    return display.insideIs(DisplayInside.Flex) || display.insideIs(DisplayInside.Grid)
+  }
+  return false
+}
+
+/// Whether nothing above fragment `index` is a node's own.
+fn belowRoot(output: &LayoutTree, slots: &List<u32>, index: usize) -> bool {
+  let values = output.fragments.values.asSlice()
+  let mut at = values[index].parent
+  while at != NO_INDEX {
+    if slotIn(slots, values[at].source) != NONE {
+      return false
+    }
+    at = values[at].parent
+  }
+  return true
+}
+
+/// The root of the fragment tree fragment `index` is in.
+pub fn rootOf(output: &LayoutTree, index: usize) -> usize {
+  let values = output.fragments.values.asSlice()
+  let mut at = index
+  while values[at].parent != NO_INDEX {
+    at = values[at].parent
+  }
+  return at
+}
+
+/// What [`Stacking.step`] returns where a context's in-flow content goes.
+pub const IN_FLOW: usize = usize.MAX - 1
+
+/// The stacking of every fragment of one layout.
+pub struct Stacking {
+  pub layers: List<Layer>,
+  pub entries: List<Entry>,
+  /// The fragments flagged [`ROOT`].
+  pub elements: List<usize>,
+  /// Per css-layout node: its place in document order, and its first fragment.
+  doc: List<u32>,
+  firstFragment: List<usize>,
+  /// Per fragment: for a fixed box's root, the fragment root it paints from, else `NO_INDEX`.
+  liftedInto: List<usize>,
+}
+
+impl Stacking {
+  pub fn make() -> Stacking {
+    return Stacking {
+      layers: List<Layer>.make(),
+      entries: List<Entry>.make(),
+      elements: List<usize>.make(),
+      doc: List<u32>.make(),
+      firstFragment: List<usize>.make(),
+      liftedInto: List<usize>.make(),
+    }
+  }
+
+  /// Whether this describes a layout of `count` fragments.
+  pub fn covers(self: &Self, count: usize) -> bool {
+    return self.layers.length() == count
+  }
+
+  fn flagsOf(self: &Self, index: usize) -> u8 {
+    if index < self.layers.length() {
+      return self.layers.get(index).flags
+    }
+    return 0
+  }
+
+  /// Whether fragment `index` is painted from its stacking context's lists.
+  pub fn hoisted(self: &Self, index: usize) -> bool {
+    return (self.flagsOf(index) & HOISTED) != 0
+  }
+
+  /// For fragment root `index`, the fragment root whose lists paint it, or `NO_INDEX`.
+  pub fn rootContext(self: &Self, index: usize) -> usize {
+    if index < self.liftedInto.length() {
+      return self.liftedInto.get(index)
+    }
+    return NO_INDEX
+  }
+
+  /// Whether fragment `index` is a root element (see [`ROOT`]).
+  pub fn rootElement(self: &Self, index: usize) -> bool {
+    return (self.flagsOf(index) & ROOT) != 0
+  }
+
+  /// Whether fragment `index` makes a stacking context with entries in its lists.
+  pub fn stacks(self: &Self, index: usize) -> bool {
+    return index < self.layers.length() && self.layers.get(index).count != 0
+  }
+
+  /// How many steps [`Stacking.step`] takes through the content of context `index`: its
+  /// entries and the in-flow content.
+  pub fn steps(self: &Self, index: usize) -> usize {
+    return u32.toUsize(self.layers.get(index).count) + 1
+  }
+
+  /// Step `k` of the content of context `index` in paint order (`reverse`: topmost first): an
+  /// entry's fragment, or [`IN_FLOW`].
+  pub fn step(self: &Self, index: usize, k: usize, reverse: bool) -> usize {
+    let layer = self.layers.get(index)
+    let at = if reverse {
+      u32.toUsize(layer.count) - k
+    } else {
+      k
+    }
+    let negative = u32.toUsize(layer.negative)
+    if at == negative {
+      return IN_FLOW
+    }
+    let offset = if at < negative {
+      at
+    } else {
+      at - 1
+    }
+    return self.entries.get(u32.toUsize(layer.first) + offset).fragment
+  }
+
+  /// Works out the stacking of `output`, laid out from `css`.
+  pub effect fn update(
+    self: &mut Self,
+    output: &LayoutTree,
+    slots: &List<u32>,
+    css: &Tree,
+    nodes: &List<Node>,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let count = output.fragments.values.length()
+    self.layers.clear()
+    self.entries.clear()
+    self.elements.clear()
+    run self.layers.appendRepeated(Layer.none(), count)
+    self.liftedInto.clear()
+    run self.liftedInto.appendRepeated(NO_INDEX, count)
+    let values = output.fragments.values.asSlice()
+    let mut hoists: usize = 0
+    let mut index: usize = 0
+    while index < count {
+      let f = &values[index]
+      let mut layer = Layer.none()
+      if f.parent == NO_INDEX {
+        layer.flags = CONTEXT
+        // A fixed box is a fragment root of its own: it stacks in the root context of the
+        // tree it is in (see `rootAbove`), not over everything.
+        if let Option<Computed>.Some { value } = boxStyle(output, slots, nodes, index) {
+          layer.flags = CONTEXT | HOISTED
+          if !value.zAuto {
+            layer.z = value.zIndex
+          }
+        }
+      } else if let Option<Computed>.Some { value } = boxStyle(output, slots, nodes, index) {
+        let item = isItem(output, slots, nodes, index)
+        if createsContext(&value, item) {
+          layer.flags = CONTEXT | HOISTED
+        } else if value.layout.position != Position.Static {
+          layer.flags = HOISTED
+        } else if belowRoot(output, slots, index) {
+          layer.flags = ROOT
+          run self.elements.append(index)
+        }
+        if !value.zAuto && zApplies(&value, item) {
+          layer.z = value.zIndex
+        }
+      }
+      if (layer.flags & HOISTED) != 0 {
+        hoists = hoists + 1
+      }
+      self.layers.set(index, layer)
+      index = index + 1
+    }
+    if hoists == 0 {
+      return ()
+    }
+    run self.order(css)
+    self.firstFragment.clear()
+    run self.firstFragment.appendRepeated(NO_INDEX, css.nodes.length())
+    index = count
+    while index > 0 {
+      index = index - 1
+      let source = values[index].source
+      if source < self.firstFragment.length() {
+        self.firstFragment.set(source, index)
+      }
+    }
+
+    // Each hoisted fragment joins the lists of the nearest context above it.
+    index = 0
+    while index < count {
+      let layer = self.layers.get(index)
+      if (layer.flags & HOISTED) != 0 {
+        let mut at = values[index].parent
+        while at != NO_INDEX && (self.layers.get(at).flags & CONTEXT) == 0 {
+          at = values[at].parent
+        }
+        if values[index].parent == NO_INDEX {
+          at = self.rootAbove(output, css, index)
+          if at == NO_INDEX {
+            // Nothing above it: it stays a root of its own and paints over the others.
+            let mut layer = self.layers.get(index)
+            layer.flags = layer.flags & (CONTEXT | ROOT)
+            self.layers.set(index, layer)
+          } else {
+            self.liftedInto.set(index, at)
+          }
+        }
+        if at != NO_INDEX {
+          let source = values[index].source
+          let doc = if source < self.doc.length() {
+            self.doc.get(source)
+          } else {
+            u32.MAX
+          }
+          run self.entries.append(Entry { context: at, z: layer.z, doc: doc, fragment: index })
+        }
+      }
+      index = index + 1
+    }
+    run self.entries.sort()
+    let mut i: usize = 0
+    while i < self.entries.length() {
+      let entry = self.entries.get(i)
+      let mut layer = self.layers.get(entry.context)
+      if layer.count == 0 {
+        layer.first = usize.toU32(i)
+      }
+      layer.count = layer.count + 1
+      if entry.z < 0 {
+        layer.negative = layer.negative + 1
+      }
+      self.layers.set(entry.context, layer)
+      i = i + 1
+    }
+  }
+
+  /// For fragment root `index` that a node's box makes (a fixed box), the fragment root of
+  /// the nearest node above it in `css` that has a fragment, or `NO_INDEX`.
+  fn rootAbove(self: &Self, output: &LayoutTree, css: &Tree, index: usize) -> usize {
+    let values = output.fragments.values.asSlice()
+    let nodes = css.nodes.asSlice()
+    let mut node = values[index].source
+    while node < nodes.length {
+      node = nodes[node].parent
+      if node == NO_INDEX || node >= self.firstFragment.length() {
+        return NO_INDEX
+      }
+      let fragment = self.firstFragment.get(node)
+      if fragment != NO_INDEX {
+        let root = rootOf(output, fragment)
+        return if root == index { NO_INDEX } else { root }
+      }
+    }
+    return NO_INDEX
+  }
+
+  /// Numbers the nodes of `css` in document order.
+  effect fn order(self: &mut Self, css: &Tree) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let nodes = css.nodes.asSlice()
+    self.doc.clear()
+    run self.doc.appendRepeated(u32.MAX, nodes.length)
+    if nodes.length == 0 {
+      return ()
+    }
+    let mut next: u32 = 0
+    let mut at: usize = 0
+    while at != NO_INDEX {
+      self.doc.set(at, next)
+      next = next + 1
+      if nodes[at].firstChild != NO_INDEX {
+        at = nodes[at].firstChild
+        continue
+      }
+      while at != NO_INDEX && nodes[at].nextSibling == NO_INDEX {
+        at = nodes[at].parent
+      }
+      if at != NO_INDEX {
+        at = nodes[at].nextSibling
+      }
+    }
+  }
+}

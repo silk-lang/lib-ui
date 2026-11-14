@@ -32,8 +32,8 @@ This file is everything that is specific to the browser.
 | `wasm` | Where the program is |
 | `root` | The element it draws in |
 | `imports` | Functions of the page that the program calls |
-| `fonts` | Font families by number: `{ 1: "Inter, sans-serif" }` is `css.fontFamily(1)` |
-| `loaders` | Loaders for URL schemes of the app's own: `{ db: async (url) => blob }` for `h.image("db:42")` |
+| `fonts` | Font families by number, for `css.fontFamilyNumber(1)`: `{ 1: "Inter, sans-serif" }`. A program's own fonts are `Font`s and need nothing here |
+| `loaders` | Loaders for URL schemes of the app's own: `{ db: async (url) => blob }` for `h.image("db:42")` or a font face |
 | `base` | The path the site lives under, such as `"/docs"` |
 
 ## The manifest

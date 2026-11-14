@@ -5,7 +5,6 @@
 //! ```silk
 //! let mut html = Html.make()
 //! html.setViewport(1280.0, 800.0)
-//! run html.font(1, "Inter, sans-serif")
 //! let markup = run render<Site, Message, Command>(&mut html, "/guide/")
 //! ```
 //!
@@ -25,9 +24,12 @@ import ui_protocol.mutation {
   Attribute,
   Role,
   Cursor,
-  NOT_FOCUSABLE
+  NOT_FOCUSABLE,
+  FACE_ITALIC,
+  FACE_OBLIQUE
 }
 import ui_protocol.record { Event }
+import ui_protocol.aria { ariaText }
 import ui_protocol.root { RootEvent, RootEventKind, RootSupport }
 import silk.collections.bytes { Bytes }
 import silk.collections.list { List }
@@ -88,6 +90,15 @@ struct Element {
   grid: Bytes,
   source: u32,
   anchored: bool,
+  /// `aria-checked="mixed"`.
+  mixed: bool,
+  /// The other ARIA attributes, as `ariaText` writes them.
+  arias: List<Aria>,
+}
+
+struct Aria {
+  name: string<'static>,
+  value: Bytes,
 }
 
 /// A font family, an image or an icon: what number `id` stands for in the markup.
@@ -110,6 +121,10 @@ pub struct Html {
   images: List<Named>,
   icons: List<Named>,
   base: String,
+  /// `@import` rules of font stylesheets, which come first in a stylesheet.
+  fontImports: Bytes,
+  /// `@font-face` rules.
+  fontFaces: Bytes,
 }
 
 fn stateIndex(state: StyleState) -> usize {
@@ -119,6 +134,7 @@ fn stateIndex(state: StyleState) -> usize {
     StyleState.Active => 2
     StyleState.Focus => 3
     StyleState.FocusVisible => 4
+    StyleState.Starting => 5
   }
 }
 
@@ -210,6 +226,48 @@ effect fn numberAttribute(out: &mut Bytes, name: string, value: f32) -> ()
   run attribute(&mut out, name, text.asSlice())
 }
 
+/// `value` as a CSS string, inside a `style` element: quotes and backslashes escaped, and no
+/// `<` to end the element.
+effect fn quoted(out: &mut Bytes, value: &[u8]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.append(b"\"")
+  let mut i: usize = 0
+  while i < value.length {
+    let c = value[i]
+    if c == 34 || c == 92 {
+      run out.append(b"\\")
+      run out.append(&[c])
+    } else if c == 60 {
+      run out.append(b"\\3c ")
+    } else if c >= 32 {
+      run out.append(&[c])
+    }
+    i = i + 1
+  }
+  run out.append(b"\"")
+}
+
+/// `value` in upper-case hexadecimal, as `unicode-range` writes code points.
+effect fn hex(out: &mut Bytes, value: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let digits = b"0123456789ABCDEF"
+  let mut shift: u32 = 28
+  let mut started = false
+  while true {
+    let digit = u32.bitAnd(u32.shiftRight(value, shift), 15)
+    if digit != 0 || started || shift == 0 {
+      started = true
+      run out.append(&[digits[u32.toUsize(digit)]])
+    }
+    if shift == 0 {
+      break
+    }
+    shift = shift - 4
+  }
+}
+
 effect fn named(list: &mut List<Named>, id: u32, value: string) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
@@ -251,6 +309,8 @@ impl Html {
       images: List<Named>.make(),
       icons: List<Named>.make(),
       base: String.make(),
+      fontImports: Bytes.make(),
+      fontFaces: Bytes.make(),
     }
   }
 
@@ -261,7 +321,7 @@ impl Html {
     self.height = height
   }
 
-  /// The font family `css.fontFamily(id)` stands for, as a CSS `font-family` value: what
+  /// The font family `css.fontFamilyNumber(id)` stands for, as a CSS `font-family` value: what
   /// `mount` gets as `fonts`.
   pub effect fn font(self: &mut Self, id: u32, names: string) -> ()
     ! OutOfMemoryError
@@ -369,6 +429,8 @@ impl Html {
             grid: Bytes.make(),
             source: 0,
             anchored: false,
+            mixed: false,
+            arias: List<Aria>.make(),
           },
         )
         while self.slots.length() <= u32.toUsize(id) {
@@ -497,6 +559,64 @@ impl Html {
       Mutation.DefineFontFamily { family, names } => {
         run named(&mut self.fonts, family, String.view(&names))
       }
+      Mutation.DeclareFontFace {
+        face,
+        family,
+        url,
+        weightMin,
+        weightMax,
+        widthMin,
+        widthMax,
+        style,
+        ranges,
+      } => {
+        drop face
+        let address = run self.address(String.view(&url))
+        let out = &mut self.fontFaces
+        run out.append(b"@font-face{font-family:")
+        run quoted(&mut out, String.utf8Bytes(String.view(&family)))
+        run out.append(b";src:url(")
+        run quoted(&mut out, String.utf8Bytes(String.view(&address)))
+        run out.append(b");font-weight:")
+        run css.write(&mut out, &css.number(weightMin))
+        if weightMax != weightMin {
+          run out.append(b" ")
+          run css.write(&mut out, &css.number(weightMax))
+        }
+        run out.append(b";font-stretch:")
+        run css.write(&mut out, &css.number(widthMin))
+        run out.append(b"%")
+        if widthMax != widthMin {
+          run out.append(b" ")
+          run css.write(&mut out, &css.number(widthMax))
+          run out.append(b"%")
+        }
+        run out.append(
+          if style == FACE_ITALIC {
+            b";font-style:italic"
+          } else if style == FACE_OBLIQUE {
+            b";font-style:oblique"
+          } else {
+            b";font-style:normal"
+          },
+        )
+        let points = ranges.asSlice()
+        let mut r: usize = 0
+        while r + 1 < points.length {
+          run out.append(if r == 0 { b";unicode-range:U+" } else { b",U+" })
+          run hex(&mut out, points[r])
+          run out.append(b"-")
+          run hex(&mut out, points[r + 1])
+          r = r + 2
+        }
+        run out.append(b";font-display:swap}")
+      }
+      Mutation.LoadFontStylesheet { url } => {
+        let address = run self.address(String.view(&url))
+        run self.fontImports.append(b"@import url(")
+        run quoted(&mut self.fontImports, String.utf8Bytes(String.view(&address)))
+        run self.fontImports.append(b");")
+      }
       Mutation.LoadImage { resource, url } => {
         let address = run self.address(String.view(&url))
         run named(&mut self.images, resource, String.view(&address))
@@ -583,6 +703,22 @@ impl Html {
       }
       Attribute.ElementId { value } => {
         node.elementId = run String.copy(String.view(&value))
+      }
+      Attribute.Indeterminate { value } => {
+        node.mixed = value
+      }
+      _ => {
+        let mut value = Bytes.make()
+        if let Option<string<'static>>.Some { value: name } = run ariaText(&entry.*, &mut value) {
+          let mut i: usize = 0
+          while i < node.arias.length() && node.arias.asSlice()[i].name != name {
+            i = i + 1
+          }
+          if i < node.arias.length() {
+            drop node.arias.remove(i)
+          }
+          run node.arias.append(Aria { name: name, value: move value })
+        }
       }
     }
   }
@@ -728,7 +864,19 @@ impl Html {
     if node.placeholder.ownedByteLength() != 0 {
       run attribute(&mut out, "placeholder", node.placeholder.ownedUtf8Bytes())
     }
-    run flagAttribute(&mut out, "aria-checked", node.checked)
+    if node.mixed {
+      run attribute(&mut out, "aria-checked", b"mixed")
+    } else {
+      run flagAttribute(&mut out, "aria-checked", node.checked)
+    }
+    let arias = node.arias.asSlice()
+    let mut i: usize = 0
+    while i < arias.length {
+      if arias[i].value.length() != 0 {
+        run attribute(&mut out, arias[i].name, arias[i].value.asSlice())
+      }
+      i = i + 1
+    }
     run flagAttribute(&mut out, "aria-selected", node.selected)
     run flagAttribute(&mut out, "aria-expanded", node.expanded)
     if node.ranged {
@@ -855,6 +1003,8 @@ impl Html {
     ? &mut Allocator {
     let mut out = Bytes.make()
     run out.append(b"<style data-silk-ssr>")
+    run out.append(self.fontImports.asSlice())
+    run out.append(self.fontFaces.asSlice())
     run out.append(String.utf8Bytes(RESET))
 
     // Later rules win: a pressed node shows its active look over its hover look.

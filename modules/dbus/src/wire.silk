@@ -1,0 +1,519 @@
+//! The D-Bus wire format: [`Writer`] marshals values in little-endian order with their
+//! alignment, [`Reader`] unmarshals them in either byte order, and [`skipValue`] steps over a
+//! value of any signature.
+//!
+//! Offsets are relative to the start of the message, so a body's values align as the
+//! specification asks when the body starts on an 8-byte boundary, which every header ends on.
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.result { Result }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f64
+import silk.num.i16
+import silk.num.i32
+import silk.num.i64
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.text.string { String }
+
+/// Why a D-Bus operation failed.
+pub union DBusError {
+  /// Bytes from the peer do not follow the wire format.
+  Malformed { pub reason: string<'static> },
+  /// The bus refused to authenticate this client.
+  AuthFailed,
+  /// The connection closed.
+  Closed,
+  /// The socket failed.
+  Socket,
+  /// No bus address is known, or it names a transport this client lacks.
+  NoAddress,
+  /// The peer answered a call with an error; the error message says which.
+  Remote,
+  /// A blocking call waited past its deadline.
+  Timeout,
+}
+
+impl Copy for DBusError {}
+
+effect fn malformed(reason: string<'static>) -> never
+  ! DBusError {
+  fail DBusError.Malformed { reason: reason }
+}
+
+/// The alignment of the type that starts `code`, a signature character.
+pub fn alignmentOf(code: u8) -> usize {
+  if code == 121 || code == 103 || code == 118 {
+    // y g v
+    return 1
+  }
+  if code == 110 || code == 113 {
+    // n q
+    return 2
+  }
+  if code == 120 || code == 116 || code == 100 || code == 40 || code == 123 || code == 114
+    || code == 101 {
+    // x t d ( { r e
+    return 8
+  }
+
+  // b i u s o a h
+  return 4
+}
+
+/// Marshals values into a message, little-endian.
+pub struct Writer {
+  bytes: List<u8>,
+}
+
+/// Where an array's length sits, and where its elements start.
+pub struct ArrayMark {
+  lengthAt: usize,
+  start: usize,
+}
+
+impl Copy for ArrayMark {}
+
+impl Writer {
+  pub fn make() -> Writer {
+    return Writer { bytes: List<u8>.make() }
+  }
+
+  pub fn length(self: &Self) -> usize {
+    return self.bytes.length()
+  }
+
+  pub fn asSlice(self: &Self) -> &[u8] {
+    return self.bytes.asSlice()
+  }
+
+  /// The bytes written, handed over.
+  pub fn finish(self: Self) -> List<u8> {
+    return move self.bytes
+  }
+
+  /// Pads with zero bytes to a multiple of `alignment`.
+  pub effect fn pad(self: &mut Self, alignment: usize) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    while self.bytes.length() % alignment != 0 {
+      run self.bytes.append(0)
+    }
+  }
+
+  effect fn little(self: &mut Self, value: u64, count: usize) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.pad(count)
+    let mut i: usize = 0
+    while i < count {
+      run self.bytes.append(u64.wrappingToU8(u64.shiftRight(value, usize.toU64(i * 8))))
+      i = i + 1
+    }
+  }
+
+  /// Writes raw bytes with no alignment, for bodies built elsewhere.
+  pub effect fn raw(self: &mut Self, data: &[u8]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut i: usize = 0
+    while i < data.length {
+      run self.bytes.append(data[i])
+      i = i + 1
+    }
+  }
+
+  pub effect fn byte(self: &mut Self, value: u8) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.bytes.append(value)
+  }
+
+  pub effect fn boolean(self: &mut Self, value: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.little(
+      if value {
+        1
+      } else {
+        0
+      },
+      4,
+    )
+  }
+
+  pub effect fn int16(self: &mut Self, value: i16) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.little(i16.wrappingToU64(value), 2)
+  }
+
+  pub effect fn uint16(self: &mut Self, value: u16) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.little(u16.toU64(value), 2)
+  }
+
+  pub effect fn int32(self: &mut Self, value: i32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.little(i32.wrappingToU64(value), 4)
+  }
+
+  pub effect fn uint32(self: &mut Self, value: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.little(u32.toU64(value), 4)
+  }
+
+  pub effect fn int64(self: &mut Self, value: i64) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.little(i64.wrappingToU64(value), 8)
+  }
+
+  pub effect fn uint64(self: &mut Self, value: u64) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.little(value, 8)
+  }
+
+  pub effect fn double(self: &mut Self, value: f64) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.little(f64.toBits(value), 8)
+  }
+
+  /// A string (`s`): its length, its bytes and a NUL.
+  pub effect fn string(self: &mut Self, value: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let bytes = String.utf8Bytes(value)
+    run self.little(usize.toU64(bytes.length), 4)
+    run self.raw(bytes)
+    run self.bytes.append(0)
+  }
+
+  /// An object path (`o`), written as a string.
+  pub effect fn objectPath(self: &mut Self, value: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.string(value)
+  }
+
+  /// A signature (`g`): a one-byte length, its characters and a NUL.
+  pub effect fn signature(self: &mut Self, value: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let bytes = String.utf8Bytes(value)
+    run self.bytes.append(usize.toU8(bytes.length))
+    run self.raw(bytes)
+    run self.bytes.append(0)
+  }
+
+  /// Starts a variant (`v`) holding a value of `signature`; write the value next.
+  pub effect fn variant(self: &mut Self, signature: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.signature(signature)
+  }
+
+  /// Starts a struct or dict entry: pads to 8.
+  pub effect fn beginStruct(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.pad(8)
+  }
+
+  /// Starts an array whose elements align to `elementAlignment`; write the elements, then
+  /// [`Writer.endArray`].
+  pub effect fn beginArray(self: &mut Self, elementAlignment: usize) -> ArrayMark
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.pad(4)
+    let lengthAt = self.bytes.length()
+    run self.little(0, 4)
+    run self.pad(elementAlignment)
+    return ArrayMark { lengthAt: lengthAt, start: self.bytes.length() }
+  }
+
+  /// Writes the array's length, which leaves out the padding before its first element.
+  pub fn endArray(self: &mut Self, mark: ArrayMark) -> () {
+    let length = usize.toU32(self.bytes.length() - mark.start)
+    self.setUint32At(mark.lengthAt, length)
+  }
+
+  /// Overwrites the little-endian `u32` at `at`.
+  pub fn setUint32At(self: &mut Self, at: usize, value: u32) -> () {
+    let bytes = self.bytes.asMutSlice()
+    let mut i: usize = 0
+    while i < 4 {
+      bytes[at + i] = u32.wrappingToU8(u32.shiftRight(value, usize.toU32(i * 8)))
+      i = i + 1
+    }
+  }
+}
+
+/// Unmarshals values from a message.
+pub struct Reader<'a> {
+  data: &'a [u8],
+  pub position: usize,
+  bigEndian: bool,
+}
+
+impl<'a> Copy for Reader<'a> {}
+
+impl<'a> Reader<'a> {
+  /// A reader over `data` whose offset 0 is 8-aligned in the message, in the byte order the
+  /// message header names.
+  pub fn make(data: &'a [u8], bigEndian: bool) -> Reader<'a> {
+    return Reader { data: data, position: 0, bigEndian: bigEndian }
+  }
+
+  pub fn atEnd(self: &Self) -> bool {
+    return self.position >= self.data.length
+  }
+
+  pub fn remaining(self: &Self) -> usize {
+    if self.position >= self.data.length {
+      return 0
+    }
+    return self.data.length - self.position
+  }
+
+  /// Skips padding to a multiple of `alignment`.
+  pub effect fn align(self: &mut Self, alignment: usize) -> ()
+    ! DBusError {
+    while self.position % alignment != 0 {
+      if self.position >= self.data.length {
+        run malformed("padding runs past the end")
+      }
+      self.position = self.position + 1
+    }
+  }
+
+  effect fn number(self: &mut Self, count: usize) -> u64
+    ! DBusError {
+    run self.align(count)
+    if self.position + count > self.data.length {
+      run malformed("a value runs past the end")
+    }
+    let mut value: u64 = 0
+    let mut i: usize = 0
+    while i < count {
+      let b = u8.toU64(self.data[self.position + i])
+      let shift = if self.bigEndian {
+        (count - 1 - i) * 8
+      } else {
+        i * 8
+      }
+      value = value | u64.shiftLeft(b, usize.toU64(shift))
+      i = i + 1
+    }
+    self.position = self.position + count
+    return value
+  }
+
+  pub effect fn byte(self: &mut Self) -> u8
+    ! DBusError {
+    if self.position >= self.data.length {
+      run malformed("a byte runs past the end")
+    }
+    let value = self.data[self.position]
+    self.position = self.position + 1
+    return value
+  }
+
+  pub effect fn boolean(self: &mut Self) -> bool
+    ! DBusError {
+    let value = run self.number(4)
+    if value > 1 {
+      run malformed("a boolean is neither 0 nor 1")
+    }
+    return value == 1
+  }
+
+  pub effect fn int16(self: &mut Self) -> i16
+    ! DBusError {
+    return u64.wrappingToI16(run self.number(2))
+  }
+
+  pub effect fn uint16(self: &mut Self) -> u16
+    ! DBusError {
+    return u64.wrappingToU16(run self.number(2))
+  }
+
+  pub effect fn int32(self: &mut Self) -> i32
+    ! DBusError {
+    return u64.wrappingToI32(run self.number(4))
+  }
+
+  pub effect fn uint32(self: &mut Self) -> u32
+    ! DBusError {
+    return u64.wrappingToU32(run self.number(4))
+  }
+
+  pub effect fn int64(self: &mut Self) -> i64
+    ! DBusError {
+    return u64.wrappingToI64(run self.number(8))
+  }
+
+  pub effect fn uint64(self: &mut Self) -> u64
+    ! DBusError {
+    return run self.number(8)
+  }
+
+  pub effect fn double(self: &mut Self) -> f64
+    ! DBusError {
+    return f64.fromBits(run self.number(8))
+  }
+
+  /// A string or object path, borrowed from the message.
+  pub effect fn string(self: &mut Self) -> string<'a>
+    ! DBusError {
+    let length = u32.toUsize(run self.uint32())
+    if self.position + length + 1 > self.data.length {
+      run malformed("a string runs past the end")
+    }
+    let bytes = Slice.view<u8>(self.data, self.position, length)
+    self.position = self.position + length + 1
+    return match String.fromUtf8(bytes) {
+      Result.Success { value } => value
+      Result.Failure { .. } => run malformed("a string is not UTF-8")
+    }
+  }
+
+  pub effect fn objectPath(self: &mut Self) -> string<'a>
+    ! DBusError {
+    return run self.string()
+  }
+
+  /// A signature, borrowed from the message.
+  pub effect fn signature(self: &mut Self) -> string<'a>
+    ! DBusError {
+    let length = u8.toUsize(run self.byte())
+    if self.position + length + 1 > self.data.length {
+      run malformed("a signature runs past the end")
+    }
+    let bytes = Slice.view<u8>(self.data, self.position, length)
+    self.position = self.position + length + 1
+    return match String.fromUtf8(bytes) {
+      Result.Success { value } => value
+      Result.Failure { .. } => run malformed("a signature is not ASCII")
+    }
+  }
+
+  /// Starts an array with elements aligned to `elementAlignment`, and returns the offset its
+  /// elements end at.
+  pub effect fn beginArray(self: &mut Self, elementAlignment: usize) -> usize
+    ! DBusError {
+    let length = u32.toUsize(run self.uint32())
+    run self.align(elementAlignment)
+    let end = self.position + length
+    if end > self.data.length {
+      run malformed("an array runs past the end")
+    }
+    return end
+  }
+
+  pub effect fn beginStruct(self: &mut Self) -> ()
+    ! DBusError {
+    run self.align(8)
+  }
+
+  /// Skips one complete value of `signature`, which must be a single complete type.
+  pub effect fn skip(self: &mut Self, signature: string) -> ()
+    ! DBusError {
+    let bytes = String.utf8Bytes(signature)
+    let end = run skipValue(&mut self, bytes, 0)
+    if end != bytes.length {
+      run malformed("a signature holds more than one type")
+    }
+  }
+
+  /// Skips every value of `signature`, a sequence of complete types.
+  pub effect fn skipAll(self: &mut Self, signature: string) -> ()
+    ! DBusError {
+    let bytes = String.utf8Bytes(signature)
+    let mut at: usize = 0
+    while at < bytes.length {
+      at = run skipValue(&mut self, bytes, at)
+    }
+  }
+}
+
+/// The index just past the complete type that starts at `at` in `signature`.
+pub effect fn typeEnd(signature: &[u8], at: usize) -> usize
+  ! DBusError {
+  if at >= signature.length {
+    run malformed("a signature ends inside a type")
+  }
+  let code = signature[at]
+  if code == 97 {
+    // a
+    return run typeEnd(signature, at + 1)
+  }
+  if code == 40 || code == 123 {
+    // ( {
+    let close: u8 = if code == 40 {
+      41
+    } else {
+      125
+    }
+    let mut i = at + 1
+    while i < signature.length && signature[i] != close {
+      i = run typeEnd(signature, i)
+    }
+    if i >= signature.length {
+      run malformed("a signature leaves a struct open")
+    }
+    return i + 1
+  }
+  return at + 1
+}
+
+/// Skips the value whose type starts at `at` in `signature`, and returns the index past that
+/// type.
+pub effect fn skipValue(reader: &mut Reader<'_>, signature: &[u8], at: usize) -> usize
+  ! DBusError {
+  let end = run typeEnd(signature, at)
+  let code = signature[at]
+  if code == 121 {
+    drop run reader.byte()
+  } else if code == 98 || code == 105 || code == 117 || code == 104 {
+    drop run reader.uint32()
+  } else if code == 110 || code == 113 {
+    drop run reader.uint16()
+  } else if code == 120 || code == 116 || code == 100 {
+    drop run reader.uint64()
+  } else if code == 115 || code == 111 {
+    drop run reader.string()
+  } else if code == 103 {
+    drop run reader.signature()
+  } else if code == 118 {
+    let inner = run reader.signature()
+    run reader.skip(inner)
+  } else if code == 97 {
+    let elementAlignment = alignmentOf(signature[at + 1])
+    let arrayEnd = run reader.beginArray(elementAlignment)
+    while reader.position < arrayEnd {
+      drop run skipValue(&mut reader, signature, at + 1)
+    }
+    if reader.position != arrayEnd {
+      run malformed("an array's elements overrun its length")
+    }
+  } else if code == 40 || code == 123 {
+    run reader.beginStruct()
+    let mut i = at + 1
+    while i < end - 1 {
+      i = run skipValue(&mut reader, signature, i)
+    }
+  } else {
+    run malformed("a signature has an unknown type code")
+  }
+  return end
+}

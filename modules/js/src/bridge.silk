@@ -9,17 +9,20 @@ import silk.core.effect { Effect }
 import silk.core.result { Result }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
+import silk.collections.slice { Slice }
 import silk.num.i32
 import silk.num.f64
 import ui_tree.css { Declaration }
-import ui_tree.legacy { Batch, NodeKind, Attribute, Mutation, StyleState, Cursor }
+import ui_tree.legacy { Batch, NodeKind, Attribute, Mutation, StyleState, Cursor, Keyframe, Role }
+import ui_tree.mutation { ariaAttribute }
 import css_style.tokens { CssError }
 import css_style.written as written
 import silkjs.js_engine { Engine }
 import silkjs.js_engine_host { EngineServices }
 import silkjs.js_value { ValueBits }
 import silkjs.js_realm { Realm, Arguments }
-import silkjs.js_owned_value { ValueRef }
+import silkjs.js_owned_value { Value, ValueRef }
+import silkjs.js_proxy_core as core
 import silkjs.js_exceptions { JsException }
 import silkjs.js_strings { Strings }
 import silkjs.js_core_types { NativeFunctionId, NativeErrorKind, ModuleDef }
@@ -27,6 +30,8 @@ import silkjs.js_heap { CellRef }
 import silkjs.js_coercion_host { CoercionHooks }
 import silkjs.js_eval as evaluation
 import silkjs.js_eval_compile as flags
+import silkjs.js_string_types { StringLengthError }
+import markdown
 
 /// `__ui.create(id, kind)`: kind 0 is a box, 1 text, 2 an input, 3 an image, 4 an icon,
 /// 5 a canvas.
@@ -48,6 +53,10 @@ pub const STYLE: u32 = 7
 /// `__ui.clearStyle(id, state)`: forgets every declaration of that look.
 pub const CLEAR_STYLE: u32 = 8
 /// `__ui.attribute(id, name, value)`. Throws a `TypeError` for a name the tree does not have.
+/// `role` takes ARIA role text and returns whether one of its words is a role the tree has
+/// (the node has no role otherwise). `__ui.attribute(id, "valueRange", min, max, now)` sets
+/// the value range, and without numbers clears it. An `aria-` name takes ARIA value text
+/// (`"aria-level", "2"`) and returns whether the tree has that attribute.
 pub const ATTRIBUTE: u32 = 9
 /// `__ui.focus(id)`.
 pub const FOCUS: u32 = 10
@@ -79,8 +88,27 @@ pub const DEV_RELOAD: u32 = 21
 pub const FONT_FAMILY: u32 = 22
 /// `__ui.open(url)`: asks the host to open an address outside the application.
 pub const OPEN: u32 = 23
+/// `__ui.defineIcon(resource, markup)`: parses SVG markup as icon resource `resource`.
+pub const DEFINE_ICON: u32 = 24
+/// `__ui.source(id, resource)`: points an image or icon node at a resource.
+pub const SOURCE: u32 = 25
+/// `__ui.release(resource)`: forgets a resource no node shows any more.
+pub const RELEASE: u32 = 26
+/// `__ui.markdown(text, flags)`: the mdast JSON of `text`, with the extensions of the
+/// [`markdown`] option bits in `flags`.
+pub const MARKDOWN: u32 = 27
+/// `__ui.keyframe(offset, css)`: adds a frame (offset 0 to 1, CSS declarations) to the
+/// `@keyframes` rule that the next `__ui.keyframes` defines.
+pub const KEYFRAME: u32 = 28
+/// `__ui.keyframes(name)`: defines `@keyframes name` from the frames added since the last
+/// one; none removes it.
+pub const KEYFRAMES: u32 = 29
 /// The number of native functions, for the installer.
-pub const LAST: u32 = 23
+pub const LAST: u32 = 29
+
+/// The runtime's promise rejection tracker callback: [`Bridge`] keeps the promises that
+/// were rejected with no handler until one is added.
+pub const REJECTION: u32 = 101
 
 /// The runtime's module loader callback: [`Bridge`] answers it from the defined modules.
 pub const MODULE_LOAD: u32 = 100
@@ -117,12 +145,23 @@ pub struct Bridge {
   /// Whether JavaScript asked for an animation frame callback.
   pub frame: bool,
   pub logs: List<LogEntry>,
+  /// Promises rejected with no handler so far, with what they were rejected with. The
+  /// host reports the ones still here after the promise jobs ran, as a browser does.
+  pub rejections: List<Rejected>,
   /// Lines JavaScript sent to the development server, oldest first.
   pub outbox: List<String>,
   /// Whether JavaScript asked for a new realm.
   pub reload: bool,
   /// Addresses JavaScript asked the host to open, oldest first.
   pub opened: List<String>,
+  /// The frames `__ui.keyframe` added for the next `__ui.keyframes`.
+  pub frames: List<Keyframe>,
+}
+
+/// A rejected promise nothing handles yet. Both values are owned.
+pub struct Rejected {
+  pub promise: Value,
+  pub reason: Value,
 }
 
 impl Bridge {
@@ -134,9 +173,11 @@ impl Bridge {
       timers: List<Timer>.make(),
       frame: false,
       logs: List<LogEntry>.make(),
+      rejections: List<Rejected>.make(),
       outbox: List<String>.make(),
       reload: false,
       opened: List<String>.make(),
+      frames: List<Keyframe>.make(),
     }
   }
 
@@ -199,14 +240,20 @@ pub fn name(id: u32) -> &'static [u8] {
   if id == DEV_RELOAD { return b"devReload" }
   if id == FONT_FAMILY { return b"fontFamily" }
   if id == OPEN { return b"open" }
+  if id == DEFINE_ICON { return b"defineIcon" }
+  if id == SOURCE { return b"source" }
+  if id == RELEASE { return b"release" }
+  if id == MARKDOWN { return b"markdown" }
+  if id == KEYFRAME { return b"keyframe" }
+  if id == KEYFRAMES { return b"keyframes" }
   return b"requestFrame"
 }
 
 /// The declared argument count of native function `id`.
 pub fn arity(id: u32) -> i32 {
   if id == NOW || id == REQUEST_FRAME || id == DEV_RELOAD { return 0 }
-  if id == DEV_SEND || id == OPEN { return 1 }
-  if id == ROOT || id == FOCUS || id == REMOVE || id == DESTROY || id == CANCEL_TIMER { return 1 }
+  if id == DEV_SEND || id == OPEN || id == KEYFRAMES { return 1 }
+  if id == ROOT || id == FOCUS || id == REMOVE || id == DESTROY || id == CANCEL_TIMER || id == RELEASE { return 1 }
   if id == INSERT_BEFORE || id == STYLE || id == ATTRIBUTE || id == SCROLL_TO || id == SELECT { return 3 }
   return 2
 }
@@ -252,6 +299,7 @@ fn state(code: u32) -> StyleState {
   if code == 2 { return StyleState.Active }
   if code == 3 { return StyleState.Focus }
   if code == 4 { return StyleState.FocusVisible }
+  if code == 5 { return StyleState.Starting }
   return StyleState.Base
 }
 
@@ -272,6 +320,7 @@ effect fn attributeOf<'v>(name: string, value: ValueRef<'v>) -> Option<Attribute
   if name == "checked" { return Option<Attribute>.some(Attribute.Checked { value: truthy(bits) }) }
   if name == "selected" { return Option<Attribute>.some(Attribute.Selected { value: truthy(bits) }) }
   if name == "expanded" { return Option<Attribute>.some(Attribute.Expanded { value: truthy(bits) }) }
+  if name == "indeterminate" { return Option<Attribute>.some(Attribute.Indeterminate { value: truthy(bits) }) }
   if name == "label" { return Option<Attribute>.some(Attribute.Label { value: run text(value) }) }
   if name == "testId" { return Option<Attribute>.some(Attribute.TestId { value: run text(value) }) }
   if name == "placeholder" { return Option<Attribute>.some(Attribute.Placeholder { value: run text(value) }) }
@@ -282,6 +331,96 @@ effect fn attributeOf<'v>(name: string, value: ValueRef<'v>) -> Option<Attribute
     return Option<Attribute>.some(Attribute.Cursor { value: cursorOf(String.utf8Bytes(String.view(&word))) })
   }
   return Option<Attribute>.none()
+}
+
+/// The first role in ARIA role text the tree has: words are separated by spaces, and later
+/// ones are fallbacks, as in `role="switch checkbox"`. `none` and `presentation` are no role.
+fn roleOf(words: &[u8]) -> Option<Role> {
+  let mut start: usize = 0
+  while start < words.length {
+    let mut end = start
+    while end < words.length && !space(words[end]) { end = end + 1 }
+    if end > start {
+      match namedRole(Slice.view(words, start, end - start)) {
+        Option<Role>.Some { value } => { return Option<Role>.some(value) }
+        Option<Role>.None => {}
+      }
+    }
+    start = end + 1
+  }
+  return Option<Role>.none()
+}
+
+fn space(byte: u8) -> bool {
+  return byte == 32 || byte == 9 || byte == 10 || byte == 12 || byte == 13
+}
+
+/// The tree's role for one ARIA role name.
+fn namedRole(word: &[u8]) -> Option<Role> {
+  if same(word, b"none") || same(word, b"presentation") { return Option<Role>.some(Role.None) }
+  if same(word, b"generic") { return Option<Role>.some(Role.Generic) }
+  if same(word, b"button") { return Option<Role>.some(Role.Button) }
+  if same(word, b"link") { return Option<Role>.some(Role.Link) }
+  if same(word, b"checkbox") { return Option<Role>.some(Role.Checkbox) }
+  if same(word, b"radio") { return Option<Role>.some(Role.Radio) }
+  if same(word, b"textbox") { return Option<Role>.some(Role.TextBox) }
+  if same(word, b"heading") { return Option<Role>.some(Role.Heading) }
+  if same(word, b"paragraph") { return Option<Role>.some(Role.Paragraph) }
+  if same(word, b"list") { return Option<Role>.some(Role.List) }
+  if same(word, b"listitem") { return Option<Role>.some(Role.ListItem) }
+  if same(word, b"img") || same(word, b"image") { return Option<Role>.some(Role.Image) }
+  if same(word, b"dialog") { return Option<Role>.some(Role.Dialog) }
+  if same(word, b"menu") { return Option<Role>.some(Role.Menu) }
+  if same(word, b"menuitem") { return Option<Role>.some(Role.MenuItem) }
+  if same(word, b"tab") { return Option<Role>.some(Role.Tab) }
+  if same(word, b"tablist") { return Option<Role>.some(Role.TabList) }
+  if same(word, b"tabpanel") { return Option<Role>.some(Role.TabPanel) }
+  if same(word, b"toolbar") { return Option<Role>.some(Role.Toolbar) }
+  if same(word, b"navigation") { return Option<Role>.some(Role.Navigation) }
+  if same(word, b"main") { return Option<Role>.some(Role.Main) }
+  if same(word, b"form") { return Option<Role>.some(Role.Form) }
+  if same(word, b"group") { return Option<Role>.some(Role.Group) }
+  if same(word, b"slider") { return Option<Role>.some(Role.Slider) }
+  if same(word, b"switch") { return Option<Role>.some(Role.Switch) }
+  if same(word, b"listbox") { return Option<Role>.some(Role.ListBox) }
+  if same(word, b"option") { return Option<Role>.some(Role.Option) }
+  if same(word, b"tooltip") { return Option<Role>.some(Role.Tooltip) }
+  if same(word, b"alert") { return Option<Role>.some(Role.Alert) }
+  if same(word, b"alertdialog") { return Option<Role>.some(Role.AlertDialog) }
+  if same(word, b"status") { return Option<Role>.some(Role.Status) }
+  if same(word, b"log") { return Option<Role>.some(Role.Log) }
+  if same(word, b"timer") { return Option<Role>.some(Role.Timer) }
+  if same(word, b"progressbar") { return Option<Role>.some(Role.ProgressBar) }
+  if same(word, b"separator") { return Option<Role>.some(Role.Separator) }
+  if same(word, b"combobox") { return Option<Role>.some(Role.ComboBox) }
+  if same(word, b"searchbox") { return Option<Role>.some(Role.SearchBox) }
+  if same(word, b"spinbutton") { return Option<Role>.some(Role.SpinButton) }
+  if same(word, b"table") { return Option<Role>.some(Role.Table) }
+  if same(word, b"rowgroup") { return Option<Role>.some(Role.RowGroup) }
+  if same(word, b"row") { return Option<Role>.some(Role.Row) }
+  if same(word, b"cell") { return Option<Role>.some(Role.Cell) }
+  if same(word, b"columnheader") { return Option<Role>.some(Role.ColumnHeader) }
+  if same(word, b"rowheader") { return Option<Role>.some(Role.RowHeader) }
+  if same(word, b"grid") { return Option<Role>.some(Role.Grid) }
+  if same(word, b"gridcell") { return Option<Role>.some(Role.GridCell) }
+  if same(word, b"tree") { return Option<Role>.some(Role.Tree) }
+  if same(word, b"treegrid") { return Option<Role>.some(Role.TreeGrid) }
+  if same(word, b"treeitem") { return Option<Role>.some(Role.TreeItem) }
+  if same(word, b"menubar") { return Option<Role>.some(Role.MenuBar) }
+  if same(word, b"menuitemcheckbox") { return Option<Role>.some(Role.MenuItemCheckbox) }
+  if same(word, b"menuitemradio") { return Option<Role>.some(Role.MenuItemRadio) }
+  if same(word, b"radiogroup") { return Option<Role>.some(Role.RadioGroup) }
+  if same(word, b"region") { return Option<Role>.some(Role.Region) }
+  if same(word, b"banner") { return Option<Role>.some(Role.Banner) }
+  if same(word, b"contentinfo") { return Option<Role>.some(Role.ContentInfo) }
+  if same(word, b"complementary") { return Option<Role>.some(Role.Complementary) }
+  if same(word, b"search") { return Option<Role>.some(Role.Search) }
+  if same(word, b"article") { return Option<Role>.some(Role.Article) }
+  if same(word, b"figure") { return Option<Role>.some(Role.Figure) }
+  if same(word, b"document") { return Option<Role>.some(Role.Document) }
+  if same(word, b"application") { return Option<Role>.some(Role.Application) }
+  if same(word, b"note") { return Option<Role>.some(Role.Note) }
+  return Option<Role>.none()
 }
 
 /// The tree's cursor for a CSS `cursor` keyword. A keyword the tree has no cursor for is the
@@ -313,6 +452,149 @@ effect fn declarationsOf(css: &String) -> List<Declaration> ! OutOfMemoryError ?
   }
 }
 
+/// What a `__ui` native function did: returned a value, or asked for a `TypeError`.
+pub union Outcome {
+  Returned { pub value: ValueBits },
+  TypeError { pub message: List<u8> },
+}
+
+/// Runs `__ui` native function `function` on `state`. A host whose engine services are not a
+/// `Bridge` (an embedded runtime's) calls it from its own native dispatch.
+pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) -> Outcome ! OutOfMemoryError ? &mut Allocator {
+  let first = id(argv.get(0).view())
+  if function == CREATE {
+    run bridge.batch.create(first, kind(id(argv.get(1).view())))
+  } else if function == APPEND {
+    run bridge.batch.append(first, id(argv.get(1).view()))
+  } else if function == INSERT_BEFORE {
+    run bridge.batch.insertBefore(first, id(argv.get(1).view()), id(argv.get(2).view()))
+  } else if function == ROOT {
+    run bridge.batch.root(first)
+  } else if function == SET_TEXT {
+    let value = run text(argv.get(1))
+    run bridge.batch.setText(first, String.view(&value))
+  } else if function == LISTEN {
+    run bridge.batch.listen(first, id(argv.get(1).view()))
+  } else if function == STYLE {
+    let css = run text(argv.get(1))
+    let declarations = run declarationsOf(&css)
+    run bridge.batch.push(Mutation.SetStyle { id: first, state: state(id(argv.get(2).view())), declarations: move declarations })
+  } else if function == CLEAR_STYLE {
+    run bridge.batch.push(Mutation.ClearStyle { id: first, state: state(id(argv.get(1).view())) })
+  } else if function == ATTRIBUTE {
+    let attribute = run text(argv.get(1))
+    if String.view(&attribute) == "valueRange" {
+      let range = if argv.get(2).view().isNumber() {
+        Attribute.ValueRange { min: f64.toF32(number(argv.get(2).view())), max: f64.toF32(number(argv.get(3).view())), value: f64.toF32(number(argv.get(4).view())) }
+      } else { Attribute.ClearValueRange }
+      run bridge.batch.attribute(first, move range)
+      return Outcome.Returned { value: ValueBits.Undefined }
+    }
+    if String.startsWith(String.view(&attribute), "aria-") {
+      let words = run text(argv.get(2))
+      let known = match run ariaAttribute(String.utf8Bytes(String.view(&attribute)), String.utf8Bytes(String.view(&words))) {
+        Option<Attribute>.Some { value } => {
+          run bridge.batch.attribute(first, move value)
+          true
+        }
+        Option<Attribute>.None => false
+      }
+      return Outcome.Returned { value: ValueBits.Bool { value: known } }
+    }
+    if String.view(&attribute) == "role" {
+      let words = run text(argv.get(2))
+      let bytes = String.utf8Bytes(String.view(&words))
+      let mut known = bytes.length == 0
+      let mut value = Role.None
+      match roleOf(bytes) {
+        Option<Role>.Some { value: found } => {
+          known = true
+          value = found
+        }
+        Option<Role>.None => {}
+      }
+      run bridge.batch.attribute(first, Attribute.Role { value: value })
+      return Outcome.Returned { value: ValueBits.Bool { value: known } }
+    }
+    match run attributeOf(String.view(&attribute), argv.get(2)) {
+      Option<Attribute>.Some { value } => { run bridge.batch.attribute(first, move value) }
+      Option<Attribute>.None => {
+        let mut message = List<u8>.make()
+        run message.appendSlice(b"the tree has no attribute '")
+        run message.appendSlice(String.utf8Bytes(String.view(&attribute)))
+        run message.append(39)
+        return Outcome.TypeError { message: move message }
+      }
+    }
+  } else if function == FOCUS {
+    run bridge.batch.focus(first)
+  } else if function == REMOVE {
+    run bridge.batch.push(Mutation.Remove { id: first })
+  } else if function == DESTROY {
+    run bridge.batch.push(Mutation.Destroy { id: first })
+  } else if function == SCROLL_TO {
+    run bridge.batch.scrollTo(first, f64.toF32(number(argv.get(1).view())), f64.toF32(number(argv.get(2).view())))
+  } else if function == LOG {
+    let line = run text(argv.get(1))
+    run bridge.logs.append(LogEntry { level: first, text: move line })
+  } else if function == NOW {
+    return Outcome.Returned { value: ValueBits.number(bridge.now) }
+  } else if function == TIMER {
+    drop bridge.cancel(first)
+    let delay = number(argv.get(1).view())
+    run bridge.timers.append(Timer { id: first, due: bridge.now + if delay > 0.0 { delay } else { 0.0 } })
+  } else if function == CANCEL_TIMER {
+    drop bridge.cancel(first)
+  } else if function == REQUEST_FRAME {
+    bridge.frame = true
+  } else if function == DEV_SEND {
+    let line = run text(argv.get(0))
+    run bridge.outbox.append(move line)
+  } else if function == OPEN {
+    let address = run text(argv.get(0))
+    run bridge.opened.append(move address)
+  } else if function == DEV_RELOAD {
+    bridge.reload = true
+  } else if function == FONT_FAMILY {
+    let names = run text(argv.get(1))
+    run bridge.batch.fontFamily(first, String.view(&names))
+  } else if function == DEFINE_ICON {
+    let markup = run text(argv.get(1))
+    run bridge.batch.icon(first, String.utf8Bytes(String.view(&markup)))
+  } else if function == SOURCE {
+    run bridge.batch.source(first, id(argv.get(1).view()))
+  } else if function == RELEASE {
+    run bridge.batch.releaseResource(first)
+  } else if function == MARKDOWN {
+    let source = run text(argv.get(0))
+    let json = run markdown.json(String.view(&source), id(argv.get(1).view()))
+    let made = run Effect.result(Strings.fromUtf8(json.asSlice()))
+    return match move made {
+      Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value } => Outcome.Returned { value: value }
+      Result<ValueBits, OutOfMemoryError | StringLengthError>.Failure { error } => match move error {
+        OutOfMemoryError allocation => { fail move allocation }
+        StringLengthError _ => {
+          let mut message = List<u8>.make()
+          run message.appendSlice(b"the markdown tree is too long for a string")
+          Outcome.TypeError { message: move message }
+        }
+      }
+    }
+  } else if function == KEYFRAME {
+    let css = run text(argv.get(1))
+    let declarations = run declarationsOf(&css)
+    let offset = f64.toF32(number(argv.get(0).view()))
+    run bridge.frames.append(Keyframe { offset: offset, declarations: move declarations })
+  } else if function == KEYFRAMES {
+    let name = run text(argv.get(0))
+    let frames = Intrinsic.replace(bridge.frames, List<Keyframe>.make())
+    run bridge.batch.keyframes(String.view(&name), move frames)
+  } else if function == SELECT {
+    run bridge.batch.select(first, f64.toUsize(number(argv.get(1).view())), f64.toUsize(number(argv.get(2).view())))
+  }
+  return Outcome.Returned { value: ValueBits.Undefined }
+}
+
 impl EngineServices for Bridge {
   /// A realm here has ECMAScript without ECMA-402 or Temporal (the prelude installs neither),
   /// so their code and CLDR tables stay out of the program.
@@ -327,74 +609,36 @@ impl EngineServices for Bridge {
 
   effect fn nativeGeneric<'r, 'v, 'm, 'w>(engine: &mut Engine<'m, Self>, function: u32, realm: Realm<'r>,
     receiver: ValueRef<'v>, argc: i32, argv: Arguments<'w>) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
-    let first = id(argv.get(0).view())
-    if function == CREATE {
-      run engine.services.batch.create(first, kind(id(argv.get(1).view())))
-    } else if function == APPEND {
-      run engine.services.batch.append(first, id(argv.get(1).view()))
-    } else if function == INSERT_BEFORE {
-      run engine.services.batch.insertBefore(first, id(argv.get(1).view()), id(argv.get(2).view()))
-    } else if function == ROOT {
-      run engine.services.batch.root(first)
-    } else if function == SET_TEXT {
-      let value = run text(argv.get(1))
-      run engine.services.batch.setText(first, String.view(&value))
-    } else if function == LISTEN {
-      run engine.services.batch.listen(first, id(argv.get(1).view()))
-    } else if function == STYLE {
-      let css = run text(argv.get(1))
-      let declarations = run declarationsOf(&css)
-      run engine.services.batch.push(Mutation.SetStyle { id: first, state: state(id(argv.get(2).view())), declarations: move declarations })
-    } else if function == CLEAR_STYLE {
-      run engine.services.batch.push(Mutation.ClearStyle { id: first, state: state(id(argv.get(1).view())) })
-    } else if function == ATTRIBUTE {
-      let attribute = run text(argv.get(1))
-      match run attributeOf(String.view(&attribute), argv.get(2)) {
-        Option<Attribute>.Some { value } => { run engine.services.batch.attribute(first, move value) }
-        Option<Attribute>.None => {
-          let mut message = List<u8>.make()
-          run message.appendSlice(b"the tree has no attribute '")
-          run message.appendSlice(String.utf8Bytes(String.view(&attribute)))
-          run message.append(39)
-          return run engine.throwError(realm, NativeErrorKind.Type, message.asSlice())
-        }
-      }
-    } else if function == FOCUS {
-      run engine.services.batch.focus(first)
-    } else if function == REMOVE {
-      run engine.services.batch.push(Mutation.Remove { id: first })
-    } else if function == DESTROY {
-      run engine.services.batch.push(Mutation.Destroy { id: first })
-    } else if function == SCROLL_TO {
-      run engine.services.batch.scrollTo(first, f64.toF32(number(argv.get(1).view())), f64.toF32(number(argv.get(2).view())))
-    } else if function == LOG {
-      let line = run text(argv.get(1))
-      run engine.services.logs.append(LogEntry { level: first, text: move line })
-    } else if function == NOW {
-      return ValueBits.number(engine.services.now)
-    } else if function == TIMER {
-      drop engine.services.cancel(first)
-      let delay = number(argv.get(1).view())
-      run engine.services.timers.append(Timer { id: first, due: engine.services.now + if delay > 0.0 { delay } else { 0.0 } })
-    } else if function == CANCEL_TIMER {
-      drop engine.services.cancel(first)
-    } else if function == REQUEST_FRAME {
-      engine.services.frame = true
-    } else if function == DEV_SEND {
-      let line = run text(argv.get(0))
-      run engine.services.outbox.append(move line)
-    } else if function == OPEN {
-      let address = run text(argv.get(0))
-      run engine.services.opened.append(move address)
-    } else if function == DEV_RELOAD {
-      engine.services.reload = true
-    } else if function == FONT_FAMILY {
-      let names = run text(argv.get(1))
-      run engine.services.batch.fontFamily(first, String.view(&names))
-    } else if function == SELECT {
-      run engine.services.batch.select(first, f64.toUsize(number(argv.get(1).view())), f64.toUsize(number(argv.get(2).view())))
+    let outcome = run call(&mut engine.services, function, argv)
+    return match move outcome {
+      Outcome.Returned { value } => value
+      Outcome.TypeError { message } => run engine.throwError(realm, NativeErrorKind.Type, message.asSlice())
     }
-    return ValueBits.Undefined
+  }
+
+  /// Keeps a promise rejected with no handler, and lets go of it when a handler is added.
+  unsafe effect fn promiseRejection<'r, 'v, 'w, 'm>(engine: &mut Engine<'m, Self>, realm: Realm<'r>,
+    callback: NativeFunctionId, promise: ValueRef<'v>, reason: ValueRef<'w>, event: u32, opaque: ?*mut u8) -> () ? &mut Allocator {
+    // 0: rejected with no handler, 1: handler added later; later codes are double settles.
+    if event > 1 { return () }
+    let handled = event == 1
+    let items = engine.services.rejections.asSlice()
+    let mut i: usize = 0
+    while i < items.length {
+      if unsafe core.sameValue(items[i].promise.view(), promise.view()) {
+        if handled {
+          let Rejected { promise: kept, reason: why } = engine.services.rejections.remove(i)
+          realm.release(&mut engine, move kept)
+          realm.release(&mut engine, move why)
+        }
+        return
+      }
+      i = i + 1
+    }
+    if handled { return }
+    // Without memory for the entry the rejection goes unreported.
+    let entry = Rejected { promise: promise.dup(), reason: reason.dup() }
+    drop run Effect.result(engine.services.rejections.append(move entry))
   }
 
   /// A module the application defined, compiled when something first imports it.

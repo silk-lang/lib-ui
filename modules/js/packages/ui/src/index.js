@@ -10,14 +10,16 @@ const native = globalThis.__ui;
 if (!native) throw new Error("@silk/ui needs the __ui functions of a ui-js host");
 
 const KINDS = { box: 0, text: 1, input: 2, image: 3, icon: 4, canvas: 5 };
-const STATES = { base: 0, hover: 1, active: 2, focus: 3, focusVisible: 4 };
+const STATES = { base: 0, hover: 1, active: 2, focus: 3, focusVisible: 4, starting: 5 };
 
 // Event types in the order of the tree's LISTEN_* flags: the index is the kind number the
 // host dispatches and the bit a node listens with.
 const TYPES = [
   "pointerdown", "pointerup", "click", "pointermove", "pointerenter", "pointerleave", "wheel",
   "keydown", "keyup", "focus", "blur", "input", "scroll", "layout", "pointercancel",
-  "gotpointercapture", "lostpointercapture", "load", "error",
+  "gotpointercapture", "lostpointercapture", "load", "error", "transitionrun", "transitionstart",
+  "transitionend", "transitioncancel", "animationstart", "animationiteration", "animationend",
+  "animationcancel",
 ];
 const KIND_OF = new Map(TYPES.map((type, kind) => [type, kind]));
 const CLICK = KIND_OF.get("click");
@@ -29,7 +31,8 @@ const CANCELABLE = new Set(["pointerdown", "pointerup", "click", "wheel", "keydo
 // Properties whose numbers are not lengths. Every other number is CSS pixels.
 const UNITLESS = new Set([
   "opacity", "flexGrow", "flexShrink", "flex", "order", "zIndex", "fontWeight", "lineHeight",
-  "aspectRatio", "tabSize", "scale",
+  "aspectRatio", "tabSize", "scale", "animationIterationCount", "gridRow", "gridRowStart", "gridRowEnd",
+  "gridColumn", "gridColumnStart", "gridColumnEnd", "gridArea",
 ]);
 
 const nodes = new Map();
@@ -67,6 +70,26 @@ function familyOf(names) {
 function cssValue(name, value) {
   if (name === "fontFamily") return familyOf(String(value));
   return typeof value === "number" && !UNITLESS.has(name) ? value + "px" : String(value);
+}
+
+// ARIA states with a tree attribute of their own, by the name after `aria-`. The host takes
+// the other ARIA names as they are; one it does not know is ignored, with one warning.
+const ARIA_STATES = { checked: "checked", selected: "selected", expanded: "expanded" };
+const ARIA_RANGE = { valuemin: 0, valuemax: 1, valuenow: 2 };
+const warned = new Set();
+
+function warnOnce(message) {
+  if (warned.has(message)) return;
+  warned.add(message);
+  console.warn(message);
+}
+
+// The part of an ARIA attribute name after `aria`, lowercase: `aria-valuenow` (the DOM
+// attribute) and `ariaValueNow` (the DOM property) are both `valuenow`. Null for other names.
+function ariaName(name) {
+  if (name.startsWith("aria-")) return name.slice(5).toLowerCase();
+  if (name.length > 4 && name.startsWith("aria") && name[4] >= "A" && name[4] <= "Z") return name.slice(4).toLowerCase();
+  return null;
 }
 
 /** The declarations of one look of a node: the base look, or what a state lays over it. */
@@ -137,6 +160,8 @@ export class Node {
   #base = null;
   #looks = null;
   #flags = 0;
+  // aria-valuemin, aria-valuemax and aria-valuenow, which the tree takes as one range.
+  #range = null;
 
   constructor(kind) {
     this.id = ++nextId;
@@ -235,7 +260,8 @@ export class Node {
     this.look("base").replace(properties);
   }
 
-  /** The look the tree lays over the base in `state`: hover, active, focus or focusVisible. */
+  /** The look the tree lays over the base in `state`: hover, active, focus, focusVisible, or
+   * starting (what transitions start from when the node first shows, as `@starting-style`). */
   look(state) {
     if (state === "base") return (this.#base ??= new Look(this, 0));
     if (!(state in STATES)) throw new TypeError("the tree has no look '" + state + "'");
@@ -247,13 +273,44 @@ export class Node {
    * Sets a tree attribute: tabIndex, disabled, label, testId, placeholder and so on. A node
    * with an `href` is a link: a click on it or inside it that no listener prevented opens
    * the address with `open`, as a click on an `<a>` follows it.
+   *
+   * `role` and `aria-*` work as in the DOM, spelled `aria-checked` or `ariaChecked`. A role
+   * or ARIA name the tree does not know is ignored with a warning.
    */
   setAttribute(name, value) {
+    if (name === "role") {
+      const words = value == null ? "" : String(value);
+      if (!native.attribute(this.id, "role", words)) warnOnce("the tree has no role '" + words + "': it is ignored");
+      return;
+    }
+    const aria = ariaName(name);
+    if (aria !== null) {
+      this.#aria(aria, value);
+      return;
+    }
     if (name === "href") {
       this._href = value ? String(value) : null;
       this.#want(KIND_OF.get("click"));
     }
     native.attribute(this.id, name, value);
+  }
+
+  #aria(name, value) {
+    if (name === "label") {
+      native.attribute(this.id, "label", value == null ? "" : String(value));
+    } else if (name in ARIA_STATES) {
+      // ARIA states are the words "true" and "false"; anything else is false.
+      if (name === "checked") native.attribute(this.id, "indeterminate", value === "mixed");
+      native.attribute(this.id, ARIA_STATES[name], value === true || value === "true");
+    } else if (name in ARIA_RANGE) {
+      const range = (this.#range ??= [undefined, undefined, undefined]);
+      range[ARIA_RANGE[name]] = value == null || value === "" ? undefined : Number(value);
+      const [min = 0, max = 100, now] = range;
+      if (now === undefined || Number.isNaN(now)) native.attribute(this.id, "valueRange");
+      else native.attribute(this.id, "valueRange", min, max, now);
+    } else if (!native.attribute(this.id, "aria-" + name, value == null ? "" : String(value))) {
+      warnOnce("the tree has no 'aria-" + name + "' yet: it is ignored");
+    }
   }
 
   // Tells the tree which events this node wants: its listeners', and clicks on a link.
@@ -384,8 +441,65 @@ export class Input extends Node {
   }
 }
 
+// Inline SVG markup as icon resources: identical markup shares one, freed when no icon shows
+// it. The ids start high, clear of resources a host or a URL table numbers from 1.
+const ICONS = new Map();
+let nextIcon = 0x40000000;
+
+function holdIcon(markup) {
+  let entry = ICONS.get(markup);
+  if (!entry) {
+    entry = { id: nextIcon++, count: 0 };
+    ICONS.set(markup, entry);
+    native.defineIcon(entry.id, markup);
+  }
+  entry.count++;
+  return entry.id;
+}
+
+function dropIcon(markup) {
+  const entry = ICONS.get(markup);
+  if (entry && --entry.count === 0) {
+    ICONS.delete(markup);
+    native.release(entry.id);
+  }
+}
+
+/**
+ * An icon: SVG drawn at the node's CSS size, as an inline `<svg>` is. Its `currentColor` is
+ * the node's `color`, so an icon that paints only with it (Lucide's, for example) takes the
+ * text color, and any other keeps its own colors.
+ */
+export class Icon extends Node {
+  #svg = "";
+
+  constructor(svg = "") {
+    super("icon");
+    this.svg = svg;
+  }
+
+  /** The SVG markup, as `outerHTML` of an `<svg>` element would give it. */
+  get svg() {
+    return this.#svg;
+  }
+
+  set svg(markup) {
+    markup = markup == null ? "" : String(markup);
+    if (markup === this.#svg) return;
+    if (this.#svg) dropIcon(this.#svg);
+    this.#svg = markup;
+    native.source(this.id, markup ? holdIcon(markup) : 0);
+  }
+
+  _forget() {
+    if (this.#svg) dropIcon(this.#svg);
+    this.#svg = "";
+  }
+}
+
 function forget(node) {
   nodes.delete(node.id);
+  node._forget?.();
   for (const child of node.childNodes) {
     child.parentNode = null;
     forget(child);
@@ -397,6 +511,7 @@ export function createNode(kind) {
   if (!(kind in KINDS)) throw new TypeError("the tree has no node kind '" + kind + "'");
   if (kind === "text") return new Text();
   if (kind === "input") return new Input();
+  if (kind === "icon") return new Icon();
   return new Node(kind);
 }
 
@@ -412,6 +527,13 @@ export function createText(data = "") {
   return new Text(data);
 }
 
+/** An icon showing `svg` markup, with `style` as its base look. */
+export function createIcon(svg, style) {
+  const icon = new Icon(svg);
+  if (style) icon.style.set(style);
+  return icon;
+}
+
 export function createInput(style) {
   const input = new Input();
   if (style) input.style.set(style);
@@ -421,6 +543,30 @@ export function createInput(style) {
 let rootNode = null;
 
 /** Makes `node` the root of the window's tree. */
+/**
+ * Defines `@keyframes name` as CSS would: `{ from: { opacity: 0 }, "50%": {...}, to: {...} }`,
+ * with selectors such as `"0%, 100%"` too. Style objects name it in `animation` or
+ * `animationName`. Defining a name again replaces its rule; `null` removes it.
+ */
+export function defineKeyframes(name, frames) {
+  for (const selector of Object.keys(frames ?? {})) {
+    let css = "";
+    const declarations = frames[selector];
+    for (const property of Object.keys(declarations)) {
+      const value = declarations[property];
+      if (value === null || value === undefined || value === "") continue;
+      css += cssName(property) + ":" + cssValue(property, value) + ";";
+    }
+    for (const part of selector.split(",")) {
+      const text = part.trim().toLowerCase();
+      const offset = text === "from" ? 0 : text === "to" ? 1 : parseFloat(text) / 100;
+      if (!(offset >= 0 && offset <= 1)) throw new Error(`@silk/ui: bad keyframe selector '${part}'`);
+      native.keyframe(offset, css);
+    }
+  }
+  native.keyframes(String(name));
+}
+
 export function mount(node) {
   rootNode = node;
   native.root(node.id);
@@ -434,6 +580,25 @@ export function root() {
 /** The node with tree id `id`, for hosts and tools. */
 export function nodeById(id) {
   return nodes.get(id) ?? null;
+}
+
+// The option bits of `__ui.markdown`.
+const MARKDOWN_FLAGS = { tables: 1, strikethrough: 2, taskLists: 4, autolinkLiterals: 8, footnotes: 16, frontmatter: 32, alerts: 64 };
+const GFM = 1 | 2 | 4 | 8;
+
+/**
+ * The syntax tree of Markdown `text`, in the shape of mdast (what remark gives): plain
+ * objects with `type` and `children`. CommonMark, with GitHub's tables, strikethrough,
+ * task lists and autolinks unless `gfm` is false. `footnotes`, `frontmatter` and
+ * `alerts` (`> [!NOTE]`, a node of type `alert` with a `kind`) turn those on.
+ */
+export function parseMarkdown(text, options = {}) {
+  let flags = options.gfm === false ? 0 : GFM;
+  for (const name in MARKDOWN_FLAGS) {
+    if (options[name] === true) flags |= MARKDOWN_FLAGS[name];
+    else if (options[name] === false) flags &= ~MARKDOWN_FLAGS[name];
+  }
+  return JSON.parse(native.markdown(String(text), flags));
 }
 
 let errorHandler = null;
@@ -517,6 +682,14 @@ function fill(event, kind, a, b, modifiers, d, e, first, second) {
     event.scrollTop = b;
   } else if (kind === 13) {
     event.bounds = { x: a, y: b, width: d, height: e };
+  } else if (kind >= 19 && kind <= 22) {
+    event.propertyName = first;
+    event.elapsedTime = a;
+    event.pseudoElement = "";
+  } else if (kind >= 23) {
+    event.animationName = first;
+    event.elapsedTime = a;
+    event.pseudoElement = "";
   }
 }
 

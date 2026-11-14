@@ -87,10 +87,10 @@ pub effect fn getClientRects(tree: &UiTree<'_>, id: u32, out: &mut List<DOMRect>
   }
   let mut index = firstFragment(tree, slot)
   while index != NO_INDEX {
-    let fragment = tree.visualFragment(index)
+    let fragment = tree.output.fragments.values.asSlice()[index]
     if !fragment.positioningShell && fragment.kind != FragmentKind.Line
       && fragment.kind != FragmentKind.Text {
-      run out.append(domRect(borderBox(&fragment)))
+      run out.append(domRect(tree.visualRect(index, borderBox(&fragment))))
     }
     index = tree.nextSourceFragment.get(index)
   }
@@ -106,10 +106,10 @@ pub effect fn getBoundingClientRect(tree: &UiTree<'_>, id: u32) -> DOMRect
   let mut result = BoundingRects.make()
   let mut index = firstFragment(tree, slot)
   while index != NO_INDEX {
-    let fragment = tree.visualFragment(index)
+    let fragment = tree.output.fragments.values.asSlice()[index]
     if !fragment.positioningShell && fragment.kind != FragmentKind.Line
       && fragment.kind != FragmentKind.Text {
-      result.append(domRect(borderBox(&fragment)))
+      result.append(domRect(tree.visualRect(index, borderBox(&fragment))))
     }
     index = tree.nextSourceFragment.get(index)
   }
@@ -147,8 +147,17 @@ pub effect fn elementsFromPoint(tree: &UiTree<'_>, x: f64, y: f64, out: &mut Lis
     index = index + 1
   }
   if tree.root != NONE {
+    // The root ends the list unless it was hit; boxes with negative z-index can come after it.
     let rootId = tree.node(tree.root).id
-    if out.length() == 0 || out.get(out.length() - 1) != rootId {
+    let mut seen = false
+    index = 0
+    while index < out.length() {
+      if out.get(index) == rootId {
+        seen = true
+      }
+      index = index + 1
+    }
+    if !seen {
       run out.append(rootId)
     }
   }
@@ -341,6 +350,7 @@ pub effect fn requestScroll(
   }
   let target = scrollTarget(&tree.*, id, x, y)
   let offset = tree.scrollOffset(id)
+  let smooth = computedSmooth || tree.node(slot).computed.scroll.smooth
   let request = run tree.viewScrollState.begin(
     ViewTarget { kind: ViewTargetKind.Element, id: u32.toUsize(id) },
     f32.toF64(offset.x),
@@ -348,7 +358,7 @@ pub effect fn requestScroll(
     target.x,
     target.y,
     behavior,
-    computedSmooth,
+    smooth,
     honorsSmooth,
   )
   if request.behavior == ScrollBehavior.Instant
@@ -424,14 +434,21 @@ pub effect fn scrollIntoView(
   if slot == NONE || !attached(&tree.*, slot) || firstFragment(&tree.*, slot) == NO_INDEX {
     return ()
   }
-  let mut target = run getBoundingClientRect(&tree.*, id)
+  let border = run getBoundingClientRect(&tree.*, id)
+  let margin = tree.node(slot).computed.scroll.margin
+  let mut target = DOMRect.make(
+    border.left() - f32.toF64(margin.left),
+    border.top() - f32.toF64(margin.top),
+    border.right() - border.left() + f32.toF64(margin.left + margin.right),
+    border.bottom() - border.top() + f32.toF64(margin.top + margin.bottom),
+  )
   let mut ancestor = tree.node(slot).parent
   while ancestor != NONE {
     let computed = tree.node(ancestor).computed
     let first = firstFragment(&tree.*, ancestor)
     if first != NO_INDEX
       && (scrolls(usedOverflow(&computed, true)) || scrolls(usedOverflow(&computed, false))) {
-      let port = domRect(paddingBox(&tree.visualFragment(first)))
+      let port = domRect(computed.scroll.port(paddingBox(&tree.visualFragment(first))))
       let horizontal = computed.text.writingMode == WritingMode.HorizontalTb
       let blockReverse = computed.text.writingMode == WritingMode.VerticalRl
         || computed.text.writingMode == WritingMode.SidewaysRl
@@ -674,7 +691,8 @@ fn visualPiece(tree: &UiTree<'_>, index: usize) -> caret.Piece {
   return piece
 }
 
-effect fn textPieces(tree: &UiTree<'_>, slot: u32, pieces: &mut List<caret.Piece>) -> ()
+/// The text fragments of the text or input node at `slot`, in source order.
+pub effect fn textPieces(tree: &UiTree<'_>, slot: u32, pieces: &mut List<caret.Piece>) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   pieces.clear()
