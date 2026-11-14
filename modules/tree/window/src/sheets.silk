@@ -53,6 +53,7 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
   import images { resolveFile }
   import font_web.fetch
   import font_web.stylesheet { parse }
+  import silk.collections.bytes { Bytes }
   import silk.concurrency.thread { Transferable }
   import silk.core.effect { Effect }
   import silk.core.option { Option }
@@ -76,9 +77,13 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
 
   impl Transferable for Input {}
 
+  /// What a worker read: plain bytes, parsed on the UI thread (rules crossing threads made
+  /// silkc dev.74 fail with an internal error).
   struct Output {
-    /// None when the sheet could not be read.
-    rules: Option<List<FontFaceRule>>,
+    ok: bool,
+    css: Bytes,
+    /// The URL the response came from, empty for a file.
+    base: String,
   }
 
   impl Transferable for Output {}
@@ -143,7 +148,8 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
         }
         let mut job = self.running.remove(i)
         if let Option<Output>.Some { value: output } = job.task.poll() {
-          if let Option<List<FontFaceRule>>.Some { value: rules } = move output.rules {
+          if output.ok {
+            let rules = run parseAt(output.css.asSlice(), String.view(&output.base))
             run done.append(Sheet { rules: move rules, directory: move job.directory })
           }
         }
@@ -157,7 +163,7 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
       let started = run Effect.result(
         Background<Output>.start(
           fn() -> Output {
-            return Output { rules: load(move input.source) }
+            return load(move input.source)
           },
         ),
       )
@@ -181,8 +187,26 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
     return run parse(css, Option<&'static Url>.None)
   }
 
+  /// The rules of `css`, with relative URLs resolved against `base` when it is a URL.
+  effect fn parseAt(css: &[u8], base: string) -> List<FontFaceRule>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if String.byteLength(base) == 0 {
+      return run rulesOf(css)
+    }
+    let parsed = run Url.parse(base, Option<&'static Url>.None)
+    return match move parsed {
+      Option<Url>.Some { value } => run parse(css, Option<&Url>.Some { value: &value })
+      Option<Url>.None => run rulesOf(css)
+    }
+  }
+
+  fn failed() -> Output {
+    return Output { ok: false, css: Bytes.make(), base: String.make() }
+  }
+
   /// Reads or fetches a sheet on a worker, with its own allocator.
-  fn load(source: Source) -> Option<List<FontFaceRule>> {
+  fn load(source: Source) -> Output {
     let mut allocator = Allocator.systemAllocatorProvider()
     return match move source {
       Source.File { path } => {
@@ -192,7 +216,7 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
           Result.Success { value } => move value
           Result.Failure { error } => {
             drop error
-            Option<List<FontFaceRule>>.None
+            failed()
           }
         }
       }
@@ -205,18 +229,16 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
           Result.Success { value } => move value
           Result.Failure { error } => {
             drop error
-            Option<List<FontFaceRule>>.None
+            failed()
           }
         }
       }
     }
   }
 
-  /// Fetches the stylesheet at HTTP(S) `url` as a desktop browser does, so Google Fonts
-  /// answers with WOFF2 faces; its `src` URLs resolve against the URL the response came from.
-  /// The same request as `font_web.fetch.stylesheet`, written out: calling that one from this
-  /// worker makes silkc dev.74 fail with an internal error on aarch64-apple-darwin.
-  effect fn fetchSheet(url: string) -> Option<List<FontFaceRule>>
+  /// Fetches the stylesheet at HTTP(S) `url` as a desktop browser does (as
+  /// `font_web.fetch.stylesheet` does), so Google Fonts answers with WOFF2 faces.
+  effect fn fetchSheet(url: string) -> Output
     ! HttpError | OutOfMemoryError
     ? &mut Http | &mut Allocator {
     let encoded = run fetch.encode(url)
@@ -225,22 +247,18 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
     run request.header("Accept", "text/css,*/*;q=0.1")
     let response = run Http.send(move request)
     if !response.ok() {
-      return Option<List<FontFaceRule>>.None
+      return failed()
     }
-    let mut final = response.url()
-    if final == "" {
-      final = String.view(&encoded)
+    let base = if response.url() == "" {
+      move encoded
+    } else {
+      run String.copy(response.url())
     }
-    let base = run Url.parse(final, Option<&'static Url>.None)
-    let rules = match move base {
-      Option<Url>.Some { value } => run parse(response.body(), Option<&Url>.Some { value: &value })
-      Option<Url>.None => run parse(response.body(), Option<&'static Url>.None)
-    }
-    return Option<List<FontFaceRule>>.some(move rules)
+    return Output { ok: true, css: response.intoBody(), base: move base }
   }
 
-  /// The rules of the stylesheet file at `path`, or None when it cannot be read.
-  effect fn readFile(path: string) -> Option<List<FontFaceRule>>
+  /// The stylesheet file at `path`.
+  effect fn readFile(path: string) -> Output
     ! OutOfMemoryError
     ? &mut Allocator {
     let made = run Effect.result(MachineFileSystem.make())
@@ -248,7 +266,7 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
       Result.Success { value } => move value
       Result.Failure { error } => {
         drop error
-        return Option<List<FontFaceRule>>.None
+        return failed()
       }
     }
     let parsed = run Effect.result(Path.fromBytes(String.utf8Bytes(path)))
@@ -256,17 +274,15 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
       Result.Success { value } => move value
       Result.Failure { error } => {
         drop error
-        return Option<List<FontFaceRule>>.None
+        return failed()
       }
     }
     let read = run Effect.result(FileSystem.readFile(&file)) |> Effect.provideMut<FileSystem>(&mut fs)
     return match move read {
-      Result.Success { value: bytes } => {
-        Option<List<FontFaceRule>>.some(run rulesOf(bytes.asSlice()))
-      }
+      Result.Success { value: bytes } => Output { ok: true, css: move bytes, base: String.make() }
       Result.Failure { error } => {
         drop error
-        Option<List<FontFaceRule>>.None
+        failed()
       }
     }
   }
