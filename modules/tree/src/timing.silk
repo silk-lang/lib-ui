@@ -1,15 +1,18 @@
 //! The timing half of CSS transitions: easing functions, and the `transition-*` lists of a
 //! computed style, read from CSS text.
+import silk.collections.list { List }
 import silk.collections.slice { Slice }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.f32
 import silk.num.u32
 import silk.num.u64
 import silk.num.u8
+import silk.num.usize
 
 /// The mask of every field `motion` transitions (`transition-property: all`).
-pub const ALL: u64 = 0xFFFFFFFFFFF
+pub const ALL: u64 = 0x7FFFFFFFFFFFF
 
 /// How many entries each `transition-*` list keeps; later ones are dropped.
 pub const LIST: usize = 8
@@ -17,13 +20,15 @@ pub const LIST: usize = 8
 pub const LINEAR: u8 = 0
 pub const BEZIER: u8 = 1
 pub const STEPS: u8 = 2
+/// `linear()` with stops: `steps` holds the key of its points in an [`EasingStops`].
+pub const STOPS: u8 = 3
 
 pub const JUMP_END: u8 = 0
 pub const JUMP_START: u8 = 1
 pub const JUMP_NONE: u8 = 2
 pub const JUMP_BOTH: u8 = 3
 
-/// An easing function (CSS Easing 1): linear, a cubic Bézier curve or steps.
+/// An easing function (CSS Easing 2): linear, linear() with stops, a cubic Bézier curve or steps.
 pub struct Easing {
   pub kind: u8,
   pub x1: f32,
@@ -54,8 +59,11 @@ impl Easing {
     return Easing { kind: STEPS, x1: 0.0, y1: 0.0, x2: 1.0, y2: 1.0, steps: steps, jump: jump }
   }
 
-  /// The output progress at input progress `p`, 0 to 1.
-  pub fn at(self: &Self, p: f32) -> f32 {
+  /// The output progress at input progress `p`, 0 to 1, with `linear()` stops from `stops`.
+  pub fn at(self: &Self, p: f32, stops: &EasingStops) -> f32 {
+    if self.kind == STOPS {
+      return stops.at(self.steps, p)
+    }
     if self.kind == BEZIER {
       if p <= 0.0 {
         return 0.0
@@ -475,11 +483,287 @@ pub fn easing(text: &[u8]) -> Option<Easing> {
     }
     return Option<Easing>.some(Easing.stepped(f32.toU32(count), jump))
   }
-  // `linear()` with stops is not supported yet; it eases linearly.
   if isFunction(text, b"linear") {
-    return Option<Easing>.some(Easing.linear())
+    if linearPoints(text) < 2 {
+      return Option<Easing>.None
+    }
+    return Option<Easing>.some(Easing {
+      kind: STOPS,
+      x1: 0.0,
+      y1: 0.0,
+      x2: 1.0,
+      y2: 1.0,
+      steps: stopsKey(text),
+      jump: JUMP_END,
+    })
   }
   return Option<Easing>.None
+}
+
+fn stopsKey(text: &[u8]) -> u32 {
+  let hash = nameHash(text)
+  return u64.toU32(u64.bitAnd(u64.bitXor(hash, u64.shiftRight(hash, 32)), 0xFFFFFFFF))
+}
+
+/// How many points `linear(...)` text has (CSS Easing 2 §"linear()"), 0 when it is invalid.
+fn linearPoints(text: &[u8]) -> usize {
+  let inner = part(text, 7, text.length - 1)
+  let mut count: usize = 0
+  let mut at: usize = 0
+  while at <= inner.length {
+    let end = itemEnd(inner, at, true)
+    let mut spans = [Span { start: 0, end: 0 }; 8]
+    let item = part(inner, at, end)
+    let words = words(item, &mut spans)
+    if words == 0 || words > 3 {
+      return 0
+    }
+    let mut numbers: usize = 0
+    let mut w: usize = 0
+    while w < words {
+      let word = part(item, spans[w].start, spans[w].end)
+      if percentOf(word).isNone() {
+        let used = numberLength(word)
+        if used == 0 || used != word.length {
+          return 0
+        }
+        numbers = numbers + 1
+      }
+      w = w + 1
+    }
+    if numbers != 1 {
+      return 0
+    }
+    let points: usize = if words == 3 { 2 } else { 1 }
+    count = count + points
+    at = end + 1
+  }
+  if count < 2 {
+    return 0
+  }
+  return count
+}
+
+fn percentOf(word: &[u8]) -> Option<f32> {
+  if word.length < 2 || word[word.length - 1] != 37 {
+    return Option<f32>.None
+  }
+  let digits = part(word, 0, word.length - 1)
+  let used = numberLength(digits)
+  if used == 0 || used != digits.length {
+    return Option<f32>.None
+  }
+  return Option<f32>.some(numberValue(digits) / 100.0)
+}
+
+struct StopsEntry {
+  key: u32,
+  start: usize,
+  count: usize,
+}
+
+impl Copy for StopsEntry {}
+
+/// The points of the `linear()` easings a tree has read, by key. Points are never removed:
+/// a style holds few distinct ones.
+pub struct EasingStops {
+  entries: List<StopsEntry>,
+  /// (input, output) pairs.
+  points: List<f32>,
+}
+
+impl EasingStops {
+  pub fn make() -> EasingStops {
+    return EasingStops { entries: List<StopsEntry>.make(), points: List<f32>.make() }
+  }
+
+  fn find(self: &Self, key: u32) -> usize {
+    let entries = self.entries.asSlice()
+    let mut i: usize = 0
+    while i < entries.length {
+      if entries[i].key == key {
+        return i
+      }
+      i = i + 1
+    }
+    return entries.length
+  }
+
+  /// Reads the points of every `linear(...)` with stops in CSS `text`.
+  pub effect fn read(self: &mut Self, text: &[u8]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut i: usize = 0
+    while i + 7 <= text.length {
+      let starts = (i == 0 || !isNameByte(text[i - 1])) && named(part(text, i, i + 7), b"linear(")
+      if !starts {
+        i = i + 1
+        continue
+      }
+      let close = closing(text, i + 6)
+      if close >= text.length {
+        return ()
+      }
+      let function = part(text, i, close + 1)
+      let key = stopsKey(function)
+      if self.find(key) == self.entries.length() {
+        let count = linearPoints(function)
+        if count >= 2 {
+          let start = self.points.length()
+          run self.points.appendRepeated(0.0, count * 2)
+          fillPoints(function, Slice.viewMut<f32>(self.points.asMutSlice(), start, count * 2))
+          run self.entries.append(StopsEntry { key: key, start: start, count: count })
+        }
+      }
+      i = close + 1
+    }
+  }
+
+  /// The output of the easing with key `key` at input `p`; `p` itself for an unknown key.
+  pub fn at(self: &Self, key: u32, p: f32) -> f32 {
+    let index = self.find(key)
+    if index == self.entries.length() {
+      return p
+    }
+    let entry = self.entries.get(index)
+    let points = Slice.view<f32>(self.points.asSlice(), entry.start, entry.count * 2)
+    return linearAt(points, entry.count, p)
+  }
+}
+
+fn isNameByte(byte: u8) -> bool {
+  return isDigit(byte) || byte == 45 || byte == 95 || (lower(byte) >= 97 && lower(byte) <= 122)
+}
+
+// The index of the parenthesis that closes the one at `open`.
+fn closing(text: &[u8], open: usize) -> usize {
+  let mut depth: u32 = 0
+  let mut i = open
+  while i < text.length {
+    if text[i] == 40 {
+      depth = depth + 1
+    } else if text[i] == 41 {
+      depth = depth - 1
+      if depth == 0 {
+        return i
+      }
+    }
+    i = i + 1
+  }
+  return text.length
+}
+
+const MISSING: f32 = -1.0e30
+
+// Writes the points of valid `linear(...)` text into `out` (two floats each), filling in
+// missing inputs: the first is 0, the last 1, each at least the largest before it, and runs
+// of missing ones spread evenly between their neighbours.
+fn fillPoints(text: &[u8], out: &mut [f32]) -> () {
+  let inner = part(text, 7, text.length - 1)
+  let mut n: usize = 0
+  let mut at: usize = 0
+  while at <= inner.length {
+    let end = itemEnd(inner, at, true)
+    let mut spans = [Span { start: 0, end: 0 }; 8]
+    let item = part(inner, at, end)
+    let words = words(item, &mut spans)
+    let mut output: f32 = 0.0
+    let mut inputs = [MISSING, MISSING]
+    let mut seen: usize = 0
+    let mut w: usize = 0
+    while w < words {
+      let word = part(item, spans[w].start, spans[w].end)
+      match percentOf(word) {
+        Option<f32>.Some { value } => {
+          inputs[seen] = value
+          seen = seen + 1
+        }
+        Option<f32>.None => {
+          output = numberValue(word)
+        }
+      }
+      w = w + 1
+    }
+    out[n * 2] = inputs[0]
+    out[n * 2 + 1] = output
+    n = n + 1
+    if seen == 2 {
+      out[n * 2] = inputs[1]
+      out[n * 2 + 1] = output
+      n = n + 1
+    }
+    at = end + 1
+  }
+  if out[0] == MISSING {
+    out[0] = 0.0
+  }
+  if out[(n - 1) * 2] == MISSING {
+    out[(n - 1) * 2] = 1.0
+  }
+  let mut largest = out[0]
+  let mut i: usize = 1
+  while i < n {
+    if out[i * 2] != MISSING {
+      if out[i * 2] < largest {
+        out[i * 2] = largest
+      }
+      largest = out[i * 2]
+    }
+    i = i + 1
+  }
+  i = 1
+  while i < n {
+    if out[i * 2] == MISSING {
+      let mut j = i
+      while out[j * 2] == MISSING {
+        j = j + 1
+      }
+      let from = out[(i - 1) * 2]
+      let to = out[j * 2]
+      let gaps = usize.toF32(j - i + 1)
+      let mut k = i
+      while k < j {
+        out[k * 2] = from + (to - from) * usize.toF32(k - i + 1) / gaps
+        k = k + 1
+      }
+      i = j
+    }
+    i = i + 1
+  }
+}
+
+// The piecewise linear function through `count` points at `p`, extended past its ends along
+// its first and last segments.
+fn linearAt(points: &[f32], count: usize, p: f32) -> f32 {
+  // The last point whose input is at most p.
+  let mut a: usize = 0
+  let mut matched = false
+  let mut i: usize = 0
+  while i < count {
+    if points[i * 2] == p {
+      a = i
+      matched = true
+    } else if points[i * 2] < p {
+      a = i
+    }
+    i = i + 1
+  }
+  if matched {
+    return points[a * 2 + 1]
+  }
+  if p < points[0] {
+    a = 0
+  } else if a == count - 1 {
+    a = count - 2
+  }
+  let x0 = points[a * 2]
+  let y0 = points[a * 2 + 1]
+  let x1 = points[(a + 1) * 2]
+  let y1 = points[(a + 1) * 2 + 1]
+  if x1 == x0 {
+    return y1
+  }
+  return y0 + (y1 - y0) * (p - x0) / (x1 - x0)
 }
 
 /// The comma-separated items of `text`, trimmed, at most `LIST`. Returns the count.

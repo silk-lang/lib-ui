@@ -7,6 +7,7 @@
 //! [`apply`] writes the animated values over its style, and [`tick`] queues the records and
 //! restyles the nodes whose animations move.
 import engine { UiTree }
+import engine
 import style { Computed }
 import motion { Sample }
 import motion
@@ -120,6 +121,7 @@ pub effect fn define(tree: &mut UiTree<'_>, name: String, frames: List<Keyframe>
     while k < declared.length {
       if declared[k].property == CssProperty.AnimationTimingFunction {
         let text = run values.cssText(&declared[k].value)
+        run tree.easingStops.read(text.asSlice())
         match timing.easing(text.asSlice()) {
           Option<Easing>.Some { value } => {
             frame.easing = value
@@ -369,12 +371,16 @@ pub effect fn apply(tree: &UiTree<'_>, slot: u32, computed: &mut Computed) -> ()
 }
 
 // The value of `field` at frame `frame`: its declarations over the underlying style.
-fn frameValue(rule: &Rule, frame: usize, field: u32, base: &Computed) -> Sample {
+effect fn frameValue(rule: &Rule, frame: usize, field: u32, base: &Computed) -> Sample
+  ! OutOfMemoryError
+  ? &mut Allocator {
   let mut styled = base.*
   let declared = rule.frames.asSlice()[frame].declarations.asSlice()
   let mut i: usize = 0
   while i < declared.length {
-    styled.apply(&declared[i])
+    if !run engine.applyTransform(&mut styled, &declared[i]) {
+      styled.apply(&declared[i])
+    }
     i = i + 1
   }
   return motion.sample(&styled, field)
@@ -394,6 +400,7 @@ effect fn applyOne(tree: &UiTree<'_>, playing: &Playing, base: &Computed, now: f
   let rule = &tree.keyframes.asSlice()[at]
   let p = directed(&playing.spec, overall)
   let frames = rule.frames.asSlice()
+  let size = motion.boxSize(tree, playing.slot)
   let mut field: u32 = 0
   while field < motion.FIELDS {
     let bit = u64.shiftLeft(1, u32.toU64(field))
@@ -417,12 +424,12 @@ effect fn applyOne(tree: &UiTree<'_>, playing: &Playing, base: &Computed, now: f
       let from = if before == usize.MAX {
         motion.sample(base, field)
       } else {
-        frameValue(rule, before, field, base)
+        run frameValue(rule, before, field, base)
       }
       let to = if after == usize.MAX {
         motion.sample(base, field)
       } else {
-        frameValue(rule, after, field, base)
+        run frameValue(rule, after, field, base)
       }
       let easing = if before != usize.MAX && frames[before].eased {
         frames[before].easing
@@ -436,7 +443,7 @@ effect fn applyOne(tree: &UiTree<'_>, playing: &Playing, base: &Computed, now: f
       } else {
         f32.max(0.0, f32.min(1.0, (p - fromOffset) / span))
       }
-      motion.write(&mut computed, field, motion.mix(field, from, to, easing.at(t)))
+      motion.write(&mut computed, field, motion.mix(field, from, to, easing.at(t, &tree.easingStops), size[0], size[1]))
     }
     field = field + 1
   }

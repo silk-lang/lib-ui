@@ -10,7 +10,7 @@
 //! frame, which also carries an eased inherited value (a color) down to the children.
 import engine { UiTree }
 import style { Computed }
-import timing { Easing, TransitionLists, TransitionSpec, Span, LIST, ALL }
+import timing { EasingStops, Easing, TransitionLists, TransitionSpec, Span, LIST, ALL }
 import timing
 import node { NONE, Event, EventKind }
 import mutation {
@@ -19,6 +19,8 @@ import mutation {
   LISTEN_TRANSITION_END,
   LISTEN_TRANSITION_CANCEL
 }
+import transform
+import transform { TransformList, Op, Origin }
 import properties.computed { Fill, BoxShadow, Visibility, Dimension, DimensionKind, Display }
 import silk.collections.list { List }
 import silk.color.rgba { Rgba }
@@ -53,7 +55,14 @@ pub const FLEX_GROW: u32 = 40
 pub const FLEX_SHRINK: u32 = 41
 pub const VISIBILITY: u32 = 42
 pub const DISPLAY: u32 = 43
-pub const FIELDS: u32 = 44
+pub const TRANSFORM: u32 = 44
+pub const TRANSLATE: u32 = 45
+pub const ROTATE: u32 = 46
+pub const SCALE: u32 = 47
+pub const TRANSFORM_ORIGIN: u32 = 48
+pub const PERSPECTIVE: u32 = 49
+pub const PERSPECTIVE_ORIGIN: u32 = 50
+pub const FIELDS: u32 = 51
 
 
 /// The CSS longhand of field `field`, as transition records name it.
@@ -102,7 +111,14 @@ pub fn fieldName(field: u32) -> &'static [u8] {
     40 => b"flex-grow"
     41 => b"flex-shrink"
     42 => b"visibility"
-    _ => b"display"
+    43 => b"display"
+    44 => b"transform"
+    45 => b"translate"
+    46 => b"rotate"
+    47 => b"scale"
+    48 => b"transform-origin"
+    49 => b"perspective"
+    _ => b"perspective-origin"
   }
 }
 
@@ -361,6 +377,11 @@ pub union Sample {
   Shadow { pub value: BoxShadow, pub present: bool },
   Seen { pub value: Visibility },
   Shown { pub value: Display },
+  List { pub value: TransformList },
+  Function { pub value: Op },
+  Place { pub value: Origin },
+  /// A `perspective` distance, 0 for `none`.
+  Distance { pub value: f32 },
 }
 
 impl Copy for Sample {}
@@ -419,13 +440,21 @@ pub fn sample(computed: &Computed, field: u32) -> Sample {
     40 => Sample.Number { value: layout.flexGrow }
     41 => Sample.Number { value: layout.flexShrink }
     42 => Sample.Seen { value: computed.text.visibility }
-    _ => Sample.Shown { value: layout.display }
+    43 => Sample.Shown { value: layout.display }
+    44 => Sample.List { value: computed.transform.list }
+    45 => Sample.Function { value: computed.transform.translate }
+    46 => Sample.Function { value: computed.transform.rotate }
+    47 => Sample.Function { value: computed.transform.scale }
+    48 => Sample.Place { value: computed.transform.origin }
+    49 => Sample.Distance { value: computed.transform.perspective }
+    _ => Sample.Place { value: computed.transform.perspectiveOrigin }
   }
 }
 
 fn numberOf(of: Sample) -> f32 {
   return match of {
     Sample.Number { value } => value
+    Sample.Distance { value } => value
     _ => 0.0
   }
 }
@@ -549,6 +578,28 @@ pub fn write(computed: &mut Computed, field: u32, value: Sample) -> () {
       Sample.Shown { value: shown } => {
         computed.layout.display = shown
       }
+      Sample.List { value: list } => {
+        computed.transform.list = list
+      }
+      Sample.Function { value: op } => {
+        if field == TRANSLATE {
+          computed.transform.translate = op
+        } else if field == ROTATE {
+          computed.transform.rotate = op
+        } else {
+          computed.transform.scale = op
+        }
+      }
+      Sample.Place { value: origin } => {
+        if field == TRANSFORM_ORIGIN {
+          computed.transform.origin = origin
+        } else {
+          computed.transform.perspectiveOrigin = origin
+        }
+      }
+      Sample.Distance { value: distance } => {
+        computed.transform.perspective = distance
+      }
       _ => {}
     }
   }
@@ -606,6 +657,22 @@ pub fn same(a: Sample, b: Sample) -> bool {
       Sample.Shown { value: other } => &value == &other
       _ => false
     }
+    Sample.List { value } => match b {
+      Sample.List { value: other } => value.same(&other)
+      _ => false
+    }
+    Sample.Function { value } => match b {
+      Sample.Function { value: other } => value.same(&other)
+      _ => false
+    }
+    Sample.Place { value } => match b {
+      Sample.Place { value: other } => value.same(&other)
+      _ => false
+    }
+    Sample.Distance { value } => match b {
+      Sample.Distance { value: other } => value == other
+      _ => false
+    }
   }
 }
 
@@ -649,6 +716,10 @@ pub fn interpolable(a: Sample, b: Sample) -> bool {
       _ => false
     }
     Sample.Shown { .. } => false
+    Sample.Distance { value } => match b {
+      Sample.Distance { value: other } => value > 0.0 && other > 0.0
+      _ => false
+    }
     _ => true
   }
 }
@@ -819,8 +890,9 @@ fn mixSeen(a: Visibility, b: Visibility, p: f32) -> Visibility {
   return b
 }
 
-/// The value of field `field` at eased progress `p` from `a` to `b`.
-pub fn mix(field: u32, a: Sample, b: Sample, p: f32) -> Sample {
+/// The value of field `field` at eased progress `p` from `a` to `b`, on a `width` by `height`
+/// border box (what transform lists that ease through matrices resolve percentages against).
+pub fn mix(field: u32, a: Sample, b: Sample, p: f32, width: f32, height: f32) -> Sample {
   if !interpolable(a, b) {
     // `display` shows for the whole transition when either end is shown.
     if field == DISPLAY && !shown(a) {
@@ -862,6 +934,27 @@ pub fn mix(field: u32, a: Sample, b: Sample, p: f32) -> Sample {
     Sample.Shown { .. } => {
       return b
     }
+    Sample.List { value } => {
+      return match b {
+        Sample.List { value: other } => Sample.List { value: transform.mixLists(&value, &other, p, width, height) }
+        _ => b
+      }
+    }
+    Sample.Function { value } => {
+      return match b {
+        Sample.Function { value: other } => Sample.Function { value: transform.mixOp(value, other, p) }
+        _ => b
+      }
+    }
+    Sample.Place { value } => {
+      return match b {
+        Sample.Place { value: other } => Sample.Place { value: transform.mixOrigin(value, other, p) }
+        _ => b
+      }
+    }
+    Sample.Distance { value } => {
+      return Sample.Distance { value: lerp(value, numberOf(b), p) }
+    }
   }
 }
 
@@ -881,6 +974,9 @@ pub struct Running {
   pub start: f64,
   pub duration: f64,
   pub easing: Easing,
+  /// The border box size a `transform` list eases over.
+  pub width: f32,
+  pub height: f32,
   /// Whether its `transitionstart` was queued.
   pub started: bool,
 }
@@ -899,9 +995,9 @@ impl Running {
     return f64.toF32((now - self.start) / self.duration)
   }
 
-  /// The value at `now`.
-  pub fn at(self: &Self, now: f64) -> Sample {
-    return mix(self.field, self.from, self.to, self.easing.at(self.progress(now)))
+  /// The value at `now`, with `linear()` easings from `stops`.
+  pub fn at(self: &Self, now: f64, stops: &EasingStops) -> Sample {
+    return mix(self.field, self.from, self.to, self.easing.at(self.progress(now), stops), self.width, self.height)
   }
 
   /// Seconds of the active phase run by `now`, as `elapsedTime`.
@@ -1027,18 +1123,18 @@ pub effect fn transition(
       let old = tree.transitions.asSlice()[at]
       if same(old.to, after) {
         // Still heading where it was.
-        write(&mut computed, field, old.at(now))
+        write(&mut computed, field, old.at(now, &tree.easingStops))
         field = field + 1
         continue
       }
-      let current = old.at(now)
+      let current = old.at(now, &tree.easingStops)
       run cancel(&mut tree, at, now)
       if hasBefore && spec.duration + spec.delay > 0.0 && !same(current, after)
         && (spec.allowDiscrete || interpolable(current, after)) {
-        let mut next = startOf(slot, id, field, current, after, &spec, now)
+        let mut next = startOf(&tree.*, slot, id, field, current, after, &spec, now)
         if same(old.reversingFrom, after) {
           // Reversing a transition part way takes as long as the part it undoes.
-          let output = old.easing.at(old.progress(now))
+          let output = old.easing.at(old.progress(now), &tree.easingStops)
           let factor = f32.max(0.0, f32.min(1.0, f32.abs(output * old.factor + 1.0 - old.factor)))
           next.reversingFrom = old.to
           next.factor = factor
@@ -1055,7 +1151,7 @@ pub effect fn transition(
     if hasBefore && spec.duration + spec.delay > 0.0 {
       let previous = sample(before, field)
       if !same(previous, after) && (spec.allowDiscrete || interpolable(previous, after)) {
-        let next = startOf(slot, id, field, previous, after, &spec, now)
+        let next = startOf(&tree.*, slot, id, field, previous, after, &spec, now)
         run begin(&mut tree, next, now, &mut computed)
       }
     }
@@ -1066,7 +1162,31 @@ pub effect fn transition(
   }
 }
 
-fn startOf(slot: u32, id: u32, field: u32, from: Sample, to: Sample, spec: &TransitionSpec, now: f64) -> Running {
+/// The border box size of the node at `slot` in the last layout, zero before its first.
+pub fn boxSize(tree: &UiTree<'_>, slot: u32) -> [f32; 2] {
+  let source = tree.node(slot).css
+  if source >= tree.fragmentOf.length() {
+    return [0.0, 0.0]
+  }
+  let index = tree.fragmentOf.get(source)
+  if index >= tree.output.fragments.values.length() {
+    return [0.0, 0.0]
+  }
+  let f = tree.output.fragments.values.asSlice()[index]
+  return [f.size.width, f.size.height]
+}
+
+fn startOf(
+  tree: &UiTree<'_>,
+  slot: u32,
+  id: u32,
+  field: u32,
+  from: Sample,
+  to: Sample,
+  spec: &TransitionSpec,
+  now: f64,
+) -> Running {
+  let size: [f32; 2] = if field == TRANSFORM { boxSize(tree, slot) } else { [0.0, 0.0] }
   return Running {
     slot: slot,
     id: id,
@@ -1078,6 +1198,8 @@ fn startOf(slot: u32, id: u32, field: u32, from: Sample, to: Sample, spec: &Tran
     start: now + f32.toF64(spec.delay),
     duration: f32.toF64(spec.duration),
     easing: spec.easing,
+    width: size[0],
+    height: size[1],
     started: false,
   }
 }
@@ -1093,7 +1215,7 @@ effect fn begin(tree: &mut UiTree<'_>, next: Running, now: f64, computed: &mut C
     added.started = true
     run record(&mut tree, EventKind.TransitionStart, added.slot, added.field, added.elapsed(now))
   }
-  write(&mut computed, added.field, added.at(now))
+  write(&mut computed, added.field, added.at(now, &tree.easingStops))
   run tree.transitions.append(added)
 }
 

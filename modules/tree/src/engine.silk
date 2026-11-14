@@ -48,6 +48,7 @@ import motion { Running }
 import animation
 import animation { Rule, Playing }
 import timing
+import timing { EasingStops }
 import transform
 import style
 import properties.computed { Display as CssDisplay, DisplayOutside, DisplayInside }
@@ -355,7 +356,7 @@ fn defaultDisplay(kind: NodeKind) -> CssDisplay {
   }
 }
 
-effect fn applyAll(computed: &mut Computed, list: &List<Declaration>) -> ()
+effect fn applyAll(computed: &mut Computed, list: &List<Declaration>, stops: &mut EasingStops) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   let items = list.asSlice()
@@ -374,27 +375,40 @@ effect fn applyAll(computed: &mut Computed, list: &List<Declaration>) -> ()
     let which = transitionList(property)
     if which != NONE {
       let text = run values.cssText(&items[i].value)
+      run stops.read(text.asSlice())
       motion.declare(&mut computed.transition, which, text.asSlice())
     } else if animationList(property) != NONE {
       let text = run values.cssText(&items[i].value)
+      run stops.read(text.asSlice())
       timing.declareAnimation(&mut computed.animation, animationList(property), text.asSlice())
-    } else if transformProperty(property) != NONE {
-      let text = run values.cssText(&items[i].value)
-      let units = transform.Units {
-        fontSize: computed.text.size,
-        rootFontSize: 16.0,
-        viewportWidth: computed.viewportWidth,
-        viewportHeight: computed.viewportHeight,
-      }
-      transform.declare(&mut computed.transform, transformProperty(property), text.asSlice(), &units)
-      if !computed.usesViewport && style.viewportDependent(&items[i]) {
-        computed.usesViewport = true
-      }
+    } else if run applyTransform(&mut computed, &items[i]) {
     } else if property != CssProperty.FontSize {
       computed.apply(&items[i])
     }
     i = i + 1
   }
+}
+
+/// Applies `declaration` when it sets a transform property; false when it does not.
+pub effect fn applyTransform(computed: &mut Computed, declaration: &Declaration) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let which = transformProperty(declaration.property)
+  if which == NONE {
+    return false
+  }
+  let text = run values.cssText(&declaration.value)
+  let units = transform.Units {
+    fontSize: computed.text.size,
+    rootFontSize: 16.0,
+    viewportWidth: computed.viewportWidth,
+    viewportHeight: computed.viewportHeight,
+  }
+  transform.declare(&mut computed.transform, which, text.asSlice(), &units)
+  if !computed.usesViewport && style.viewportDependent(declaration) {
+    computed.usesViewport = true
+  }
+  return true
 }
 
 /// Which transform property `property` is (see `transform.declare`), or NONE.
@@ -638,6 +652,8 @@ pub struct UiTree<'a> {
   overrides: List<StyleOverride>,
   /// The running CSS transitions of every root (see `motion`).
   pub transitions: List<Running>,
+  /// The points of the `linear()` easings styles have used.
+  pub easingStops: EasingStops,
   /// The `@keyframes` rules the client defined (see `animation`).
   pub keyframes: List<Rule>,
   /// The CSS animations every root plays.
@@ -757,6 +773,7 @@ impl<'a> UiTree<'a> {
       empty: Scene.make(),
       overrides: List<StyleOverride>.make(),
       transitions: List<Running>.make(),
+      easingStops: EasingStops.make(),
       keyframes: List<Rule>.make(),
       animations: List<Playing>.make(),
     }
@@ -3020,6 +3037,7 @@ impl<'a> UiTree<'a> {
     if parent != NONE {
       inherited = self.node(parent).computed.text
     }
+    let mut stops = Intrinsic.replace(self.easingStops, EasingStops.make())
     let node = self.node(slot)
     let mut computed = Computed.inViewport(inherited, self.input.width, self.input.height)
 
@@ -3041,38 +3059,40 @@ impl<'a> UiTree<'a> {
       }
     }
     if node.transition.ownedByteLength() != 0 {
+      run stops.read(String.utf8Bytes(String.view(&node.transition)))
       motion.declare(&mut computed.transition, motion.SHORTHAND, String.utf8Bytes(String.view(&node.transition)))
     }
     if node.kind != NodeKind.Text && self.overrides.length() == 0 {
-      run applyAll(&mut computed, &node.base)
+      run applyAll(&mut computed, &node.base, &mut stops)
       if node.hovered {
-        run applyAll(&mut computed, &node.hover)
+        run applyAll(&mut computed, &node.hover, &mut stops)
       }
       if node.pressed {
-        run applyAll(&mut computed, &node.active)
+        run applyAll(&mut computed, &node.active, &mut stops)
       }
       if self.focused == slot {
-        run applyAll(&mut computed, &node.focus)
+        run applyAll(&mut computed, &node.focus, &mut stops)
         if self.focusVisible || node.kind == NodeKind.Input {
-          run applyAll(&mut computed, &node.focusVisible)
+          run applyAll(&mut computed, &node.focusVisible, &mut stops)
         }
       }
     } else if node.kind != NodeKind.Text {
-      run self.applyOverridden(&mut computed, node.id, StyleState.Base, &node.base)
+      run self.applyOverridden(&mut computed, node.id, StyleState.Base, &node.base, &mut stops)
       if node.hovered {
-        run self.applyOverridden(&mut computed, node.id, StyleState.Hover, &node.hover)
+        run self.applyOverridden(&mut computed, node.id, StyleState.Hover, &node.hover, &mut stops)
       }
       if node.pressed {
-        run self.applyOverridden(&mut computed, node.id, StyleState.Active, &node.active)
+        run self.applyOverridden(&mut computed, node.id, StyleState.Active, &node.active, &mut stops)
       }
       if self.focused == slot {
-        run self.applyOverridden(&mut computed, node.id, StyleState.Focus, &node.focus)
+        run self.applyOverridden(&mut computed, node.id, StyleState.Focus, &node.focus, &mut stops)
         if self.focusVisible || node.kind == NodeKind.Input {
           run self.applyOverridden(
             &mut computed,
             node.id,
             StyleState.FocusVisible,
             &node.focusVisible,
+            &mut stops,
           )
         }
       }
@@ -3087,9 +3107,10 @@ impl<'a> UiTree<'a> {
       if !hasBefore && rendered && node.starting.length() != 0 {
         // First shown: transitions start from the starting style over the new one.
         before = computed
-        run applyAll(&mut before, &node.starting)
+        run applyAll(&mut before, &node.starting, &mut stops)
         hasBefore = true
       }
+      self.easingStops = move stops
       let animated = run animation.update(&mut self, slot, rendered, &computed)
       run motion.transition(&mut self, slot, &before, hasBefore, &mut computed, animated)
       if animated != 0 {
@@ -3141,12 +3162,13 @@ impl<'a> UiTree<'a> {
     id: u32,
     state: StyleState,
     client: &List<Declaration>,
+    stops: &mut EasingStops,
   ) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
     let at = self.overrideIndex(id, state)
     if at == usize.MAX {
-      run applyAll(&mut computed, client)
+      run applyAll(&mut computed, client, &mut stops)
       return ()
     }
     let laid = &self.overrides.asSlice()[at]
@@ -3165,7 +3187,7 @@ impl<'a> UiTree<'a> {
       run css.set(&mut merged, &over[j])
       j = j + 1
     }
-    run applyAll(&mut computed, &merged)
+    run applyAll(&mut computed, &merged, &mut stops)
   }
 
   /// Whether node `id` has an override in `state`. Costs nothing while there are none.
