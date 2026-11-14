@@ -12,19 +12,28 @@ cd "$root"
 silk build --manifest-path "$here/silk.toml" \
   --profile-input "{\"target\":\"wasm32-unknown-unknown\",\"optimization\":\"$optimization\",\"debug\":false,\"stack-size\":\"256KiB\"}"
 
-# The same program for this machine draws the first view, which goes into index.html.
-silk build --manifest-path "$here/silk.toml"
-native="$(ls -d "$root"/build/llvm/*/debug | grep -v wasm32 | head -1)/ui-bench-web"
+# With PRERENDER=1 the same program, built for this machine, draws the first view, which goes
+# into index.html. It is off by default: the entries the benchmark compares this one with
+# render from script, so a first paint measured with it on is not theirs to compare.
+prerender="${PRERENDER:-0}"
+if [ "$prerender" = 1 ]; then
+  silk build --manifest-path "$here/silk.toml"
+  native="$(ls -d "$root"/build/llvm/*/debug | grep -v wasm32 | head -1)/ui-bench-web"
+fi
 
 profile=release
 [ "$optimization" = "size" ] && profile=release-size
 mkdir -p "$target/dist"
 cp "$here/page/package.json" "$here/page/package-lock.json" "$target/"
-# index.html up to the marker, the first view with nothing around it (white space would be
-# nodes the program did not make), and the rest.
+# index.html up to the marker, then the first view with nothing around it (white space would
+# be nodes the program did not make) or nothing at all, and the rest.
 before="$(sed '/<!--shell-->/,$d' "$here/page/index.html")"
 after="$(sed '1,/<!--shell-->/d' "$here/page/index.html")"
-{ printf '%s' "$before"; "$native" shell; printf '%s\n' "$after"; } > "$target/index.html"
+{
+  printf '%s' "$before"
+  if [ "$prerender" = 1 ]; then "$native" shell; fi
+  printf '%s\n' "$after"
+} > "$target/index.html"
 cp "$root/build/llvm/wasm32-unknown-unknown/$profile/ui-bench-web" "$target/dist/bench.wasm"
 cp "$root/modules/app/dom/js/silk-ui-dom.js" "$target/dist/silk-ui-dom.js"
 echo "Built $target"
