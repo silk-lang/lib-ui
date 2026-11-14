@@ -64,6 +64,9 @@ pub struct Dom {
   /// which only single nodes can.
   pub cloning: bool,
   templates: Templates,
+  /// Whether `out` holds the start of a render that `mutateEarly` wrote and `mutate` has yet
+  /// to end.
+  early: bool,
   width: f32,
   height: f32,
   waiting: List<Event>,
@@ -77,6 +80,7 @@ impl Dom {
       scratch: Bytes.make(),
       dropped: 0,
       cloning: false,
+      early: false,
       templates: Templates.make(),
       width: 0.0,
       height: 0.0,
@@ -129,16 +133,12 @@ impl Dom {
   }
 }
 
-impl Backend for Dom {
-  fn copiesBatches(self: &Self) -> bool {
-    return true
-  }
-
-  effect fn mutate(self: &mut Self, batch: List<Mutation>) -> ()
-    ! TreeError | OutOfMemoryError
+impl Dom {
+  /// Writes `list` to `out` in the wire format. A subtree is written as a copy of a template
+  /// only when all of it is in `list`.
+  effect fn write(self: &mut Self, list: &[Mutation]) -> ()
+    ! OutOfMemoryError
     ? &mut Allocator {
-    self.out.clear()
-    let list = batch.asSlice()
     let mut i: usize = 0
     while i < list.length {
       // The document shows the mounted element only: another root fails, and there is
@@ -171,9 +171,37 @@ impl Backend for Dom {
     if self.cloning {
       self.templates.endBatch()
     }
+  }
+}
+
+impl Backend for Dom {
+  fn copiesBatches(self: &Self) -> bool {
+    return true
+  }
+
+  effect fn mutate(self: &mut Self, batch: List<Mutation>) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if !self.early {
+      self.out.clear()
+    }
+    self.early = false
+    run self.write(batch.asSlice())
     if self.out.length() != 0 {
       apply(self.out.asSlice())
     }
+  }
+
+  effect fn mutateEarly(self: &mut Self, batch: &mut List<Mutation>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    // The bytes wait in `out` for the `mutate` that ends the render: the page gets one batch.
+    if !self.early {
+      self.out.clear()
+    }
+    self.early = true
+    run self.write(batch.asSlice())
+    batch.clear()
   }
 
   effect fn events(self: &mut Self, out: &mut List<Event>) -> ()

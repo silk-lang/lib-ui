@@ -33,7 +33,7 @@ This file is everything that is specific to the browser.
 | `root` | The element it draws in |
 | `imports` | Functions of the page that the program calls |
 | `fonts` | Font families by number: `{ 1: "Inter, sans-serif" }` is `css.fontFamily(1)` |
-| `images`, `icons` | Addresses by number, for `h.image(1)` and `h.icon(1)` |
+| `loaders` | Loaders for URL schemes of the app's own: `{ db: async (url) => blob }` for `h.image("db:42")` |
 | `base` | The path the site lives under, such as `"/docs"` |
 
 ## The manifest

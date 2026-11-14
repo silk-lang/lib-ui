@@ -46,6 +46,7 @@ struct Board {
 
 union Message {
   AddRows,
+  AddMany,
   AddGroup { kind: u32 },
   Select { id: u64 },
   Rename { id: u64 },
@@ -89,6 +90,14 @@ impl Program<Message, NoCommand> for Board {
       Message.AddRows => {
         let mut i: u32 = 0
         while i < 3 {
+          run model.rows.append(Row { id: model.nextId, label: run named("row ", model.nextId) })
+          model.nextId = model.nextId + 1
+          i = i + 1
+        }
+      }
+      Message.AddMany => {
+        let mut i: u32 = 0
+        while i < 500 {
           run model.rows.append(Row { id: model.nextId, label: run named("row ", model.nextId) })
           model.nextId = model.nextId + 1
           i = i + 1
@@ -538,6 +547,16 @@ impl Page {
 struct Watched {
   dom: Dom,
   page: Page,
+  /// Whether `Dom` gets the start of a long render early (`Backend.mutateEarly`).
+  parts: bool,
+  /// How many mutations it got that way.
+  early: usize,
+}
+
+impl Watched {
+  fn make(parts: bool) -> Watched {
+    return Watched { dom: Dom.make(), page: Page.make(), parts: parts, early: 0 }
+  }
 }
 
 impl Backend for Watched {
@@ -550,6 +569,15 @@ impl Backend for Watched {
     ? &mut Allocator {
     run Backend.mutate(&mut self.dom, move batch)
     run self.page.apply(self.dom.out.asSlice())
+  }
+
+  effect fn mutateEarly(self: &mut Self, batch: &mut List<Mutation>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.parts {
+      self.early = self.early + batch.length()
+      run Backend.mutateEarly(&mut self.dom, &mut batch)
+    }
   }
 
   effect fn events(self: &mut Self, out: &mut List<Event>) -> ()
@@ -622,8 +650,8 @@ effect fn plan() -> List<Message>
 effect fn copiesBody() -> ()
   ! AssertionError<'static> | TreeError | OutOfMemoryError
   ? &mut Allocator {
-  let mut plain = Watched { dom: Dom.make(), page: Page.make() }
-  let mut copied = Watched { dom: Dom.make(), page: Page.make() }
+  let mut plain = Watched.make(false)
+  let mut copied = Watched.make(true)
   let mut first = run program.make<Board, Message, NoCommand>()
   let mut second = run program.make<Board, Message, NoCommand>()
   run first.start(&mut plain, 0.0)
@@ -650,6 +678,77 @@ effect fn copiesBody() -> ()
   }
   run Testing.expect(plain.page.copies == 0, "no copies unless the page asked")
   run Testing.expect(copied.page.copies > 40, "rows and groups are copies")
+}
+
+/// A render with more mutations than `Dom` is given at once: the page is the one a single
+/// batch gives, with copies and without.
+effect fn partsBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut whole = Watched.make(false)
+  let mut parts = Watched.make(true)
+  let mut copied = Watched.make(true)
+  let mut first = run program.make<Board, Message, NoCommand>()
+  let mut second = run program.make<Board, Message, NoCommand>()
+  let mut third = run program.make<Board, Message, NoCommand>()
+  run first.start(&mut whole, 0.0)
+  run drain(&mut first, &mut whole)
+  run second.start(&mut parts, 0.0)
+  run drain(&mut second, &mut parts)
+  run third.start(&mut copied, 0.0)
+  run drain(&mut third, &mut copied)
+  copied.dom.cloning = true
+
+  let mut round: u32 = 0
+  while round < 3 {
+    // 500 rows, then changes to rows made in different parts of that render.
+    let mut step: u32 = 0
+    while step < 4 {
+      // Ids start at 3 (`init` makes two rows), and each round adds 500.
+      let last: u64 = 2 + 500 * (u32.toU64(round) + 1)
+      first.send(partStep(step, last))
+      run drain(&mut first, &mut whole)
+      second.send(partStep(step, last))
+      run drain(&mut second, &mut parts)
+      third.send(partStep(step, last))
+      run drain(&mut third, &mut copied)
+      run Testing.expect(!whole.page.broken && !parts.page.broken && !copied.page.broken, "every batch reads")
+      let mut one = Bytes.make()
+      run whole.page.show(whole.page.root, &mut one)
+      let mut two = Bytes.make()
+      run parts.page.show(parts.page.root, &mut two)
+      let mut three = Bytes.make()
+      run copied.page.show(copied.page.root, &mut three)
+      run Testing.expect(sameBytes(one.asSlice(), two.asSlice()), "parts give the same page")
+      run Testing.expect(sameBytes(one.asSlice(), three.asSlice()), "and so do parts with copies")
+      run Testing.expect(first.stats.mutations == second.stats.mutations, "the count has the parts")
+      step = step + 1
+    }
+    round = round + 1
+  }
+  run Testing.expect(whole.early == 0, "a backend that is not asked gets one batch")
+  run Testing.expect(parts.early >= 3 * 4096, "each long render went in parts")
+  run Testing.expect(copied.early >= 3 * 4096, "with copies too")
+  run Testing.expect(copied.page.copies > 1200, "nearly every row is a copy")
+}
+
+fn partStep(step: u32, last: u64) -> Message {
+  if step == 0 {
+    return Message.AddMany
+  }
+  if step == 1 {
+    return Message.Rename { id: last - 250 }
+  }
+  if step == 2 {
+    return Message.Select { id: last - 20 }
+  }
+  return Message.Remove { id: last - 400 }
+}
+
+test effect fn longRendersGoInParts() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run partsBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
 test effect fn copiedSubtreesGiveTheSamePage() -> ()
