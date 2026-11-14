@@ -244,6 +244,33 @@ test("aria-value* make one range, and it clears without a value", () => {
   ]);
 });
 
+test("ARIA relations name nodes by id, before and after the id is set", () => {
+  const field = createBox();
+  const title = createBox();
+  const hint = createBox();
+  mock.take();
+  field.setAttribute("aria-labelledby", "title missing");
+  title.setAttribute("id", "title");
+  field.setAttribute("ariaDescribedBy", "hint");
+  hint.setAttribute("id", "hint");
+  hint.setAttribute("id", "");
+  title.destroy();
+  field.setAttribute("aria-labelledby", null);
+  assert.deepEqual(mock.take(), [
+    ["attribute", field.id, "aria-labelledby", ""],
+    ["attribute", title.id, "id", "title"],
+    ["attribute", field.id, "aria-labelledby", String(title.id)],
+    ["attribute", field.id, "aria-describedby", ""],
+    ["attribute", hint.id, "id", "hint"],
+    ["attribute", field.id, "aria-describedby", String(hint.id)],
+    ["attribute", field.id, "aria-describedby", ""],
+    ["attribute", hint.id, "id", ""],
+    ["destroy", title.id],
+    ["attribute", field.id, "aria-labelledby", ""],
+    ["attribute", field.id, "aria-labelledby", ""],
+  ]);
+});
+
 test("an unknown role or ARIA name warns once and throws nothing", () => {
   const box = createBox();
   const warnings = [];
@@ -253,13 +280,13 @@ test("an unknown role or ARIA name warns once and throws nothing", () => {
     mock.take();
     box.setAttribute("role", "unknown");
     box.setAttribute("role", "unknown");
-    box.setAttribute("aria-describedby", "x");
+    box.setAttribute("aria-braillelabel", "x");
     assert.deepEqual(mock.take(), [
       ["attribute", box.id, "role", "unknown"],
       ["attribute", box.id, "role", "unknown"],
-      ["attribute", box.id, "aria-describedby", "x"],
+      ["attribute", box.id, "aria-braillelabel", "x"],
     ]);
-    assert.deepEqual(warnings, ["the tree has no role 'unknown': it is ignored", "the tree has no 'aria-describedby' yet: it is ignored"]);
+    assert.deepEqual(warnings, ["the tree has no role 'unknown': it is ignored", "the tree has no 'aria-braillelabel' yet: it is ignored"]);
   } finally {
     console.warn = warn;
   }

@@ -111,6 +111,9 @@ class IdTable {
   }
 }
 
+// ARIA attributes whose value is a list of node numbers, written as element ids.
+const RELATIONS = new Set(["aria-labelledby", "aria-describedby", "aria-controls", "aria-activedescendant"]);
+
 // `Mutation.DeclareFontFace` styles, by number.
 const FACE_STYLES = ["normal", "italic", "oblique"];
 
@@ -288,6 +291,10 @@ class Page {
 
     // Nodes destroyed in this batch, still to take out of the document (see `removeDestroyed`).
     this.destroyed = [];
+    // ARIA relations by source node: name to the target node numbers, written as element ids
+    // once the batch is in (see `relate`).
+    this.relations = new Map();
+    this.relating = false;
     // The subtrees the program made templates of (op 29), by number.
     this.templates = [];
     this.rootId = 0;
@@ -755,7 +762,32 @@ class Page {
       }
     }
     if (this.destroyed.length) this.removeDestroyed();
+    if (this.relating) this.relate();
     this.place();
+  }
+
+  // Writes each relation's targets as their element ids, giving a target without one
+  // `silk-<number>`. Targets made later in a batch, or renamed, are why this waits for its end.
+  relate() {
+    this.relating = false;
+    for (const [id, names] of this.relations) {
+      const node = this.nodes.values[id];
+      if (!node) {
+        this.relations.delete(id);
+        continue;
+      }
+      for (const [name, targets] of names) {
+        const refs = [];
+        for (const target of targets) {
+          const element = this.nodes.values[target];
+          if (!element?.setAttribute) continue;
+          if (!element.id) element.id = `silk-${target}`;
+          refs.push(element.id);
+        }
+        if (refs.length) node.setAttribute(name, refs.join(" "));
+        else node.removeAttribute(name);
+      }
+    }
   }
 
   // Inline properties the base look does not own (a cursor, a grid, a popup's place): set
@@ -1115,6 +1147,7 @@ class Page {
         if (this.nodes.get(id) === node) {
           this.nodes.delete(id);
           this.meta.delete(id);
+          if (this.relations.delete(id) || this.relations.size) this.relating = true;
         }
       }
       // Depth first, without recursion: down, then along, then up and along. The nodes inside
@@ -1283,10 +1316,24 @@ class Page {
       }
       case 19:
         set("id", r.text());
+        if (this.relations.size) this.relating = true;
         break;
       case 20: {
         const name = r.text();
-        set(name, r.text() || null);
+        const value = r.text();
+        if (!RELATIONS.has(name)) {
+          set(name, value || null);
+          break;
+        }
+        let names = this.relations.get(id);
+        if (value) {
+          if (!names) this.relations.set(id, (names = new Map()));
+          names.set(name, value.split(" ").map(Number));
+        } else {
+          names?.delete(name);
+          set(name, null);
+        }
+        this.relating = true;
         break;
       }
       case 21:

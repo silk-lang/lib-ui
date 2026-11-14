@@ -29,7 +29,7 @@ import ui_protocol.mutation {
   FACE_OBLIQUE
 }
 import ui_protocol.record { Event }
-import ui_protocol.aria { ariaText }
+import ui_protocol.aria { ariaText, isRelation, idsOf }
 import ui_protocol.root { RootEvent, RootEventKind, RootSupport }
 import silk.collections.bytes { Bytes }
 import silk.collections.list { List }
@@ -123,6 +123,8 @@ pub struct Html {
   base: String,
   /// `@import` rules of font stylesheets, which come first in a stylesheet.
   fontImports: Bytes,
+  /// Nodes an ARIA relation has named: each gets an element id, `silk-<id>` without its own.
+  targets: List<u32>,
   /// `@font-face` rules.
   fontFaces: Bytes,
 }
@@ -310,6 +312,7 @@ impl Html {
       icons: List<Named>.make(),
       base: String.make(),
       fontImports: Bytes.make(),
+      targets: List<u32>.make(),
       fontFaces: Bytes.make(),
     }
   }
@@ -717,6 +720,16 @@ impl Html {
           if i < node.arias.length() {
             drop node.arias.remove(i)
           }
+          if isRelation(String.utf8Bytes(name)) {
+            let ids = run idsOf(value.asSlice())
+            let mut k: usize = 0
+            while k < ids.length() {
+              if !contains(self.targets.asSlice(), ids.get(k)) {
+                run self.targets.append(ids.get(k))
+              }
+              k = k + 1
+            }
+          }
           run node.arias.append(Aria { name: name, value: move value })
         }
       }
@@ -836,8 +849,10 @@ impl Html {
     if node.className.ownedByteLength() != 0 {
       run attribute(&mut out, "class", node.className.ownedUtf8Bytes())
     }
-    if node.elementId.ownedByteLength() != 0 {
-      run attribute(&mut out, "id", node.elementId.ownedUtf8Bytes())
+    if node.elementId.ownedByteLength() != 0 || contains(self.targets.asSlice(), node.id) {
+      let mut name = Bytes.make()
+      run self.elementIdOf(&mut name, node.id)
+      run attribute(&mut out, "id", name.asSlice())
     }
     if node.tabSet {
       if node.tab == NOT_FOCUSABLE {
@@ -872,7 +887,23 @@ impl Html {
     let arias = node.arias.asSlice()
     let mut i: usize = 0
     while i < arias.length {
-      if arias[i].value.length() != 0 {
+      if arias[i].value.length() != 0 && isRelation(String.utf8Bytes(arias[i].name)) {
+        let ids = run idsOf(arias[i].value.asSlice())
+        let mut refs = Bytes.make()
+        let mut k: usize = 0
+        while k < ids.length() {
+          if self.slot(ids.get(k)) != 0 {
+            if refs.length() != 0 {
+              run refs.append(b" ")
+            }
+            run self.elementIdOf(&mut refs, ids.get(k))
+          }
+          k = k + 1
+        }
+        if refs.length() != 0 {
+          run attribute(&mut out, arias[i].name, refs.asSlice())
+        }
+      } else if arias[i].value.length() != 0 {
         run attribute(&mut out, arias[i].name, arias[i].value.asSlice())
       }
       i = i + 1
@@ -885,6 +916,17 @@ impl Html {
       run numberAttribute(&mut out, "aria-valuenow", node.value)
     }
     run self.style(&mut out, node)
+  }
+
+  /// Node `id`'s element id: its own, or `silk-<id>` as the DOM backend names it.
+  effect fn elementIdOf(self: &Self, out: &mut Bytes, id: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    let slot = self.slot(id)
+    if slot != 0 && self.nodes.asSlice()[slot - 1].elementId.ownedByteLength() != 0 {
+      run out.append(self.nodes.asSlice()[slot - 1].elementId.ownedUtf8Bytes())
+      return ()
+    }
+    run out.append(b"silk-")
+    run digits(&mut out, id)
   }
 
   effect fn element(self: &Self, out: &mut Bytes, id: u32) -> ()
@@ -1102,4 +1144,15 @@ fn hasScheme(url: &[u8]) -> bool {
 
 fn letter(c: u8) -> bool {
   return (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+}
+
+fn contains(ids: &[u32], id: u32) -> bool {
+  let mut i: usize = 0
+  while i < ids.length {
+    if ids[i] == id {
+      return true
+    }
+    i = i + 1
+  }
+  return false
 }
