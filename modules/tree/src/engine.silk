@@ -546,6 +546,9 @@ pub struct UiTree<'a> {
   pub root: u32,
   /// The focused slot, or NONE.
   pub focused: u32,
+  /// Where focus goes back to when it leaves a focus trap's subtree by removal: by trap id,
+  /// the id of the node focused before focus went into the trap, as a modal `<dialog>` does.
+  returns: List<FocusReturn>,
   families: Families,
   pub resources: Resources,
   /// `LoadImage`, `LoadIcon`, `LoadFontFace` and `LoadFontStylesheet` mutations waiting for
@@ -733,6 +736,7 @@ impl<'a> UiTree<'a> {
       slotOfCss: List<u32>.make(),
       root: NONE,
       focused: NONE,
+      returns: List<FocusReturn>.make(),
       families: Families.make(),
       resources: move resources,
       loads: List<Mutation>.make(),
@@ -1904,7 +1908,8 @@ impl<'a> UiTree<'a> {
     let detached = self.nodeMut(slot)
     detached.parent = NONE
     if self.focused != NONE && self.within(self.focused, slot) {
-      run self.focusSlot(NONE)
+      let to = self.returnSlot(self.focused, slot)
+      run self.moveFocus(to, false)
     }
     // No style depends on a sibling or a child, so the nodes left behind keep theirs. The
     // detached subtree is resolved when it is attached again.
@@ -1962,7 +1967,11 @@ impl<'a> UiTree<'a> {
       let id = node.id
       let nodeCss = node.css
       let inner = node.inner
+      let trap = node.focusTrap
       drop self.ids.remove(Word { value: u32.toU64(id) })
+      if trap {
+        self.forgetReturn(id)
+      }
       if self.overrides.length() != 0 {
         // The id may name another node later: its overrides go with this one.
         self.dropOverrides(id)
@@ -2707,12 +2716,85 @@ impl<'a> UiTree<'a> {
     node.content = node.content + 1
   }
 
+  /// Where focus goes when `focused` leaves the tree with the subtree at `removed`: the node
+  /// focused before focus entered the outermost trap being removed, when that node is still
+  /// in the root and outside the subtree; NONE (blur) otherwise.
+  fn returnSlot(self: &Self, focused: u32, removed: u32) -> u32 {
+    let mut target = NONE
+    let mut at = focused
+    while at != NONE {
+      if self.node(at).focusTrap {
+        let to = self.returnOf(self.node(at).id)
+        if to != NONE {
+          target = to
+        }
+      }
+      if at == removed {
+        break
+      }
+      at = self.node(at).parent
+    }
+    if target == NONE || !self.node(target).live || self.within(target, removed) || !self.within(target, self.root) {
+      return NONE
+    }
+    return target
+  }
+
+  fn returnOf(self: &Self, trap: u32) -> u32 {
+    let returns = self.returns.asSlice()
+    let mut i: usize = 0
+    while i < returns.length {
+      if returns[i].trap == trap {
+        return self.slotOf(returns[i].to)
+      }
+      i = i + 1
+    }
+    return NONE
+  }
+
+  fn forgetReturn(self: &mut Self, trap: u32) -> () {
+    let mut i: usize = 0
+    while i < self.returns.length() {
+      if self.returns.asSlice()[i].trap == trap {
+        drop self.returns.remove(i)
+        return ()
+      }
+      i = i + 1
+    }
+  }
+
+  /// Notes, for each focus trap that `slot` is in and `previous` is not, that focus came from
+  /// `previous`.
+  effect fn noteReturns(self: &mut Self, previous: u32, slot: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut at = slot
+    while at != NONE {
+      if self.node(at).focusTrap && !self.within(previous, at) {
+        let trap = self.node(at).id
+        let to = self.node(previous).id
+        self.forgetReturn(trap)
+        run self.returns.append(FocusReturn { trap: trap, to: to })
+      }
+      at = self.node(at).parent
+    }
+  }
+
   /// Moves focus to `slot` (NONE blurs), queueing focus and blur records for listeners.
   pub effect fn focusSlot(self: &mut Self, slot: u32) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
+    run self.moveFocus(slot, true)
+  }
+
+  /// [`focusSlot`], noting where focus came from when `note`: not when it goes back.
+  effect fn moveFocus(self: &mut Self, slot: u32, note: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
     if slot == self.focused {
       return ()
+    }
+    let before = self.focused
+    if note && before != NONE && slot != NONE {
+      run self.noteReturns(before, slot)
     }
     self.semanticRevision = self.semanticRevision + 1
     self.revision = self.revision + 1
@@ -3420,6 +3502,12 @@ impl<'a> UiTree<'a> {
     if node.transition.ownedByteLength() != 0 {
       run stops.read(String.utf8Bytes(String.view(&node.transition)))
       motion.declare(&mut computed.transition, motion.SHORTHAND, String.utf8Bytes(String.view(&node.transition)))
+    }
+    // The user agent's `:focus-visible { outline: auto }`, under every look the app sets, so
+    // `outline: none` or another outline in any of them replaces it, as in a browser.
+    if self.focused == slot && node.kind != NodeKind.Text && (self.focusVisible || node.kind == NodeKind.Input) {
+      computed.outline.auto = true
+      computed.outline.width = FOCUS_RING_WIDTH
     }
     if node.kind != NodeKind.Text && self.overrides.length() == 0 {
       run applyAll(&mut computed, &node.base, &mut stops)
@@ -4448,3 +4536,13 @@ fn writtenFamily(declaration: &Declaration) -> bool {
   return declaration.property == CssProperty.FontFamily && convert.number(&declaration.value).isNone()
 }
 
+/// The width of the default focus ring, as Chromium draws `outline: auto`.
+const FOCUS_RING_WIDTH: f32 = 2.0
+
+/// A focus trap and the node focus returns to when the trap is removed (see `returnSlot`).
+struct FocusReturn {
+  trap: u32,
+  to: u32,
+}
+
+impl Copy for FocusReturn {}
