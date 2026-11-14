@@ -1,0 +1,226 @@
+//! Logical properties apply as the physical ones their box's writing mode and direction map
+//! them to, `outline` draws a ring outside the border box, over the content, and line-clamp
+//! and text-overflow cut lines with an ellipsis.
+import ui_tree.css
+import ui_tree.css { px }
+import ui_fixtures.fixtures as fixtures
+import ui_tree.legacy { UiTree, TreeError, Batch, FrameInput, CpuSnapshot, NodeKind, WritingMode }
+import ui_tree.mutation { Declaration, Value, Keyword, CssProperty, Position, Direction, Overflow, WhiteSpace }
+import ui_tree.style { Computed, TextStyle }
+import vector.geometry_error { GeometryError }
+import vector.pixmap { Pixmap }
+import silk.color.rgba { Rgba }
+import silk.core.effect { Effect }
+import silk.num.u32
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+
+fn length(property: CssProperty, pixels: f32) -> Declaration {
+  return Declaration { property: property, value: px(pixels), important: false }
+}
+
+fn word(property: CssProperty, keyword: Keyword) -> Declaration {
+  return Declaration { property: property, value: Value.Keyword { value: keyword }, important: false }
+}
+
+fn styled(mode: WritingMode, direction: Direction, declarations: &[Declaration]) -> Computed {
+  let mut text = TextStyle.initial()
+  text.writingMode = mode
+  text.direction = direction
+  let mut computed = Computed.inheriting(text)
+  let mut i: usize = 0
+  while i < declarations.length {
+    computed.apply(&declarations[i])
+    i = i + 1
+  }
+  return computed
+}
+
+effect fn mappingBody() -> () ! AssertionError<'static> {
+  let sides = [
+    length(CssProperty.MarginInlineStart, 1.0),
+    length(CssProperty.PaddingBlockEnd, 2.0),
+    length(CssProperty.InsetInlineEnd, 3.0),
+    length(CssProperty.InlineSize, 50.0),
+    length(CssProperty.MaxBlockSize, 60.0),
+    length(CssProperty.BorderStartEndRadius, 4.0),
+    length(CssProperty.ScrollMarginBlockStart, 5.0),
+  ]
+  let ltr = styled(WritingMode.HorizontalTb, Direction.Ltr, &sides)
+  run Testing.expect(ltr.layout.margin.left.value == 1.0, "inline-start is left in ltr")
+  run Testing.expect(ltr.layout.padding.bottom.value == 2.0, "block-end is bottom")
+  run Testing.expect(ltr.layout.inset.right.value == 3.0, "inline-end is right in ltr")
+  run Testing.expect(ltr.layout.width.value == 50.0, "inline-size is the width")
+  run Testing.expect(ltr.layout.maxHeight.value == 60.0, "max-block-size is the max height")
+  run Testing.expect(ltr.paint.radii.topRight == 4.0, "start-end is the top right corner in ltr")
+  run Testing.expect(ltr.scroll.margin.top == 5.0, "scroll-margin-block-start is the top")
+
+  let rtl = styled(WritingMode.HorizontalTb, Direction.Rtl, &sides)
+  run Testing.expect(rtl.layout.margin.right.value == 1.0, "inline-start is right in rtl")
+  run Testing.expect(rtl.layout.inset.left.value == 3.0, "inline-end is left in rtl")
+  run Testing.expect(rtl.paint.radii.topLeft == 4.0, "start-end is the top left corner in rtl")
+
+  let vertical = styled(WritingMode.VerticalRl, Direction.Ltr, &sides)
+  run Testing.expect(vertical.layout.margin.top.value == 1.0, "inline-start is the top in vertical-rl")
+  run Testing.expect(vertical.layout.padding.left.value == 2.0, "block-end is the left in vertical-rl")
+  run Testing.expect(vertical.layout.height.value == 50.0, "inline-size is the height in vertical writing")
+  run Testing.expect(vertical.paint.radii.bottomRight == 4.0, "start-end is the bottom right corner in vertical-rl")
+  run Testing.expect(vertical.scroll.margin.right == 5.0, "block-start is the right in vertical-rl")
+
+  // A physical declaration after a logical one for the same side wins, as in the cascade.
+  let later = styled(
+    WritingMode.HorizontalTb,
+    Direction.Ltr,
+    &[length(CssProperty.MarginInlineStart, 1.0), length(CssProperty.MarginLeft, 9.0)],
+  )
+  run Testing.expect(later.layout.margin.left.value == 9.0, "the later declaration wins")
+
+  let ring = styled(
+    WritingMode.HorizontalTb,
+    Direction.Ltr,
+    &[word(CssProperty.OutlineStyle, Keyword.Auto), word(CssProperty.OverscrollBehaviorBlock, Keyword.Contain)],
+  )
+  run Testing.expect(ring.outline.drawn() && ring.outline.colorAuto, "outline: auto draws a focus ring")
+  run Testing.expect(!styled(WritingMode.HorizontalTb, Direction.Ltr, &[]).outline.drawn(), "no outline at first")
+}
+
+test effect fn logicalPropertiesMapToPhysicalSides() -> () ! AssertionError<'static> {
+  run mappingBody()
+}
+
+fn rgbAt(pixels: &Pixmap, x: usize, y: usize) -> Rgba<u8> {
+  let at = (y * u32.toUsize(pixels.width()) + x) * 4
+  let data = pixels.data()
+  return Rgba<u8> { r: data[at], g: data[at + 1], b: data[at + 2], a: data[at + 3] }
+}
+
+fn red(color: Rgba<u8>) -> bool {
+  return color.r > 200 && color.g < 60 && color.b < 60
+}
+
+fn white(color: Rgba<u8>) -> bool {
+  return color.r > 240 && color.g > 240 && color.b > 240
+}
+
+effect fn outlineBody() -> ()
+  ! AssertionError<'static> | TreeError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.style(1, &[css.width(px(64.0)), css.height(px(64.0)), css.backgroundColor(fixtures.rgb(0xffffff))])
+  run batch.box(
+    1,
+    2,
+    &[
+      css.position(Position.Absolute),
+      css.left(px(20.0)),
+      css.top(px(20.0)),
+      css.width(px(20.0)),
+      css.height(px(20.0)),
+      length(CssProperty.OutlineWidth, 4.0),
+      word(CssProperty.OutlineStyle, Keyword.Solid),
+      Declaration { property: CssProperty.OutlineColor, value: Value.Color { value: Rgba<f32> { r: 1.0, g: 0.0, b: 0.0, a: 1.0 } }, important: false },
+      length(CssProperty.OutlineOffset, 2.0),
+    ],
+  )
+  run tree.apply(run batch.take())
+  run tree.frame(FrameInput { width: 64.0, height: 64.0, scale: 1.0, time: 0.0 })
+  let mut snapshot = CpuSnapshot.make()
+  run snapshot.sync(&mut tree)
+  let pixels = run snapshot.render(&tree)
+  // The ring spans 14 to 18 left of the box (offset 2, width 4); the gap 18 to 20 stays clear.
+  run Testing.expect(red(rgbAt(&pixels, 16, 30)), "the outline draws outside the border box")
+  run Testing.expect(white(rgbAt(&pixels, 19, 30)), "outline-offset leaves a gap")
+  run Testing.expect(white(rgbAt(&pixels, 12, 30)), "the ring is as wide as outline-width")
+  run Testing.expect(red(rgbAt(&pixels, 30, 43)), "below the box too")
+}
+
+test effect fn outlineDrawsOutsideTheBorderBox() -> ()
+  ! AssertionError<'static> | TreeError | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run outlineBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// Glyphs drawn in all, and the text fragments with more glyphs than ASCII source characters:
+/// those that end in an ellipsis (one glyph, or three dots where the font has none).
+tuple Drawn(usize, usize)
+
+effect fn ellipsized(declarations: &[Declaration]) -> Drawn
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.style(1, declarations)
+  run batch.text(1, 2, "aaaa bbbb cccc dddd eeee ffff gggg")
+  run tree.apply(run batch.take())
+  run tree.frame(FrameInput { width: 200.0, height: 200.0, scale: 1.0, time: 0.0 })
+  let mut glyphs: usize = 0
+  let mut marked: usize = 0
+  let mut index: usize = 0
+  while index < tree.output.fragments.texts.length() {
+    let fragment = tree.output.fragments.texts.get(index)
+    let count = tree.provider.text.runGlyphs(fragment.shapeKey).length
+    let source = fragment.sourceEnd - fragment.sourceStart
+    glyphs = glyphs + count
+    if count > source {
+      marked = marked + 1
+    }
+    index = index + 1
+  }
+  return Drawn(glyphs, marked)
+}
+
+effect fn clampBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let all = run ellipsized(&[css.width(px(60.0)), css.fontSize(px(12.0))])
+  run Testing.expect(all.1 == 0, "no ellipsis by default")
+  let clamped = run ellipsized(
+    &[
+      css.width(px(60.0)),
+      css.fontSize(px(12.0)),
+      Declaration { property: CssProperty.MaxLines, value: css.number(2.0), important: false },
+    ],
+  )
+  run Testing.expect(clamped.0 < all.0 && clamped.1 == 0, "max-lines drops the lines after the second")
+  let ellipsis = run ellipsized(
+    &[
+      css.width(px(60.0)),
+      css.fontSize(px(12.0)),
+      Declaration { property: CssProperty.MaxLines, value: css.number(2.0), important: false },
+      word(CssProperty.BlockEllipsis, Keyword.Auto),
+    ],
+  )
+  run Testing.expect(ellipsis.1 == 1 && ellipsis.0 <= clamped.0 + 3, "block-ellipsis ends the last line in an ellipsis")
+  let overflow = run ellipsized(
+    &[
+      css.width(px(60.0)),
+      css.fontSize(px(12.0)),
+      css.whiteSpace(WhiteSpace.NoWrap),
+      css.overflowX(Overflow.Hidden),
+      word(CssProperty.TextOverflow, Keyword.Ellipsis),
+    ],
+  )
+  run Testing.expect(overflow.1 == 1 && overflow.0 < all.0, "text-overflow: ellipsis cuts the overflowing line")
+  let visible = run ellipsized(
+    &[
+      css.width(px(60.0)),
+      css.fontSize(px(12.0)),
+      css.whiteSpace(WhiteSpace.NoWrap),
+      word(CssProperty.TextOverflow, Keyword.Ellipsis),
+    ],
+  )
+  run Testing.expect(visible.1 == 0, "not while overflow is visible")
+}
+
+test effect fn lineClampAndTextOverflowEndInAnEllipsis() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run clampBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
