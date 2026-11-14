@@ -18,6 +18,7 @@ import properties.convert { Context }
 import properties.values { Unit }
 import properties.convert
 import properties.keyword_enums
+import paint_css
 import silk.collections.hash { Hash, HashSeed }
 import silk.color.rgba { Rgba }
 import silk.core.option { Option }
@@ -37,9 +38,26 @@ pub struct Computed {
   /// lays out as zero.
   pub paint: Paint,
   pub text: TextStyle,
+  pub effects: EffectState,
 }
 
 impl Copy for Computed {}
+
+/// What a node's style says about its paint effects, which `paint_css` reads into the node.
+pub struct EffectState {
+  /// Whether the node's looks set a property `paint_css` reads.
+  pub declared: bool,
+  /// `paint_css.Effects.hash` of the node's effects.
+  pub hash: u64,
+  /// The node whose `text-shadow` this one paints (it inherits), or `NO_SHADOW`.
+  pub shadowFrom: u32,
+  pub shadowHash: u64,
+}
+
+impl Copy for EffectState {}
+
+/// `EffectState.shadowFrom` when no `text-shadow` applies.
+pub const NO_SHADOW: u32 = 4294967295
 
 fn setDimension(target: &mut Dimension, value: &Value, context: &Context) -> () {
   match convert.dimension(value, context) {
@@ -105,7 +123,12 @@ fn setColor(target: &mut Rgba<f32>, value: &Value) -> bool {
 impl Computed {
   /// The initial style of an element whose parent's text style is `text`.
   pub fn inheriting(text: TextStyle) -> Computed {
-    return Computed { layout: CssStyle.make(), paint: Paint.initial(), text: text }
+    return Computed {
+      layout: CssStyle.make(),
+      paint: Paint.initial(),
+      text: text,
+      effects: EffectState { declared: false, hash: 0, shadowFrom: NO_SHADOW, shadowHash: 0 },
+    }
   }
 
   /// Applies one declaration. A value that does not fit its property is ignored, as an
@@ -156,6 +179,10 @@ impl Computed {
   }
 
   fn set(self: &mut Self, property: CssProperty, value: &Value) -> () {
+    if paint_css.handles(property) {
+      self.effects.declared = true
+      return ()
+    }
     let context = Context {
       fontSize: self.text.size,
       rootFontSize: 16.0,
@@ -869,28 +896,6 @@ impl Computed {
           Option.None => {}
         }
       }
-      CssProperty.BackgroundImage => {
-        match convert.fill(value) {
-          Option.Some { value: found } => {
-            match found {
-              Fill.Gradient { .. } => {
-                self.paint.background = found
-              }
-              Fill.None => {
-                // `none` removes a gradient and leaves a background color alone.
-                match self.paint.background {
-                  Fill.Gradient { .. } => {
-                    self.paint.background = Fill.None
-                  }
-                  _ => {}
-                }
-              }
-              _ => {}
-            }
-          }
-          Option.None => {}
-        }
-      }
       CssProperty.BorderTopColor => {
         drop setColor(&mut self.paint.borderColor, value)
       }
@@ -1092,6 +1097,7 @@ impl Computed {
     }
     h = floatHash(h, self.paint.opacity)
     h = floatHash(h, self.paint.backdropBlur)
+    h = Hash.combine(Hash.combine(h, self.effects.hash), self.effects.shadowHash)
     h = colorHash(h, self.text.color)
     h = Hash.combine(h, decorationIndex(self.text.decoration))
     h = colorHash(h, self.text.lineColor())
