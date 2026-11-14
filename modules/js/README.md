@@ -50,7 +50,8 @@ mount(createBox({ width: 400, height: 300 }, button));
   `disabled`, `label`, `testId`, `placeholder`, `multiline`, `readOnly`, `checked`,
   `selected`, `expanded`, `focusTrap`, `href`, `cursor`, `transition`). A name the tree does
   not have throws a `TypeError`. `cursor` takes the CSS keywords (`pointer`, `text`, `grab`,
-  `not-allowed` and the resize ones).
+  `not-allowed` and the resize ones); the `cursor` style property does the same, and a node
+  without one shows its nearest ancestor's.
 - **Accessibility.** `role` and `aria-*` work as in the DOM, as `aria-label` or `ariaLabel`.
   `role` takes the first word that names a role the tree has (`"switch checkbox"`), and
   `aria-label`, `aria-checked`, `aria-selected`, `aria-expanded` and `aria-valuemin`,
