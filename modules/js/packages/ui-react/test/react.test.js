@@ -88,3 +88,32 @@ test("flushSync commits a state change made outside an event", () => {
   flushSync(() => set("b"));
   assert.equal(label.data, "b");
 });
+
+test("a rich input defines its marks and atoms and keeps the document it is given", () => {
+  let input;
+  const bold = { fontWeight: 700 };
+  const chip = { paddingLeft: 4 };
+  function Composer() {
+    const [document, setDocument] = useState({ text: "hi", marks: [{ start: 0, end: 2, marks: ["bold"] }], atoms: [] });
+    return h("richinput", {
+      ref: (node) => (input = node),
+      marks: { bold },
+      atoms: { mention: chip },
+      document,
+      // Only the first three characters are accepted.
+      onInput: (event) => setDocument(event.document.text.length > 3 ? document : event.document),
+    });
+  }
+  mock.take();
+  createRoot(createBox()).render(h(Composer));
+  const calls = mock.take();
+  assert.equal(find(calls, "mark").length, 1);
+  assert.equal(find(calls, "atomStyle").length, 1);
+  assert.deepEqual(find(calls, "richText")[0].slice(2), ["hi", "0,2,1;", ""]);
+  globalThis.__ui.dispatch(11, input.id, 3, 3, 0, 1, 0, "hi!", "insertText", "0,3,1;", "");
+  assert.equal(input.document.text, "hi!");
+  assert.equal(find(mock.take(), "richText").length, 0);
+  globalThis.__ui.dispatch(11, input.id, 4, 4, 0, 1, 0, "hi!?", "insertText", "0,4,1;", "");
+  assert.equal(input.document.text, "hi!");
+  assert.deepEqual(input.document.marks, [{ start: 0, end: 3, marks: ["bold"] }]);
+});

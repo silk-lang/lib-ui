@@ -1,0 +1,351 @@
+//! Rich inputs: marks and atoms over the value of the editor fixture's multiline input,
+//! edited by keys, typing, `Format` and `InsertAtom`, with undo, the records they queue, and
+//! what they draw.
+import ui_fixtures.fixtures as fixtures
+import ui_fixtures.fixtures { rgb }
+import ui_tree.css
+import ui_tree.css { px }
+import ui_tree.legacy {
+  UiTree,
+  TreeError,
+  Batch,
+  FrameInput,
+  Event,
+  EventKind,
+  Input,
+  HostRequest,
+  Keymap,
+  MarkSpan,
+  Atom,
+  MOD_SHIFT,
+  MOD_CONTROL,
+  CpuSnapshot
+}
+import vector.geometry_error { GeometryError }
+import vector.pixmap { Pixmap }
+import font_collection.lib { FontCollection }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+import silk.num.usize
+
+const BOLD: u32 = 1
+
+const NOTES: u32 = fixtures.NOTES
+
+/// "Hi ", a mention atom, " there": the atom's object character is bytes 3 to 6.
+const VALUE: string<'static> = "Hi \u{fffc} there"
+
+fn viewport() -> FrameInput {
+  return fixtures.viewport(3)
+}
+
+effect fn mention() -> Atom
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return Atom { kind: 0, label: run String.copy("@ada"), data: run String.copy("user-1") }
+}
+
+/// The editor fixture with its notes input made rich: bold "Hi" and a mention, focused.
+effect fn editor(collection: &FontCollection) -> UiTree<'_>
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut tree = run UiTree.make(collection)
+  tree.keymap = Keymap.Standard
+  let mut batch = Batch.make()
+  run fixtures.editor(&mut batch)
+  run batch.defineMark(NOTES, 0, &[css.fontWeight(700.0)])
+  run batch.defineAtom(
+    NOTES,
+    0,
+    &[css.backgroundColor(rgb(0xdbeafe)), css.paddingLeft(px(4.0)), css.paddingRight(px(4.0))],
+  )
+  let atom = run mention()
+  run batch.richText(NOTES, VALUE, &[MarkSpan { start: 0, end: 2, marks: BOLD }], &[move atom])
+  run batch.focus(NOTES)
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  return move tree
+}
+
+effect fn drain(tree: &mut UiTree<'_>) -> List<Event>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut events = List<Event>.make()
+  run tree.takeEvents(&mut events)
+  return move events
+}
+
+effect fn key(tree: &mut UiTree<'_>, name: string, modifiers: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run tree.dispatch(
+    Input.KeyDown {
+      key: run String.copy(name),
+      code: run String.copy(name),
+      modifiers: modifiers,
+      repeat: false,
+    },
+  )
+  run tree.dispatch(
+    Input.KeyUp { key: run String.copy(name), code: run String.copy(name), modifiers: modifiers },
+  )
+}
+
+effect fn typeText(tree: &mut UiTree<'_>, text: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run tree.dispatch(Input.TextInput { text: run String.copy(text) })
+}
+
+effect fn select(tree: &mut UiTree<'_>, anchor: usize, focus: usize) -> ()
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut batch = Batch.make()
+  run batch.select(NOTES, anchor, focus)
+  run tree.apply(run batch.take())
+}
+
+effect fn format(tree: &mut UiTree<'_>, on: bool) -> ()
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut batch = Batch.make()
+  run batch.format(NOTES, 0, on)
+  run tree.apply(run batch.take())
+}
+
+fn value<'t>(tree: &'t UiTree<'_>) -> string<'t> {
+  return String.view(&tree.node(tree.slotOf(NOTES)).text)
+}
+
+fn selected(tree: &UiTree<'_>, anchor: usize, focus: usize) -> bool {
+  let s = tree.selection(NOTES)
+  return s.x == anchor && s.y == focus
+}
+
+fn spans<'t>(tree: &'t UiTree<'_>) -> &'t List<MarkSpan> {
+  return &tree.node(tree.slotOf(NOTES)).edit().marks
+}
+
+/// Whether the marks are exactly `expected`, as (start, end, marks) triples.
+fn marked(tree: &UiTree<'_>, expected: &[MarkSpan]) -> bool {
+  let list = spans(tree).asSlice()
+  if list.length != expected.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < list.length {
+    if list[i].start != expected[i].start || list[i].end != expected[i].end
+      || list[i].marks != expected[i].marks {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn atomCount(tree: &UiTree<'_>) -> usize {
+  return tree.node(tree.slotOf(NOTES)).edit().atoms.length()
+}
+
+/// The last `Input` record.
+fn lastInput(events: &List<Event>) -> usize {
+  let values = events.asSlice()
+  let mut i = values.length
+  while i > 0 {
+    i = i - 1
+    if values[i].kind == EventKind.Input {
+      return i
+    }
+  }
+  return usize.MAX
+}
+
+fn span(start: usize, end: usize) -> MarkSpan {
+  return MarkSpan { start: start, end: end, marks: BOLD }
+}
+
+// Editing.
+
+effect fn editingBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run editor(&collection)
+  run Testing.expect(value(&tree) == VALUE, "the rich value is the input's text")
+  run Testing.expect(selected(&tree, 12, 12), "a new value puts the caret at the end")
+
+  // The caret steps over an atom as one character, and Backspace takes it whole.
+  run select(&mut tree, 6, 6)
+  run key(&mut tree, "ArrowLeft", 0)
+  run Testing.expect(selected(&tree, 3, 3), "left over the atom")
+  run key(&mut tree, "ArrowRight", MOD_SHIFT)
+  run Testing.expect(selected(&tree, 3, 6), "Shift+Right selects it")
+  run select(&mut tree, 6, 6)
+  drop run drain(&mut tree)
+  run key(&mut tree, "Backspace", 0)
+  run Testing.expect(value(&tree) == "Hi  there" && atomCount(&tree) == 0, "Backspace deletes it")
+  let deleted = run drain(&mut tree)
+  let at = lastInput(&deleted)
+  run Testing.expect(
+    at != usize.MAX && deleted.asSlice()[at].atoms.length() == 0
+      && deleted.asSlice()[at].marks.length() == 1,
+    "the input record carries the atoms and marks",
+  )
+  run key(&mut tree, "z", MOD_CONTROL)
+  run Testing.expect(value(&tree) == VALUE && atomCount(&tree) == 1, "undo brings it back")
+  run Testing.expect(
+    String.view(&tree.node(tree.slotOf(NOTES)).edit().atoms.asSlice()[0].label) == "@ada",
+    "with its label",
+  )
+
+  // Typed text takes the marks of the text before it.
+  run select(&mut tree, 2, 2)
+  run typeText(&mut tree, "!")
+  run Testing.expect(marked(&tree, &[span(0, 3)]), "typing after bold text is bold")
+  run select(&mut tree, 4, 4)
+  run typeText(&mut tree, "x")
+  run Testing.expect(marked(&tree, &[span(0, 3)]), "typing after plain text is plain")
+  run key(&mut tree, "z", MOD_CONTROL)
+  run key(&mut tree, "z", MOD_CONTROL)
+  run Testing.expect(value(&tree) == VALUE && marked(&tree, &[span(0, 2)]), "undo restores the marks")
+
+  // Format over a selection, then at a caret for the next typed text.
+  run select(&mut tree, 7, 12)
+  drop run drain(&mut tree)
+  run format(&mut tree, true)
+  run Testing.expect(marked(&tree, &[span(0, 2), span(7, 12)]), "Format marks the selection")
+  let formatted = run drain(&mut tree)
+  let f = lastInput(&formatted)
+  run Testing.expect(
+    f != usize.MAX && String.view(&formatted.asSlice()[f].inputType) == "format",
+    "and queues a format record",
+  )
+  run select(&mut tree, 12, 12)
+  run format(&mut tree, false)
+  run Testing.expect(tree.node(tree.slotOf(NOTES)).edit().activeMarks(value(&tree)) == 0, "a caret format sets the typing marks")
+  run typeText(&mut tree, "!")
+  run Testing.expect(marked(&tree, &[span(0, 2), span(7, 12)]), "so the next text is plain")
+  run key(&mut tree, "z", MOD_CONTROL)
+  run key(&mut tree, "z", MOD_CONTROL)
+  run Testing.expect(marked(&tree, &[span(0, 2)]), "undo takes the format back")
+
+  // An atom replaces what was typed for it; typed object characters are dropped.
+  run select(&mut tree, 12, 12)
+  run typeText(&mut tree, " @gr\u{fffc}")
+  run Testing.expect(value(&tree) == "Hi \u{fffc} there @gr", "typing never makes an atom")
+  let mut batch = Batch.make()
+  run batch.insertAtom(
+    NOTES,
+    13,
+    16,
+    Atom { kind: 0, label: run String.copy("@grace"), data: run String.copy("user-2") },
+  )
+  run tree.apply(run batch.take())
+  run Testing.expect(
+    value(&tree) == "Hi \u{fffc} there \u{fffc}" && atomCount(&tree) == 2 && selected(&tree, 16, 16),
+    "InsertAtom replaces the range and puts the caret after it",
+  )
+  run Testing.expect(
+    String.view(&tree.node(tree.slotOf(NOTES)).edit().atoms.asSlice()[1].data) == "user-2",
+    "the atoms stay in value order",
+  )
+
+  // Copy writes atoms as their labels.
+  run key(&mut tree, "a", MOD_CONTROL)
+  run key(&mut tree, "c", MOD_CONTROL)
+  let mut requests = List<HostRequest>.make()
+  run tree.takeRequests(&mut requests)
+  let copied = match &requests.asSlice()[0] {
+    HostRequest.WriteClipboard { text } => String.view(&text) == "Hi @ada there @grace"
+    _ => false
+  }
+  run Testing.expect(copied, "copy writes the labels")
+}
+
+test effect fn richInputsEditMarksAndAtoms() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run editingBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Layout and paint.
+
+fn samePixels(a: &Pixmap, b: &Pixmap) -> bool {
+  let x = a.data()
+  let y = b.data()
+  if a.width() != b.width() || a.height() != b.height() || x.length != y.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < x.length {
+    if x[i] != y[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+effect fn render(tree: &mut UiTree<'_>) -> Pixmap
+  ! GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut snapshot = CpuSnapshot.make()
+  run snapshot.sync(&mut tree)
+  return run snapshot.render(&tree)
+}
+
+effect fn layoutBody() -> ()
+  ! AssertionError<'static> | TreeError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run editor(&collection)
+
+  // The atom is a box of its own: the caret after it is past its label and padding.
+  run select(&mut tree, 3, 3)
+  run tree.frame(viewport())
+  let before = run tree.caretRect(NOTES)
+  run select(&mut tree, 6, 6)
+  run tree.frame(viewport())
+  let after = run tree.caretRect(NOTES)
+  run Testing.expect(after.xMin - before.xMin > 30.0, "the caret skips the atom's width")
+  run Testing.expect(after.yMin == before.yMin, "on the same line")
+
+  // Edits drawn frame by frame match a fresh input with the same rich value.
+  run select(&mut tree, 12, 12)
+  run tree.frame(viewport())
+  run typeText(&mut tree, "!")
+  run tree.frame(viewport())
+  run select(&mut tree, 7, 13)
+  run format(&mut tree, true)
+  run tree.frame(viewport())
+  let edited = run render(&mut tree)
+  let mut fresh = run editor(&collection)
+  let mut batch = Batch.make()
+  let atom = run mention()
+  run batch.richText(NOTES, "Hi \u{fffc} there!", &[span(0, 2), span(7, 13)], &[move atom])
+  run batch.select(NOTES, 7, 13)
+  run fresh.apply(run batch.take())
+  run fresh.frame(viewport())
+  let expected = run render(&mut fresh)
+  run Testing.expect(samePixels(&edited, &expected), "edited pixels match a fresh tree")
+
+  // Marks change what is drawn.
+  let mut plain = run editor(&collection)
+  let mut unmark = Batch.make()
+  let other = run mention()
+  run unmark.richText(NOTES, "Hi \u{fffc} there!", &[], &[move other])
+  run unmark.select(NOTES, 7, 13)
+  run plain.apply(run unmark.take())
+  run plain.frame(viewport())
+  let unmarked = run render(&mut plain)
+  run Testing.expect(!samePixels(&unmarked, &expected), "bold runs draw differently")
+}
+
+test effect fn richInputsLayOutRunsAndAtoms() -> ()
+  ! AssertionError<'static> | TreeError | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run layoutBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}

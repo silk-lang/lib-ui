@@ -14,6 +14,7 @@ export function installMock() {
     "attribute", "focus", "remove", "destroy", "scrollTo", "select", "fontFamily", "open",
     "defineIcon", "source", "release",
     "keyframe", "keyframes",
+    "richText", "mark", "atomStyle", "format", "insertAtom",
   ]) {
     native[name] = record(name);
   }

@@ -368,6 +368,14 @@ boundary on the nearest line by the same positions. Nothing is shaped outside la
   input scrolls so the caret is in view (a single-line input scrolls back to its start on
   blur). `CaretColor`, `SelectionColor` and `PlaceholderColor` style it. `caretRect(id)` and
   `selection(id)` report it, and `describe` writes `selection=`, `preedit=` and the input flags.
+- **Rich inputs.** `SetRichText` gives an input a document: its value, mark spans (`MarkSpan`,
+  bits over value bytes) and atoms (`Atom { kind, label, data }`), each atom one `OBJECT`
+  (U+FFFC) in the value, so offsets stay value bytes and the caret steps over an atom as one
+  unit. `DefineMark` and `DefineAtom` give a mark bit or atom kind its declarations. The input
+  lays out one inline run per stretch of equal marks and an inline-block per atom (its
+  label), under the input's own text style. Typing takes the marks before the caret (or the
+  ones `Format` set at the caret), `Format` over a range and `InsertAtom` are undo steps with
+  their own `inputType`, and `Input` records carry the marks, atoms and active marks.
 
 ## Frames
 

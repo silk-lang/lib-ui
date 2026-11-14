@@ -2,7 +2,7 @@
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
-import silk.text.string { String }
+import silk.text.string { String, InvalidUtf8 }
 import silk.num.u32
 import silk.num.f32
 import ui_tree.lib { Tree, ProtocolError, Input, EventKind, EventRecord, Event, Motion }
@@ -133,7 +133,7 @@ pub fn numbersOf(event: &Event) -> [f64; 5] {
     Event.Wheel { pointer, deltaX, deltaY } => [f32.toF64(pointer.x), f32.toF64(pointer.y), u32.toF64(pointer.modifiers.toBits()), f32.toF64(deltaX), f32.toF64(deltaY)]
     Event.KeyDown { key, repeat } => [0.0, 0.0, u32.toF64(key.modifiers.toBits()), if repeat { 1.0 } else { 0.0 }, 0.0]
     Event.KeyUp { key } => [0.0, 0.0, u32.toF64(key.modifiers.toBits()), 0.0, 0.0]
-    Event.Input { change } => [usize.toF64(change.selection.anchor), usize.toF64(change.selection.focus), 0.0, 0.0, 0.0]
+    Event.Input { change } => [usize.toF64(change.selection.anchor), usize.toF64(change.selection.focus), 0.0, u32.toF64(change.activeMarks), 0.0]
     Event.Scroll { x, y } => [f32.toF64(x), f32.toF64(y), 0.0, 0.0, 0.0]
     Event.Layout { bounds } => [f32.toF64(bounds.xMin), f32.toF64(bounds.yMin), 0.0, f32.toF64(bounds.xMax - bounds.xMin), f32.toF64(bounds.yMax - bounds.yMin)]
     _ => [0.0, 0.0, 0.0, 0.0, 0.0]
@@ -172,6 +172,73 @@ pub effect fn secondString(event: &Event) -> Value ! OutOfMemoryError ? &mut All
     Event.KeyUp { key } => run jsString(String.view(&key.code))
     Event.Input { change } => run jsString(change.inputType.name())
     _ => Value.immediate(ValueBits.Undefined)
+  }
+}
+
+/// The third and fourth strings of an event: a rich input's marks and atoms, packed as
+/// `__ui.richText` takes them (empty for every other record).
+pub effect fn thirdString(event: &Event) -> Value ! OutOfMemoryError ? &mut Allocator {
+  let packed = run richStrings(event)
+  return run jsString(String.view(&packed[0]))
+}
+
+pub effect fn fourthString(event: &Event) -> Value ! OutOfMemoryError ? &mut Allocator {
+  let packed = run richStrings(event)
+  return run jsString(String.view(&packed[1]))
+}
+
+effect fn richStrings(event: &Event) -> [String; 2] ! OutOfMemoryError ? &mut Allocator {
+  let mut marks = String.make()
+  let mut atoms = String.make()
+  match &event.* {
+    Event.Input { change } => {
+      let spans = change.marks.asSlice()
+      let mut i: usize = 0
+      while i < spans.length {
+        run appendNumber(&mut marks, spans[i].start)
+        run marks.append(",")
+        run appendNumber(&mut marks, spans[i].end)
+        run marks.append(",")
+        run appendNumber(&mut marks, u32.toUsize(spans[i].marks))
+        run marks.append(";")
+        i = i + 1
+      }
+      let list = change.atoms.asSlice()
+      i = 0
+      while i < list.length {
+        run appendNumber(&mut atoms, u32.toUsize(list[i].kind))
+        run atoms.append("\u{0}")
+        run atoms.append(String.view(&list[i].label))
+        run atoms.append("\u{0}")
+        run atoms.append(String.view(&list[i].data))
+        run atoms.append("\u{0}")
+        i = i + 1
+      }
+    }
+    _ => ()
+  }
+  return [move marks, move atoms]
+}
+
+effect fn appendNumber(out: &mut String, value: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut digits: [u8; 20] = [0; 20]
+  let mut count: usize = 0
+  let mut rest = value
+  while true {
+    digits[count] = usize.toU8(rest % 10) + 48
+    count = count + 1
+    rest = rest / 10
+    if rest == 0 {
+      break
+    }
+  }
+  while count > 0 {
+    count = count - 1
+    let one: [u8; 1] = [digits[count]]
+    match String.fromUtf8(&one) {
+      Result<string, InvalidUtf8>.Success { value: text } => { run out.append(text) }
+      Result<string, InvalidUtf8>.Failure { .. } => ()
+    }
   }
 }
 
@@ -268,7 +335,8 @@ effect fn evaluateIn<'a, 'm>(engine: &mut Engine<'m, Bridge>, realm: Realm<'a>, 
   return run evaluation.evaluate(&mut engine, memory, realm, source, name, mode)
 }
 
-/// Calls `__ui.dispatch(kind, target, a, b, modifiers, d, e, first, second)` when the
+/// Calls `__ui.dispatch(kind, target, a, b, modifiers, d, e, first, second, third, fourth)`
+/// (the last two are a rich input's packed marks and atoms) when the
 /// application installed one (see `numbersOf` for the numbers and `firstString` for the
 /// strings), and says whether it returned true, which means a handler prevented the default.
 effect fn dispatchIn<'a, 'm>(engine: &mut Engine<'m, Bridge>, realm: Realm<'a>, record: &EventRecord) -> bool ! OutOfMemoryError | JsException ? &mut Allocator {
@@ -279,6 +347,8 @@ effect fn dispatchIn<'a, 'm>(engine: &mut Engine<'m, Bridge>, realm: Realm<'a>, 
     let numbers = numbersOf(&record.event)
     let first = run firstString(&record.event)
     let second = run secondString(&record.event)
+    let third = run thirdString(&record.event)
+    let fourth = run fourthString(&record.event)
     let arguments = [
       ValueBits.number(u32.toF64(kindCode(record.event.kind()))),
       ValueBits.number(u32.toF64(record.target.raw())),
@@ -289,6 +359,8 @@ effect fn dispatchIn<'a, 'm>(engine: &mut Engine<'m, Bridge>, realm: Realm<'a>, 
       ValueBits.number(numbers[4]),
       first.borrow().view(),
       second.borrow().view(),
+      third.borrow().view(),
+      fourth.borrow().view(),
     ]
     let called = run Effect.result(promise.call(&mut engine, realm, function.borrow(), ui.borrow(), &arguments))
     match move called {
