@@ -7,7 +7,7 @@ import svg_render.environment { noHostStyles }
 import svg_core.structure { Options as StructureOptions }
 import svg_core.resources { DataOnly, Limits as ResourceLimits, ProcessingMode, Resolver }
 import svg_core.url { Url, UrlError }
-import svg_css.colors { Color as CssColor, Context as ColorContext }
+import svg_css.colors { Color as CssColor, Context as ColorContext, SystemColor, systemIndex }
 import svg_css.media_features { Environment as MediaEnvironment }
 import svg_css.tokens { Limits }
 import svg_fonts.database { FontDatabase }
@@ -19,8 +19,13 @@ import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.color.rgba { Rgba }
+import silk.num.f32
 import silk.num.u32
 import silk.text.string { String }
+
+/// The size an icon is rendered at to tell whether it paints only with `currentColor`.
+const CLASSIFY_SIZE: u32 = 32
 
 /// A resource that could not be defined: the data did not decode or parse.
 pub struct ResourceError {}
@@ -204,14 +209,17 @@ struct IconHost {
   fonts: FontDatabase,
 }
 
-fn hostOf<'h>(host: &'h IconHost) -> Environment<'h, 'h> {
-  let black = CssColor.srgb(0.0, 0.0, 0.0, 1.0)
+/// The icon host with `current` as `currentColor` and as CanvasText, the initial `color` of an
+/// SVG's root, so that an icon inherits the node's color as an inline `<svg>` does.
+fn hostOf<'h>(host: &'h IconHost, current: CssColor) -> Environment<'h, 'h> {
+  let mut system = [CssColor.srgb(0.0, 0.0, 0.0, 1.0); 19]
+  system[systemIndex(SystemColor.CanvasText)] = current
   let mut structure = StructureOptions.defaults()
   structure.policy.mode = ProcessingMode.Animated
   return Environment<'h, 'h> {
     base: &host.base,
     media: MediaEnvironment.headless(300.0, 150.0),
-    colors: ColorContext.make(black, [black; 19]),
+    colors: ColorContext.make(current, system),
     fontFamily: b"sans-serif",
     systemFonts: [b"16px sans-serif"; 6],
     cssLimits: Limits.make(),
@@ -251,13 +259,23 @@ effect fn iconTile(
   icon: IconId,
   width: u32,
   height: u32,
+  style: IconStyle,
   time: f64,
 ) -> Option<AtlasTile>
   ! RenderError | AtlasError | OutOfMemoryError
   ? &mut Resolver | &mut Allocator {
   return Option<AtlasTile>.Some {
-    value: run icons.icon(&mut atlas, host, icon, width, height, IconStyle.Mask, time),
+    value: run icons.icon(&mut atlas, host, icon, width, height, style, time),
   }
+}
+
+effect fn unclassified(error: RenderError) -> bool {
+  drop error
+  return true
+}
+
+fn black() -> CssColor {
+  return CssColor.srgb(0.0, 0.0, 0.0, 1.0)
 }
 
 effect fn imageTile(images: &mut ImageStore, atlas: &mut Atlas, id: ImageId) -> Option<AtlasTile>
@@ -362,15 +380,24 @@ impl Resources {
   pub effect fn defineIcon(self: &mut Self, atlas: &mut Atlas, id: u32, data: &[u8]) -> ()
     ! ResourceError | OutOfMemoryError
     ? &mut Allocator {
-    let host = hostOf(&self.host)
+    let host = hostOf(&self.host, black())
+    let white = hostOf(&self.host, CssColor.srgb(1.0, 1.0, 1.0, 1.0))
     let icon = run Effect.catch<RenderError>(self.icons.register(data, &host), badSvg)
       |> Effect.provideMut<Resolver>(&mut self.resolver)
+    drop run Effect.catch<RenderError>(
+      self.icons.classify(icon, CLASSIFY_SIZE, &host, &white),
+      unclassified,
+    )
+      |> Effect.provideMut<Resolver>(&mut self.resolver)
     drop host
+    drop white
     run self.release(&mut atlas, id)
     run self.put(id, Resource.Icon { icon: icon })
   }
 
-  /// The mask tile of `icon` at `width` x `height` device pixels, or None when it cannot be drawn.
+  /// The tile of `icon` at `width` x `height` device pixels, or None when it cannot be drawn:
+  /// a mask to tint with `color` when the icon paints only with `currentColor`
+  /// ([`Resources.tinted`]), otherwise its own colors with `color` as `currentColor`.
   pub effect fn iconTile(
     self: &mut Self,
     atlas: &mut Atlas,
@@ -378,17 +405,34 @@ impl Resources {
     width: u32,
     height: u32,
     time: f64,
+    color: Rgba<f32>,
   ) -> Option<AtlasTile>
     ! OutOfMemoryError
     ? &mut Allocator {
-    let host = hostOf(&self.host)
+    let tinted = self.icons.tinted(icon)
+    let current = if tinted {
+      black()
+    } else {
+      CssColor.srgb(f32.toF64(color.r), f32.toF64(color.g), f32.toF64(color.b), f32.toF64(color.a))
+    }
+    let style = if tinted {
+      IconStyle.Mask
+    } else {
+      IconStyle.Color
+    }
+    let host = hostOf(&self.host, current)
     let tile = run Effect.catchAll(
-      iconTile(&mut self.icons, &mut atlas, &host, icon, width, height, time),
+      iconTile(&mut self.icons, &mut atlas, &host, icon, width, height, style, time),
       noTile,
     )
       |> Effect.provideMut<Resolver>(&mut self.resolver)
     drop host
     return tile
+  }
+
+  /// Whether `icon` paints only with `currentColor`, so its tile is a mask to tint.
+  pub fn tinted(self: &Self, icon: IconId) -> bool {
+    return self.icons.tinted(icon)
   }
 
   /// The tile of `image`, or None when it cannot be placed.

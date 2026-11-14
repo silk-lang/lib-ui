@@ -337,6 +337,55 @@ effect fn decorate(
   }
 }
 
+/// The color of an `outline: auto` focus ring whose color is `auto`.
+const FOCUS_RING: Rgba<f32> = Rgba<f32> { r: 0.0, g: 0.373, b: 0.8, a: 1.0 }
+
+/// Draws the outline of a box with computed style `c` around `rect`, its border box (CSS
+/// pixels), over what the box painted. It follows the border radii, grown by its distance.
+effect fn paintOutline(p: &mut Painter<'_, '_>, c: &Computed, rect: Rect<f32>, mask: ContentMask) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let o = c.outline
+  if !o.drawn() {
+    return ()
+  }
+  let color = if !o.colorAuto {
+    o.color
+  } else if o.auto {
+    FOCUS_RING
+  } else {
+    c.text.color
+  }
+  if color.a <= 0.0 {
+    return ()
+  }
+  let s = p.scale
+  let reach = o.offset + o.width
+  let outer = grow(rect, reach)
+  if outer.xMax <= outer.xMin || outer.yMax <= outer.yMin {
+    return ()
+  }
+  let radius = fn(r: f32) -> f32 {
+    return if r > 0.0 { f32.max(0.0, r + reach) * s } else { 0.0 }
+  }
+  let mut quad = Quad.fill(device(outer, s), mask, Background.solid(Rgba<f32> { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }))
+  quad.cornerRadii = Corners<f32>.new(
+    radius(c.paint.radii.topLeft),
+    radius(c.paint.radii.topRight),
+    radius(c.paint.radii.bottomRight),
+    radius(c.paint.radii.bottomLeft),
+  )
+  let w = o.width * s
+  quad.borderWidths = Insets<f32> { top: w, right: w, bottom: w, left: w }
+  quad.borderColor = color
+  quad.borderStyle = if !o.auto && o.style == StyleBorder.Dashed {
+    BorderStyle.Dashed
+  } else {
+    BorderStyle.Solid
+  }
+  drop run p.scene.quad(quad)
+}
+
 effect fn noGlyph<E>(error: E) -> Option<RasterGlyph> {
   drop error
   return Option<RasterGlyph>.None
@@ -785,16 +834,28 @@ effect fn paintContent(p: &mut Painter<'_, '_>, slot: u32, f: &Fragment, mask: C
             f32.toU32(w),
             f32.toU32(h),
             p.time,
+            c.text.color,
           )
           if let Option<AtlasTile>.Some { value: placed } = tile {
-            drop run p.scene.glyph(
-              GlyphSprite {
-                bounds: Rect<f32>.new(x, y, x + w, y + h),
-                mask: mask,
-                tile: placed,
-                color: c.text.color,
-              },
-            )
+            let bounds = Rect<f32>.new(x, y, x + w, y + h)
+            if p.resources.tinted(icon) {
+              drop run p.scene.glyph(
+                GlyphSprite { bounds: bounds, mask: mask, tile: placed, color: c.text.color },
+              )
+            } else {
+              drop run p.scene.image(
+                ImageSprite {
+                  quarterTurns: 0,
+                  clipBounds: bounds,
+                  bounds: bounds,
+                  mask: mask,
+                  tile: placed,
+                  opacity: 1.0,
+                  cornerRadii: Corners<f32>.zero(),
+                  grayscale: false,
+                },
+              )
+            }
           }
         }
       }
@@ -1014,6 +1075,9 @@ fn ownInk(
     let offset = f32.max(f32.abs(c.paint.shadow.offsetX), f32.abs(c.paint.shadow.offsetY))
     reach = reach + offset + f32.max(c.paint.shadow.spread, 0.0) + 2.0 * c.paint.shadow.blur
   }
+  if c.outline.drawn() {
+    reach = f32.max(reach, 2.0 + c.outline.offset + c.outline.width)
+  }
   return grow(box, reach)
 }
 
@@ -1229,6 +1293,12 @@ effect fn paintFragmentIn(p: &mut Painter<'_, '_>, index: usize, mask: ContentMa
         }
       }
       run paintChildren(&mut p, index, mask)
+      if slot != NONE && !f.nonpainting {
+        let c = p.nodes.asSlice()[u32.toUsize(slot)].computed
+        if c.text.visible {
+          run paintOutline(&mut p, &c, borderBox(&f), mask)
+        }
+      }
     }
     FragmentKind.Box => {
       run paintBox(&mut p, index, f, mask)
@@ -1380,6 +1450,9 @@ effect fn paintBox(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Con
     }
     if c.clips() && c.text.visible {
       run paintThumbs(&mut p, slot, &c, &f, mask)
+    }
+    if c.text.visible && !f.nonpainting {
+      run paintOutline(&mut p, &c, borderBox(&f), mask)
     }
     if layered {
       run p.scene.popLayer()

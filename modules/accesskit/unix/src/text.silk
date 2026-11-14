@@ -1,0 +1,403 @@
+//! Text for AT-SPI: offsets as Unicode scalar indices, ranges by granularity, and the text
+//! attributes a screen reader asks about.
+//!
+//! Ported from AccessKit (`accesskit_atspi_common/src/util.rs` and `text_attributes.rs`),
+//! Copyright 2022 The AccessKit Authors, under the MIT or Apache-2.0 license.
+import accesskit.lib { Color, Rect, TextAlign, TextDecorationStyle }
+import accesskit_consumer.lib { NodeRef, Position, Range }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f64
+import silk.num.i32
+import silk.num.i64
+import silk.num.f32
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+import silk.text.string { String }
+
+/// `value` in decimal.
+pub effect fn decimalU64(value: u64) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut digits: [u8; 20] = [0; 20]
+  let mut count: usize = 0
+  let mut rest = value
+  if rest == 0 {
+    digits[0] = 48
+    count = 1
+  }
+  while rest > 0 {
+    digits[count] = u64.wrappingToU8(rest % 10) + 48
+    count = count + 1
+    rest = rest / 10
+  }
+  let mut out = String.make()
+  while count > 0 {
+    count = count - 1
+    let one: [u8; 1] = [digits[count]]
+    run out.append(String.fromUtf8(&one).unwrapOr(""))
+  }
+  return move out
+}
+
+/// `value` in decimal, with a minus sign when negative.
+pub effect fn decimalI64(value: i64) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if value < 0 {
+    let mut out = run String.copy("-")
+    let digits = run decimalU64(i64.wrappingToU64(0 - value))
+    run out.append(digits.view())
+    return move out
+  }
+  return run decimalU64(i64.wrappingToU64(value))
+}
+
+/// `value` the way Rust prints a float: no fraction when it is whole, otherwise up to six
+/// fraction digits without trailing zeros.
+pub effect fn number(value: f64) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let negative = value < 0.0
+  let magnitude = if negative {
+    0.0 - value
+  } else {
+    value
+  }
+  let scaled = f64.round(magnitude * 1000000.0)
+  let whole = f64.toU64(f64.floor(scaled / 1000000.0))
+  let mut fraction = f64.toU64(scaled - u64.toF64(whole) * 1000000.0)
+  let mut out = if negative {
+    run String.copy("-")
+  } else {
+    String.make()
+  }
+  let digits = run decimalU64(whole)
+  run out.append(digits.view())
+  if fraction > 0 {
+    let mut places: usize = 6
+    while fraction % 10 == 0 {
+      fraction = fraction / 10
+      places = places - 1
+    }
+    let tail = run decimalU64(fraction)
+    run out.append(".")
+    let mut pad = places - String.byteLength(tail.view())
+    while pad > 0 {
+      run out.append("0")
+      pad = pad - 1
+    }
+    run out.append(tail.view())
+  }
+  return move out
+}
+
+/// The granularity of `GetStringAtOffset`.
+pub enum Granularity {
+  Char,
+  Word,
+  Sentence,
+  Line,
+  Paragraph,
+}
+
+impl Granularity {
+  pub fn of(value: u32) -> Option<Granularity> {
+    return match value {
+      0 => Option.Some { value: Granularity.Char }
+      1 => Option.Some { value: Granularity.Word }
+      2 => Option.Some { value: Granularity.Sentence }
+      3 => Option.Some { value: Granularity.Line }
+      4 => Option.Some { value: Granularity.Paragraph }
+      _ => Option.None
+    }
+  }
+}
+
+/// The text position at scalar `offset` of `node`.
+pub fn positionAt<'a>(node: &NodeRef<'a>, offset: i32) -> Option<Position<'a>> {
+  if offset < 0 {
+    return Option.None
+  }
+  return node.textPositionFromGlobalUsvIndex(i32.wrappingToUsize(offset))
+}
+
+/// `position` as an AT-SPI offset.
+pub fn offsetOf(position: &Position<'_>) -> i32 {
+  return usize.wrappingToI32(position.toGlobalUsvIndex())
+}
+
+/// The range of `granularity` around `offset`, or none when the offset is out of range or the
+/// granularity is a sentence, which AccessKit does not support.
+pub fn rangeAt<'a>(node: &NodeRef<'a>, offset: i32, granularity: Granularity) -> Option<Range<'a>> {
+  let at = match positionAt(node, offset) {
+    Option.Some { value } => value
+    Option.None => {
+      return Option.None
+    }
+  }
+  let start = match granularity {
+    Granularity.Char => at
+    Granularity.Line => if at.isLineStart() {
+      at
+    } else {
+      at.backwardToLineStart()
+    }
+    Granularity.Paragraph => if at.isParagraphStart() {
+      at
+    } else {
+      at.backwardToParagraphStart()
+    }
+    Granularity.Word => if at.isWordStart() {
+      at
+    } else {
+      at.backwardToWordStart()
+    }
+    Granularity.Sentence => {
+      return Option.None
+    }
+  }
+  let end = match granularity {
+    Granularity.Char => if at.isDocumentEnd() {
+      at
+    } else {
+      start.forwardToCharacterEnd()
+    }
+    Granularity.Line => start.forwardToLineEnd()
+    Granularity.Paragraph => start.forwardToParagraphEnd()
+    Granularity.Word => start.forwardToWordEnd()
+    Granularity.Sentence => {
+      return Option.None
+    }
+  }
+  let mut range = start.toDegenerateRange()
+  range.setEnd(end)
+  return Option.Some { value: range }
+}
+
+/// The range from `start` to `end`, where an `end` of -1 means the end of the text.
+pub fn rangeBetween<'a>(node: &NodeRef<'a>, start: i32, end: i32) -> Option<Range<'a>> {
+  let from = match positionAt(node, start) {
+    Option.Some { value } => value
+    Option.None => {
+      return Option.None
+    }
+  }
+  let to = if end == -1 {
+    node.documentRange().endPosition()
+  } else {
+    match positionAt(node, end) {
+      Option.Some { value } => value
+      Option.None => {
+        return Option.None
+      }
+    }
+  }
+  let mut range = from.toDegenerateRange()
+  range.setEnd(to)
+  return Option.Some { value: range }
+}
+
+/// The union of the boxes of `range`, in the coordinates of its node.
+pub effect fn rangeBounds(range: &Range<'_>) -> Option<Rect>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut boxes = List<Rect>.make()
+  run range.boundingBoxes(&mut boxes)
+  if boxes.length() == 0 {
+    return Option.None
+  }
+  let mut out = boxes.get(0)
+  let mut i: usize = 1
+  while i < boxes.length() {
+    let next = boxes.get(i)
+    out = Rect.make(
+      f64.min(out.x0, next.x0),
+      f64.min(out.y0, next.y0),
+      f64.max(out.x1, next.x1),
+      f64.max(out.y1, next.y1),
+    )
+    i = i + 1
+  }
+  return Option.Some { value: out }
+}
+
+/// The names of the text attributes, in the order [`attributeOf`] numbers them.
+pub fn ATTRIBUTE_NAMES() -> [string<'static>; 10] {
+  return [
+    "family-name",
+    "size",
+    "weight",
+    "style",
+    "strikethrough",
+    "underline",
+    "bg-color",
+    "fg-color",
+    "language",
+    "justification",
+  ]
+}
+
+/// The index of attribute `name` in [`ATTRIBUTE_NAMES`].
+pub fn attributeIndex(name: string) -> Option<usize> {
+  let names = ATTRIBUTE_NAMES()
+  let mut i: usize = 0
+  while i < names.length {
+    if names[i] == name {
+      return Option.Some { value: i }
+    }
+    i = i + 1
+  }
+  return Option.None
+}
+
+effect fn colorText(color: Color) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = run decimalU64(u8.toU64(color.red))
+  run out.append(",")
+  let green = run decimalU64(u8.toU64(color.green))
+  run out.append(green.view())
+  run out.append(",")
+  let blue = run decimalU64(u8.toU64(color.blue))
+  run out.append(blue.view())
+  return move out
+}
+
+/// Text attribute `index` of the text run or text node `node`.
+pub effect fn attributeOf(node: &NodeRef<'_>, index: usize) -> Option<String>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match index {
+    0 => match node.fontFamily() {
+      Option.Some { value } => Option.Some { value: run String.copy(value) }
+      Option.None => Option.None
+    }
+    1 => match node.fontSize() {
+      Option.Some { value } => Option.Some { value: run number(f32.toF64(value)) }
+      Option.None => Option.None
+    }
+    2 => match node.fontWeight() {
+      Option.Some { value } => Option.Some { value: run number(f32.toF64(value)) }
+      Option.None => Option.None
+    }
+    3 => if node.isItalic() {
+      Option.Some { value: run String.copy("italic") }
+    } else {
+      Option.None
+    }
+    4 => match node.strikethrough() {
+      Option.Some { value: _ } => Option.Some { value: run String.copy("true") }
+      Option.None => Option.None
+    }
+    5 => match node.underline() {
+      Option.Some { value } => Option.Some {
+        value: run String.copy(
+          if value.style == TextDecorationStyle.Double {
+            "double"
+          } else {
+            "single"
+          },
+        ),
+      }
+      Option.None => Option.None
+    }
+    6 => match node.backgroundColor() {
+      Option.Some { value } => Option.Some { value: run colorText(value) }
+      Option.None => Option.None
+    }
+    7 => match node.foregroundColor() {
+      Option.Some { value } => Option.Some { value: run colorText(value) }
+      Option.None => Option.None
+    }
+    8 => match node.language() {
+      Option.Some { value } => Option.Some { value: run String.copy(value) }
+      Option.None => Option.None
+    }
+    9 => match node.textAlign() {
+      Option.Some { value } => Option.Some {
+        value: run String.copy(
+          match value {
+            TextAlign.Left => "left"
+            TextAlign.Center => "center"
+            TextAlign.Right => "right"
+            TextAlign.Justify => "fill"
+          },
+        ),
+      }
+      Option.None => Option.None
+    }
+    _ => Option.None
+  }
+}
+
+/// One text attribute and its value.
+pub struct TextAttribute {
+  pub name: string<'static>,
+  pub value: String,
+}
+
+/// The attributes at `offset` of `node` that differ from its defaults (or all of them with
+/// `includeDefaults`), and where the run of text sharing them starts and ends.
+pub effect fn attributeRun(
+  node: &NodeRef<'_>,
+  offset: i32,
+  includeDefaults: bool,
+  out: &mut List<TextAttribute>,
+) -> Option<[i32; 2]>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let at = match positionAt(node, offset) {
+    Option.Some { value } => value
+    Option.None => {
+      return Option.None
+    }
+  }
+  let names = ATTRIBUTE_NAMES()
+  let piece = at.innerNode()
+  let mut i: usize = 0
+  while i < names.length {
+    match run attributeOf(&piece, i) {
+      Option.Some { value } => {
+        let mut keep = true
+        if !includeDefaults {
+          match run attributeOf(node, i) {
+            Option.Some { value: fallback } => {
+              keep = fallback.view() != value.view()
+            }
+            Option.None => {}
+          }
+        }
+        if keep {
+          run out.append(TextAttribute { name: names[i], value: move value })
+        }
+      }
+      Option.None => {}
+    }
+    i = i + 1
+  }
+  let start = if at.isFormatStart() {
+    at
+  } else {
+    at.backwardToFormatStart()
+  }
+  let end = at.forwardToFormatEnd()
+  return Option.Some { value: [offsetOf(&start), offsetOf(&end)] }
+}
+
+/// The attributes of `node` itself.
+pub effect fn defaultAttributes(node: &NodeRef<'_>, out: &mut List<TextAttribute>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let names = ATTRIBUTE_NAMES()
+  let mut i: usize = 0
+  while i < names.length {
+    match run attributeOf(node, i) {
+      Option.Some { value } => run out.append(TextAttribute { name: names[i], value: move value })
+      Option.None => {}
+    }
+    i = i + 1
+  }
+}

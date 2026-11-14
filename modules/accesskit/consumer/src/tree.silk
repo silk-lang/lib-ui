@@ -1,0 +1,1261 @@
+//! The consumer's copy of an accessibility tree: it applies [`TreeUpdate`]s, checks them, and
+//! reports what changed to a [`ChangeHandler`].
+//!
+//! Ported from AccessKit (`accesskit_consumer/src/tree.rs`), Copyright 2021 The AccessKit
+//! Authors, under the MIT or Apache-2.0 license (see LICENSE-MIT and LICENSE-APACHE).
+import accesskit.lib { Node, NodeId, TreeId, TreeInfo, TreeUpdate, NodeEntry, Role }
+import node { NodeRef }
+import silk.collections.hash { Hash, HashKey, HashSeed }
+import silk.collections.hash_map { HashMap }
+import silk.collections.hash_set { HashSet }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.u64
+import silk.num.u8
+import silk.num.usize
+
+/// The index the consumer gives each tree it has seen: 0 for the main tree.
+pub struct TreeIndex {
+  pub value: u32,
+}
+
+impl Copy for TreeIndex {}
+
+/// A node id that is unique across the main tree and its grafted subtrees.
+pub struct FullNodeId {
+  pub tree: TreeIndex,
+  pub local: NodeId,
+}
+
+impl Copy for FullNodeId {}
+
+impl FullNodeId {
+  pub fn make(local: NodeId, tree: TreeIndex) -> FullNodeId {
+    return FullNodeId { tree: tree, local: local }
+  }
+
+  /// The node `local` in the same tree as this one.
+  pub fn withSameTree(self: Self, local: NodeId) -> FullNodeId {
+    return FullNodeId { tree: self.tree, local: local }
+  }
+
+  pub fn equals(self: Self, other: FullNodeId) -> bool {
+    return self.tree.value == other.tree.value && self.local.value == other.local.value
+  }
+
+  /// A 64-bit form for platform APIs that want one number: the tree index in the top 16 bits
+  /// and the local id in the rest. Local ids at or above 2^48 in a subtree collide.
+  pub fn toU64(self: Self) -> u64 {
+    return u64.bitOr(
+      u64.shiftLeft(u32.toU64(self.tree.value), 48),
+      u64.bitAnd(self.local.value, 281474976710655),
+    )
+  }
+
+  fn keyEquals(left: &FullNodeId, right: &FullNodeId) -> bool {
+    return left.tree.value == right.tree.value && left.local.value == right.local.value
+  }
+
+  fn keyHash(value: &FullNodeId, seed: &HashSeed) -> u64 {
+    return Hash.combine(Hash.mix(seed, value.local.value), u32.toU64(value.tree.value))
+  }
+}
+
+impl HashKey for FullNodeId {
+  equals: FullNodeId.keyEquals
+
+  hash: FullNodeId.keyHash
+}
+
+struct TreeIdKey {
+  id: TreeId,
+}
+
+impl Copy for TreeIdKey {}
+
+impl TreeIdKey {
+  fn keyEquals(left: &TreeIdKey, right: &TreeIdKey) -> bool {
+    return left.id.equals(right.id)
+  }
+
+  fn keyHash(value: &TreeIdKey, seed: &HashSeed) -> u64 {
+    let b = value.id.bytes
+    let mut low: u64 = 0
+    let mut high: u64 = 0
+    let mut i: usize = 0
+    while i < 8 {
+      low = u64.bitOr(u64.shiftLeft(low, 8), u8ToU64(b[i]))
+      high = u64.bitOr(u64.shiftLeft(high, 8), u8ToU64(b[i + 8]))
+      i = i + 1
+    }
+    return Hash.combine(Hash.mix(seed, low), high)
+  }
+}
+
+fn u8ToU64(value: u8) -> u64 {
+  return u32.toU64(u8.toU32(value))
+}
+
+impl HashKey for TreeIdKey {
+  equals: TreeIdKey.keyEquals
+
+  hash: TreeIdKey.keyHash
+}
+
+fn key(id: TreeId) -> TreeIdKey {
+  return TreeIdKey { id: id }
+}
+
+/// A node's parent and its index among the parent's children.
+pub struct ParentAndIndex {
+  pub parent: FullNodeId,
+  pub index: usize,
+}
+
+impl Copy for ParentAndIndex {}
+
+fn sameParent(a: Option<ParentAndIndex>, b: Option<ParentAndIndex>) -> bool {
+  return match a {
+    Option.Some { value: x } => match b {
+      Option.Some { value: y } => x.parent.equals(y.parent) && x.index == y.index
+      Option.None => false
+    }
+    Option.None => b.isNone()
+  }
+}
+
+/// A node as the consumer holds it.
+pub struct NodeState {
+  pub parent: Option<ParentAndIndex>,
+  pub data: Node,
+}
+
+struct Slot {
+  id: FullNodeId,
+  live: bool,
+  state: NodeState,
+}
+
+struct SubtreeState {
+  root: FullNodeId,
+  focus: FullNodeId,
+}
+
+impl Copy for SubtreeState {}
+
+struct TreeIndexMap {
+  idToIndex: HashMap<TreeIdKey, u32>,
+  indexToId: List<TreeId>,
+}
+
+impl TreeIndexMap {
+  fn make() -> TreeIndexMap {
+    return TreeIndexMap {
+      idToIndex: HashMap<TreeIdKey, u32>.make(Hash.seed(4049)),
+      indexToId: List<TreeId>.make(),
+    }
+  }
+
+  effect fn getOrCreate(self: &mut Self, id: TreeId) -> TreeIndex
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match self.idToIndex.get(key(id)) {
+      Option.Some { value } => {
+        return TreeIndex { value: value }
+      }
+      Option.None => {}
+    }
+    let index = usize.toU32(self.indexToId.length())
+    run self.indexToId.append(id)
+    drop run self.idToIndex.insert(key(id), index)
+    return TreeIndex { value: index }
+  }
+
+  fn get(self: &Self, id: TreeId) -> Option<TreeIndex> {
+    return match self.idToIndex.get(key(id)) {
+      Option.Some { value } => Option.Some { value: TreeIndex { value: value } }
+      Option.None => Option.None
+    }
+  }
+
+  fn idOf(self: &Self, index: TreeIndex) -> Option<TreeId> {
+    let at = u32.toUsize(index.value)
+    if at >= self.indexToId.length() {
+      return Option.None
+    }
+    return Option.Some { value: self.indexToId.get(at) }
+  }
+
+  effect fn copy(self: &Self) -> TreeIndexMap
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut out = TreeIndexMap.make()
+    let mut i: usize = 0
+    while i < self.indexToId.length() {
+      drop run out.getOrCreate(self.indexToId.get(i))
+      i = i + 1
+    }
+    return move out
+  }
+}
+
+/// A set of node ids that remembers the order they were first added in.
+pub struct IdSet {
+  set: HashSet<FullNodeId>,
+  order: List<FullNodeId>,
+}
+
+impl IdSet {
+  pub fn make() -> IdSet {
+    return IdSet { set: HashSet<FullNodeId>.make(Hash.seed(7121)), order: List<FullNodeId>.make() }
+  }
+
+  pub effect fn insert(self: &mut Self, id: FullNodeId) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !(run self.set.insert(id)) {
+      run self.order.append(id)
+      return true
+    }
+    return false
+  }
+
+  pub fn contains(self: &Self, id: FullNodeId) -> bool {
+    return self.set.contains(id)
+  }
+
+  pub fn remove(self: &mut Self, id: FullNodeId) -> () {
+    if self.set.remove(id).isSome() {
+      let mut i: usize = 0
+      while i < self.order.length() {
+        if self.order.get(i).equals(id) {
+          drop self.order.remove(i)
+          return ()
+        }
+        i = i + 1
+      }
+    }
+  }
+
+  pub fn length(self: &Self) -> usize {
+    return self.order.length()
+  }
+
+  /// The ids in the order they were added.
+  pub fn asSlice(self: &Self) -> &[FullNodeId] {
+    return self.order.asSlice()
+  }
+}
+
+struct TreeIdSet {
+  set: HashSet<TreeIdKey>,
+  order: List<TreeId>,
+}
+
+impl TreeIdSet {
+  fn make() -> TreeIdSet {
+    return TreeIdSet { set: HashSet<TreeIdKey>.make(Hash.seed(7151)), order: List<TreeId>.make() }
+  }
+
+  effect fn insert(self: &mut Self, id: TreeId) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !(run self.set.insert(key(id))) {
+      run self.order.append(id)
+      return true
+    }
+    return false
+  }
+}
+
+struct Changes {
+  added: IdSet,
+  updated: IdSet,
+  removed: IdSet,
+}
+
+impl Changes {
+  fn make() -> Changes {
+    return Changes { added: IdSet.make(), updated: IdSet.make(), removed: IdSet.make() }
+  }
+}
+
+/// Everything the consumer knows about a tree at one moment.
+pub struct TreeState {
+  slots: List<Slot>,
+  free: List<u32>,
+  index: HashMap<FullNodeId, u32>,
+  info: TreeInfo,
+  root: FullNodeId,
+  focus: FullNodeId,
+  hostFocused: bool,
+  subtrees: HashMap<TreeIdKey, SubtreeState>,
+  graftParents: HashMap<TreeIdKey, FullNodeId>,
+  treeIndexMap: TreeIndexMap,
+}
+
+impl TreeState {
+  fn slotOf(self: &Self, id: FullNodeId) -> Option<u32> {
+    return self.index.get(id)
+  }
+
+  /// The state of node `id`, if it is in the tree.
+  pub fn nodeState(self: &Self, id: FullNodeId) -> Option<&NodeState> {
+    return match self.index.get(id) {
+      Option.Some { value } => Option.Some {
+        value: &self.slots.asSlice()[u32.toUsize(value)].state,
+      }
+      Option.None => Option.None
+    }
+  }
+
+  fn nodeStateMut(self: &mut Self, id: FullNodeId) -> Option<&mut NodeState> {
+    return match self.index.get(id) {
+      Option.Some { value } => Option.Some {
+        value: &mut self.slots.asMutSlice()[u32.toUsize(value)].state,
+      }
+      Option.None => Option.None
+    }
+  }
+
+  effect fn insertNode(self: &mut Self, id: FullNodeId, state: NodeState) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match self.index.get(id) {
+      Option.Some { value } => {
+        self.slots.set(u32.toUsize(value), Slot { id: id, live: true, state: move state })
+        return ()
+      }
+      Option.None => {}
+    }
+    let slot = match self.free.pop() {
+      Option.Some { value } => {
+        self.slots.set(u32.toUsize(value), Slot { id: id, live: true, state: move state })
+        value
+      }
+      Option.None => {
+        let at = usize.toU32(self.slots.length())
+        run self.slots.append(Slot { id: id, live: true, state: move state })
+        at
+      }
+    }
+    drop run self.index.insert(id, slot)
+  }
+
+  /// Removes node `id`, returning its data.
+  effect fn removeNode(self: &mut Self, id: FullNodeId) -> Option<Node>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match self.index.remove(id) {
+      Option.Some { value } => {
+        let at = u32.toUsize(value)
+        let old = self.slots.remove(at)
+        run self.slots.insert(
+          at,
+          Slot {
+            id: id,
+            live: false,
+            state: NodeState { parent: Option.None, data: Node.make(Role.Unknown) },
+          },
+        )
+        run self.free.append(value)
+        Option.Some { value: move old.state.data }
+      }
+      Option.None => Option.None
+    }
+  }
+
+  fn checkGlobal(self: &Self) -> () {
+    if !self.index.contains(self.root) {
+      Intrinsic.trap("accesskit: the root id is not in the node list")
+    }
+    if !self.index.contains(self.focus) {
+      Intrinsic.trap("accesskit: the focused id is not in the node list")
+    }
+  }
+
+  fn effectiveFocus(self: &Self) -> FullNodeId {
+    let rootSubtree = match self.subtrees.get(key(TreeId.root())) {
+      Option.Some { value } => value
+      Option.None => {
+        return self.focus
+      }
+    }
+    let mut current = rootSubtree.focus
+    while let Option.Some { value: state } = self.nodeState(current) {
+      let subtreeId = match state.data.treeId() {
+        Option.Some { value } => value
+        Option.None => {
+          break
+        }
+      }
+      match self.subtrees.get(key(subtreeId)) {
+        Option.Some { value: subtree } => {
+          current = subtree.focus
+        }
+        Option.None => {
+          Intrinsic.trap("accesskit: focus is on a graft node whose subtree does not exist")
+        }
+      }
+    }
+    return current
+  }
+
+  effect fn update(self: &mut Self, update: TreeUpdate, record: bool, changes: &mut Changes) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut update = move update
+    let treeId = update.treeId
+    let treeIndex = run self.treeIndexMap.getOrCreate(treeId)
+    let mut unreachable = IdSet.make()
+    let mut seenChildIds = HashSet<FullNodeId>.make(Hash.seed(83))
+
+    let isRoot = treeId.equals(TreeId.root())
+    if !isRoot {
+      let subtreeExists = self.subtrees.contains(key(treeId))
+      if update.tree.isSome() && !self.graftParents.contains(key(treeId)) {
+        Intrinsic.trap("accesskit: cannot push a subtree before a graft node for it exists")
+      }
+      if !subtreeExists && update.tree.isNone() {
+        Intrinsic.trap("accesskit: the first update of a subtree must include tree data")
+      }
+    }
+
+    let mut newTreeRoot: Option<FullNodeId> = Option.None
+    match move update.tree {
+      Option.Some { value: tree } => {
+        let newRoot = FullNodeId.make(tree.root, treeIndex)
+        if isRoot {
+          if tree.root.value != self.info.root.value {
+            drop run unreachable.insert(self.root)
+          }
+          self.root = newRoot
+          self.info = move tree
+        } else {
+          match self.subtrees.get(key(treeId)) {
+            Option.Some { value: subtree } => {
+              if !subtree.root.equals(newRoot) {
+                drop run unreachable.insert(subtree.root)
+              }
+            }
+            Option.None => {}
+          }
+        }
+        newTreeRoot = Option.Some { value: newRoot }
+      }
+      Option.None => {}
+    }
+    update.tree = Option.None
+
+    let root: NodeId = match newTreeRoot {
+      Option.Some { value } => value.local
+      Option.None => match self.subtrees.get(key(treeId)) {
+        Option.Some { value } => value.root.local
+        Option.None => self.info.root
+      }
+    }
+
+    let mut pendingNodes = HashMap<FullNodeId, Node>.make(Hash.seed(89))
+    let mut pendingChildren = HashMap<FullNodeId, ParentAndIndex>.make(Hash.seed(97))
+    let mut pendingGrafts = HashMap<TreeIdKey, FullNodeId>.make(Hash.seed(101))
+    let mut graftsToRemove = TreeIdSet.make()
+
+    while let Option.Some { value: entry } = update.nodes.pop() {
+      let entry: NodeEntry = move entry
+      let localId = entry.id
+      let nodeData = move entry.node
+      let nodeId = FullNodeId.make(localId, treeIndex)
+      unreachable.remove(nodeId)
+
+      let children = nodeData.children()
+      let mut childIndex: usize = 0
+      while childIndex < children.length {
+        let childId = FullNodeId.make(children[childIndex], treeIndex)
+        if run seenChildIds.insert(childId) {
+          Intrinsic.trap("accesskit: the update includes a duplicate child")
+        }
+        unreachable.remove(childId)
+        let parentAndIndex = ParentAndIndex { parent: nodeId, index: childIndex }
+        let mut known = false
+        match self.nodeStateMut(childId) {
+          Option.Some { value: childState } => {
+            known = true
+            if !sameParent(childState.parent, Option.Some { value: parentAndIndex }) {
+              childState.parent = Option.Some { value: parentAndIndex }
+              if record {
+                drop run changes.updated.insert(childId)
+              }
+            }
+          }
+          Option.None => {}
+        }
+        if !known {
+          match pendingNodes.remove(childId) {
+            Option.Some { value: childData } => {
+              run self.addNode(
+                &mut pendingGrafts,
+                record,
+                &mut changes,
+                Option.Some { value: parentAndIndex },
+                childId,
+                move childData,
+              )
+            }
+            Option.None => {
+              drop run pendingChildren.insert(childId, parentAndIndex)
+            }
+          }
+        }
+        childIndex = childIndex + 1
+      }
+
+      if self.index.contains(nodeId) {
+        let graftParent = self.graftParents.get(key(treeId))
+        let mut oldChildren = List<FullNodeId>.make()
+        let mut changed = false
+        let mut oldTree: Option<TreeId> = Option.None
+        match self.nodeState(nodeId) {
+          Option.Some { value: state } => {
+            let existing = state.data.children()
+            let mut i: usize = 0
+            while i < existing.length {
+              run oldChildren.append(FullNodeId.make(existing[i], treeIndex))
+              i = i + 1
+            }
+            changed = !state.data.equals(&nodeData)
+            oldTree = state.data.treeId()
+          }
+          Option.None => {}
+        }
+        if localId.value == root.value {
+          match self.nodeStateMut(nodeId) {
+            Option.Some { value: state } => {
+              state.parent = match graftParent {
+                Option.Some { value: graftId } => Option.Some {
+                  value: ParentAndIndex { parent: graftId, index: 0 },
+                }
+                Option.None => Option.None
+              }
+            }
+            Option.None => {}
+          }
+        }
+        let mut i: usize = 0
+        while i < oldChildren.length() {
+          let child = oldChildren.get(i)
+          if !seenChildIds.contains(child) {
+            drop run unreachable.insert(child)
+          }
+          i = i + 1
+        }
+        if changed {
+          if nodeData.treeId().isSome() && nodeData.children().length != 0 {
+            Intrinsic.trap("accesskit: a node has both a tree id and children")
+          }
+          let newTree = nodeData.treeId()
+          if !sameTree(oldTree, newTree) {
+            match oldTree {
+              Option.Some { value } => {
+                drop run graftsToRemove.insert(value)
+              }
+              Option.None => {}
+            }
+            match newTree {
+              Option.Some { value } => run recordGraft(&mut pendingGrafts, value, nodeId)
+              Option.None => {}
+            }
+          }
+          match self.nodeStateMut(nodeId) {
+            Option.Some { value: state } => {
+              state.data = move nodeData
+            }
+            Option.None => {}
+          }
+          if record {
+            drop run changes.updated.insert(nodeId)
+          }
+        }
+      } else {
+        match pendingChildren.remove(nodeId) {
+          Option.Some { value: parentAndIndex } => {
+            run self.addNode(
+              &mut pendingGrafts,
+              record,
+              &mut changes,
+              Option.Some { value: parentAndIndex },
+              nodeId,
+              move nodeData,
+            )
+          }
+          Option.None => {
+            if localId.value == root.value {
+              let noParent: Option<ParentAndIndex> = Option.None
+              run self.addNode(
+                &mut pendingGrafts,
+                record,
+                &mut changes,
+                noParent,
+                nodeId,
+                move nodeData,
+              )
+            } else {
+              drop run pendingNodes.insert(nodeId, move nodeData)
+            }
+          }
+        }
+      }
+    }
+
+    if pendingNodes.length() != 0 {
+      Intrinsic.trap(
+        "accesskit: the update includes nodes that are neither in the tree nor a child of another node in the update",
+      )
+    }
+    if pendingChildren.length() != 0 {
+      Intrinsic.trap(
+        "accesskit: the update names children that are neither in the tree nor in the update",
+      )
+    }
+
+    let treeFocus = FullNodeId.make(update.focus, treeIndex)
+    match newTreeRoot {
+      Option.Some { value: newRoot } => {
+        drop run self.subtrees.insert(key(treeId), SubtreeState { root: newRoot, focus: treeFocus })
+      }
+      Option.None => {
+        match self.subtrees.get(key(treeId)) {
+          Option.Some { value: subtree } => {
+            drop run self.subtrees.insert(
+              key(treeId),
+              SubtreeState { root: subtree.root, focus: treeFocus },
+            )
+          }
+          Option.None => {
+            if isRoot {
+              drop run self.subtrees.insert(
+                key(treeId),
+                SubtreeState { root: self.root, focus: treeFocus },
+              )
+            }
+          }
+        }
+      }
+    }
+
+    let mut stack = List<FullNodeId>.make()
+    let unreachableIds = unreachable.asSlice()
+    let mut u: usize = 0
+    while u < unreachableIds.length {
+      run stack.append(unreachableIds[u])
+      while let Option.Some { value: id } = stack.pop() {
+        if record {
+          drop run changes.removed.insert(id)
+        }
+        let node = match run self.removeNode(id) {
+          Option.Some { value } => move value
+          Option.None => Intrinsic.trap("accesskit: an unreachable node is missing")
+        }
+        match node.treeId() {
+          Option.Some { value } => {
+            drop run graftsToRemove.insert(value)
+          }
+          Option.None => {}
+        }
+        let children = node.children()
+        let mut i: usize = 0
+        while i < children.length {
+          let child = FullNodeId.make(children[i], id.tree)
+          let isNewRoot = match newTreeRoot {
+            Option.Some { value } => value.equals(child)
+            Option.None => false
+          }
+          if !seenChildIds.contains(child) && !isNewRoot {
+            run stack.append(child)
+          }
+          i = i + 1
+        }
+      }
+      u = u + 1
+    }
+
+    let mut subtreesToRemove = List<TreeId>.make()
+    run subtreesToRemove.appendSlice(graftsToRemove.order.asSlice())
+    let mut i: usize = 0
+    while i < subtreesToRemove.length() {
+      let subtreeId = subtreesToRemove.get(i)
+      i = i + 1
+      if self.graftParents.remove(key(subtreeId)).isNone() {
+        continue
+      }
+      if pendingGrafts.contains(key(subtreeId)) {
+        continue
+      }
+      match self.subtrees.remove(key(subtreeId)) {
+        Option.Some { value: subtree } => {
+          run stack.append(subtree.root)
+          while let Option.Some { value: id } = stack.pop() {
+            let node = match run self.removeNode(id) {
+              Option.Some { value } => move value
+              Option.None => {
+                continue
+              }
+            }
+            if record {
+              drop run changes.removed.insert(id)
+            }
+            match node.treeId() {
+              Option.Some { value: nested } => {
+                if run graftsToRemove.insert(nested) {
+                  run subtreesToRemove.append(nested)
+                }
+              }
+              Option.None => {}
+            }
+            let children = node.children()
+            let mut c: usize = 0
+            while c < children.length {
+              run stack.append(FullNodeId.make(children[c], id.tree))
+              c = c + 1
+            }
+          }
+        }
+        Option.None => {}
+      }
+    }
+
+    let mut g: usize = 0
+    while g < pendingGrafts.bucketCount() {
+      if pendingGrafts.occupiedAt(g) {
+        let subtreeKey = pendingGrafts.keyAt(g)
+        let graftNode = pendingGrafts.valueAt(g)
+        if self.graftParents.contains(subtreeKey) {
+          Intrinsic.trap("accesskit: a subtree already has a graft parent")
+        }
+        drop run self.graftParents.insert(subtreeKey, graftNode)
+        match self.subtrees.get(subtreeKey) {
+          Option.Some { value: subtree } => {
+            let subtreeRoot = subtree.root
+            match self.nodeStateMut(subtreeRoot) {
+              Option.Some { value: rootState } => {
+                rootState.parent = Option.Some {
+                  value: ParentAndIndex { parent: graftNode, index: 0 },
+                }
+                if record && !changes.added.contains(subtreeRoot) {
+                  drop run changes.updated.insert(subtreeRoot)
+                }
+              }
+              Option.None => {}
+            }
+          }
+          Option.None => {}
+        }
+      }
+      g = g + 1
+    }
+
+    match newTreeRoot {
+      Option.Some { value: newRoot } => {
+        match self.graftParents.get(key(treeId)) {
+          Option.Some { value: graftNode } => {
+            match self.nodeStateMut(newRoot) {
+              Option.Some { value: rootState } => {
+                rootState.parent = Option.Some {
+                  value: ParentAndIndex { parent: graftNode, index: 0 },
+                }
+                if record && !changes.added.contains(newRoot) {
+                  drop run changes.updated.insert(newRoot)
+                }
+              }
+              Option.None => {}
+            }
+          }
+          Option.None => {}
+        }
+      }
+      Option.None => {}
+    }
+
+    self.focus = self.effectiveFocus()
+    self.checkGlobal()
+  }
+
+  effect fn addNode(
+    self: &mut Self,
+    pendingGrafts: &mut HashMap<TreeIdKey, FullNodeId>,
+    record: bool,
+    changes: &mut Changes,
+    parent: Option<ParentAndIndex>,
+    id: FullNodeId,
+    data: Node,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match data.treeId() {
+      Option.Some { value: subtreeId } => {
+        if data.children().length != 0 {
+          Intrinsic.trap("accesskit: a node has both a tree id and children")
+        }
+        run recordGraft(&mut pendingGrafts, subtreeId, id)
+      }
+      Option.None => {}
+    }
+    run self.insertNode(id, NodeState { parent: parent, data: move data })
+    if record {
+      drop run changes.added.insert(id)
+    }
+  }
+
+  pub fn hasNode(self: &Self, id: FullNodeId) -> bool {
+    return self.index.contains(id)
+  }
+
+  pub fn nodeById(self: &Self, id: FullNodeId) -> Option<NodeRef<'_>> {
+    return match self.index.get(id) {
+      Option.Some { value } => Option.Some {
+        value: NodeRef {
+          treeState: self,
+          id: id,
+          state: &self.slots.asSlice()[u32.toUsize(value)].state,
+        },
+      }
+      Option.None => Option.None
+    }
+  }
+
+  pub fn nodeByTreeLocalId(self: &Self, local: NodeId, treeId: TreeId) -> Option<NodeRef<'_>> {
+    return match self.treeIndexMap.get(treeId) {
+      Option.Some { value } => self.nodeById(FullNodeId.make(local, value))
+      Option.None => Option.None
+    }
+  }
+
+  pub fn rootId(self: &Self) -> FullNodeId {
+    return self.root
+  }
+
+  pub fn rootNode(self: &Self) -> NodeRef<'_> {
+    return match self.nodeById(self.root) {
+      Option.Some { value } => value
+      Option.None => Intrinsic.trap("accesskit: no root")
+    }
+  }
+
+  /// The root of subtree `treeId`, if it exists.
+  pub fn subtreeRoot(self: &Self, treeId: TreeId) -> Option<FullNodeId> {
+    return match self.subtrees.get(key(treeId)) {
+      Option.Some { value } => Option.Some { value: value.root }
+      Option.None => Option.None
+    }
+  }
+
+  pub fn isHostFocused(self: &Self) -> bool {
+    return self.hostFocused
+  }
+
+  /// The node that has focus while the host window has it.
+  pub fn focusIdInTree(self: &Self) -> FullNodeId {
+    return self.focus
+  }
+
+  pub fn focusInTree(self: &Self) -> NodeRef<'_> {
+    return match self.nodeById(self.focus) {
+      Option.Some { value } => value
+      Option.None => Intrinsic.trap("accesskit: no focus")
+    }
+  }
+
+  /// The focused node, or `None` while the host window does not have focus.
+  pub fn focusId(self: &Self) -> Option<FullNodeId> {
+    if self.hostFocused {
+      return Option.Some { value: self.focus }
+    }
+    return Option.None
+  }
+
+  /// The focused node, or its active descendant when it has one.
+  pub fn focusNode(self: &Self) -> Option<NodeRef<'_>> {
+    return match self.focusId() {
+      Option.Some { value: id } => match self.nodeById(id) {
+        Option.Some { value: focused } => match focused.activeDescendant() {
+          Option.Some { value: active } => Option.Some { value: active }
+          Option.None => Option.Some { value: focused }
+        }
+        Option.None => Option.None
+      }
+      Option.None => Option.None
+    }
+  }
+
+  /// The innermost dialog around the focus.
+  pub fn activeDialog(self: &Self) -> Option<NodeRef<'_>> {
+    let mut node = self.focusNode()
+    while let Option.Some { value: candidate } = node {
+      if candidate.isDialog() {
+        return Option.Some { value: candidate }
+      }
+      node = candidate.parent()
+    }
+    return Option.None
+  }
+
+  pub fn toolkitName(self: &Self) -> string {
+    return match &self.info.toolkitName {
+      Option.Some { value } => value.view()
+      Option.None => "AccessKit"
+    }
+  }
+
+  /// The toolkit version, only when a toolkit name was given too.
+  pub fn toolkitVersion(self: &Self) -> Option<string> {
+    if self.info.toolkitName.isNone() {
+      return Option.None
+    }
+    return match &self.info.toolkitVersion {
+      Option.Some { value } => Option.Some { value: value.view() }
+      Option.None => Option.None
+    }
+  }
+
+  /// The local id and tree id of node `id`.
+  pub fn locateNode(self: &Self, id: FullNodeId) -> Option<LocatedNode> {
+    if !self.hasNode(id) {
+      return Option.None
+    }
+    return match self.treeIndexMap.idOf(id.tree) {
+      Option.Some { value } => Option.Some { value: LocatedNode { local: id.local, tree: value } }
+      Option.None => Option.None
+    }
+  }
+
+  /// Every node id in the tree, in no particular order.
+  pub effect fn allNodeIds(self: &Self, out: &mut List<FullNodeId>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut i: usize = 0
+    while i < self.slots.length() {
+      let slot = &self.slots.asSlice()[i]
+      if slot.live {
+        run out.append(slot.id)
+      }
+      i = i + 1
+    }
+  }
+
+  effect fn copy(self: &Self) -> TreeState
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut out = TreeState {
+      slots: List<Slot>.make(),
+      free: List<u32>.make(),
+      index: HashMap<FullNodeId, u32>.make(Hash.seed(4021)),
+      info: run self.info.copy(),
+      root: self.root,
+      focus: self.focus,
+      hostFocused: self.hostFocused,
+      subtrees: HashMap<TreeIdKey, SubtreeState>.make(Hash.seed(4027)),
+      graftParents: HashMap<TreeIdKey, FullNodeId>.make(Hash.seed(4049)),
+      treeIndexMap: run self.treeIndexMap.copy(),
+    }
+    run out.copyMapsFrom(self)
+    let mut i: usize = 0
+    while i < self.slots.length() {
+      let slot = &self.slots.asSlice()[i]
+      if slot.live {
+        run out.insertNode(
+          slot.id,
+          NodeState { parent: slot.state.parent, data: run slot.state.data.copy() },
+        )
+      }
+      i = i + 1
+    }
+    return move out
+  }
+
+  effect fn copyMapsFrom(self: &mut Self, source: &TreeState) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.subtrees.clear()
+    let mut i: usize = 0
+    while i < source.subtrees.bucketCount() {
+      if source.subtrees.occupiedAt(i) {
+        drop run self.subtrees.insert(source.subtrees.keyAt(i), source.subtrees.valueAt(i))
+      }
+      i = i + 1
+    }
+    self.graftParents.clear()
+    i = 0
+    while i < source.graftParents.bucketCount() {
+      if source.graftParents.occupiedAt(i) {
+        drop run self.graftParents.insert(
+          source.graftParents.keyAt(i),
+          source.graftParents.valueAt(i),
+        )
+      }
+      i = i + 1
+    }
+    self.treeIndexMap = run source.treeIndexMap.copy()
+  }
+}
+
+/// A node's local id and the tree it is in.
+pub struct LocatedNode {
+  pub local: NodeId,
+  pub tree: TreeId,
+}
+
+impl Copy for LocatedNode {}
+
+fn sameTree(a: Option<TreeId>, b: Option<TreeId>) -> bool {
+  return match a {
+    Option.Some { value: x } => match b {
+      Option.Some { value: y } => x.equals(y)
+      Option.None => false
+    }
+    Option.None => b.isNone()
+  }
+}
+
+effect fn recordGraft(
+  pendingGrafts: &mut HashMap<TreeIdKey, FullNodeId>,
+  subtreeId: TreeId,
+  graftNode: FullNodeId,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if subtreeId.equals(TreeId.root()) {
+    Intrinsic.trap("accesskit: cannot graft the root tree")
+  }
+  if pendingGrafts.contains(key(subtreeId)) {
+    Intrinsic.trap("accesskit: a subtree already has a graft parent")
+  }
+  drop run pendingGrafts.insert(key(subtreeId), graftNode)
+}
+
+/// What an adapter does when the tree changes. Each call gets nodes of the tree before
+/// (`old`) and after (`new`) the update.
+pub interface ChangeHandler {
+  effect fn nodeAdded(self: &mut Self, node: &NodeRef<'_>) -> () ! OutOfMemoryError ? &mut Allocator
+
+  effect fn nodeUpdated(self: &mut Self, old: &NodeRef<'_>, new: &NodeRef<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator
+
+  effect fn focusMoved(self: &mut Self, old: Option<NodeRef<'_>>, new: Option<NodeRef<'_>>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator
+
+  effect fn nodeRemoved(self: &mut Self, node: &NodeRef<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator
+}
+
+/// An accessibility tree as an adapter holds it: the current state, updated in place by
+/// [`Tree.update`].
+pub struct Tree {
+  current: TreeState,
+  next: TreeState,
+}
+
+impl Tree {
+  /// The tree that `initial` describes. `initial.tree` must be set, for the main tree.
+  pub effect fn make(initial: TreeUpdate, hostFocused: bool) -> Tree
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut initial = move initial
+    let info = match move initial.tree {
+      Option.Some { value } => move value
+      Option.None => Intrinsic.trap("accesskit: the first update must include tree data")
+    }
+    initial.tree = Option.None
+    if !initial.treeId.equals(TreeId.root()) {
+      Intrinsic.trap("accesskit: the first update must be for the main tree")
+    }
+    let mut treeIndexMap = TreeIndexMap.make()
+    let treeIndex = run treeIndexMap.getOrCreate(initial.treeId)
+    let root = FullNodeId.make(info.root, treeIndex)
+    let focus = FullNodeId.make(initial.focus, treeIndex)
+    let mut state = TreeState {
+      slots: List<Slot>.make(),
+      free: List<u32>.make(),
+      index: HashMap<FullNodeId, u32>.make(Hash.seed(4021)),
+      info: move info,
+      root: root,
+      focus: focus,
+      hostFocused: hostFocused,
+      subtrees: HashMap<TreeIdKey, SubtreeState>.make(Hash.seed(4027)),
+      graftParents: HashMap<TreeIdKey, FullNodeId>.make(Hash.seed(4049)),
+      treeIndexMap: move treeIndexMap,
+    }
+    let mut changes = Changes.make()
+    run state.update(move initial, false, &mut changes)
+    let next = run state.copy()
+    return Tree { current: move state, next: move next }
+  }
+
+  /// Applies `update` and tells `handler` what changed.
+  pub effect fn update<H: ChangeHandler>(self: &mut Self, update: TreeUpdate, handler: &mut H) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut changes = Changes.make()
+    run self.next.update(move update, true, &mut changes)
+    run self.processChanges(&changes, &mut handler)
+  }
+
+  /// Records whether the host window has focus and tells `handler` about the focus change.
+  pub effect fn updateHostFocusState<H: ChangeHandler>(
+    self: &mut Self,
+    hostFocused: bool,
+    handler: &mut H,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.next.hostFocused = hostFocused
+    let changes = Changes.make()
+    run self.processChanges(&changes, &mut handler)
+  }
+
+  effect fn processChanges<H: ChangeHandler>(
+    self: &mut Self,
+    changes: &Changes,
+    handler: &mut H,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let added = changes.added.asSlice()
+    let updated = changes.updated.asSlice()
+    let removed = changes.removed.asSlice()
+    run notify(&self.current, &self.next, changes, &mut handler)
+    let mut i: usize = 0
+    while i < added.length {
+      run self.copyNodeToCurrent(added[i])
+      i = i + 1
+    }
+    i = 0
+    while i < updated.length {
+      run self.copyNodeToCurrent(updated[i])
+      i = i + 1
+    }
+    i = 0
+    while i < removed.length {
+      drop run self.current.removeNode(removed[i])
+      i = i + 1
+    }
+    if !self.current.info.equals(&self.next.info) {
+      self.current.info = run self.next.info.copy()
+    }
+    self.current.root = self.next.root
+    self.current.focus = self.next.focus
+    self.current.hostFocused = self.next.hostFocused
+    run self.current.copyMapsFrom(&self.next)
+  }
+
+  effect fn copyNodeToCurrent(self: &mut Self, id: FullNodeId) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let copied = match self.next.nodeState(id) {
+      Option.Some { value: state } => NodeState {
+        parent: state.parent,
+        data: run state.data.copy(),
+      }
+      Option.None => {
+        return ()
+      }
+    }
+    run self.current.insertNode(id, move copied)
+  }
+
+  /// The current state.
+  pub fn state(self: &Self) -> &TreeState {
+    return &self.current
+  }
+}
+
+effect fn notify<H: ChangeHandler>(
+  current: &TreeState,
+  next: &TreeState,
+  changes: &Changes,
+  handler: &mut H,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let added = changes.added.asSlice()
+  let updated = changes.updated.asSlice()
+  let removed = changes.removed.asSlice()
+  let mut i: usize = 0
+  while i < added.length {
+    match next.nodeById(added[i]) {
+      Option.Some { value: node } => run handler.nodeAdded(&node)
+      Option.None => {}
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < updated.length {
+    match current.nodeById(updated[i]) {
+      Option.Some { value: old } => match next.nodeById(updated[i]) {
+        Option.Some { value: new } => run handler.nodeUpdated(&old, &new)
+        Option.None => {}
+      }
+      Option.None => {}
+    }
+    i = i + 1
+  }
+  let oldFocus = current.focusNode()
+  let newFocus = next.focusNode()
+  let oldId: Option<FullNodeId> = match oldFocus {
+    Option.Some { value } => Option.Some { value: value.id }
+    Option.None => Option.None
+  }
+  let newId: Option<FullNodeId> = match newFocus {
+    Option.Some { value } => Option.Some { value: value.id }
+    Option.None => Option.None
+  }
+  if !sameId(oldId, newId) {
+    match oldFocus {
+      Option.Some { value: oldNode } => {
+        let id = oldNode.id
+        if !changes.updated.contains(id) && !changes.removed.contains(id) {
+          match next.nodeById(id) {
+            Option.Some { value: newVersion } => run handler.nodeUpdated(&oldNode, &newVersion)
+            Option.None => {}
+          }
+        }
+      }
+      Option.None => {}
+    }
+    match newFocus {
+      Option.Some { value: newNode } => {
+        let id = newNode.id
+        if !changes.added.contains(id) && !changes.updated.contains(id) {
+          match current.nodeById(id) {
+            Option.Some { value: oldVersion } => run handler.nodeUpdated(&oldVersion, &newNode)
+            Option.None => {}
+          }
+        }
+      }
+      Option.None => {}
+    }
+    run handler.focusMoved(oldFocus, newFocus)
+  }
+  i = 0
+  while i < removed.length {
+    match current.nodeById(removed[i]) {
+      Option.Some { value: node } => run handler.nodeRemoved(&node)
+      Option.None => {}
+    }
+    i = i + 1
+  }
+}
+
+fn sameId(a: Option<FullNodeId>, b: Option<FullNodeId>) -> bool {
+  return match a {
+    Option.Some { value: x } => match b {
+      Option.Some { value: y } => x.equals(y)
+      Option.None => false
+    }
+    Option.None => b.isNone()
+  }
+}

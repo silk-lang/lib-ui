@@ -9,6 +9,8 @@
 //   tree, with a `Capture` suffix for the capture phase. Listeners receive the @silk/ui
 //   event, which has the DOM members.
 // - `value` on <input>: a controlled value, as in React DOM.
+// - `svg` on <icon>: SVG markup, drawn at the icon's CSS size with its `color` as
+//   `currentColor`.
 // - Everything else is a tree attribute: `tabIndex`, `testId`, `label`, `disabled`,
 //   `placeholder` and so on, and `role` and `aria-*` as in React DOM.
 import Reconciler from "react-reconciler";
@@ -23,7 +25,7 @@ import { createNode, createText, mount, root as mountedRoot } from "@silk/ui";
 
 const LOOKS = { style: "base", hoverStyle: "hover", activeStyle: "active", focusStyle: "focus", focusVisibleStyle: "focusVisible" };
 const CONTINUOUS = new Set(["pointermove", "pointerenter", "pointerleave", "wheel", "scroll", "layout"]);
-const SKIP = new Set(["children", "key", "ref", "value", "defaultValue"]);
+const SKIP = new Set(["children", "key", "ref", "value", "defaultValue", "svg"]);
 
 let updatePriority = 0;
 let eventPriority = 0;
@@ -122,6 +124,7 @@ function applyProps(node, previous, next) {
     if (name in LOOKS) diffStyle(node.look(LOOKS[name]), previous[name], null);
     else if (!eventOf(name)) node.setAttribute(name, name === "tabIndex" ? -2147483648 : typeof previous[name] === "boolean" ? false : "");
   }
+  if (node.kind === "icon" && next.svg !== previous.svg) node.svg = next.svg;
   if (node.kind === "input") {
     if (next.value !== undefined) {
       if (String(next.value) !== node.value) node.value = next.value;

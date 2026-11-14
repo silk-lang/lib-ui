@@ -1,0 +1,150 @@
+//! Which nodes platform adapters expose: generic containers and text runs are looked through,
+//! hidden subtrees and nodes clipped out of view are left out.
+//!
+//! Ported from AccessKit (`accesskit_consumer/src/filters.rs`), Copyright 2023 The AccessKit
+//! Authors, under the MIT or Apache-2.0 license (see LICENSE-MIT and LICENSE-APACHE).
+import accesskit.lib { Rect, Role }
+import node { NodeRef, FilteredCursor }
+import tree { FullNodeId }
+import silk.core.option { Option }
+
+/// Decides which nodes a walk exposes.
+pub interface NodeFilter {
+  fn filter(self: &Self, node: &NodeRef<'_>) -> FilterResult
+}
+
+/// [`commonFilter`] as a [`NodeFilter`].
+pub struct CommonFilter {}
+
+impl NodeFilter for CommonFilter {
+  fn filter(self: &Self, node: &NodeRef<'_>) -> FilterResult {
+    return commonFilter(node)
+  }
+}
+
+/// [`commonFilterWithRootException`] as a [`NodeFilter`].
+pub struct CommonFilterWithRootException {}
+
+impl NodeFilter for CommonFilterWithRootException {
+  fn filter(self: &Self, node: &NodeRef<'_>) -> FilterResult {
+    return commonFilterWithRootException(node)
+  }
+}
+
+struct WithoutParentChecks {}
+
+impl NodeFilter for WithoutParentChecks {
+  fn filter(self: &Self, node: &NodeRef<'_>) -> FilterResult {
+    return commonFilterWithoutParentChecks(node)
+  }
+}
+
+/// Includes the text runs of a text node `root` (and `root` itself), looking through
+/// everything else.
+pub struct TextRunFilter {
+  pub root: FullNodeId,
+}
+
+impl NodeFilter for TextRunFilter {
+  fn filter(self: &Self, node: &NodeRef<'_>) -> FilterResult {
+    if node.id.equals(self.root) || node.accessRole() == Role.TextRun {
+      return FilterResult.Include
+    }
+    return FilterResult.ExcludeNode
+  }
+}
+
+/// What a filter says about a node.
+pub enum FilterResult {
+  /// Expose the node.
+  Include,
+  /// Skip the node but look at its children.
+  ExcludeNode,
+  /// Skip the node and its subtree.
+  ExcludeSubtree,
+}
+
+fn commonFilterBase(node: &NodeRef<'_>) -> Option<FilterResult> {
+  if node.isFocused() {
+    return Option.Some { value: FilterResult.Include }
+  }
+  if node.isHidden() {
+    return Option.Some { value: FilterResult.ExcludeSubtree }
+  }
+  if node.isGraft() {
+    return Option.Some { value: FilterResult.ExcludeNode }
+  }
+  let kind = node.accessRole()
+  if kind == Role.GenericContainer || kind == Role.TextRun {
+    return Option.Some { value: FilterResult.ExcludeNode }
+  }
+  return Option.None
+}
+
+fn commonFilterWithoutParentChecks(node: &NodeRef<'_>) -> FilterResult {
+  return commonFilterBase(node).unwrapOr(FilterResult.Include)
+}
+
+fn firstSiblingInParentBbox(cursor: FilteredCursor<'_>, parentBbox: Rect) -> bool {
+  let mut cursor = cursor
+  return match cursor.next(&WithoutParentChecks {}) {
+    Option.Some { value: sibling } => match sibling.boundingBox() {
+      Option.Some { value: bbox } => !bbox.intersect(parentBbox).isEmpty()
+      Option.None => false
+    }
+    Option.None => false
+  }
+}
+
+/// The filter the platform adapters use.
+pub fn commonFilter(node: &NodeRef<'_>) -> FilterResult {
+  match commonFilterBase(node) {
+    Option.Some { value } => {
+      return value
+    }
+    Option.None => {}
+  }
+  match node.parent() {
+    Option.Some { value: parent } => {
+      if commonFilter(&parent) == FilterResult.ExcludeSubtree {
+        return FilterResult.ExcludeSubtree
+      }
+    }
+    Option.None => {}
+  }
+  match node.filteredParent(&WithoutParentChecks {}) {
+    Option.Some { value: parent } => {
+      if parent.clipsChildren() {
+        match node.boundingBox() {
+          Option.Some { value: bbox } => match parent.boundingBox() {
+            Option.Some { value: parentBbox } => {
+              if bbox.intersect(parentBbox).isEmpty()
+                && !(firstSiblingInParentBbox(
+                  node.followingFilteredSiblings(&WithoutParentChecks {}),
+                  parentBbox,
+                )
+                  || firstSiblingInParentBbox(
+                    node.precedingFilteredSiblings(&WithoutParentChecks {}),
+                    parentBbox,
+                  )) {
+                return FilterResult.ExcludeSubtree
+              }
+            }
+            Option.None => {}
+          }
+          Option.None => {}
+        }
+      }
+    }
+    Option.None => {}
+  }
+  return FilterResult.Include
+}
+
+/// [`commonFilter`], but always including the root.
+pub fn commonFilterWithRootException(node: &NodeRef<'_>) -> FilterResult {
+  if node.isRoot() {
+    return FilterResult.Include
+  }
+  return commonFilter(node)
+}

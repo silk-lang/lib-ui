@@ -1,0 +1,656 @@
+//! How NSAccessibility sees an AccessKit node: its title, value, flags, related elements and
+//! text, written as the record the AppKit side builds its element from.
+//!
+//! Ported from AccessKit (`accesskit_macos/src/node.rs` and `util.rs`), Copyright 2022 The
+//! AccessKit Authors, under the MIT or Apache-2.0 license. AccessKit's macOS elements ask the
+//! tree on every call; here the Silk side computes the same answers ahead of time and sends them
+//! as a record (see [`record`]), and AppKit's text queries are answered from the record's lines,
+//! characters and format runs.
+import accesskit.lib { Action, Role, Toggled, Orientation, TextAlign, Rect }
+import accesskit_consumer.lib { NodeRef, Position, FilterResult, CommonFilter, commonFilter }
+import record {
+  Record,
+  TAG_ROLE,
+  TAG_SUBROLE,
+  TAG_ROLE_DESCRIPTION,
+  TAG_IDENTIFIER,
+  TAG_TITLE,
+  TAG_HELP,
+  TAG_PLACEHOLDER,
+  TAG_VALUE_BOOL,
+  TAG_VALUE_NUMBER,
+  TAG_VALUE_TEXT,
+  TAG_MIN_VALUE,
+  TAG_MAX_VALUE,
+  TAG_URL,
+  TAG_ORIENTATION,
+  TAG_FLAGS,
+  TAG_FRAME,
+  TAG_PARENT,
+  TAG_CHILDREN,
+  TAG_SELECTED_CHILDREN,
+  TAG_LINKED,
+  TAG_TABS,
+  TAG_BRAILLE_LABEL,
+  TAG_BRAILLE_ROLE_DESCRIPTION,
+  TAG_DOM_IDENTIFIER,
+  TAG_ROWS,
+  TAG_TEXT,
+  FLAG_FOCUSED,
+  FLAG_ENABLED,
+  FLAG_REQUIRED,
+  FLAG_SELECTED,
+  FLAG_MODAL,
+  FLAG_FOCUSABLE,
+  FLAG_CLICKABLE,
+  FLAG_INCREMENT,
+  FLAG_DECREMENT,
+  FLAG_TEXT,
+  FLAG_ITEM_LIKE,
+  FLAG_PICKABLE,
+  FLAG_SELECTABLE_CONTAINER,
+  FLAG_TAB_LIST,
+  FLAG_DIALOG,
+  FLAG_SCROLL,
+  FLAG_URL,
+  FLAG_SET_VALUE,
+  FLAG_HAS_FRAME,
+  FLAG_IS_SELECTED,
+  FLAG_IS_UNSELECTED,
+  FLAG_ATTRIBUTES,
+  FLAG_ROOT,
+  FLAG_HAS_PARENT
+}
+import roles { nsRole, nsSubrole, labelIsExposedInValue }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.num.usize
+import silk.text.string { String }
+
+/// Whether the adapter exposes `node` as an element.
+pub fn included(node: &NodeRef<'_>) -> bool {
+  return commonFilter(node) == FilterResult.Include
+}
+
+/// Whether `node` may be reported as the focused element.
+pub fn canBeFocused(node: &NodeRef<'_>) -> bool {
+  return included(node) && node.accessRole() != Role.Window
+}
+
+/// `node`'s id as the AppKit side knows it.
+pub fn elementId(node: &NodeRef<'_>) -> u64 {
+  return node.id.toU64()
+}
+
+/// The value AppKit reads from `accessibilityValue`.
+pub union MacValue {
+  Bool { value: bool },
+  Number { value: f64 },
+  Text { value: String },
+}
+
+impl MacValue {
+  pub fn equals(self: &Self, other: &MacValue) -> bool {
+    return match &self.* {
+      MacValue.Bool { value } => match &other.* {
+        MacValue.Bool { value: theirs } => value == theirs
+        _ => false
+      }
+      MacValue.Number { value } => match &other.* {
+        MacValue.Number { value: theirs } => value == theirs
+        _ => false
+      }
+      MacValue.Text { value } => match &other.* {
+        MacValue.Text { value: theirs } => value.view() == theirs.view()
+        _ => false
+      }
+    }
+  }
+
+  pub fn isBool(self: &Self) -> bool {
+    return match &self.* {
+      MacValue.Bool { value: _ } => true
+      _ => false
+    }
+  }
+}
+
+/// Whether two optional values are equal.
+pub fn sameValue(left: &Option<MacValue>, right: &Option<MacValue>) -> bool {
+  return match &left.* {
+    Option.Some { value: mine } => match &right.* {
+      Option.Some { value: theirs } => mine.equals(&theirs)
+      Option.None => false
+    }
+    Option.None => right.isNone()
+  }
+}
+
+/// Whether two optional strings are equal.
+pub fn sameText(left: &Option<String>, right: &Option<String>) -> bool {
+  return match &left.* {
+    Option.Some { value: mine } => match &right.* {
+      Option.Some { value: theirs } => mine.view() == theirs.view()
+      Option.None => false
+    }
+    Option.None => right.isNone()
+  }
+}
+
+/// `accessibilityTitle`.
+pub effect fn title(node: &NodeRef<'_>) -> Option<String>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if node.isRoot() && node.accessRole() == Role.Window {
+    // VoiceOver misbehaves when the group standing for the top-level window has a title.
+    return Option.None
+  }
+  if labelIsExposedInValue(node.accessRole()) {
+    return Option.None
+  }
+  return run node.label()
+}
+
+/// The label live regions announce: the value for nodes named by their value.
+pub effect fn label(node: &NodeRef<'_>) -> Option<String>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if node.labelComesFromValue() {
+    return run node.value()
+  }
+  return run node.label()
+}
+
+/// `accessibilityValue`.
+pub effect fn value(node: &NodeRef<'_>) -> Option<MacValue>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match node.toggled() {
+    Option.Some { value } => {
+      return Option.Some { value: MacValue.Bool { value: value != Toggled.False } }
+    }
+    Option.None => {}
+  }
+  if node.accessRole() == Role.Tab {
+    // Tabs are radio buttons on the Mac, checked when selected.
+    return Option.Some { value: MacValue.Bool { value: node.isSelected().unwrapOr(false) } }
+  }
+  if labelIsExposedInValue(node.accessRole()) {
+    match run node.label() {
+      Option.Some { value } => {
+        return Option.Some { value: MacValue.Text { value: move value } }
+      }
+      Option.None => {}
+    }
+  }
+  match run node.value() {
+    Option.Some { value } => {
+      return Option.Some { value: MacValue.Text { value: move value } }
+    }
+    Option.None => {}
+  }
+  return match node.numericValue() {
+    Option.Some { value } => Option.Some { value: MacValue.Number { value: value } }
+    Option.None => Option.None
+  }
+}
+
+/// A container whose children are rows the user selects (tab lists are not, on the Mac).
+pub fn isContainerWithSelectableChildren(node: &NodeRef<'_>) -> bool {
+  return node.isContainerWithSelectableChildren() && node.accessRole() != Role.TabList
+}
+
+/// An item a container selects (tabs are not, on the Mac).
+pub fn isItemLike(node: &NodeRef<'_>) -> bool {
+  return node.isItemLike() && node.accessRole() != Role.Tab
+}
+
+/// The NSAccessibility flags of `node`: its states and the selectors it allows.
+pub fn flags(node: &NodeRef<'_>) -> u32 {
+  let filter = CommonFilter {}
+  let mut bits: u32 = 0
+  if node.isFocused() && canBeFocused(node) {
+    bits = bits | FLAG_FOCUSED()
+  }
+  if !node.isDisabled() {
+    bits = bits | FLAG_ENABLED()
+  }
+  if node.isRequired() {
+    bits = bits | FLAG_REQUIRED()
+  }
+  let selected = node.isSelected()
+  if isItemLike(node) && node.isSelectable() && selected.unwrapOr(false) {
+    bits = bits | FLAG_SELECTED()
+  }
+  if node.isModal() {
+    bits = bits | FLAG_MODAL()
+  }
+  if node.isFocusable(&filter) {
+    bits = bits | FLAG_FOCUSABLE()
+  }
+  let clickable = node.isClickable(&filter)
+  if clickable {
+    bits = bits | FLAG_CLICKABLE()
+  }
+  if node.supportsIncrement(&filter) {
+    bits = bits | FLAG_INCREMENT()
+  }
+  if node.supportsDecrement(&filter) {
+    bits = bits | FLAG_DECREMENT()
+  }
+  let text = node.supportsTextRanges()
+  if text {
+    bits = bits | FLAG_TEXT()
+  }
+  if isItemLike(node) {
+    bits = bits | FLAG_ITEM_LIKE()
+    if clickable && node.isSelectable() {
+      bits = bits | FLAG_PICKABLE()
+    }
+  }
+  if isContainerWithSelectableChildren(node) {
+    bits = bits | FLAG_SELECTABLE_CONTAINER()
+  }
+  if node.accessRole() == Role.TabList {
+    bits = bits | FLAG_TAB_LIST()
+  }
+  if node.isDialog() {
+    bits = bits | FLAG_DIALOG()
+  }
+  if node.supportsAction(Action.ScrollIntoView, &filter) {
+    bits = bits | FLAG_SCROLL()
+  }
+  if node.supportsUrl() {
+    bits = bits | FLAG_URL()
+  }
+  if (text && !node.isReadOnly()) || node.supportsAction(Action.SetValue, &filter) {
+    bits = bits | FLAG_SET_VALUE()
+  }
+  if node.boundingBox().isSome() {
+    bits = bits | FLAG_HAS_FRAME()
+  }
+  match selected {
+    Option.Some { value } => {
+      bits = bits
+        | if value {
+          FLAG_IS_SELECTED()
+        } else {
+          FLAG_IS_UNSELECTED()
+        }
+    }
+    Option.None => {}
+  }
+  if node.hasBrailleLabel() || node.hasBrailleRoleDescription() || node.hasHtmlId() {
+    bits = bits | FLAG_ATTRIBUTES()
+  }
+  if node.isRoot() {
+    bits = bits | FLAG_ROOT()
+  }
+  if node.filteredParent(&filter).isSome() {
+    bits = bits | FLAG_HAS_PARENT()
+  }
+  return bits
+}
+
+/// The included children of `node`.
+pub effect fn childIds(node: &NodeRef<'_>, out: &mut List<u64>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let filter = CommonFilter {}
+  let mut cursor = node.filteredChildren(&filter)
+  while let Option.Some { value: child } = cursor.next(&filter) {
+    run out.append(elementId(&child))
+  }
+}
+
+/// The elements AppKit shows as the view's children: the root, or the root's included
+/// children when the root is not included.
+pub effect fn rootIds(root: &NodeRef<'_>, out: &mut List<u64>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if included(root) {
+    run out.append(elementId(root))
+  } else {
+    run childIds(root, &mut out)
+  }
+}
+
+effect fn writeOptionalText(out: &mut Record, tag: u8, value: Option<String>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match move value {
+    Option.Some { value: text } => run out.textField(tag, text.view())
+    Option.None => {}
+  }
+}
+
+effect fn writeOptionalView(out: &mut Record, tag: u8, value: Option<string>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match value {
+    Option.Some { value: text } => run out.textField(tag, text)
+    Option.None => {}
+  }
+}
+
+/// Writes the record of `node` to `out`.
+pub effect fn writeRecord(node: &NodeRef<'_>, out: &mut Record) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let filter = CommonFilter {}
+  run out.textField(TAG_ROLE(), nsRole(node))
+  run writeOptionalView(&mut out, TAG_SUBROLE(), nsSubrole(node))
+  run writeOptionalView(&mut out, TAG_ROLE_DESCRIPTION(), node.roleDescription())
+  run writeOptionalView(&mut out, TAG_IDENTIFIER(), node.authorId())
+  run writeOptionalText(&mut out, TAG_TITLE(), run title(node))
+  run writeOptionalText(&mut out, TAG_HELP(), run node.description())
+  run writeOptionalView(&mut out, TAG_PLACEHOLDER(), node.placeholder())
+  match run value(node) {
+    Option.Some { value: shown } => match move shown {
+      MacValue.Bool { value } => {
+        run out.byte(TAG_VALUE_BOOL())
+        run out.byte(
+          if value {
+            1
+          } else {
+            0
+          },
+        )
+      }
+      MacValue.Number { value } => run out.numberField(TAG_VALUE_NUMBER(), value)
+      MacValue.Text { value } => run out.textField(TAG_VALUE_TEXT(), value.view())
+    }
+    Option.None => {}
+  }
+  match node.minNumericValue() {
+    Option.Some { value } => run out.numberField(TAG_MIN_VALUE(), value)
+    Option.None => {}
+  }
+  match node.maxNumericValue() {
+    Option.Some { value } => run out.numberField(TAG_MAX_VALUE(), value)
+    Option.None => {}
+  }
+  if node.supportsUrl() {
+    run writeOptionalView(&mut out, TAG_URL(), node.url())
+  }
+  match node.orientation() {
+    Option.Some { value } => {
+      run out.byte(TAG_ORIENTATION())
+      run out.byte(
+        if value == Orientation.Vertical {
+          1
+        } else {
+          2
+        },
+      )
+    }
+    Option.None => {}
+  }
+  run out.byte(TAG_FLAGS())
+  run out.uint32(flags(node))
+  match node.boundingBox() {
+    Option.Some { value } => {
+      run out.byte(TAG_FRAME())
+      run out.rect(value)
+    }
+    Option.None => {}
+  }
+  match node.filteredParent(&filter) {
+    Option.Some { value } => {
+      run out.byte(TAG_PARENT())
+      run out.uint64(elementId(&value))
+    }
+    Option.None => {}
+  }
+  let mut ids = List<u64>.make()
+  run childIds(node, &mut ids)
+  run out.idsField(TAG_CHILDREN(), &ids)
+  if isContainerWithSelectableChildren(node) {
+    let mut items = List<NodeRef<'_>>.make()
+    run node.items(&filter, &mut items)
+    ids.clear()
+    let mut i: usize = 0
+    while i < items.length() {
+      run ids.append(elementId(&items.get(i)))
+      i = i + 1
+    }
+    run out.idsField(TAG_ROWS(), &ids)
+    ids.clear()
+    i = 0
+    while i < items.length() {
+      if items.get(i).isSelected().unwrapOr(false) {
+        run ids.append(elementId(&items.get(i)))
+      }
+      i = i + 1
+    }
+    run out.idsField(TAG_SELECTED_CHILDREN(), &ids)
+  }
+  let mut controlled = List<NodeRef<'_>>.make()
+  run node.controls(&mut controlled)
+  ids.clear()
+  let mut c: usize = 0
+  while c < controlled.length() {
+    let one = controlled.get(c)
+    if included(&one) {
+      run ids.append(elementId(&one))
+    }
+    c = c + 1
+  }
+  if ids.length() > 0 {
+    run out.idsField(TAG_LINKED(), &ids)
+  }
+  if node.accessRole() == Role.TabList {
+    ids.clear()
+    let mut cursor = node.filteredChildren(&filter)
+    while let Option.Some { value: child } = cursor.next(&filter) {
+      if child.accessRole() == Role.Tab {
+        run ids.append(elementId(&child))
+      }
+    }
+    run out.idsField(TAG_TABS(), &ids)
+  }
+  run writeOptionalView(&mut out, TAG_BRAILLE_LABEL(), node.brailleLabel())
+  run writeOptionalView(&mut out, TAG_BRAILLE_ROLE_DESCRIPTION(), node.brailleRoleDescription())
+  run writeOptionalView(&mut out, TAG_DOM_IDENTIFIER(), node.htmlId())
+  if node.supportsTextRanges() {
+    run out.byte(TAG_TEXT())
+    run writeText(node, &mut out)
+  }
+}
+
+/// The most lines and characters a record carries; text past them is still readable, but
+/// AppKit gets no line or character geometry for it.
+pub fn TEXT_LIMIT() -> usize {
+  return 65536
+}
+
+effect fn writeSpan(out: &mut Record, start: &Position<'_>, end: &Position<'_>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run out.index(start.toGlobalUtf16Index())
+  run out.index(end.toGlobalUtf16Index())
+}
+
+/// The union of the boxes between `start` and `end`.
+effect fn spanBounds<'a>(start: &Position<'a>, end: &Position<'a>) -> Rect
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut range = start.toDegenerateRange()
+  range.setEnd(end.*)
+  let mut boxes = List<Rect>.make()
+  run range.boundingBoxes(&mut boxes)
+  if boxes.length() == 0 {
+    return Rect.make(0.0, 0.0, 0.0, 0.0)
+  }
+  let mut out = boxes.get(0)
+  let mut i: usize = 1
+  while i < boxes.length() {
+    let next = boxes.get(i)
+    out = Rect.make(
+      f64.min(out.x0, next.x0),
+      f64.min(out.y0, next.y0),
+      f64.max(out.x1, next.x1),
+      f64.max(out.y1, next.y1),
+    )
+    i = i + 1
+  }
+  return out
+}
+
+/// Writes the text block of a node that supports text ranges.
+pub effect fn writeText(node: &NodeRef<'_>, out: &mut Record) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let document = node.documentRange()
+  let text = run document.text()
+  run out.text(text.view())
+  run out.index(document.endPosition().toGlobalUtf16Index())
+  match node.textSelection() {
+    Option.Some { value: selection } => {
+      run out.byte(1)
+      run writeSpan(&mut out, &selection.startPosition(), &selection.endPosition())
+      let line = match node.textSelectionFocus() {
+        Option.Some { value } => value.toLineIndex()
+        Option.None => 0
+      }
+      run out.index(line)
+    }
+    Option.None => {
+      run out.byte(0)
+      run out.index(0)
+      run out.index(0)
+      run out.index(0)
+    }
+  }
+
+  // Lines, as `lineRangeFromIndex` numbers them.
+  let mut lines = Record.make()
+  let mut count: usize = 0
+  let mut pos = node.documentStart()
+  let mut first = true
+  while count < TEXT_LIMIT() {
+    let end = if pos.isDocumentEnd() {
+      pos
+    } else {
+      pos.forwardToLineEnd()
+    }
+    run writeSpan(&mut lines, &pos, &end)
+    count = count + 1
+    if pos.isDocumentEnd() || (first && end.isDocumentEnd()) {
+      break
+    }
+    first = false
+    pos = pos.forwardToLineStart()
+  }
+  run out.index(count)
+  run out.raw(lines.asSlice())
+
+  // Characters and their bounds.
+  let mut characters = Record.make()
+  count = 0
+  pos = node.documentStart()
+  while !pos.isDocumentEnd() && count < TEXT_LIMIT() {
+    let end = pos.forwardToCharacterEnd()
+    if end.toGlobalUtf16Index() <= pos.toGlobalUtf16Index() {
+      break
+    }
+    run writeSpan(&mut characters, &pos, &end)
+    run characters.rect(run spanBounds(&pos, &end))
+    count = count + 1
+    pos = end
+  }
+  run out.index(count)
+  run out.raw(characters.asSlice())
+
+  // Format runs and their attributes.
+  let mut runs = Record.make()
+  count = 0
+  pos = node.documentStart()
+  while count < TEXT_LIMIT() {
+    let end = pos.forwardToFormatEnd()
+    run writeSpan(&mut runs, &pos, &end)
+    run writeAttributes(&pos.innerNode(), &mut runs)
+    count = count + 1
+    if end.isDocumentEnd() || end.toGlobalUtf16Index() <= pos.toGlobalUtf16Index() {
+      break
+    }
+    pos = end
+  }
+  run out.index(count)
+  run out.raw(runs.asSlice())
+}
+
+/// Writes the attributes of text run `run`, ending with tag 0.
+effect fn writeAttributes(piece: &NodeRef<'_>, out: &mut Record) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match piece.fontFamily() {
+    Option.Some { value } => run out.textField(1, value)
+    Option.None => {}
+  }
+  match piece.fontSize() {
+    Option.Some { value } => run out.numberField(2, f32.toF64(value))
+    Option.None => {}
+  }
+  match piece.fontWeight() {
+    Option.Some { value } => {
+      if value >= 700.0 {
+        run out.byte(3)
+      }
+    }
+    Option.None => {}
+  }
+  if piece.isItalic() {
+    run out.byte(4)
+  }
+  match piece.underline() {
+    Option.Some { value } => {
+      run out.byte(5)
+      run out.color(value.color)
+    }
+    Option.None => {}
+  }
+  match piece.strikethrough() {
+    Option.Some { value } => {
+      run out.byte(6)
+      run out.color(value.color)
+    }
+    Option.None => {}
+  }
+  match piece.backgroundColor() {
+    Option.Some { value } => {
+      run out.byte(7)
+      run out.color(value)
+    }
+    Option.None => {}
+  }
+  match piece.foregroundColor() {
+    Option.Some { value } => {
+      run out.byte(8)
+      run out.color(value)
+    }
+    Option.None => {}
+  }
+  match piece.language() {
+    Option.Some { value } => run out.textField(9, value)
+    Option.None => {}
+  }
+  match piece.textAlign() {
+    Option.Some { value } => {
+      run out.byte(10)
+      run out.byte(
+        match value {
+          TextAlign.Left => 0
+          TextAlign.Center => 1
+          TextAlign.Right => 2
+          TextAlign.Justify => 3
+        },
+      )
+    }
+    Option.None => {}
+  }
+  run out.byte(0)
+}
