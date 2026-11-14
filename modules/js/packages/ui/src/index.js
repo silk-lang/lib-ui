@@ -582,6 +582,25 @@ export function nodeById(id) {
   return nodes.get(id) ?? null;
 }
 
+// The option bits of `__ui.markdown`.
+const MARKDOWN_FLAGS = { tables: 1, strikethrough: 2, taskLists: 4, autolinkLiterals: 8, footnotes: 16, frontmatter: 32, alerts: 64 };
+const GFM = 1 | 2 | 4 | 8;
+
+/**
+ * The syntax tree of Markdown `text`, in the shape of mdast (what remark gives): plain
+ * objects with `type` and `children`. CommonMark, with GitHub's tables, strikethrough,
+ * task lists and autolinks unless `gfm` is false. `footnotes`, `frontmatter` and
+ * `alerts` (`> [!NOTE]`, a node of type `alert` with a `kind`) turn those on.
+ */
+export function parseMarkdown(text, options = {}) {
+  let flags = options.gfm === false ? 0 : GFM;
+  for (const name in MARKDOWN_FLAGS) {
+    if (options[name] === true) flags |= MARKDOWN_FLAGS[name];
+    else if (options[name] === false) flags &= ~MARKDOWN_FLAGS[name];
+  }
+  return JSON.parse(native.markdown(String(text), flags));
+}
+
 let errorHandler = null;
 let pendingError = null;
 
