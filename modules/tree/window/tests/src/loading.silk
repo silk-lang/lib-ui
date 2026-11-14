@@ -1,0 +1,78 @@
+//! The native loader serves the URLs a tree asks for: files the program carries, `data:` URLs,
+//! and schemes it has no loader for, which fail. The nodes showing a source hear how it ended.
+import ui_fixtures.fixtures as fixtures
+import ui_tree.legacy { UiTree, TreeError, Batch, Event, EventKind, NodeKind }
+import ui_tree.mutation { LISTEN_LOAD, LISTEN_ERROR }
+import ui_tree_window.loader { Loader, schemeLength }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { AssertionError, Testing }
+import silk.text.string { String }
+
+const DOT: string<'static> = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAYAAAD0In+KAAAADklEQVR4nGP4z8DwH4QBEfcD/ePF9e8AAAAASUVORK5CYII="
+
+effect fn heard(events: &List<Event>, kind: EventKind, target: u32) -> bool {
+  let list = events.asSlice()
+  let mut i: usize = 0
+  while i < list.length {
+    if list[i].kind == kind && list[i].target == target {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+effect fn body() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut loader = Loader.make()
+  run loader.file("icons/dot.svg", b"<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 2 2\"><circle cx=\"1\" cy=\"1\" r=\"1\"/></svg>")
+
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.loadImage(1, DOT)
+  run batch.loadIcon(2, "./icons/dot.svg?v=2")
+  run batch.loadImage(3, "nope:thing")
+  run batch.loadImage(4, "data:image/png;base64,!!!")
+  run batch.create(10, NodeKind.Image)
+  run batch.listen(10, LISTEN_LOAD)
+  run batch.source(10, 1)
+  run batch.append(1, 10)
+  run batch.create(11, NodeKind.Icon)
+  run batch.listen(11, LISTEN_LOAD)
+  run batch.source(11, 2)
+  run batch.append(1, 11)
+  run batch.create(12, NodeKind.Image)
+  run batch.listen(12, LISTEN_ERROR)
+  run batch.source(12, 3)
+  run batch.append(1, 12)
+  run tree.apply(run batch.take())
+
+  run Testing.expect(run loader.serve(&mut tree), "installing sources changes the tree")
+  run Testing.expect(tree.resources.get(1).isSome(), "a data: URL image is installed")
+  run Testing.expect(tree.resources.get(2).isSome(), "a carried icon is found by relative URL")
+  run Testing.expect(tree.resources.get(3).isNone(), "an unknown scheme installs nothing")
+  run Testing.expect(tree.resources.get(4).isNone(), "a malformed data: URL installs nothing")
+  run Testing.expect(!loader.pending(), "nothing is left to load")
+
+  let mut events = List<Event>.make()
+  run tree.takeEvents(&mut events)
+  run Testing.expect(run heard(&events, EventKind.Load, 10), "the image hears load")
+  run Testing.expect(run heard(&events, EventKind.Load, 11), "the icon hears load")
+  run Testing.expect(run heard(&events, EventKind.Error, 12), "the unknown scheme ends in error")
+
+  run Testing.expect(schemeLength(String.utf8Bytes("https://a.b/c.png")) == 5, "https is a scheme")
+  run Testing.expect(schemeLength(String.utf8Bytes("photos/a:b.png")) == 0, "a slash ends a scheme")
+  run Testing.expect(schemeLength(String.utf8Bytes("C:/photos/a.png")) == 0, "a drive is not a scheme")
+}
+
+test effect fn loaderServesUrls() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run body() |> Effect.provideMut<Allocator>(&mut allocator)
+}

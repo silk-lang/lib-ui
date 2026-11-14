@@ -8,13 +8,13 @@ const { createBox, createText, createInput, mount, nodeById, setErrorHandler, pa
 test("nodes queue their mutations", () => {
   mock.take();
   const label = createText("hi");
-  const box = createBox({ width: 10, opacity: 0.5, backgroundColor: "red" }, label);
+  const box = createBox({ width: 10, opacity: 0.5, backgroundColor: "red", gridColumn: 2 }, label);
   mount(box);
   assert.deepEqual(mock.take(), [
     ["create", label.id, 1],
     ["setText", label.id, "hi"],
     ["create", box.id, 0],
-    ["style", box.id, "width:10px;opacity:0.5;background-color:red;", 0],
+    ["style", box.id, "width:10px;opacity:0.5;background-color:red;grid-column:2;", 0],
     ["append", box.id, label.id],
     ["root", box.id],
   ]);

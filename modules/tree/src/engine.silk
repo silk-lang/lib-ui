@@ -11,6 +11,7 @@ import cssom_view { ScrollAnimation }
 import svg_css.cssom_view_window { ScrollState, ViewTarget, ViewTargetKind }
 import svg_css.cssom_error { CssomError }
 import ui_protocol.grid { Grid }
+import grid_css
 import ui_protocol.options { RootOptions }
 import ui_protocol.root { RootEvent, RootEventKind, RootSupport, ExtraRoot }
 import mutation {
@@ -30,6 +31,8 @@ import mutation {
   LISTEN_FOCUS,
   LISTEN_BLUR,
   LISTEN_LAYOUT,
+  LISTEN_LOAD,
+  LISTEN_ERROR,
   NOT_FOCUSABLE
 }
 import css
@@ -380,6 +383,10 @@ pub struct StyleOverride {
   pub replace: bool,
 }
 
+const SOURCE_PENDING: u8 = 0
+const SOURCE_LOADED: u8 = 1
+const SOURCE_FAILED: u8 = 2
+
 /// The retained tree.
 ///
 /// It borrows the fonts it draws with. Each frame: [`UiTree.apply`] the client's batches, call
@@ -417,6 +424,13 @@ pub struct UiTree<'a> {
   pub focused: u32,
   families: Families,
   pub resources: Resources,
+  /// `LoadImage` and `LoadIcon` mutations waiting for the host's loaders (`takeLoads`). The
+  /// tree does no I/O: a host reads, fetches or looks up the URL, then defines the resource.
+  pub loads: List<Mutation>,
+  /// What became of each loaded resource, by id: `SOURCE_*`.
+  sourceStates: List<u8>,
+  /// Nodes that were given a source that already settled, told after the batch.
+  sourceTells: List<u32>,
   fontKeys: List<FontKeyEntry>,
   fontFaces: List<FontFaceEntry>,
   pub faces: List<FaceSlot<'a>>,
@@ -580,6 +594,9 @@ impl<'a> UiTree<'a> {
       focused: NONE,
       families: Families.make(),
       resources: move resources,
+      loads: List<Mutation>.make(),
+      sourceStates: List<u8>.make(),
+      sourceTells: List<u32>.make(),
       fontKeys: List<FontKeyEntry>.make(),
       fontFaces: List<FontFaceEntry>.make(),
       faces: List<FaceSlot<'a>>.make(),
@@ -661,6 +678,61 @@ impl<'a> UiTree<'a> {
 
   // Nodes.
 
+  /// Says that resource `resource` (from a `LoadImage` or `LoadIcon`) loaded or failed: each
+  /// image or icon showing it that listens gets a `Load` or `Error` record, and so does any
+  /// node that shows it later.
+  pub effect fn settleSource(self: &mut Self, resource: u32, ok: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let at = u32.toUsize(resource)
+    let have = self.sourceStates.length()
+    if at >= have {
+      run self.sourceStates.appendRepeated(SOURCE_PENDING, at + 1 - have)
+    }
+    let states = self.sourceStates.asMutSlice()
+    states[at] = if ok { SOURCE_LOADED } else { SOURCE_FAILED }
+    drop states
+    let mut i: usize = 0
+    while i < self.nodes.length() {
+      let node = &self.nodes.asSlice()[i]
+      if node.live && node.resource == resource
+        && (node.kind == NodeKind.Image || node.kind == NodeKind.Icon) {
+        run self.tellSource(usize.toU32(i), ok)
+      }
+      i = i + 1
+    }
+  }
+
+  fn sourceState(self: &Self, resource: u32) -> u8 {
+    let at = u32.toUsize(resource)
+    if at >= self.sourceStates.length() {
+      return SOURCE_PENDING
+    }
+    return self.sourceStates.asSlice()[at]
+  }
+
+  /// Queues the `Load` or `Error` record of node `slot`, if it listens.
+  effect fn tellSource(self: &mut Self, slot: u32, ok: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let node = self.node(slot)
+    let flag = if ok { LISTEN_LOAD } else { LISTEN_ERROR }
+    if u32.bitAnd(node.listeners, flag) == 0 {
+      return ()
+    }
+    let id = node.id
+    let mut path = List<u32>.make()
+    run self.pathTo(slot, &mut path)
+    let kind = if ok { EventKind.Load } else { EventKind.Error }
+    run self.queueEvent(Event.make(kind, id, move path))
+  }
+
+  /// The `LoadImage` and `LoadIcon` requests applied since the last call, for the host to
+  /// serve: it loads each URL and answers with `DefineImage` or `DefineIcon`.
+  pub fn takeLoads(self: &mut Self) -> List<Mutation> {
+    return Intrinsic.replace(self.loads, List<Mutation>.make())
+  }
+
   /// The slot of node `id`, or NONE.
   pub fn slotOf(self: &Self, id: u32) -> u32 {
     return match self.ids.get(Word { value: u32.toU64(id) }) {
@@ -682,6 +754,17 @@ impl<'a> UiTree<'a> {
   /// parent, its hover, press or focus state): the next resolve restyles it, and its
   /// descendants as far as what they inherit changed. Its ancestors are marked so the resolve
   /// finds it from the root.
+  /// Installs the grid the base look's grid properties describe, replacing any earlier
+  /// template, as `Mutation.SetGrid` does.
+  effect fn styleGrid(self: &mut Self, slot: u32) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let grid = run grid_css.gridOf(self.node(slot).base.asSlice())
+    let css = self.node(slot).css
+    run Effect.catchAll(grid.install(&mut self.layout, NodeId { index: css }), layoutFailed)
+    self.paintDirty = true
+  }
+
   pub fn restyle(self: &mut Self, slot: u32) -> () {
     self.stylesPending = true
     let nodes = self.nodes.asMutSlice()
@@ -767,6 +850,21 @@ impl<'a> UiTree<'a> {
     run self.applyAll(move batch)
     if self.current != before && self.rootOpen(before) {
       drop run self.useRoot(before)
+    }
+    if self.sourceTells.length() > 0 {
+      let tells = Intrinsic.replace(self.sourceTells, List<u32>.make())
+      let ids = tells.asSlice()
+      let mut i: usize = 0
+      while i < ids.length {
+        let slot = self.slotOf(ids[i])
+        if slot != NONE {
+          let state = self.sourceState(self.node(slot).resource)
+          if state != SOURCE_PENDING {
+            run self.tellSource(slot, state == SOURCE_LOADED)
+          }
+        }
+        i = i + 1
+      }
     }
   }
 
@@ -859,6 +957,10 @@ impl<'a> UiTree<'a> {
         let node = self.nodeMut(slot)
         let mut i: usize = 0
         while i < values.length {
+          if run grid_css.rejects(&values[i]) {
+            i = i + 1
+            continue
+          }
           match state {
             StyleState.Base => {
               run css.set(&mut node.base, &values[i])
@@ -879,10 +981,14 @@ impl<'a> UiTree<'a> {
           i = i + 1
         }
         self.restyle(slot)
+        if state == StyleState.Base && grid_css.mentionsGrid(values) {
+          run self.styleGrid(slot)
+        }
       }
       Mutation.ClearStyle { id, state } => {
         let slot = run self.require(index, id)
         let node = self.nodeMut(slot)
+        let hadGrid = state == StyleState.Base && grid_css.mentionsGrid(node.base.asSlice())
         match state {
           StyleState.Base => {
             node.base.clear()
@@ -901,6 +1007,9 @@ impl<'a> UiTree<'a> {
           }
         }
         self.restyle(slot)
+        if hadGrid {
+          run self.styleGrid(slot)
+        }
       }
       Mutation.SetText { id, value } => {
         let slot = run self.require(index, id)
@@ -1092,14 +1201,19 @@ impl<'a> UiTree<'a> {
               fail TreeError.WrongKind { index: index, id: id }
             }
           }
-          Option<Resource>.None => {
-            fail TreeError.UnknownResource { index: index, resource: resource }
-          }
+          // Not loaded yet: the node shows nothing until it is (see `Mutation.LoadImage`).
+          Option<Resource>.None => {}
         }
         let node = self.nodeMut(slot)
         node.resource = resource
         node.content = node.content + 1
         run self.updateNatural(slot)
+        // A source that already settled still tells a new node, as an image from the cache
+        // does on the web.
+        // Told once the batch is applied, when the node is in place.
+        if self.sourceState(resource) != SOURCE_PENDING {
+          run self.sourceTells.append(id)
+        }
       }
       Mutation.SetCanvas { id, commands } => {
         let slot = run self.require(index, id)
@@ -1157,6 +1271,12 @@ impl<'a> UiTree<'a> {
           fail TreeError.BadResource { index: index, resource: resource }
         }
         run self.refreshSources(resource)
+      }
+      Mutation.LoadImage { resource, url } => {
+        run self.loads.append(Mutation.LoadImage { resource: resource, url: move url })
+      }
+      Mutation.LoadIcon { resource, url } => {
+        run self.loads.append(Mutation.LoadIcon { resource: resource, url: move url })
       }
     }
   }

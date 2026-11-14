@@ -28,7 +28,17 @@ a Chromium of your own.
 `OPTIMIZATION=size modules/bench/web/build.sh jfb` builds the smaller WebAssembly instead of the
 faster one.
 
-Off the browser the program is a profiling driver: it renders 1,000 rows and selects one 200
-times through the same runtime and diff, with the page's batches encoded and dropped. Build it
+`PRERENDER=1 modules/bench/web/build.sh jfb` puts the first view (the heading, the buttons and an
+empty table) in `index.html`, drawn ahead of time: `build.sh` builds the program for this machine
+too, runs `ui-bench-web shell`, which prints that view as markup, and puts it inside the page's
+root element. The page shows it as soon as the stylesheet arrives, and the program adopts those
+nodes when it has loaded, so the first paint does not wait for the WebAssembly file (82 ms
+instead of about 1,000 ms on the benchmark's server). It is off by default and stays out of the
+numbers we report: vue, react and the other entries this one is compared with render from
+script, so their first paint and a prerendered one do not measure the same thing.
+
+Off the browser, with no argument, the program is a profiling driver: it renders 1,000 rows and
+selects one 200 times through the same runtime and diff, with the page's batches encoded and
+dropped. Build it
 with `silk build --manifest-path modules/bench/web/silk.toml --profile-input
 '{"optimization":"speed","debug":true}'` and run it under `valgrind --tool=callgrind`.
