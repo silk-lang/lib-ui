@@ -1126,7 +1126,8 @@ class Page {
         set("placeholder", r.text());
         break;
       case 12:
-        set("aria-checked", r.u8() === 1 ? "true" : "false");
+        meta.checked = r.u8() === 1;
+        set("aria-checked", meta.mixed ? "mixed" : meta.checked ? "true" : "false");
         break;
       case 13:
         set("aria-selected", r.u8() === 1 ? "true" : "false");
@@ -1159,6 +1160,16 @@ class Page {
       }
       case 19:
         set("id", r.text());
+        break;
+      case 20: {
+        const name = r.text();
+        set(name, r.text() || null);
+        break;
+      }
+      case 21:
+        meta.mixed = r.u8() === 1;
+        if (meta.mixed) set("aria-checked", "mixed");
+        else set("aria-checked", meta.checked === undefined ? null : meta.checked ? "true" : "false");
         break;
       default:
         throw new Error(`silk-ui: unknown attribute ${code}`);

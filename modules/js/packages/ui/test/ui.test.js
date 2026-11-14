@@ -168,14 +168,19 @@ test("role and aria-* reach the tree under its own names", () => {
   box.setAttribute("role", "button");
   box.setAttribute("aria-label", "Save");
   box.setAttribute("ariaExpanded", true);
-  box.setAttribute("aria-checked", "false");
+  box.setAttribute("aria-checked", "mixed");
   box.setAttribute("aria-selected", "true");
+  box.setAttribute("ariaLevel", 2);
+  box.setAttribute("aria-live", "polite");
   assert.deepEqual(mock.take(), [
     ["attribute", box.id, "role", "button"],
     ["attribute", box.id, "label", "Save"],
     ["attribute", box.id, "expanded", true],
+    ["attribute", box.id, "indeterminate", true],
     ["attribute", box.id, "checked", false],
     ["attribute", box.id, "selected", true],
+    ["attribute", box.id, "aria-level", "2"],
+    ["attribute", box.id, "aria-live", "polite"],
   ]);
 });
 
@@ -202,7 +207,11 @@ test("an unknown role or ARIA name warns once and throws nothing", () => {
     box.setAttribute("role", "unknown");
     box.setAttribute("role", "unknown");
     box.setAttribute("aria-describedby", "x");
-    assert.deepEqual(mock.take(), [["attribute", box.id, "role", "unknown"], ["attribute", box.id, "role", "unknown"]]);
+    assert.deepEqual(mock.take(), [
+      ["attribute", box.id, "role", "unknown"],
+      ["attribute", box.id, "role", "unknown"],
+      ["attribute", box.id, "aria-describedby", "x"],
+    ]);
     assert.deepEqual(warnings, ["the tree has no role 'unknown': it is ignored", "the tree has no 'aria-describedby' yet: it is ignored"]);
   } finally {
     console.warn = warn;
