@@ -42,7 +42,8 @@ about 9 GB for silkc.
 ## Checking
 
 `tests` is a program that runs `fixtures/net.js` in the runtime-backed realm against a local
-HTTP and WebSocket server (`fixtures/server.mjs`, run by Node):
+HTTP and WebSocket server (`fixtures/server.mjs`, run by Node). CI's `node` job runs it on Linux,
+with the natives from Ubuntu's static archives:
 
 ```sh
 silk build --manifest-path modules/js/node/tests/silk.toml
