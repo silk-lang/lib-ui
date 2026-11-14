@@ -31,7 +31,8 @@ const CANCELABLE = new Set(["pointerdown", "pointerup", "click", "wheel", "keydo
 // Properties whose numbers are not lengths. Every other number is CSS pixels.
 const UNITLESS = new Set([
   "opacity", "flexGrow", "flexShrink", "flex", "order", "zIndex", "fontWeight", "lineHeight",
-  "aspectRatio", "tabSize", "scale", "animationIterationCount",
+  "aspectRatio", "tabSize", "scale", "animationIterationCount", "gridRow", "gridRowStart", "gridRowEnd",
+  "gridColumn", "gridColumnStart", "gridColumnEnd", "gridArea",
 ]);
 
 const nodes = new Map();
