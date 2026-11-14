@@ -19,6 +19,8 @@ import ui_tree.legacy {
   Atom,
   MOD_SHIFT,
   MOD_CONTROL,
+  LISTEN_INPUT,
+  LISTEN_SELECTION_CHANGE,
   CpuSnapshot
 }
 import vector.geometry_error { GeometryError }
@@ -348,4 +350,96 @@ test effect fn richInputsLayOutRunsAndAtoms() -> ()
   ! AssertionError<'static> | TreeError | GeometryError | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   run layoutBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Selection changes.
+
+/// The `SelectionChange` records among `events`, as (start, end, activeMarks) triples.
+effect fn selectionChanges(events: &List<Event>, out: &mut List<MarkSpan>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let values = events.asSlice()
+  let mut i: usize = 0
+  while i < values.length {
+    if values[i].kind == EventKind.SelectionChange {
+      run out.append(
+        MarkSpan { start: values[i].selectionStart, end: values[i].selectionEnd, marks: values[i].activeMarks },
+      )
+    }
+    i = i + 1
+  }
+}
+
+effect fn changesOf(tree: &mut UiTree<'_>) -> List<MarkSpan>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let events = run drain(&mut tree)
+  let mut out = List<MarkSpan>.make()
+  run selectionChanges(&events, &mut out)
+  return move out
+}
+
+fn only(changes: &List<MarkSpan>, start: usize, end: usize, marks: u32) -> bool {
+  let list = changes.asSlice()
+  return list.length == 1 && list[0].start == start && list[0].end == end && list[0].marks == marks
+}
+
+effect fn selectionBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run editor(&collection)
+  let mut batch = Batch.make()
+  run batch.listen(NOTES, LISTEN_INPUT | LISTEN_SELECTION_CHANGE)
+  run tree.apply(run batch.take())
+  drop run changesOf(&mut tree)
+  let end = String.byteLength(VALUE)
+
+  // A caret move with no edit reports the new caret and the marks typing would get.
+  run key(&mut tree, "ArrowLeft", 0)
+  run Testing.expect(only(&run changesOf(&mut tree), end - 1, end - 1, 0), "ArrowLeft reports the caret")
+  run key(&mut tree, "Home", 0)
+  run Testing.expect(only(&run changesOf(&mut tree), 0, 0, BOLD), "the caret in bold text reports bold")
+  // Home again moves nothing and reports nothing.
+  run key(&mut tree, "Home", 0)
+  let still = run changesOf(&mut tree)
+  run Testing.expect(still.length() == 0, "no move, no record")
+
+  // Shift extends: the record has the range, start before end.
+  run key(&mut tree, "ArrowRight", MOD_SHIFT)
+  run Testing.expect(only(&run changesOf(&mut tree), 0, 1, BOLD), "a range reports start and end")
+
+  // An edit reports its Input record first, then the selection after it.
+  run key(&mut tree, "End", 0)
+  drop run changesOf(&mut tree)
+  run typeText(&mut tree, "!")
+  let events = run drain(&mut tree)
+  let input = lastInput(&events)
+  let mut after = List<MarkSpan>.make()
+  run selectionChanges(&events, &mut after)
+  run Testing.expect(input != usize.MAX && events.asSlice()[events.length() - 1].kind == EventKind.SelectionChange,
+    "selectionchange follows input")
+  run Testing.expect(only(&after, end + 1, end + 1, 0), "the caret after the edit")
+
+  // Format at a caret moves nothing but changes the typing marks.
+  run format(&mut tree, true)
+  run Testing.expect(only(&run changesOf(&mut tree), end + 1, end + 1, BOLD), "typing marks report")
+
+  // A programmatic select reports too, as setSelectionRange does on the web.
+  run select(&mut tree, 1, 3)
+  run Testing.expect(only(&run changesOf(&mut tree), 1, 3, BOLD), "select reports")
+
+  // No listener, no record.
+  let mut quiet = Batch.make()
+  run quiet.listen(NOTES, LISTEN_INPUT)
+  run tree.apply(run quiet.take())
+  run key(&mut tree, "ArrowLeft", 0)
+  let unheard = run changesOf(&mut tree)
+  run Testing.expect(unheard.length() == 0, "only for listeners")
+}
+
+test effect fn selectionChangeFollowsCaretMoves() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run selectionBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }

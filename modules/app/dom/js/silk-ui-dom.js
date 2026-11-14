@@ -46,6 +46,7 @@ const EVENT = {
   animationIteration: 24,
   animationEnd: 25,
   animationCancel: 26,
+  selectionChange: 27,
 };
 
 // The listener flag of event kind `k` is `1 << k`.
@@ -1474,6 +1475,10 @@ class Page {
     on("animationend", motion(EVENT.animationEnd, "animationName"));
     on("animationcancel", motion(EVENT.animationCancel, "animationName"));
     on("input", (event) => this.forward(EVENT.input, event));
+    // An input's selectionchange bubbles from the input, as the tree's does.
+    on("selectionchange", (event) => {
+      if (event.target.nodeType === 1) this.forward(EVENT.selectionChange, event);
+    });
     on(
       "wheel",
       (event) => {

@@ -376,6 +376,11 @@ boundary on the nearest line by the same positions. Nothing is shaped outside la
   label), under the input's own text style. Typing takes the marks before the caret (or the
   ones `Format` set at the caret), `Format` over a range and `InsertAtom` are undo steps with
   their own `inputType`, and `Input` records carry the marks, atoms and active marks.
+- **Selection changes.** After each input and each batch, a focused input whose selection
+  (or, in a rich input, the marks typing would get) moved since the last report queues a
+  `SelectionChange` record for `LISTEN_SELECTION_CHANGE` listeners on its path, as DOM
+  `selectionchange` at an input: caret keys, clicks, drags, `Select` and edits (after their
+  `Input` record) all report, and a key that moves nothing does not.
 
 ## Frames
 
