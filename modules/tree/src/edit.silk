@@ -49,7 +49,7 @@ import layout.lib { LayoutTree }
 import ui_text.system { TextSystem }
 import node { NONE, NO_INDEX, Event, EventKind }
 import input { MOD_SHIFT, MOD_CONTROL, MOD_ALT, MOD_META }
-import mutation { NodeKind, LISTEN_INPUT, Declaration }
+import mutation { NodeKind, LISTEN_INPUT, LISTEN_SELECTION_CHANGE, Declaration }
 import node { Node }
 import scrollbar { rangeOf }
 import layout.lib { NodeId, InvalidNode }
@@ -170,6 +170,10 @@ pub struct EditState {
   pub markStyles: List<Styled>,
   pub atomStyles: List<Styled>,
   pub runs: List<Run>,
+  /// The selection and typing marks the last `SelectionChange` record reported.
+  reportedAnchor: usize,
+  reportedFocus: usize,
+  reportedMarks: u32,
 }
 
 impl EditState {
@@ -210,6 +214,9 @@ impl EditState {
       markStyles: List<Styled>.make(),
       atomStyles: List<Styled>.make(),
       runs: List<Run>.make(),
+      reportedAnchor: 0,
+      reportedFocus: 0,
+      reportedMarks: 0,
     }
   }
 
@@ -712,19 +719,54 @@ effect fn oneLine(text: string) -> String
 }
 
 /// Queues an `Input` record for `slot` when it or a node above it listens.
-effect fn inputRecord(tree: &mut UiTree<'_>, slot: u32, inputType: string) -> ()
+/// Queues a `SelectionChange` record when the focused input's selection, or a rich input's
+/// typing marks, changed since the last one. Runs after each input and each batch, so it
+/// follows the `Input` record of an edit as DOM `selectionchange` follows `input`.
+pub effect fn reportSelection(tree: &mut UiTree<'_>) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
+  let slot = tree.focused
+  if slot == NONE || tree.node(slot).kind != NodeKind.Input || !tree.node(slot).hasEdit() {
+    return ()
+  }
+  let e = state(&tree.*, slot)
+  let marks = if e.rich { e.activeMarks(String.view(&tree.node(slot).text)) } else { 0 }
+  if e.anchor == e.reportedAnchor && e.focus == e.reportedFocus && marks == e.reportedMarks {
+    return ()
+  }
+  let low = e.low()
+  let high = e.high()
+  let edited = stateMut(&mut tree, slot)
+  edited.reportedAnchor = edited.anchor
+  edited.reportedFocus = edited.focus
+  edited.reportedMarks = marks
+  if !listensOnPath(&tree.*, slot, LISTEN_SELECTION_CHANGE) {
+    return ()
+  }
+  let mut path = List<u32>.make()
+  run tree.pathTo(slot, &mut path)
+  let mut event = Event.make(EventKind.SelectionChange, tree.node(slot).id, move path)
+  event.selectionStart = low
+  event.selectionEnd = high
+  event.activeMarks = marks
+  run tree.queueEvent(move event)
+}
+
+fn listensOnPath(tree: &UiTree<'_>, slot: u32, flag: u32) -> bool {
   let mut at = slot
-  let mut listens = false
   while at != NONE {
-    if u32.bitAnd(tree.node(at).listeners, LISTEN_INPUT) != 0 {
-      listens = true
-      break
+    if u32.bitAnd(tree.node(at).listeners, flag) != 0 {
+      return true
     }
     at = tree.node(at).parent
   }
-  if !listens {
+  return false
+}
+
+effect fn inputRecord(tree: &mut UiTree<'_>, slot: u32, inputType: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !listensOnPath(&tree.*, slot, LISTEN_INPUT) {
     return ()
   }
   let mut path = List<u32>.make()

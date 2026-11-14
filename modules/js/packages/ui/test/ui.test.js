@@ -338,3 +338,19 @@ test("a rich input sends its document with UTF-8 offsets and names its marks", (
     ["select", input.id, 1, 3],
   ]);
 });
+
+test("selectionchange moves the caret of an input and names a rich input's typing marks", () => {
+  const input = createRichInput();
+  input.defineMark("bold", { fontWeight: 700 });
+  input.document = { text: "é" + OBJECT + "x", marks: [], atoms: [{ kind: "mention", label: "@a", data: "" }] };
+  mock.take();
+  let seen = null;
+  input.addEventListener("selectionchange", (event) => (seen = event));
+  assert.equal(mock.take()[0][0], "listen");
+  // Bytes 5 and 6 are the end of the object character and of "x".
+  globalThis.__ui.dispatch(27, input.id, 5, 6, 0, 1, 0);
+  assert.equal(seen.type, "selectionchange");
+  assert.equal(seen.selectionStart, 2);
+  assert.equal(input.selectionEnd, 3);
+  assert.deepEqual(input.activeMarks, ["bold"]);
+});

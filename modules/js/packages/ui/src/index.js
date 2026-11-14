@@ -19,7 +19,7 @@ const TYPES = [
   "keydown", "keyup", "focus", "blur", "input", "scroll", "layout", "pointercancel",
   "gotpointercapture", "lostpointercapture", "load", "error", "transitionrun", "transitionstart",
   "transitionend", "transitioncancel", "animationstart", "animationiteration", "animationend",
-  "animationcancel",
+  "animationcancel", "selectionchange",
 ];
 const KIND_OF = new Map(TYPES.map((type, kind) => [type, kind]));
 const CLICK = KIND_OF.get("click");
@@ -491,6 +491,11 @@ export class Input extends Node {
     this.selectionStart = Math.min(anchor, focus);
     this.selectionEnd = Math.max(anchor, focus);
   }
+
+  _selected(start, end) {
+    this.selectionStart = start;
+    this.selectionEnd = end;
+  }
 }
 
 // Inline SVG markup as icon resources: identical markup shares one, freed when no icon shows
@@ -720,6 +725,12 @@ export class RichInput extends Input {
     this.#document = { text: value, marks: spans, atoms: list };
     this.activeMarks = this.#names(active ?? 0);
   }
+
+  _selected(start, end, active) {
+    const text = this.#document.text;
+    super._selected(indexOf(text, start), indexOf(text, end));
+    this.activeMarks = this.#names(active ?? 0);
+  }
 }
 
 /** A rich text field with `style` as its base look. */
@@ -934,6 +945,10 @@ function fill(event, kind, a, b, modifiers, d, e, first, second, third, fourth) 
     event.propertyName = first;
     event.elapsedTime = a;
     event.pseudoElement = "";
+  } else if (kind === 27) {
+    event.target._selected?.(a, b, d);
+    event.selectionStart = event.target.selectionStart;
+    event.selectionEnd = event.target.selectionEnd;
   } else if (kind >= 23) {
     event.animationName = first;
     event.elapsedTime = a;

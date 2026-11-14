@@ -43,6 +43,7 @@ import mutation {
 import css
 import properties.declare
 import properties.values
+import properties.convert
 import input { Input }
 import interact
 import layers
@@ -108,6 +109,7 @@ import silk.collections.hash_map { HashMap }
 import silk.collections.list { List }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
+import silk.core.result { Result }
 import silk.mem.box { Box }
 import silk.core.ownership { Copy }
 import silk.geometry.rect { Rect }
@@ -907,6 +909,46 @@ impl<'a> UiTree<'a> {
   /// parent, its hover, press or focus state): the next resolve restyles it, and its
   /// descendants as far as what they inherit changed. Its ancestors are marked so the resolve
   /// finds it from the root.
+  /// `declared` with each `font-family` written as CSS text (`Inter, sans-serif`) turned into
+  /// the family list id the computed style reads, or None when none is written so.
+  effect fn namedFamilies(self: &mut Self, declared: &[Declaration]) -> Option<List<Declaration>>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut found = false
+    let mut i: usize = 0
+    while i < declared.length {
+      if writtenFamily(&declared[i]) {
+        found = true
+      }
+      i = i + 1
+    }
+    if !found {
+      return Option<List<Declaration>>.None
+    }
+    let mut out = List<Declaration>.make()
+    i = 0
+    while i < declared.length {
+      if writtenFamily(&declared[i]) {
+        let text = run values.cssText(&declared[i].value)
+        match String.fromUtf8(Bytes.asSlice(&text)) {
+          Result.Success { value: names } => {
+            let id = run self.families.intern(names)
+            run out.append(Declaration {
+              property: CssProperty.FontFamily,
+              value: values.number(u32.toF32(id)),
+              important: declared[i].important,
+            })
+          }
+          Result.Failure { error: _ } => {}
+        }
+      } else {
+        run out.append(run values.cloneDeclaration(&declared[i]))
+      }
+      i = i + 1
+    }
+    return Option<List<Declaration>>.Some { value: move out }
+  }
+
   /// Installs the grid the base look's grid properties describe, replacing any earlier
   /// template, as `Mutation.SetGrid` does.
   effect fn styleGrid(self: &mut Self, slot: u32) -> ()
@@ -1008,6 +1050,7 @@ impl<'a> UiTree<'a> {
     ? &mut Allocator {
     let before = self.current
     run self.applyAll(move batch)
+    run edit.reportSelection(&mut self)
     if self.current != before && self.rootOpen(before) {
       drop run self.useRoot(before)
     }
@@ -1114,9 +1157,14 @@ impl<'a> UiTree<'a> {
       Mutation.SetStyle { id, state, declarations } => {
         let slot = run self.require(index, id)
         let prepared = run expand.prepared(declarations.asSlice())
-        let values = match &prepared {
+        let expanded = match &prepared {
           Option.Some { value } => value.asSlice()
           Option.None => declarations.asSlice()
+        }
+        let named = run self.namedFamilies(expanded)
+        let values = match &named {
+          Option.Some { value } => value.asSlice()
+          Option.None => expanded
         }
         let node = self.nodeMut(slot)
         let mut i: usize = 0
@@ -2748,6 +2796,7 @@ impl<'a> UiTree<'a> {
     }
     run interact.begin(&mut self, &input)
     run interact.finish(&mut self, move input, false)
+    run edit.reportSelection(&mut self)
   }
 
   /// The first half of `dispatch`: hit testing, hover, and the record of the input itself
@@ -2782,6 +2831,7 @@ impl<'a> UiTree<'a> {
     let started = self.pendingRoot
     drop run self.useRoot(started)
     run interact.finish(&mut self, move input, prevented)
+    run edit.reportSelection(&mut self)
   }
 
   /// The id of the node a pointer at (`x`, `y`) would target in the last frame, or NONE.
@@ -3561,6 +3611,11 @@ impl<'a> UiTree<'a> {
       return false
     }
     return self.overrideIndex(id, state) != usize.MAX
+  }
+
+  /// The `font-family` text font family `family` was defined with, if the tree knows it.
+  pub fn fontFamilyText(self: &Self, family: u32) -> Option<string<'_>> {
+    return self.families.text(family)
   }
 
   /// Node `id`'s override in `state`, if it has one.
@@ -4387,3 +4442,9 @@ fn sameText(left: &TextStyle, right: &TextStyle) -> bool {
     && &left.placeholderColor == &right.placeholderColor
     && left.hasPlaceholderColor == right.hasPlaceholderColor
 }
+
+// A `font-family` written as CSS text rather than as a family list id.
+fn writtenFamily(declaration: &Declaration) -> bool {
+  return declaration.property == CssProperty.FontFamily && convert.number(&declaration.value).isNone()
+}
+

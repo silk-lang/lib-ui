@@ -56,7 +56,10 @@ mount(createBox({ width: 400, height: 300 }, button));
   the document; `format(name, on)` and `toggleMark(name)` mark the selection, or the text typed
   next at a caret; `insertAtom(start, end, atom)` replaces a range with an atom (a `@` trigger
   turning into a mention). Offsets are string indices. An `input` event also has `document`,
-  and `activeMarks` holds the marks typed text gets. Typing takes the marks before the caret;
+  and `activeMarks` holds the marks typed text gets. A `selectionchange` event (bubbling, as
+  on the web) follows every caret or selection move and every change of `activeMarks`, with
+  `selectionStart` and `selectionEnd`: listen for it to open a picker by a `@` the caret moved
+  next to. Typing takes the marks before the caret;
   undo, IME and copy (which writes atom labels) work as in a plain input.
 - **Attributes.** `setAttribute(name, value)` for the tree's attributes (`tabIndex`,
   `disabled`, `label`, `testId`, `placeholder`, `multiline`, `readOnly`, `checked`,
