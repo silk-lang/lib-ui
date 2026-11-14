@@ -10,7 +10,7 @@ const native = globalThis.__ui;
 if (!native) throw new Error("@silk/ui needs the __ui functions of a ui-js host");
 
 const KINDS = { box: 0, text: 1, input: 2, image: 3, icon: 4, canvas: 5 };
-const STATES = { base: 0, hover: 1, active: 2, focus: 3, focusVisible: 4 };
+const STATES = { base: 0, hover: 1, active: 2, focus: 3, focusVisible: 4, starting: 5 };
 
 // Event types in the order of the tree's LISTEN_* flags: the index is the kind number the
 // host dispatches and the bit a node listens with.
@@ -236,7 +236,8 @@ export class Node {
     this.look("base").replace(properties);
   }
 
-  /** The look the tree lays over the base in `state`: hover, active, focus or focusVisible. */
+  /** The look the tree lays over the base in `state`: hover, active, focus, focusVisible, or
+   * starting (what transitions start from when the node first shows, as `@starting-style`). */
   look(state) {
     if (state === "base") return (this.#base ??= new Look(this, 0));
     if (!(state in STATES)) throw new TypeError("the tree has no look '" + state + "'");

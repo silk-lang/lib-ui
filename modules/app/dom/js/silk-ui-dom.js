@@ -52,8 +52,10 @@ const PREVENT_SCROLL = 2;
 const PREVENT_KEYS = 4;
 
 // Later sheets win: a pressed node shows its active look over its hover look.
-const STATES = [null, ":hover", ":active", ":focus", ":focus-visible"];
-const STATE_ORDER = [1, 3, 4, 2];
+// The starting look (5) is an `@starting-style` block holding the node's rule.
+const STATES = [null, ":hover", ":active", ":focus", ":focus-visible", ""];
+const STATE_ORDER = [5, 1, 3, 4, 2];
+const STARTING = 5;
 
 // The same rules as `RESET` in `src/html.silk`, which a server render carries. `:where` gives
 // them no specificity, so the page's own stylesheets win. A pseudo-element rule that matches
@@ -1016,11 +1018,12 @@ class Page {
         attribute = "data-silk-html";
         node.setAttribute(attribute, id);
       }
-      const at = sheet.insertRule(`[${attribute}="${id}"]${STATES[state]} {}`, sheet.cssRules.length);
+      const selector = `[${attribute}="${id}"]${STATES[state]} {}`;
+      const at = sheet.insertRule(state === STARTING ? `@starting-style { ${selector} }` : selector, sheet.cssRules.length);
       rule = sheet.cssRules[at];
       rules.set(id, rule);
     }
-    return rule?.style;
+    return state === STARTING ? rule?.cssRules[0]?.style : rule?.style;
   }
 
   dropRule(id, state) {
