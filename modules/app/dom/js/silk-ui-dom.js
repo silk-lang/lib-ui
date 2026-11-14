@@ -110,6 +110,9 @@ class IdTable {
   }
 }
 
+// `Mutation.DeclareFontFace` styles, by number.
+const FACE_STYLES = ["normal", "italic", "oblique"];
+
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
 
@@ -269,6 +272,10 @@ class Page {
     // The address of each image and icon resource, by number.
     this.images = new Map();
     this.icons = new Map();
+    // Font faces the program declared, by number, as promises of their `FontFace`.
+    this.faces = new Map();
+    // The stylesheets of font rules linked so far.
+    this.stylesheets = new Set();
     // Addresses this page made for resources the program defined, to revoke.
     this.made = new Map();
     this.anchored = new Set();
@@ -701,6 +708,27 @@ class Page {
           this.load(this.icons, r.u32(), r.text());
           break;
         case 33: {
+          const face = r.u32();
+          const family = r.text();
+          const url = r.text();
+          const weight = [r.f32(), r.f32()];
+          const width = [r.f32(), r.f32()];
+          const style = FACE_STYLES[r.u8()] ?? "normal";
+          const ranges = [];
+          for (let count = r.u32(); count >= 2; count -= 2) ranges.push([r.u32(), r.u32()]);
+          this.declareFace(face, family, url, weight, width, style, ranges);
+          break;
+        }
+        case 34: {
+          const face = r.u32();
+          r.text();
+          this.faces.get(face)?.then((found) => found?.load()).catch(() => {});
+          break;
+        }
+        case 35:
+          this.linkFonts(r.text());
+          break;
+        case 36: {
           // `@keyframes`, in a sheet of their own, one rule per name.
           const name = r.text();
           const frames = [];
@@ -777,6 +805,60 @@ class Page {
   // loader, which answers with a Blob or an address; any other URL is the browser's to load.
   // A relative URL is one of the app's own files, so it resolves against the app's root (the
   // origin and `base`), not against the current route.
+  // An address the page can fetch for `url`, as `load` resolves image and icon URLs: a
+  // scheme with a loader goes through it (to a Blob or an address), any other scheme is
+  // fetched as it is, and a relative URL is the app's own file.
+  async resolve(url) {
+    const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(url)?.[1]?.toLowerCase();
+    const loader = scheme ? this.loaders[scheme] : undefined;
+    if (loader) return await loader(url);
+    return scheme ? url : new URL(url, `${location.origin}${this.base}/`).href;
+  }
+
+  // An `@font-face` rule: the browser fetches the file when text first needs the face, and
+  // swaps it in, as for a page's own rule. A face from a loader's Blob loads at once.
+  declareFace(face, family, url, weight, width, style, ranges) {
+    const range = (n) => n.toString(16).toUpperCase();
+    const descriptors = {
+      weight: weight[0] === weight[1] ? `${weight[0]}` : `${weight[0]} ${weight[1]}`,
+      stretch: width[0] === width[1] ? `${width[0]}%` : `${width[0]}% ${width[1]}%`,
+      style,
+      display: "swap",
+    };
+    if (ranges.length > 0) {
+      descriptors.unicodeRange = ranges.map(([first, last]) => `U+${range(first)}-${range(last)}`).join(", ");
+    }
+    const made = this.resolve(url).then(
+      async (found) => {
+        const source = found instanceof Blob ? await found.arrayBuffer() : `url(${JSON.stringify(String(found))})`;
+        const font = new FontFace(family, source, descriptors);
+        document.fonts.add(font);
+        return font;
+      },
+      (error) => {
+        console.error(`silk-ui: could not load font ${url}`, error);
+        return undefined;
+      },
+    );
+    this.faces.set(face, made);
+  }
+
+  // A stylesheet of `@font-face` rules (Google Fonts and the like), linked once.
+  linkFonts(url) {
+    this.resolve(url).then(
+      (found) => {
+        const href = found instanceof Blob ? URL.createObjectURL(found) : String(found);
+        if (this.stylesheets.has(href)) return;
+        this.stylesheets.add(href);
+        const link = document.createElement("link");
+        link.rel = "stylesheet";
+        link.href = href;
+        document.head.append(link);
+      },
+      (error) => console.error(`silk-ui: could not load fonts ${url}`, error),
+    );
+  }
+
   load(map, resource, url) {
     const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(url)?.[1]?.toLowerCase();
     const loader = scheme ? this.loaders[scheme] : undefined;

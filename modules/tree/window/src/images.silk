@@ -75,13 +75,35 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
   /// Resource ids belong to the caller. Use a different id for each concurrently displayed image.
   pub struct Images {
     entries: List<Entry>,
-    running: List<Load>
+    running: List<Load>,
+    /// Whether the ids are font faces (`forFonts`) rather than image and icon resources.
+    fonts: bool,
   }
 
   impl Images {
     /// Creates an empty native image loader.
     pub fn make() -> Images {
-      return Images { entries: List<Entry>.make(), running: List<Load>.make() }
+      return Images { entries: List<Entry>.make(), running: List<Load>.make(), fonts: false }
+    }
+
+    /// A loader of font files for the tree's declared faces (`UiTree.loadFontFace`), by face
+    /// id. Queue them with `fontFile` and `fontUrl`.
+    pub fn forFonts() -> Images {
+      return Images { entries: List<Entry>.make(), running: List<Load>.make(), fonts: true }
+    }
+
+    /// Queues reading the font file at local `path` for face `face` (see `forFonts`).
+    pub effect fn fontFile(self: &mut Self, face: u32, path: string) -> ()
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      run self.fileIcon(face, path)
+    }
+
+    /// Queues fetching the font file at HTTP(S) `url` for face `face` (see `forFonts`).
+    pub effect fn fontUrl(self: &mut Self, face: u32, url: string) -> ()
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      run self.urlIcon(face, url)
     }
 
     /// Queues local file reading and decoding. The string is copied before this returns.
@@ -243,6 +265,7 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
     pub effect fn poll(self: &mut Self, tree: &mut UiTree<'_>) -> bool
       ! TreeError | OutOfMemoryError
       ? &mut Allocator {
+      let fonts = self.fonts
       let mut changed = false
       let mut i: usize = 0
       while i < self.running.length() {
@@ -267,7 +290,15 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
                   run tree.apply(run batch.take())
                   drop entries[j].load.finish(job.generation, ImageError.None)
                 }
-                Loaded.Svg { data } => {
+                Loaded.Svg { data } => if fonts {
+                  let loaded = run tree.loadFontFace(job.resource, move data, 0)
+                  let error = if loaded {
+                    ImageError.None
+                  } else {
+                    ImageError.Decode
+                  }
+                  drop entries[j].load.finish(job.generation, error)
+                } else {
                   let mut batch = Batch.make()
                   run batch.icon(job.resource, data.asSlice())
                   let installed = run Effect.catch<TreeError>(applyIcon(&mut tree, run batch.take()), badIcon)

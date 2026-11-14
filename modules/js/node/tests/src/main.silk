@@ -1,0 +1,69 @@
+//! The network check of `ui-js-node`: runs the module at the path in its first argument in a
+//! runtime-backed realm with `@silk/ui`, turns the loop until the module calls process.exit,
+//! and exits with its status (2 when JavaScript queued no mutation for the tree). Run by
+//! `scripts/check`, which starts `fixtures/server.mjs` and passes its port in SILK_TEST_PORT.
+import ui_js.lib { uiPackage }
+import ui_js_node.lib { NodeApp }
+import node_runtime.runtime.embed { Host, Options }
+import node_runtime.runtime.embed as embed
+import node_runtime.runtime.session { Runtime }
+import silkjs.js_exceptions { JsException }
+import silkjs.js_atomics_native { SynchronizationError }
+import silkjs.js_libc_platform as platform
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.host_input { HostInput }
+
+struct Check {
+  source: List<u8>,
+  /// JavaScript queued mutations for the tree.
+  built: bool,
+}
+
+impl Host for Check {
+  effect fn drive<'e, 'm>(self: &mut Self, runtime: &mut Runtime<'e, 'm>) -> i32 ! OutOfMemoryError | JsException ? &mut Allocator {
+    let mut app = run NodeApp.make(&mut runtime.*)
+    run app.define(b"@silk/ui", uiPackage())
+    run app.entry(b"/ui-js-node-check/net.js", self.source.asSlice())
+    let mut turns: u32 = 0
+    while turns < 1200 {
+      run app.turn(0.05)
+      if app.pending() != 0 { self.built = true }
+      if let Option<i32>.Some { value } = app.exitStatus() {
+        if value == 0 && !self.built { return 2 }
+        return value
+      }
+      turns = turns + 1
+    }
+    return 3
+  }
+}
+
+effect fn check(path: &[u8]) -> i32 ! OutOfMemoryError | SynchronizationError | platform.PlatformError ? &mut Allocator {
+  let mut host = Check { source: run platform.readFile(path), built: false }
+  let options = run Options.make(b"ui-js-node-check")
+  return run embed.start(move options, &mut host)
+}
+
+effect fn noArgument<E>(error: E) -> Option<Bytes> {
+  drop error
+  return Option<Bytes>.None
+}
+
+effect fn failed<E>(error: E) -> i32 {
+  drop error
+  return 4
+}
+
+pub effect fn main() -> i32 ? &mut HostInput {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let argument = run Effect.catchAll(HostInput.argument(1), noArgument) |> Effect.provideMut<Allocator>(&mut allocator)
+  let path = match move argument {
+    Option<Bytes>.Some { value } => move value
+    Option<Bytes>.None => { return 5 }
+  }
+  return run Effect.catchAll(check(Bytes.asSlice(&path)), failed) |> Effect.provideMut<Allocator>(&mut allocator)
+}
