@@ -1,5 +1,6 @@
-//! Serves the image and icon URLs a tree asks for (`Mutation.LoadImage` and `LoadIcon`, taken
-//! with `UiTree.takeLoads`) on a native host. The URL's scheme picks the loader:
+//! Serves the image, icon and font face URLs a tree asks for (`Mutation.LoadImage`, `LoadIcon`
+//! and `LoadFontFace`, taken with `UiTree.takeLoads`) on a native host. The URL's scheme picks
+//! the loader:
 //!
 //! - a relative URL (`"photos/dusk.png"`) is one of the app's own files: one the app embedded
 //!   with [`Loader.file`] (bytes the program carries, from `Source.read`), or else the file at
@@ -9,7 +10,9 @@
 //! - `data:` holds the bytes in the URL itself, base64 or percent-encoded.
 //!
 //! When a load ends, the tree tells the nodes showing it (`UiTree.settleSource`): each that
-//! listens gets a `load` or `error` record, as an `img` element does on the web.
+//! listens gets a `load` or `error` record, as an `img` element does on the web. A font face
+//! gets its file (`UiTree.loadFontFace`, TrueType or OpenType) or fails, and its text keeps
+//! the fallback.
 import remote { Remote, ImageState }
 import ui_tree.legacy { UiTree, TreeError, Batch, Mutation }
 import codec.decode
@@ -48,6 +51,10 @@ pub struct Loader {
   /// Resources handed to `remote` that have not settled, and whether each is an icon.
   waiting: List<Settled>,
   settled: List<Settled>,
+  /// Font files, by face id.
+  faces: Remote,
+  /// Faces handed to `faces` that have not settled.
+  waitingFaces: List<u32>,
 }
 
 impl Loader {
@@ -57,6 +64,8 @@ impl Loader {
       remote: Remote.make(),
       waiting: List<Settled>.make(),
       settled: List<Settled>.make(),
+      faces: Remote.forFonts(),
+      waitingFaces: List<u32>.make(),
     }
   }
 
@@ -75,7 +84,7 @@ impl Loader {
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
     let mut changed = false
-    let loads = tree.takeLoads()
+    let loads = run tree.takeLoads()
     let list = loads.asSlice()
     let mut i: usize = 0
     while i < list.length {
@@ -86,6 +95,10 @@ impl Loader {
         Mutation.LoadIcon { resource, url } => {
           changed = (run self.start(&mut tree, resource, true, String.view(&url))) || changed
         }
+        Mutation.LoadFontFace { face, url } => {
+          changed = (run self.startFace(&mut tree, face, String.view(&url))) || changed
+        }
+        // Stylesheets of `@font-face` rules are not read here yet.
         _ => {}
       }
       i = i + 1
@@ -104,6 +117,23 @@ impl Loader {
         run self.settle(entry.resource, entry.icon, state == ImageState.Ready)
       }
     }
+    if self.waitingFaces.length() > 0 {
+      changed = (run self.faces.poll(&mut tree)) || changed
+      let mut w: usize = 0
+      while w < self.waitingFaces.length() {
+        let face = self.waitingFaces.get(w)
+        let state = self.faces.state(face)
+        if state == ImageState.Loading {
+          w = w + 1
+          continue
+        }
+        drop self.waitingFaces.remove(w)
+        if state != ImageState.Ready {
+          tree.failFontFace(face)
+        }
+        changed = true
+      }
+    }
     // The nodes showing a settled source hear `load` or `error`.
     let settled = Intrinsic.replace(self.settled, List<Settled>.make())
     let ended = settled.asSlice()
@@ -118,7 +148,59 @@ impl Loader {
 
   /// Whether loads are still running, so the host keeps polling.
   pub fn pending(self: &Self) -> bool {
-    return self.waiting.length() > 0 || self.remote.pending()
+    return self.waiting.length() > 0 || self.remote.pending() || self.waitingFaces.length() > 0
+      || self.faces.pending()
+  }
+
+  /// Starts loading the file of font face `face` from `url`. Returns whether the face changed
+  /// at once (it loaded or failed).
+  effect fn startFace(self: &mut Self, tree: &mut UiTree<'_>, face: u32, url: string) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let bytes = String.utf8Bytes(url)
+    let scheme = schemeLength(bytes)
+    if scheme == 0 {
+      let path = relative(bytes)
+      let mut found = Option<&'static [u8]>.None
+      let files = self.files.asSlice()
+      let mut f: usize = 0
+      while f < files.length {
+        if same(String.utf8Bytes(files[f].path), path) {
+          found = Option<&'static [u8]>.some(files[f].data)
+          break
+        }
+        f = f + 1
+      }
+      drop files
+      if let Option<&'static [u8]>.Some { value: data } = found {
+        return run installFace(&mut tree, face, data)
+      }
+      run self.faces.fontFile(face, String.slice(url, bytes.length - path.length, path.length))
+      run self.waitingFaces.append(face)
+      return false
+    }
+    if lowered(bytes, scheme, "data") {
+      let mut decoded = Bytes.make()
+      if run dataBytes(&mut decoded, Slice.view(bytes, scheme + 1, bytes.length - scheme - 1)) {
+        return run installFace(&mut tree, face, decoded.asSlice())
+      }
+      tree.failFontFace(face)
+      return true
+    }
+    if lowered(bytes, scheme, "file") {
+      let mut path = String.make()
+      run UrlPercent.appendDecodedText(&mut path, filePath(bytes, scheme), false)
+      run self.faces.fontFile(face, String.view(&path))
+      run self.waitingFaces.append(face)
+      return false
+    }
+    if lowered(bytes, scheme, "http") || lowered(bytes, scheme, "https") {
+      run self.faces.fontUrl(face, url)
+      run self.waitingFaces.append(face)
+      return false
+    }
+    tree.failFontFace(face)
+    return true
   }
 
   effect fn settle(self: &mut Self, resource: u32, icon: bool, ok: bool) -> ()
@@ -219,6 +301,18 @@ impl Loader {
     run self.settle(resource, icon, ok)
     return ok
   }
+}
+
+/// Gives face `face` the font file `data` the loader has at hand.
+effect fn installFace(tree: &mut UiTree<'_>, face: u32, data: &[u8]) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut copied = Bytes.make()
+  run Bytes.append(&mut copied, data)
+  if !(run tree.loadFontFace(face, move copied, 0)) {
+    tree.failFontFace(face)
+  }
+  return true
 }
 
 effect fn applied(tree: &mut UiTree<'_>, mutations: List<Mutation>) -> bool
