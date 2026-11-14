@@ -1,0 +1,115 @@
+//! CSS `text-transform`, applied where text is shaped, so fragment offsets and carets still
+//! name the source text.
+import properties.computed { TextTransform }
+import silk.text.regex_unicode { UnicodeCase }
+import silk.text.unicode_properties { GeneralCategory }
+import silk.text.string { String }
+import silk.text.utf8_scan
+import silk.core.result { Result }
+import silk.collections.slice { Slice }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.u8
+
+fn utf8Length(scalar: u32) -> usize {
+  if scalar < 0x80 {
+    return 1
+  }
+  if scalar < 0x800 {
+    return 2
+  }
+  if scalar < 0x10000 {
+    return 3
+  }
+  return 4
+}
+
+fn wordPart(scalar: u32) -> bool {
+  if scalar == 0x27 || scalar == 0x2019 {
+    // An apostrophe continues the word: "don't" capitalizes as "Don't".
+    return true
+  }
+  return match GeneralCategory.of(scalar) {
+    GeneralCategory.Ll | GeneralCategory.Lm | GeneralCategory.Lo | GeneralCategory.Lt
+      | GeneralCategory.Lu | GeneralCategory.Mc | GeneralCategory.Me | GeneralCategory.Mn
+      | GeneralCategory.Nd | GeneralCategory.Nl | GeneralCategory.No => true
+    _ => false
+  }
+}
+
+fn upper(scalar: u32) -> u32 {
+  // ECMAScript's non-Unicode canonicalization is the simple uppercase mapping.
+  return UnicodeCase.canonicalize(scalar, false)
+}
+
+fn lower(scalar: u32) -> u32 {
+  // Simple case folding, which is the lowercase mapping outside a few special letters.
+  return UnicodeCase.canonicalize(scalar, true)
+}
+
+/// Appends `text` to `out` as `transform` makes it, and returns the last character of `text`.
+/// `previous` is the character before `text`, or 0 where a word starts. A character whose
+/// transform has another UTF-8 length is kept as written, so each byte offset still names the
+/// same character; `full-width` changes every length and is not applied.
+pub effect fn append(out: &mut String, text: string, transform: TextTransform, previous: u32) -> u32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let bytes = String.utf8Bytes(text)
+  if transform == TextTransform.None || transform == TextTransform.FullWidth {
+    run out.append(text)
+    if bytes.length == 0 {
+      return previous
+    }
+    let mut at = bytes.length - 1
+    while at > 0 && (bytes[at] & 0xC0) == 0x80 {
+      at = at - 1
+    }
+    return utf8_scan.decode(bytes, at).scalar
+  }
+  let mut before = previous
+  let mut at: usize = 0
+  while at < bytes.length {
+    let decoded = utf8_scan.decode(bytes, at)
+    let scalar = decoded.scalar
+    let mut mapped = scalar
+    if transform == TextTransform.Uppercase {
+      mapped = upper(scalar)
+    } else if transform == TextTransform.Lowercase {
+      mapped = lower(scalar)
+    } else if transform == TextTransform.Capitalize && !wordPart(before) {
+      mapped = upper(scalar)
+    }
+    if mapped == scalar || utf8Length(mapped) != decoded.next - at {
+      run out.append(String.slice(text, at, decoded.next - at))
+    } else {
+      let mut encoded: [u8; 4] = [0, 0, 0, 0]
+      let length = decoded.next - at
+      if length == 1 {
+        encoded[0] = u32.toU8(mapped)
+      } else if length == 2 {
+        encoded[0] = u32.toU8(0xC0 | u32.shiftRight(mapped, 6))
+        encoded[1] = u32.toU8(0x80 | (mapped & 0x3F))
+      } else if length == 3 {
+        encoded[0] = u32.toU8(0xE0 | u32.shiftRight(mapped, 12))
+        encoded[1] = u32.toU8(0x80 | (u32.shiftRight(mapped, 6) & 0x3F))
+        encoded[2] = u32.toU8(0x80 | (mapped & 0x3F))
+      } else {
+        encoded[0] = u32.toU8(0xF0 | u32.shiftRight(mapped, 18))
+        encoded[1] = u32.toU8(0x80 | (u32.shiftRight(mapped, 12) & 0x3F))
+        encoded[2] = u32.toU8(0x80 | (u32.shiftRight(mapped, 6) & 0x3F))
+        encoded[3] = u32.toU8(0x80 | (mapped & 0x3F))
+      }
+      match String.fromUtf8(Slice.view(&encoded, 0, length)) {
+        Result.Success { value } => {
+          run out.append(value)
+        }
+        Result.Failure { error: _ } => {
+          run out.append(String.slice(text, at, length))
+        }
+      }
+    }
+    before = scalar
+    at = decoded.next
+  }
+  return before
+}
