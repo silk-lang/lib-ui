@@ -1,9 +1,9 @@
 //! The tree as an AccessKit tree: a first full update, diffs that carry only what changed,
 //! focus, removals, and actions coming back from an adapter.
 import ui_tree.css
-import ui_tree.css { px, Declaration }
-import ui_tree.lib { Tree, TreeError, Viewport, EventKind, Attribute, Role, Node }
-import ui_tree.access { AccessTree, ActionOutcome, accessId, windowId, doAction }
+import ui_tree.css { px, Declaration, Keyword }
+import ui_tree.lib { Tree, TreeError, Viewport, EventKind, Attribute, Role, Node, Selection }
+import ui_tree.access { AccessTree, ActionOutcome, accessId, windowId, runId, doAction, accessibleName }
 import accesskit.lib {
   Role as AccessRole,
   Action,
@@ -12,6 +12,8 @@ import accesskit.lib {
   TreeId,
   TreeUpdate,
   NodeEntry,
+  TextPosition,
+  TextSelection,
   Toggled
 }
 import ui_fixtures.fixtures as fixtures
@@ -19,6 +21,7 @@ import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.testing.testing { Testing, AssertionError }
+import silk.num.usize
 import silk.text.string { String }
 
 fn viewport() -> Viewport {
@@ -76,7 +79,10 @@ effect fn accessUpdates() -> ()
   let rootId = root.id().raw()
   let mut access = AccessTree.make()
   let first = run access.fullUpdate(tree.engine())
-  run Testing.expect(first.nodes.length() == 5, "the window, the root and its three children")
+  run Testing.expect(
+    first.nodes.length() == 6,
+    "the window, the root, its three children and the input's empty text run",
+  )
   run Testing.expect(
     match &first.tree {
       Option.Some { value } => value.root.equals(windowId())
@@ -276,4 +282,264 @@ test effect fn adapterActionsReachTheTree() -> ()
   ! TreeError | OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run accessActions() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+fn labelIs(update: &TreeUpdate, id: u32, wanted: string) -> bool {
+  return match entryOf(update, id) {
+    Option.Some { value } => match value.node.label() {
+      Option.Some { value: name } => name == wanted
+      Option.None => String.byteLength(wanted) == 0
+    }
+    Option.None => false
+  }
+}
+
+fn childCount(update: &TreeUpdate, id: u32) -> usize {
+  return match entryOf(update, id) {
+    Option.Some { value } => value.node.children().length
+    Option.None => usize.MAX
+  }
+}
+
+effect fn accessNamesAndPruning() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run Tree.make(&fonts)
+  let root = run tree.box(&[])
+  // A button named by its content: <button><span>  Save </span> draft</button>.
+  let save = run tree.box(&sized(120.0, 30.0))
+  let span = run tree.span(&[])
+  let saveText = run tree.text("  Save ")
+  let draftText = run tree.text(" draft")
+  run tree.append(span, saveText)
+  run tree.append(save, span)
+  run tree.append(save, draftText)
+  run tree.setRole(save, Role.Button)
+  // A heading inside a role-less wrapper: the wrapper goes, the heading text is folded.
+  let wrapper = run tree.box(&[])
+  let heading = run tree.box(&[])
+  let headingText = run tree.text("Inbox")
+  run tree.append(heading, headingText)
+  run tree.append(wrapper, heading)
+  run tree.setRole(heading, Role.Heading)
+  // Plain text stays, as a label of its own; white space alone goes.
+  let note = run tree.text("Three unread")
+  let blank = run tree.text("   ")
+  // A hidden box is left out.
+  let hidden = run tree.box(&[css.display(Keyword.None)])
+  run tree.setRole(hidden, Role.Button)
+  run tree.setAttribute(hidden, Attribute.Label { value: run String.copy("Hidden") })
+  run tree.append(root, save)
+  run tree.append(root, wrapper)
+  run tree.append(root, note)
+  run tree.append(root, blank)
+  run tree.append(root, hidden)
+  run tree.setRoot(root)
+  drop run tree.frame(viewport(), 0.0)
+
+  let mut access = AccessTree.make()
+  let first = run access.fullUpdate(tree.engine())
+  run Testing.expect(labelIs(&first, save.id().raw(), "Save draft"), "the button is named by its text")
+  run Testing.expect(childCount(&first, save.id().raw()) == 0, "a button's children are not published")
+  run Testing.expect(
+    !carries(&first, saveText.id().raw()) && !carries(&first, span.id().raw()),
+    "nor its text",
+  )
+  run Testing.expect(!carries(&first, wrapper.id().raw()), "the role-less wrapper is left out")
+  run Testing.expect(labelIs(&first, heading.id().raw(), "Inbox"), "the heading is named by its text")
+  run Testing.expect(!carries(&first, headingText.id().raw()), "its text is not published again")
+  run Testing.expect(carries(&first, note.id().raw()), "plain text is published")
+  run Testing.expect(!carries(&first, blank.id().raw()), "white space alone is not")
+  run Testing.expect(!carries(&first, hidden.id().raw()), "display: none is not")
+  run Testing.expect(
+    childCount(&first, root.id().raw()) == 3,
+    "the root holds the button, the heading (moved up) and the text",
+  )
+  let mut name = String.make()
+  run accessibleName(tree.engine(), tree.engine().slotOf(note.id().raw()), &mut name)
+  run Testing.expect(name.ownedByteLength() == 0, "text has no name of its own")
+
+  // Changing text inside the button renames it.
+  run tree.setText(draftText, " copy")
+  drop run tree.frame(viewport(), 0.0)
+  let second = match run access.update(tree.engine()) {
+    Option.Some { value } => move value
+    Option.None => Intrinsic.trap("test: expected an update")
+  }
+  run Testing.expect(labelIs(&second, save.id().raw(), "Save copy"), "the button's new name")
+}
+
+test effect fn namesComeFromContentAndEmptyBoxesArePruned() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run accessNamesAndPruning() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn accessModal() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run Tree.make(&fonts)
+  let root = run tree.box(&[])
+  let page = run tree.box(&sized(100.0, 30.0))
+  let dialog = run tree.box(&sized(200.0, 100.0))
+  let ok = run tree.box(&sized(60.0, 30.0))
+  run tree.append(dialog, ok)
+  run tree.append(root, page)
+  run tree.append(root, dialog)
+  run tree.setRoot(root)
+  run tree.setRole(page, Role.Button)
+  run tree.setAttribute(page, Attribute.Label { value: run String.copy("Behind") })
+  run tree.setAttribute(page, Attribute.TabIndex { value: 0 })
+  run tree.setRole(ok, Role.Button)
+  run tree.setAttribute(ok, Attribute.Label { value: run String.copy("OK") })
+  run tree.setRole(dialog, Role.Dialog)
+  run tree.setAttribute(dialog, Attribute.Label { value: run String.copy("Confirm") })
+  run tree.setAttribute(dialog, Attribute.FocusTrap { value: true })
+  // Focus stays behind the dialog: the dialog still hides the page.
+  run tree.focus(page)
+  drop run tree.frame(viewport(), 0.0)
+
+  let mut access = AccessTree.make()
+  let update = run access.fullUpdate(tree.engine())
+  run Testing.expect(!carries(&update, page.id().raw()), "the page behind the dialog is hidden")
+  run Testing.expect(carries(&update, ok.id().raw()), "the dialog's button is there")
+  run Testing.expect(
+    match entryOf(&update, dialog.id().raw()) {
+      Option.Some { value } => value.node.isModal()
+      Option.None => false
+    },
+    "the dialog is modal",
+  )
+  run Testing.expect(update.focus.equals(windowId()), "focus outside the dialog is on the window")
+  let click = ActionRequest {
+    action: Action.Click,
+    targetTree: TreeId.root(),
+    targetNode: accessId(page.id().raw()),
+    data: Option.None,
+  }
+  run Testing.expect(
+    (run doAction(tree.engineMut(), &click)) == ActionOutcome.Unavailable,
+    "nodes behind the dialog take no actions",
+  )
+}
+
+test effect fn modalDialogsHideTheRest() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run accessModal() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+fn sameBytes(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < a.length {
+    if a[i] != b[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+effect fn accessTextRuns() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run Tree.make(&fonts)
+  let root = run tree.box(&[])
+  let note = run tree.text("Hi wörld")
+  let field = run tree.input(&sized(200.0, 30.0))
+  run tree.append(root, note)
+  run tree.append(root, field)
+  run tree.setRoot(root)
+  run tree.setText(field, "hello")
+  run tree.focus(field)
+  run tree.select(field, Selection.caret(5))
+  drop run tree.frame(viewport(), 0.0)
+
+  let noteId = note.id().raw()
+  let fieldId = field.id().raw()
+  let mut access = AccessTree.make()
+  let first = run access.fullUpdate(tree.engine())
+  run Testing.expect(
+    match entryOf(&first, noteId) {
+      Option.Some { value } => value.node.children().length == 1
+        && value.node.children()[0].equals(runId(noteId, 0))
+      Option.None => false
+    },
+    "the text has one run",
+  )
+  let mut found = false
+  let nodes = first.nodes.asSlice()
+  let mut i: usize = 0
+  while i < nodes.length {
+    if nodes[i].id.equals(runId(noteId, 0)) {
+      let r = &nodes[i].node
+      found = r.accessRole() == AccessRole.TextRun
+        && match r.value() {
+          Option.Some { value } => value == "Hi wörld"
+          Option.None => false
+        }
+        && sameBytes(r.characterLengths(), &[1, 1, 1, 1, 2, 1, 1, 1])
+        && sameBytes(r.wordStarts(), &[0, 3])
+        && match r.characterWidths() {
+          Option.Some { value } => value.length == 8 && value[0] > 0.0
+          Option.None => false
+        }
+        && match r.bounds() {
+          Option.Some { value: b } => b.width() > 0.0 && b.height() > 0.0
+          Option.None => false
+        }
+    }
+    i = i + 1
+  }
+  run Testing.expect(found, "the run holds the text, its characters and its word starts")
+  run Testing.expect(
+    match entryOf(&first, fieldId) {
+      Option.Some { value } => match value.node.textSelection() {
+        Option.Some { value: selection } => selection.focus.node.equals(runId(fieldId, 0))
+          && selection.focus.characterIndex == 5
+          && selection.anchor.characterIndex == 5
+        Option.None => false
+      }
+      Option.None => false
+    },
+    "the input's caret sits after its fifth character",
+  )
+
+  // An adapter selects "ell".
+  let select = ActionRequest {
+    action: Action.SetTextSelection,
+    targetTree: TreeId.root(),
+    targetNode: accessId(fieldId),
+    data: Option.Some {
+      value: ActionData.SetTextSelection {
+        value: TextSelection {
+          anchor: TextPosition { node: runId(fieldId, 0), characterIndex: 1 },
+          focus: TextPosition { node: runId(fieldId, 0), characterIndex: 4 },
+        },
+      },
+    },
+  }
+  run Testing.expect(
+    (run doAction(tree.engineMut(), &select)) == ActionOutcome.Done,
+    "setting the selection is done",
+  )
+  run Testing.expect(
+    match tree.selection(field) {
+      Option.Some { value } => value.anchor == 1 && value.focus == 4
+      Option.None => false
+    },
+    "the input selects bytes 1 to 4",
+  )
+}
+
+test effect fn textBecomesTextRunsWithTheSelection() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run accessTextRuns() |> Effect.provideMut<Allocator>(&mut allocator)
 }
