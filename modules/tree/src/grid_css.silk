@@ -1,0 +1,870 @@
+//! The CSS grid properties of a node's base look (`grid-template-columns`, `grid-row`,
+//! `grid-area`, ...) read into its [`Grid`], with the syntax of CSS Grid Layout 2. As in CSS, a
+//! declaration that does not parse is dropped and the others still apply. Lengths are `px`,
+//! the absolute units and `rem` (16px); `em` and viewport units have no size here yet.
+import ui_protocol.grid {
+  Grid,
+  GridAxis,
+  GridTrack,
+  GridBreadth,
+  GridBreadthKind,
+  GridNamedLine,
+  GridRepeat,
+  GridRepeatKind,
+  GridArea,
+  GridAutoFlow,
+  GridLine,
+  GridLineKind,
+  GridPlacement,
+  GridError
+}
+import mutation { Declaration, CssProperty }
+import properties.values
+import svg_css.lexer
+import svg_css.tokens { TokenBuffer, Kind, Limits, CssError, insensitive }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f64
+import silk.text.string { String }
+
+const MAX_TRACKS: usize = 10000
+
+/// Whether `property` is one the grid of a node is read from.
+pub fn isGridProperty(property: CssProperty) -> bool {
+  return property == CssProperty.GridTemplateColumns || property == CssProperty.GridTemplateRows
+    || property == CssProperty.GridTemplateAreas
+    || property == CssProperty.GridTemplate
+    || property == CssProperty.Grid
+    || property == CssProperty.GridAutoColumns
+    || property == CssProperty.GridAutoRows
+    || property == CssProperty.GridAutoFlow
+    || property == CssProperty.GridRowStart
+    || property == CssProperty.GridRowEnd
+    || property == CssProperty.GridColumnStart
+    || property == CssProperty.GridColumnEnd
+    || property == CssProperty.GridRow
+    || property == CssProperty.GridColumn
+    || property == CssProperty.GridArea
+}
+
+/// Whether any of `declarations` is a grid property.
+pub fn mentionsGrid(declarations: &[Declaration]) -> bool {
+  let mut i: usize = 0
+  while i < declarations.length {
+    if isGridProperty(declarations[i].property) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+/// The grid template and item placement that `declarations` set, applied in order.
+pub effect fn gridOf(declarations: &[Declaration]) -> Grid
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut grid = Grid.make()
+  let mut i: usize = 0
+  while i < declarations.length {
+    if isGridProperty(declarations[i].property) {
+      drop run applied(&mut grid, &declarations[i])
+    }
+    i = i + 1
+  }
+  if !grid.template.valid(grid.names.length() + 1) {
+    return Grid.make()
+  }
+  return move grid
+}
+
+/// Whether `declaration` is a grid property whose value does not parse. CSS drops such a
+/// declaration, so it never replaces an earlier valid one.
+pub effect fn rejects(declaration: &Declaration) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !isGridProperty(declaration.property) {
+    return false
+  }
+  let mut scratch = Grid.make()
+  return !run applied(&mut scratch, declaration)
+}
+
+/// Applies `declaration` to `grid`. Says whether its value parsed.
+effect fn applied(grid: &mut Grid, declaration: &Declaration) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let text = run values.cssText(&declaration.value)
+  let result = run Effect.result(apply(&mut grid.*, declaration.property, Bytes.asSlice(&text)))
+  return match move result {
+    Result<(), GridError | CssError | OutOfMemoryError>.Success { .. } => true
+    Result<(), GridError | CssError | OutOfMemoryError>.Failure { error } => match move error {
+      OutOfMemoryError allocation => { fail move allocation }
+      GridError _ => false
+      CssError _ => false
+    }
+  }
+}
+
+/// Where a parse is in a run of tokens; `end` is exclusive.
+struct Cursor {
+  at: usize,
+  end: usize,
+}
+
+impl Copy for Cursor {}
+
+fn kindAt(buffer: &TokenBuffer, at: usize) -> Kind {
+  return buffer.tokens.asSlice()[at].kind
+}
+
+fn isSpace(kind: Kind) -> bool {
+  return match kind {
+    Kind.Whitespace => true
+    _ => false
+  }
+}
+
+/// Whether the cursor has only whitespace left. Moves it past leading whitespace.
+fn done(buffer: &TokenBuffer, cursor: &mut Cursor) -> bool {
+  while cursor.at < cursor.end && isSpace(kindAt(buffer, cursor.at)) {
+    cursor.at = cursor.at + 1
+  }
+  return cursor.at >= cursor.end
+}
+
+/// The next token that is not whitespace, or Eof at the end.
+fn peek(buffer: &TokenBuffer, cursor: &mut Cursor) -> Kind {
+  if done(buffer, &mut cursor) {
+    return Kind.Eof
+  }
+  return kindAt(buffer, cursor.at)
+}
+
+/// The tokens inside the block or function at the cursor; the cursor moves past its end.
+fn enter(buffer: &TokenBuffer, cursor: &mut Cursor) -> Cursor {
+  let open = cursor.at
+  let mut close = buffer.tokens.asSlice()[open].matching
+  if close <= open || close > cursor.end {
+    close = cursor.end
+  }
+  cursor.at = if close < cursor.end { close + 1 } else { cursor.end }
+  return Cursor { at: open + 1, end: close }
+}
+
+fn word(buffer: &TokenBuffer, kind: Kind, expected: &[u8]) -> bool {
+  return match kind {
+    Kind.Ident { text } => insensitive(buffer.text(text), expected)
+    _ => false
+  }
+}
+
+fn isSlash(kind: Kind) -> bool {
+  return match kind {
+    Kind.Delim { scalar } => scalar == 47
+    _ => false
+  }
+}
+
+effect fn finish(buffer: &TokenBuffer, cursor: &mut Cursor) -> () ! GridError {
+  if !done(buffer, &mut cursor) {
+    fail GridError {}
+  }
+}
+
+effect fn comma(buffer: &TokenBuffer, cursor: &mut Cursor) -> () ! GridError {
+  match peek(buffer, &mut cursor) {
+    Kind.Comma => {
+      cursor.at = cursor.at + 1
+    }
+    _ => { fail GridError {} }
+  }
+}
+
+/// The value split at its top-level slashes.
+effect fn slashed(buffer: &TokenBuffer, cursor: Cursor) -> List<Cursor>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut parts = List<Cursor>.make()
+  let mut start = cursor.at
+  let mut at = cursor.at
+  while at < cursor.end {
+    let kind = kindAt(buffer, at)
+    if isSlash(kind) {
+      run parts.append(Cursor { at: start, end: at })
+      start = at + 1
+      at = at + 1
+    } else {
+      let matching = buffer.tokens.asSlice()[at].matching
+      at = if matching > at && matching < cursor.end { matching + 1 } else { at + 1 }
+    }
+  }
+  run parts.append(Cursor { at: start, end: cursor.end })
+  return move parts
+}
+
+fn textOf(bytes: &[u8]) -> string {
+  // The lexer's text is the UTF-8 of a string, or the decoded text of an escape.
+  return unsafe String.fromUtf8Unchecked(bytes)
+}
+
+/// Pixels per unit, for the units with a fixed size.
+effect fn pixels(unit: &[u8]) -> f64 ! GridError {
+  if insensitive(unit, b"px") { return 1.0 }
+  if insensitive(unit, b"rem") { return 16.0 }
+  if insensitive(unit, b"in") { return 96.0 }
+  if insensitive(unit, b"cm") { return 96.0 / 2.54 }
+  if insensitive(unit, b"mm") { return 96.0 / 25.4 }
+  if insensitive(unit, b"q") { return 96.0 / 101.6 }
+  if insensitive(unit, b"pt") { return 96.0 / 72.0 }
+  if insensitive(unit, b"pc") { return 16.0 }
+  fail GridError {}
+}
+
+fn keywordBreadth(kind: GridBreadthKind) -> GridBreadth {
+  return GridBreadth { kind: kind, length: 0.0, percent: 0.0 }
+}
+
+/// A `<track-breadth>`: a length, a percentage, `fr`, `auto`, `min-content` or `max-content`.
+effect fn breadth(buffer: &TokenBuffer, cursor: &mut Cursor) -> GridBreadth ! GridError {
+  let kind = peek(buffer, &mut cursor)
+  cursor.at = cursor.at + 1
+  match kind {
+    Kind.Ident { text } => {
+      let name = buffer.text(text)
+      if insensitive(name, b"auto") { return GridBreadth.auto() }
+      if insensitive(name, b"min-content") { return keywordBreadth(GridBreadthKind.MinContent) }
+      if insensitive(name, b"max-content") { return keywordBreadth(GridBreadthKind.MaxContent) }
+    }
+    Kind.Number { value, .. } => {
+      if value == 0.0 { return GridBreadth.fixed(0.0) }
+    }
+    Kind.Percentage { value, .. } => {
+      if value >= 0.0 {
+        return GridBreadth { kind: GridBreadthKind.Percent, length: 0.0, percent: f64.toF32(value / 100.0) }
+      }
+    }
+    Kind.Dimension { value, unit, .. } => {
+      if value >= 0.0 {
+        let name = buffer.text(unit)
+        if insensitive(name, b"fr") {
+          return GridBreadth.flex(f64.toF32(value))
+        }
+        return GridBreadth.fixed(f64.toF32(value * run pixels(name)))
+      }
+    }
+    _ => {}
+  }
+  fail GridError {}
+}
+
+/// A `<track-size>`: a breadth, `minmax(min, max)` or `fit-content(limit)`.
+effect fn trackSize(buffer: &TokenBuffer, cursor: &mut Cursor) -> GridTrack ! GridError {
+  match peek(buffer, &mut cursor) {
+    Kind.Function { name } => {
+      let function = buffer.text(name)
+      let mut inner = enter(buffer, &mut cursor)
+      if insensitive(function, b"minmax") {
+        let min = run breadth(buffer, &mut inner)
+        run comma(buffer, &mut inner)
+        let max = run breadth(buffer, &mut inner)
+        run finish(buffer, &mut inner)
+        let track = GridTrack.minmax(min, max)
+        if track.valid() { return track }
+      } else if insensitive(function, b"fit-content") {
+        let limit = run breadth(buffer, &mut inner)
+        run finish(buffer, &mut inner)
+        let track = GridTrack.fitContent(limit)
+        if track.valid() { return track }
+      }
+      fail GridError {}
+    }
+    _ => {
+      let track = GridTrack.breadth(run breadth(buffer, &mut cursor))
+      if !track.valid() { fail GridError {} }
+      return track
+    }
+  }
+}
+
+/// A `[name ...]` group at the cursor, naming `line` of `axis`.
+effect fn lineNames(buffer: &TokenBuffer, cursor: &mut Cursor, grid: &mut Grid, axis: &mut GridAxis, line: usize, repeat: usize) -> ()
+  ! GridError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut inner = enter(buffer, &mut cursor)
+  while !done(buffer, &mut inner) {
+    match kindAt(buffer, inner.at) {
+      Kind.Ident { text } => {
+        let name = run grid.name(textOf(buffer.text(text)))
+        run axis.lines.append(GridNamedLine { line: line, name: name, repeat: repeat })
+        inner.at = inner.at + 1
+      }
+      _ => { fail GridError {} }
+    }
+  }
+}
+
+fn isNames(kind: Kind) -> bool {
+  return match kind {
+    Kind.OpenSquare => true
+    _ => false
+  }
+}
+
+/// The line a name group at this point of `axis` names: a track boundary, or the next
+/// line-name slot of a subgrid.
+fn boundary(axis: &GridAxis) -> usize {
+  return if axis.subgrid { axis.lineCount } else { axis.tracks.length() }
+}
+
+/// A name group of `axis`; on a subgrid each group is a line of its own.
+effect fn group(buffer: &TokenBuffer, cursor: &mut Cursor, grid: &mut Grid, axis: &mut GridAxis, repeat: usize) -> ()
+  ! GridError | OutOfMemoryError
+  ? &mut Allocator {
+  let line = boundary(&axis.*)
+  run lineNames(buffer, &mut cursor, &mut grid.*, &mut axis.*, line, repeat)
+  if axis.subgrid {
+    axis.lineCount = axis.lineCount + 1
+  }
+}
+
+/// `repeat(count, pattern)` at the cursor.
+effect fn repeatTracks(buffer: &TokenBuffer, cursor: &mut Cursor, grid: &mut Grid, axis: &mut GridAxis) -> ()
+  ! GridError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut inner = enter(buffer, &mut cursor)
+  let mut kind = GridRepeatKind.Count
+  let mut count: usize = 1
+  match peek(buffer, &mut inner) {
+    Kind.Number { value, integer } => {
+      if !integer || value < 1.0 || value > 10000.0 { fail GridError {} }
+      count = f64.toUsize(value)
+    }
+    Kind.Ident { text } => {
+      let name = buffer.text(text)
+      if insensitive(name, b"auto-fill") {
+        kind = GridRepeatKind.AutoFill
+      } else if insensitive(name, b"auto-fit") && !axis.subgrid {
+        kind = GridRepeatKind.AutoFit
+      } else {
+        fail GridError {}
+      }
+    }
+    _ => { fail GridError {} }
+  }
+  inner.at = inner.at + 1
+  run comma(buffer, &mut inner)
+  let start = boundary(&axis.*)
+  let index = axis.repeats.length() + 1
+  while !done(buffer, &mut inner) {
+    if isNames(kindAt(buffer, inner.at)) {
+      run group(buffer, &mut inner, &mut grid.*, &mut axis.*, index)
+    } else if axis.subgrid || axis.tracks.length() >= MAX_TRACKS {
+      fail GridError {}
+    } else {
+      run axis.tracks.append(run trackSize(buffer, &mut inner))
+    }
+  }
+  let end = boundary(&axis.*)
+  if end == start { fail GridError {} }
+  run axis.repeats.append(GridRepeat { start: start, length: end - start, count: count, kind: kind })
+}
+
+/// A `grid-template-rows` or `grid-template-columns` value: `none`, a track list, or
+/// `subgrid` with line names.
+effect fn trackList(buffer: &TokenBuffer, cursor: &mut Cursor, grid: &mut Grid) -> GridAxis
+  ! GridError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut axis = GridAxis.make()
+  let first = peek(buffer, &mut cursor)
+  if word(buffer, first, b"none") {
+    cursor.at = cursor.at + 1
+    run finish(buffer, &mut cursor)
+    return move axis
+  }
+  if word(buffer, first, b"subgrid") {
+    cursor.at = cursor.at + 1
+    axis.subgrid = true
+  }
+  while !done(buffer, &mut cursor) {
+    let kind = kindAt(buffer, cursor.at)
+    if isNames(kind) {
+      run group(buffer, &mut cursor, &mut grid.*, &mut axis, 0)
+    } else {
+      let repeat = match kind {
+        Kind.Function { name } => insensitive(buffer.text(name), b"repeat")
+        _ => false
+      }
+      if repeat {
+        run repeatTracks(buffer, &mut cursor, &mut grid.*, &mut axis)
+      } else if axis.subgrid || axis.tracks.length() >= MAX_TRACKS {
+        fail GridError {}
+      } else {
+        run axis.tracks.append(run trackSize(buffer, &mut cursor))
+      }
+    }
+  }
+  if !axis.subgrid && axis.tracks.length() == 0 || !axis.valid(grid.names.length() + 1) {
+    fail GridError {}
+  }
+  return move axis
+}
+
+/// `grid-auto-rows` or `grid-auto-columns`: one or more track sizes.
+effect fn autoTracks(buffer: &TokenBuffer, cursor: &mut Cursor) -> List<GridTrack>
+  ! GridError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut tracks = List<GridTrack>.make()
+  while !done(buffer, &mut cursor) {
+    if tracks.length() >= MAX_TRACKS { fail GridError {} }
+    run tracks.append(run trackSize(buffer, &mut cursor))
+  }
+  if tracks.length() == 0 { fail GridError {} }
+  return move tracks
+}
+
+fn nameByte(byte: u8) -> bool {
+  return byte >= 128 || byte == 95 || byte == 45 || byte >= 48 && byte <= 57
+    || byte >= 65 && byte <= 90 || byte >= 97 && byte <= 122
+}
+
+fn whiteByte(byte: u8) -> bool {
+  return byte == 32 || byte == 9 || byte == 10 || byte == 12 || byte == 13
+}
+
+/// One row string of `grid-template-areas` added to `template`'s cells: the names of its
+/// cells (zero for a `.` run) appended to `cells`.
+effect fn areaRow(row: &[u8], grid: &mut Grid, cells: &mut List<usize>) -> usize
+  ! GridError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut count: usize = 0
+  let mut at: usize = 0
+  while at < row.length {
+    let byte = row[at]
+    if whiteByte(byte) {
+      at = at + 1
+    } else if byte == 46 {
+      while at < row.length && row[at] == 46 { at = at + 1 }
+      run cells.append(0)
+      count = count + 1
+    } else if nameByte(byte) {
+      let start = at
+      while at < row.length && nameByte(row[at]) { at = at + 1 }
+      let name = run grid.areaName(textOf(Slice.view<u8>(row, start, at - start)))
+      run cells.append(name)
+      count = count + 1
+    } else {
+      fail GridError {}
+    }
+  }
+  return count
+}
+
+/// The named areas of `rows` (row strings), as `grid-template-areas` sets them.
+effect fn areas(rows: &List<Bytes>, grid: &mut Grid) -> ()
+  ! GridError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut cells = List<usize>.make()
+  let mut columns: usize = 0
+  let mut row: usize = 0
+  while row < rows.length() {
+    let count = run areaRow(Bytes.asSlice(&rows.asSlice()[row]), &mut grid.*, &mut cells)
+    if count == 0 || row > 0 && count != columns || count > MAX_TRACKS { fail GridError {} }
+    columns = count
+    row = row + 1
+  }
+  if rows.length() > MAX_TRACKS { fail GridError {} }
+  let mut found = List<GridArea>.make()
+  let mut cell: usize = 0
+  while cell < cells.length() {
+    let name = cells.get(cell)
+    if name != 0 {
+      let r = cell / columns
+      let c = cell % columns
+      let mut index: usize = 0
+      while index < found.length() && found.asSlice()[index].name != name { index = index + 1 }
+      if index == found.length() {
+        run found.append(GridArea { name: name, rowStart: r, rowEnd: r + 1, columnStart: c, columnEnd: c + 1 })
+      } else {
+        let entry = &mut found.asMutSlice()[index]
+        entry.rowEnd = r + 1
+        if c < entry.columnStart { entry.columnStart = c }
+        if c >= entry.columnEnd { entry.columnEnd = c + 1 }
+      }
+    }
+    cell = cell + 1
+  }
+  // Each name must fill its rectangle and nothing outside it.
+  let mut index: usize = 0
+  while index < found.length() {
+    let area = found.get(index)
+    let mut r = area.rowStart
+    while r < area.rowEnd {
+      let mut c = area.columnStart
+      while c < area.columnEnd {
+        if cells.get(r * columns + c) != area.name { fail GridError {} }
+        c = c + 1
+      }
+      r = r + 1
+    }
+    index = index + 1
+  }
+  grid.template.areas = move found
+  grid.template.areaRows = rows.length()
+  grid.template.areaColumns = if rows.length() == 0 { 0 } else { columns }
+}
+
+/// `grid-template-areas`: `none` or one string per row.
+effect fn templateAreas(buffer: &TokenBuffer, cursor: &mut Cursor, grid: &mut Grid) -> ()
+  ! GridError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut rows = List<Bytes>.make()
+  if word(buffer, peek(buffer, &mut cursor), b"none") {
+    cursor.at = cursor.at + 1
+    run finish(buffer, &mut cursor)
+  } else {
+    while !done(buffer, &mut cursor) {
+      match kindAt(buffer, cursor.at) {
+        Kind.String { text } => {
+          run rows.append(run Bytes.copy(buffer.text(text)))
+          cursor.at = cursor.at + 1
+        }
+        _ => { fail GridError {} }
+      }
+    }
+    if rows.length() == 0 { fail GridError {} }
+  }
+  run areas(&rows, &mut grid.*)
+}
+
+/// `grid-auto-flow`: `row` or `column`, with `dense` or not.
+effect fn autoFlow(buffer: &TokenBuffer, cursor: &mut Cursor, grid: &mut Grid) -> () ! GridError {
+  let mut direction = false
+  let mut flow = GridAutoFlow.Row
+  let mut dense = false
+  while !done(buffer, &mut cursor) {
+    let kind = kindAt(buffer, cursor.at)
+    cursor.at = cursor.at + 1
+    if !direction && word(buffer, kind, b"row") {
+      direction = true
+    } else if !direction && word(buffer, kind, b"column") {
+      direction = true
+      flow = GridAutoFlow.Column
+    } else if !dense && word(buffer, kind, b"dense") {
+      dense = true
+    } else {
+      fail GridError {}
+    }
+  }
+  if !direction && !dense { fail GridError {} }
+  grid.template.flow = flow
+  grid.template.dense = dense
+}
+
+/// A `<grid-line>`: `auto`, a name, `<integer> <name>?` or `span` with a count, a name or both.
+effect fn gridLine(buffer: &TokenBuffer, cursor: Cursor, grid: &mut Grid) -> GridLine
+  ! GridError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut part = cursor
+  let first = peek(buffer, &mut part)
+  if word(buffer, first, b"auto") {
+    part.at = part.at + 1
+    run finish(buffer, &mut part)
+    return GridLine.auto()
+  }
+  let mut span = false
+  let mut number: i32 = 0
+  let mut counted = false
+  let mut name: usize = 0
+  while !done(buffer, &mut part) {
+    let kind = kindAt(buffer, part.at)
+    part.at = part.at + 1
+    match kind {
+      Kind.Ident { text } => {
+        if !span && insensitive(buffer.text(text), b"span") {
+          span = true
+        } else if name == 0 {
+          name = run grid.name(textOf(buffer.text(text)))
+        } else {
+          fail GridError {}
+        }
+      }
+      Kind.Number { value, integer } => {
+        if counted || !integer || value == 0.0 { fail GridError {} }
+        counted = true
+        number = if value > 10000.0 { 10000 } else if value < -10000.0 { -10000 } else { f64.toI32(value) }
+      }
+      _ => { fail GridError {} }
+    }
+  }
+  if span {
+    if counted && number < 0 || !counted && name == 0 { fail GridError {} }
+    return GridLine { kind: GridLineKind.Span, number: if counted { number } else { 1 }, name: name }
+  }
+  if !counted && name == 0 { fail GridError {} }
+  return GridLine { kind: GridLineKind.Line, number: number, name: name }
+}
+
+/// The end line a shorthand gives an omitted one: the start's name when the start is a bare
+/// name, `auto` otherwise.
+fn defaultEnd(start: GridLine) -> GridLine {
+  if start.kind == GridLineKind.Line && start.number == 0 && start.name != 0 {
+    return start
+  }
+  return GridLine.auto()
+}
+
+/// `grid-template` (and the template forms of `grid`): `none`, `rows / columns`, or row
+/// strings with their sizes and names, then `/ columns`.
+effect fn template(buffer: &TokenBuffer, cursor: &mut Cursor, grid: &mut Grid) -> ()
+  ! GridError | OutOfMemoryError
+  ? &mut Allocator {
+  if word(buffer, peek(buffer, &mut cursor), b"none") {
+    cursor.at = cursor.at + 1
+    run finish(buffer, &mut cursor)
+    grid.template.rows = GridAxis.make()
+    grid.template.columns = GridAxis.make()
+    let rows = List<Bytes>.make()
+    run areas(&rows, &mut grid.*)
+    return ()
+  }
+  let parts = run slashed(buffer, cursor.*)
+  if parts.length() > 2 { fail GridError {} }
+  let mut first = parts.get(0)
+  let mut hasStrings = false
+  let mut scan = first.at
+  while scan < first.end {
+    match kindAt(buffer, scan) {
+      Kind.String { .. } => { hasStrings = true }
+      _ => {}
+    }
+    scan = scan + 1
+  }
+  if !hasStrings {
+    if parts.length() != 2 { fail GridError {} }
+    let mut second = parts.get(1)
+    let rows = run trackList(buffer, &mut first, &mut grid.*)
+    let columns = run trackList(buffer, &mut second, &mut grid.*)
+    grid.template.rows = move rows
+    grid.template.columns = move columns
+    let none = List<Bytes>.make()
+    run areas(&none, &mut grid.*)
+    return ()
+  }
+  let mut rows = GridAxis.make()
+  let mut strings = List<Bytes>.make()
+  while !done(buffer, &mut first) {
+    if isNames(kindAt(buffer, first.at)) {
+      let line = rows.tracks.length()
+      run lineNames(buffer, &mut first, &mut grid.*, &mut rows, line, 0)
+    }
+    match peek(buffer, &mut first) {
+      Kind.String { text } => {
+        run strings.append(run Bytes.copy(buffer.text(text)))
+        first.at = first.at + 1
+      }
+      _ => { fail GridError {} }
+    }
+    let size = match peek(buffer, &mut first) {
+      Kind.String { .. } => GridTrack.breadth(GridBreadth.auto())
+      Kind.OpenSquare => GridTrack.breadth(GridBreadth.auto())
+      Kind.Eof => GridTrack.breadth(GridBreadth.auto())
+      _ => run trackSize(buffer, &mut first)
+    }
+    run rows.tracks.append(size)
+    if isNames(peek(buffer, &mut first)) {
+      let line = rows.tracks.length()
+      run lineNames(buffer, &mut first, &mut grid.*, &mut rows, line, 0)
+    }
+  }
+  let mut columns = GridAxis.make()
+  if parts.length() == 2 {
+    let mut second = parts.get(1)
+    columns = run trackList(buffer, &mut second, &mut grid.*)
+    if columns.subgrid || columns.repeats.length() != 0 && autoRepeat(&columns) { fail GridError {} }
+  }
+  if rows.tracks.length() > MAX_TRACKS || !rows.valid(grid.names.length() + 1) { fail GridError {} }
+  run areas(&strings, &mut grid.*)
+  grid.template.rows = move rows
+  grid.template.columns = move columns
+}
+
+/// Whether `part` names `auto-flow` at its top level.
+fn flows(buffer: &TokenBuffer, part: Cursor) -> bool {
+  let mut at = part.at
+  while at < part.end {
+    if word(buffer, kindAt(buffer, at), b"auto-flow") { return true }
+    at = at + 1
+  }
+  return false
+}
+
+/// The `auto-flow` side of a `grid` shorthand: `auto-flow`, `dense` in either order, then
+/// the implicit track sizes, which default to `auto`.
+effect fn flowSide(buffer: &TokenBuffer, part: Cursor) -> List<GridTrack>
+  ! GridError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut cursor = part
+  let mut flow = false
+  let mut dense = false
+  while !done(buffer, &mut cursor) {
+    let kind = kindAt(buffer, cursor.at)
+    if !flow && word(buffer, kind, b"auto-flow") {
+      flow = true
+    } else if !dense && word(buffer, kind, b"dense") {
+      dense = true
+    } else {
+      break
+    }
+    cursor.at = cursor.at + 1
+  }
+  if !flow { fail GridError {} }
+  let mut tracks = List<GridTrack>.make()
+  if !done(buffer, &mut cursor) {
+    tracks = run autoTracks(buffer, &mut cursor)
+  }
+  return move tracks
+}
+
+/// `grid`: a `grid-template` value, or `auto-flow` on one side of the slash with the
+/// explicit tracks of the other. Every grid longhand it does not set goes back to initial.
+effect fn shorthand(buffer: &TokenBuffer, cursor: Cursor, grid: &mut Grid) -> ()
+  ! GridError | OutOfMemoryError
+  ? &mut Allocator {
+  let parts = run slashed(buffer, cursor)
+  let rowsFlow = flows(buffer, parts.get(0))
+  let columnsFlow = parts.length() == 2 && flows(buffer, parts.get(1))
+  if !rowsFlow && !columnsFlow {
+    let mut whole = cursor
+    run template(buffer, &mut whole, &mut grid.*)
+    grid.template.autoRows = List<GridTrack>.make()
+    grid.template.autoColumns = List<GridTrack>.make()
+    grid.template.flow = GridAutoFlow.Row
+    grid.template.dense = false
+    return ()
+  }
+  if parts.length() != 2 || rowsFlow && columnsFlow { fail GridError {} }
+  let flowPart = if rowsFlow { parts.get(0) } else { parts.get(1) }
+  let mut tracksPart = if rowsFlow { parts.get(1) } else { parts.get(0) }
+  let dense = denseIn(buffer, flowPart)
+  let implicit = run flowSide(buffer, flowPart)
+  let explicit = run trackList(buffer, &mut tracksPart, &mut grid.*)
+  let none = List<Bytes>.make()
+  run areas(&none, &mut grid.*)
+  grid.template.dense = dense
+  if rowsFlow {
+    grid.template.flow = GridAutoFlow.Row
+    grid.template.rows = GridAxis.make()
+    grid.template.columns = move explicit
+    grid.template.autoRows = move implicit
+    grid.template.autoColumns = List<GridTrack>.make()
+  } else {
+    grid.template.flow = GridAutoFlow.Column
+    grid.template.columns = GridAxis.make()
+    grid.template.rows = move explicit
+    grid.template.autoColumns = move implicit
+    grid.template.autoRows = List<GridTrack>.make()
+  }
+}
+
+fn denseIn(buffer: &TokenBuffer, part: Cursor) -> bool {
+  let mut at = part.at
+  while at < part.end {
+    if word(buffer, kindAt(buffer, at), b"dense") { return true }
+    at = at + 1
+  }
+  return false
+}
+
+fn autoRepeat(axis: &GridAxis) -> bool {
+  let repeats = axis.repeats.asSlice()
+  let mut i: usize = 0
+  while i < repeats.length {
+    if repeats[i].kind != GridRepeatKind.Count { return true }
+    i = i + 1
+  }
+  return false
+}
+
+/// Applies one grid declaration, `property: css`, to `grid`. Fails without a change to the
+/// template when the value does not parse.
+effect fn apply(grid: &mut Grid, property: CssProperty, css: &[u8]) -> ()
+  ! GridError | CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let limits = Limits.make()
+  let buffer = run lexer.tokenize(css, &limits)
+  let all = buffer.all()
+  let mut cursor = Cursor { at: all.start, end: all.end }
+  if property == CssProperty.GridTemplateColumns {
+    let axis = run trackList(&buffer, &mut cursor, &mut grid.*)
+    grid.template.columns = move axis
+  } else if property == CssProperty.GridTemplateRows {
+    let axis = run trackList(&buffer, &mut cursor, &mut grid.*)
+    grid.template.rows = move axis
+  } else if property == CssProperty.GridTemplateAreas {
+    run templateAreas(&buffer, &mut cursor, &mut grid.*)
+  } else if property == CssProperty.GridTemplate {
+    run template(&buffer, &mut cursor, &mut grid.*)
+  } else if property == CssProperty.Grid {
+    run shorthand(&buffer, cursor, &mut grid.*)
+  } else if property == CssProperty.GridAutoColumns {
+    let tracks = run autoTracks(&buffer, &mut cursor)
+    grid.template.autoColumns = move tracks
+  } else if property == CssProperty.GridAutoRows {
+    let tracks = run autoTracks(&buffer, &mut cursor)
+    grid.template.autoRows = move tracks
+  } else if property == CssProperty.GridAutoFlow {
+    run autoFlow(&buffer, &mut cursor, &mut grid.*)
+  } else {
+    run placement(&buffer, cursor, &mut grid.*, property)
+  }
+}
+
+/// The placement longhands and their `grid-row`, `grid-column` and `grid-area` shorthands.
+effect fn placement(buffer: &TokenBuffer, cursor: Cursor, grid: &mut Grid, property: CssProperty) -> ()
+  ! GridError | OutOfMemoryError
+  ? &mut Allocator {
+  let parts = run slashed(buffer, cursor)
+  let count = parts.length()
+  let mut value = grid.template.placement
+  if property == CssProperty.GridRowStart || property == CssProperty.GridRowEnd
+    || property == CssProperty.GridColumnStart
+    || property == CssProperty.GridColumnEnd {
+    if count != 1 { fail GridError {} }
+    let line = run gridLine(buffer, parts.get(0), &mut grid.*)
+    if property == CssProperty.GridRowStart {
+      value.rowStart = line
+    } else if property == CssProperty.GridRowEnd {
+      value.rowEnd = line
+    } else if property == CssProperty.GridColumnStart {
+      value.columnStart = line
+    } else {
+      value.columnEnd = line
+    }
+  } else if property == CssProperty.GridRow || property == CssProperty.GridColumn {
+    if count > 2 { fail GridError {} }
+    let start = run gridLine(buffer, parts.get(0), &mut grid.*)
+    let end = if count == 2 { run gridLine(buffer, parts.get(1), &mut grid.*) } else { defaultEnd(start) }
+    if property == CssProperty.GridRow {
+      value.rowStart = start
+      value.rowEnd = end
+    } else {
+      value.columnStart = start
+      value.columnEnd = end
+    }
+  } else if property == CssProperty.GridArea {
+    if count > 4 { fail GridError {} }
+    let rowStart = run gridLine(buffer, parts.get(0), &mut grid.*)
+    let columnStart = if count > 1 { run gridLine(buffer, parts.get(1), &mut grid.*) } else { defaultEnd(rowStart) }
+    let rowEnd = if count > 2 { run gridLine(buffer, parts.get(2), &mut grid.*) } else { defaultEnd(rowStart) }
+    let columnEnd = if count > 3 { run gridLine(buffer, parts.get(3), &mut grid.*) } else { defaultEnd(columnStart) }
+    value = GridPlacement { rowStart: rowStart, rowEnd: rowEnd, columnStart: columnStart, columnEnd: columnEnd }
+  } else {
+    fail GridError {}
+  }
+  grid.template.placement = value
+}

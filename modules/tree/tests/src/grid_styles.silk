@@ -1,0 +1,188 @@
+//! Grid properties in a node's style lay it out as `Tree.setGrid` would: templates, repeat(),
+//! fr, minmax, named lines and areas, placement shorthands, and dropped invalid values.
+import ui_tree.lib { Tree, TreeError, Viewport, BoxNode, StyleState }
+import ui_tree.css { Declaration }
+import ui_fixtures.fixtures as fixtures
+import svg_css.written as written
+import svg_css.tokens { CssError }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.geometry.rect { Rect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+
+fn viewport() -> Viewport {
+  return Viewport { width: 400.0, height: 300.0, scale: 1.0 }
+}
+
+effect fn style(css: &[u8]) -> List<Declaration>
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  return run written.declarations(css)
+}
+
+effect fn restyle(tree: &mut Tree<'_>, node: BoxNode, css: &[u8]) -> ()
+  ! TreeError | CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let declarations = run style(css)
+  run tree.setStyle(node, declarations.asSlice())
+}
+
+effect fn rect(tree: &Tree<'_>, node: BoxNode) -> Rect<f32>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match run tree.bounds(node) {
+    Option.Some { value } => value
+    Option.None => Rect<f32> { xMin: -1.0, yMin: -1.0, xMax: -1.0, yMax: -1.0 }
+  }
+}
+
+effect fn at(tree: &Tree<'_>, node: BoxNode, x: f32, y: f32) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let found = run rect(tree, node)
+  return found.xMin == x && found.yMin == y
+}
+
+/// A 400px wide grid container styled with `css` and `count` 20px tall items.
+effect fn grid(tree: &mut Tree<'_>, css: &[u8], count: usize) -> List<BoxNode>
+  ! TreeError | CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let root = run tree.box(&[])
+  run restyle(&mut tree, root, b"display: grid; width: 400px")
+  run restyle(&mut tree, root, css)
+  run tree.setRoot(root)
+  let mut items = List<BoxNode>.make()
+  run items.append(root)
+  let mut i: usize = 0
+  while i < count {
+    let item = run tree.box(&[])
+    run restyle(&mut tree, item, b"height: 20px")
+    run tree.append(root, item)
+    run items.append(item)
+    i = i + 1
+  }
+  return move items
+}
+
+effect fn columnsFromStyle() -> ()
+  ! TreeError | CssError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run Tree.make(&fonts)
+  let items = run grid(&mut tree, b"grid-template-columns: 100px 1fr 2fr", 6)
+  drop run tree.frame(viewport(), 0.0)
+  let nodes = items.asSlice()
+  run Testing.expect(run at(&tree, nodes[1], 0.0, 0.0), "the first item starts the first row")
+  run Testing.expect(run at(&tree, nodes[2], 100.0, 0.0), "the second sits after the 100px column")
+  run Testing.expect(run at(&tree, nodes[3], 200.0, 0.0), "1fr takes a third of the rest")
+  run Testing.expect(run at(&tree, nodes[4], 0.0, 20.0), "the fourth wraps to a second row")
+  run Testing.expect(run at(&tree, nodes[6], 200.0, 20.0), "and the sixth ends it")
+  let last = run rect(&tree, nodes[6])
+  run Testing.expect(last.xMax == 400.0, "2fr takes the rest of the width")
+
+  run restyle(&mut tree, nodes[0], b"grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 20px")
+  drop run tree.frame(viewport(), 0.0)
+  run Testing.expect(run at(&tree, nodes[2], 210.0, 0.0), "repeat() with a gap makes two 190px columns")
+  run Testing.expect(run at(&tree, nodes[3], 0.0, 20.0), "so the third item wraps")
+
+  run restyle(&mut tree, nodes[0], b"grid-template-columns: repeat(3, 1fr) oops")
+  drop run tree.frame(viewport(), 0.0)
+  run Testing.expect(run at(&tree, nodes[3], 0.0, 20.0), "a value that does not parse is dropped")
+
+  run tree.clearStyle(nodes[0], StyleState.Base)
+  run restyle(&mut tree, nodes[0], b"display: grid; width: 400px")
+  drop run tree.frame(viewport(), 0.0)
+  run Testing.expect(run at(&tree, nodes[2], 0.0, 20.0), "clearing the look takes the template away")
+}
+
+effect fn contentSizedColumns() -> ()
+  ! TreeError | CssError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run Tree.make(&fonts)
+  let items = run grid(&mut tree, b"grid-template-columns: auto auto auto; justify-content: start", 6)
+  let nodes = items.asSlice()
+  run restyle(&mut tree, nodes[1], b"width: 50px")
+  run restyle(&mut tree, nodes[4], b"width: 70px")
+  drop run tree.frame(viewport(), 0.0)
+  run Testing.expect(run at(&tree, nodes[2], 70.0, 0.0), "an auto column is as wide as its widest item")
+  run Testing.expect(run at(&tree, nodes[4], 0.0, 20.0), "three auto columns put the fourth item on row two")
+}
+
+effect fn namedLinesAndAreas() -> ()
+  ! TreeError | CssError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run Tree.make(&fonts)
+  let items = run grid(
+    &mut tree,
+    b"grid-template: \"head head\" 30px [body-top] \"side main\" 50px / [left] 100px [split] 1fr",
+    3,
+  )
+  let nodes = items.asSlice()
+  run restyle(&mut tree, nodes[1], b"grid-area: main")
+  run restyle(&mut tree, nodes[2], b"grid-area: head")
+  run restyle(&mut tree, nodes[3], b"grid-column: left / split; grid-row: body-top")
+  drop run tree.frame(viewport(), 0.0)
+  run Testing.expect(run at(&tree, nodes[1], 100.0, 30.0), "grid-area places an item in its named area")
+  let head = run rect(&tree, nodes[2])
+  run Testing.expect(head.xMin == 0.0 && head.yMin == 0.0 && head.xMax == 400.0, "an area spans its columns")
+  run Testing.expect(run at(&tree, nodes[3], 0.0, 30.0), "named lines place by name")
+  let side = run rect(&tree, nodes[3])
+  run Testing.expect(side.xMax == 100.0, "and end at the named line")
+}
+
+effect fn placementShorthands() -> ()
+  ! TreeError | CssError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run Tree.make(&fonts)
+  let items = run grid(&mut tree, b"grid-template-columns: repeat(4, 100px); grid-auto-rows: 40px", 3)
+  let nodes = items.asSlice()
+  run restyle(&mut tree, nodes[1], b"grid-column: span 2")
+  run restyle(&mut tree, nodes[2], b"grid-row: 2; grid-column: 2 / -1")
+  drop run tree.frame(viewport(), 0.0)
+  let wide = run rect(&tree, nodes[1])
+  run Testing.expect(wide.xMin == 0.0 && wide.xMax == 200.0, "span 2 covers two columns")
+  let placed = run rect(&tree, nodes[2])
+  run Testing.expect(placed.xMin == 100.0 && placed.xMax == 400.0 && placed.yMin == 40.0, "negative lines count from the end")
+  run Testing.expect(run at(&tree, nodes[3], 200.0, 0.0), "auto items fill the free cells after")
+
+  run restyle(&mut tree, nodes[0], b"grid-auto-flow: column")
+  run restyle(&mut tree, nodes[1], b"grid-column: auto")
+  drop run tree.frame(viewport(), 0.0)
+  run Testing.expect(run at(&tree, nodes[1], 0.0, 0.0), "grid-auto-flow is read too")
+
+  run restyle(&mut tree, nodes[0], b"grid: auto-flow 30px / 200px 1fr")
+  run restyle(&mut tree, nodes[2], b"grid-row: auto; grid-column: auto")
+  drop run tree.frame(viewport(), 0.0)
+  run Testing.expect(run at(&tree, nodes[3], 0.0, 30.0), "the grid shorthand sets flow, implicit rows and columns")
+  let second = run rect(&tree, nodes[2])
+  run Testing.expect(second.xMin == 200.0 && second.xMax == 400.0, "with its explicit columns")
+}
+
+test effect fn gridStylesSetColumns() -> ()
+  ! TreeError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run columnsFromStyle() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn gridStylesSizeAutoColumnsToContent() -> ()
+  ! TreeError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run contentSizedColumns() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn gridStylesNameLinesAndAreas() -> ()
+  ! TreeError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run namedLinesAndAreas() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn gridStylesPlaceItems() -> ()
+  ! TreeError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run placementShorthands() |> Effect.provideMut<Allocator>(&mut allocator)
+}
