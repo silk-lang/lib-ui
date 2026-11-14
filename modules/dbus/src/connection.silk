@@ -1,0 +1,479 @@
+//! A connection to a D-Bus message bus: address parsing, SASL `EXTERNAL` authentication,
+//! `Hello`, blocking method calls for setup, and a pump that never waits for use inside a
+//! host's event loop.
+import wire { DBusError }
+import message { Message, MessageType, Decoded, decode }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.collections.slice { Slice }
+import silk.io.byte_duplex { ByteDuplex, ByteIoError, ReadTransfer }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.net.socket_native {
+  Connection,
+  ConnectOptions,
+  NativeSocketError,
+  Received,
+  Sent,
+  connectUnixOwned,
+  RawSocket
+}
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+import silk.system.host_input { HostInput, HostInputError }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.system_clock { Instant, SystemClock }
+import silk.text.string { String }
+
+static if Intrinsic.targetOperatingSystem() == "linux"
+  || Intrinsic.targetOperatingSystem() == "darwin" {
+  unsafe extern "C" fn geteuid() -> u32
+}
+
+fn effectiveUser() -> u32 {
+  static if Intrinsic.targetOperatingSystem() == "linux"
+    || Intrinsic.targetOperatingSystem() == "darwin" {
+    return unsafe geteuid()
+  } else {
+    return 0
+  }
+}
+
+effect fn socketFailed(error: NativeSocketError) -> never
+  ! DBusError {
+  drop error
+  fail DBusError.Socket
+}
+
+effect fn ioFailed(error: ByteIoError) -> never
+  ! DBusError {
+  drop error
+  fail DBusError.Socket
+}
+
+/// The socket path one address entry names: `unix:path=...` as a file path, `unix:abstract=...`
+/// with a leading NUL. None for other transports.
+pub effect fn socketPathOf(entry: string) -> Option<Bytes>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !String.startsWith(entry, "unix:") {
+    return Option.None
+  }
+  let rest = String.slice(entry, 5, String.byteLength(entry) - 5)
+  let mut start: usize = 0
+  let length = String.byteLength(rest)
+  while start < length {
+    let tail = String.slice(rest, start, length - start)
+    let end = match String.find(tail, ",") {
+      Option.Some { value } => value
+      Option.None => String.byteLength(tail)
+    }
+    let pair = String.slice(tail, 0, end)
+    let abstract = String.startsWith(pair, "abstract=")
+    if String.startsWith(pair, "path=") || abstract {
+      let skip: usize = if abstract {
+        9
+      } else {
+        5
+      }
+      let mut out = Bytes.make()
+      if abstract {
+        run out.append(&[0])
+      }
+      run unescape(String.slice(pair, skip, String.byteLength(pair) - skip), &mut out)
+      return Option.Some { value: move out }
+    }
+    start = start + end + 1
+  }
+  return Option.None
+}
+
+fn hexValue(c: u8) -> u8 {
+  if c >= 48 && c <= 57 {
+    return c - 48
+  }
+  if c >= 97 && c <= 102 {
+    return c - 87
+  }
+  if c >= 65 && c <= 70 {
+    return c - 55
+  }
+  return 0
+}
+
+/// Undoes the `%xx` escapes of an address value.
+effect fn unescape(value: string, out: &mut Bytes) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let bytes = String.utf8Bytes(value)
+  let mut i: usize = 0
+  while i < bytes.length {
+    if bytes[i] == 37 && i + 2 < bytes.length {
+      run out.append(&[hexValue(bytes[i + 1]) * 16 + hexValue(bytes[i + 2])])
+      i = i + 3
+    } else {
+      run out.append(&[bytes[i]])
+      i = i + 1
+    }
+  }
+}
+
+/// The session bus address from `DBUS_SESSION_BUS_ADDRESS`, if it is set.
+pub effect fn sessionBusAddress() -> Option<String>
+  ! HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator {
+  return match run HostInput.variableNamed("DBUS_SESSION_BUS_ADDRESS") {
+    Option.Some { value } => match String.fromUtf8(value.asSlice()) {
+      Result.Success { value: text } => Option.Some { value: run String.copy(text) }
+      Result.Failure { .. } => Option.None
+    }
+    Option.None => Option.None
+  }
+}
+
+/// A connection to a message bus.
+pub struct Bus {
+  socket: Connection,
+  /// Bytes read and not yet parsed into messages.
+  inbox: List<u8>,
+  /// Bytes waiting for room in the socket.
+  outbox: List<u8>,
+  /// Messages read and not yet taken.
+  queue: List<Message>,
+  nextSerial: u32,
+  closed: bool,
+  /// The name the bus gave this connection in reply to `Hello`.
+  pub uniqueName: String,
+}
+
+/// A copy of `deadline`, since an `Instant` is not `Copy`.
+fn again(deadline: &Option<Instant>) -> Option<Instant> {
+  return match &deadline.* {
+    Option.Some { value } => Option.Some {
+      value: SystemClock.make(SystemClock.seconds(&value), SystemClock.nanoseconds(&value)),
+    }
+    Option.None => Option.None
+  }
+}
+
+fn hexDigit(value: u8) -> u8 {
+  if value < 10 {
+    return 48 + value
+  }
+  return 87 + value
+}
+
+impl Bus {
+  /// Connects to the first entry of `address` this client can reach, authenticates with the
+  /// effective user id, and says `Hello`.
+  pub effect fn connect(address: string, deadline: Option<Instant>) -> Bus
+    ! DBusError | OutOfMemoryError
+    ? &mut Allocator | &mut MonotonicClock {
+    let length = String.byteLength(address)
+    let mut start: usize = 0
+    while start < length {
+      let tail = String.slice(address, start, length - start)
+      let end = match String.find(tail, ";") {
+        Option.Some { value } => value
+        Option.None => String.byteLength(tail)
+      }
+      match run socketPathOf(String.slice(tail, 0, end)) {
+        Option.Some { value: path } => {
+          let socket = run Effect.catch<NativeSocketError>(
+            connectUnixOwned(path.asSlice(), ConnectOptions.defaults(), again(&deadline)),
+            socketFailed,
+          )
+          let mut bus = Bus {
+            socket: move socket,
+            inbox: List<u8>.make(),
+            outbox: List<u8>.make(),
+            queue: List<Message>.make(),
+            nextSerial: 1,
+            closed: false,
+            uniqueName: String.make(),
+          }
+          run bus.authenticate(&deadline)
+          let hello = run Message.methodCall(
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "Hello",
+          )
+          let reply = run bus.call(move hello, again(&deadline))
+          let mut reader = reply.reader()
+          let name = run reader.string()
+          bus.uniqueName = run String.copy(name)
+          return move bus
+        }
+        Option.None => {}
+      }
+      start = start + end + 1
+    }
+    fail DBusError.NoAddress
+  }
+
+  effect fn writeAll(self: &mut Self, data: &[u8], deadline: &Option<Instant>) -> ()
+    ! DBusError
+    ? &mut MonotonicClock {
+    let mut sent: usize = 0
+    while sent < data.length {
+      let count = run Effect.catch<ByteIoError>(
+        ByteDuplex.writeSome(Slice.view<u8>(data, sent, data.length - sent), again(deadline))
+          |> Effect.provideMut<ByteDuplex>(&mut self.socket),
+        ioFailed,
+      )
+      sent = sent + count
+    }
+  }
+
+  /// Reads one `\r\n`-terminated line of the authentication exchange.
+  effect fn readLine(self: &mut Self, deadline: &Option<Instant>) -> Bytes
+    ! DBusError | OutOfMemoryError
+    ? &mut Allocator | &mut MonotonicClock {
+    let mut line = Bytes.make()
+    let mut one: [u8; 1] = [0]
+    while true {
+      let read = run Effect.catch<ByteIoError>(
+        ByteDuplex.readSome(&mut one, again(deadline))
+          |> Effect.provideMut<ByteDuplex>(&mut self.socket),
+        ioFailed,
+      )
+      match move read {
+        ReadTransfer.Data { count } => {
+          if count == 1 {
+            if one[0] == 10 {
+              return move line
+            }
+            if one[0] != 13 {
+              run line.append(&one)
+            }
+          }
+        }
+        ReadTransfer.End => {
+          fail DBusError.Closed
+        }
+      }
+    }
+    return move line
+  }
+
+  effect fn authenticate(self: &mut Self, deadline: &Option<Instant>) -> ()
+    ! DBusError | OutOfMemoryError
+    ? &mut Allocator | &mut MonotonicClock {
+    // The uid in decimal, hex-encoded byte by byte.
+    let mut decimal = List<u8>.make()
+    let mut uid = effectiveUser()
+    if uid == 0 {
+      run decimal.append(48)
+    }
+    while uid > 0 {
+      run decimal.append(u32.toU8(uid % 10) + 48)
+      uid = uid / 10
+    }
+    let mut command = List<u8>.make()
+    run command.append(0)
+    let prefix = String.utf8Bytes("AUTH EXTERNAL ")
+    let mut i: usize = 0
+    while i < prefix.length {
+      run command.append(prefix[i])
+      i = i + 1
+    }
+    let mut d = decimal.length()
+    while d > 0 {
+      d = d - 1
+      let digit = decimal.get(d)
+      run command.append(hexDigit(digit / 16))
+      run command.append(hexDigit(digit % 16))
+    }
+    run command.append(13)
+    run command.append(10)
+    run self.writeAll(command.asSlice(), deadline)
+    let answer = run self.readLine(deadline)
+    let text = answer.asSlice()
+    if text.length < 3 || text[0] != 79 || text[1] != 75 || text[2] != 32 {
+      fail DBusError.AuthFailed
+    }
+    run self.writeAll(String.utf8Bytes("BEGIN\r\n"), deadline)
+  }
+
+  /// Whether the bus closed the connection.
+  pub fn isClosed(self: &Self) -> bool {
+    return self.closed
+  }
+
+  /// The socket's descriptor, for a host loop that waits for it to be readable.
+  pub fn rawDescriptor(self: &Self) -> RawSocket {
+    return self.socket.rawDescriptor()
+  }
+
+  /// Queues `message` with the next serial, sends what the socket takes now, and returns the
+  /// serial.
+  pub effect fn send(self: &mut Self, message: &Message) -> u32
+    ! DBusError | OutOfMemoryError
+    ? &mut Allocator {
+    let serial = self.nextSerial
+    self.nextSerial = self.nextSerial + 1
+    let bytes = run message.encode(serial)
+    let data = bytes.asSlice()
+    let mut i: usize = 0
+    while i < data.length {
+      run self.outbox.append(data[i])
+      i = i + 1
+    }
+    run self.flush()
+    return serial
+  }
+
+  /// Sends what the socket takes of the queued bytes, without waiting.
+  pub effect fn flush(self: &mut Self) -> ()
+    ! DBusError | OutOfMemoryError
+    ? &mut Allocator {
+    while self.outbox.length() > 0 {
+      let sent = run Effect.catch<NativeSocketError>(
+        self.socket.tryWrite(self.outbox.asSlice()),
+        socketFailed,
+      )
+      match move sent {
+        Sent.Count { count } => {
+          if count == 0 {
+            return ()
+          }
+          let rest = run self.outbox.splitOff(count)
+          self.outbox = move rest
+        }
+        Sent.WouldBlock => {
+          return ()
+        }
+      }
+    }
+  }
+
+  /// Whether bytes are waiting to be sent.
+  pub fn hasPendingOutput(self: &Self) -> bool {
+    return self.outbox.length() > 0
+  }
+
+  /// Reads what the socket holds now, without waiting, and parses whole messages into the
+  /// queue. Also sends queued bytes.
+  pub effect fn pump(self: &mut Self) -> ()
+    ! DBusError | OutOfMemoryError
+    ? &mut Allocator {
+    run self.flush()
+    let mut buffer: [u8; 4096] = [0; 4096]
+    while !self.closed {
+      let received = run Effect.catch<NativeSocketError>(
+        self.socket.tryRead(&mut buffer),
+        socketFailed,
+      )
+      match move received {
+        Received.Data { count } => {
+          let mut i: usize = 0
+          while i < count {
+            run self.inbox.append(buffer[i])
+            i = i + 1
+          }
+        }
+        Received.End => {
+          self.closed = true
+        }
+        Received.WouldBlock => {
+          break
+        }
+      }
+    }
+    run self.parse()
+  }
+
+  effect fn parse(self: &mut Self) -> ()
+    ! DBusError | OutOfMemoryError
+    ? &mut Allocator {
+    while true {
+      let decoded = run decode(self.inbox.asSlice())
+      match move decoded {
+        Option.Some { value } => {
+          let decoded: Decoded = move value
+          let rest = run self.inbox.splitOff(decoded.length)
+          self.inbox = move rest
+          run self.queue.append(move decoded.message)
+        }
+        Option.None => {
+          return ()
+        }
+      }
+    }
+  }
+
+  /// The oldest message read and not yet taken.
+  pub fn take(self: &mut Self) -> Option<Message> {
+    if self.queue.length() == 0 {
+      return Option.None
+    }
+    return Option.Some { value: self.queue.remove(0) }
+  }
+
+  /// Sends `call` and waits for its reply, keeping other messages for [`Bus.take`]. An error
+  /// reply fails with `Remote`.
+  pub effect fn call(self: &mut Self, call: Message, deadline: Option<Instant>) -> Message
+    ! DBusError | OutOfMemoryError
+    ? &mut Allocator | &mut MonotonicClock {
+    let serial = run self.send(&call)
+    drop call
+    if self.outbox.length() > 0 {
+      let pending = Intrinsic.replace(self.outbox, List<u8>.make())
+      run self.writeAll(pending.asSlice(), &deadline)
+    }
+    while true {
+      let mut i: usize = 0
+      while i < self.queue.length() {
+        let kind = self.queue.asSlice()[i].kind
+        let replyTo = self.queue.asSlice()[i].replySerial
+        if (kind == MessageType.MethodReturn || kind == MessageType.Error) && replyTo == serial {
+          let reply = self.queue.remove(i)
+          if reply.kind == MessageType.Error {
+            fail DBusError.Remote
+          }
+          return move reply
+        }
+        i = i + 1
+      }
+      if self.closed {
+        fail DBusError.Closed
+      }
+      let mut buffer: [u8; 4096] = [0; 4096]
+      let read = run Effect.catch<ByteIoError>(
+        ByteDuplex.readSome(&mut buffer, again(&deadline))
+          |> Effect.provideMut<ByteDuplex>(&mut self.socket),
+        ioFailed,
+      )
+      match move read {
+        ReadTransfer.Data { count } => {
+          let mut j: usize = 0
+          while j < count {
+            run self.inbox.append(buffer[j])
+            j = j + 1
+          }
+        }
+        ReadTransfer.End => {
+          self.closed = true
+        }
+      }
+      run self.parse()
+    }
+    fail DBusError.Closed
+  }
+
+  /// Closes the connection.
+  pub effect fn close(self: &mut Self) -> ()
+    ! DBusError {
+    self.closed = true
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      // There are no native sockets on wasm, so no connection was ever opened.
+      return ()
+    } else {
+      run Effect.catch<NativeSocketError>(self.socket.close(), socketFailed)
+    }
+  }
+}

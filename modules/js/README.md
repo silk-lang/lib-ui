@@ -33,7 +33,11 @@ mount(createBox({ width: 400, height: 300 }, button));
   its subtree. `mount(node)` makes a node the root.
 - **Style.** `node.style.set({ ... })` sets properties by their camel case names. Numbers are
   CSS pixels, except for unitless properties such as `opacity` and `flexGrow`. `null` takes a
-  property out. `node.look("hover")` (also `active`, `focus`, `focusVisible`) is the look the
+  property out. `fontFamily` takes CSS `font-family` text (`"monospace"`, `"Noto Sans, sans-serif"`),
+  resolved in the host's font collection. Grid layouts take the CSS grid properties
+  (`gridTemplateColumns: "auto 1fr"`, `repeat()`, `minmax()`, named lines and
+  `gridTemplateAreas`, `gridArea`, `gridColumn: "span 2"`); numbers for the placement
+  properties are line numbers. Grid properties apply from the base look only. `node.look("hover")` (also `active`, `focus`, `focusVisible`) is the look the
   tree lays over the base in that state.
 - **Events.** `addEventListener(type, listener, options)` with `capture` and `once`. An event
   runs the capture phase from the root down, the target, then bubbles, with
@@ -44,8 +48,26 @@ mount(createBox({ width: 400, height: 300 }, button));
   `value`.
 - **Attributes.** `setAttribute(name, value)` for the tree's attributes (`tabIndex`,
   `disabled`, `label`, `testId`, `placeholder`, `multiline`, `readOnly`, `checked`,
-  `selected`, `expanded`, `focusTrap`, `href`, `transition`). A name the tree does not have
-  throws a `TypeError`.
+  `selected`, `expanded`, `focusTrap`, `href`, `cursor`, `transition`). A name the tree does
+  not have throws a `TypeError`. `cursor` takes the CSS keywords (`pointer`, `text`, `grab`,
+  `not-allowed` and the resize ones); the `cursor` style property does the same, and a node
+  without one shows its nearest ancestor's.
+- **Accessibility.** `role` and `aria-*` work as in the DOM, as `aria-label` or `ariaLabel`.
+  `role` takes the first word that names a role the tree has (`"switch checkbox"`). The
+  tree has the ARIA states and properties for names, values, levels, sets, toggles, validity
+  and live regions (`aria-level`, `aria-pressed`, `aria-live`, `aria-checked="mixed"` and so
+  on). Other roles and ARIA names are ignored with one console warning each.
+- **Links.** A node with an `href` is a link, as an `<a>` is: a click on it or inside it that
+  no listener prevented calls `open(href)`, which hands the address to the host.
+- **Markdown.** `parseMarkdown(text, options)` returns the syntax tree of the text in
+  the shape of [mdast](https://github.com/syntax-tree/mdast), the tree remark gives, so
+  renderers written for remark's tree work on it, and an application needs no Markdown
+  parser in its bundle. The parser is the Silk standard library's (`silk.markdown`):
+  CommonMark with GitHub's tables, strikethrough, task lists and autolinks. `gfm: false`
+  turns those four off, each can be set alone (`tables`, `strikethrough`, `taskLists`,
+  `autolinkLiterals`), and `footnotes`, `frontmatter` (a `yaml` or `toml` node) and
+  `alerts` (`> [!NOTE]`, a node of type `alert` with a `kind`) turn on more. Nodes have no
+  `position`.
 - **Errors.** A listener that throws does not stop the dispatch. `setErrorHandler` receives
   the exception. Without a handler the host reports the first one after the input.
 
@@ -79,7 +101,7 @@ createRoot().render(<Counter />);
   for the looks of those states. `onClick`, `onPointerDown`, `onKeyDown`, `onInput` and so
   on for every event of the tree, with a `Capture` suffix for the capture phase. Listeners
   receive the `@silk/ui` event. Every other prop is a tree attribute (`tabIndex`, `testId`,
-  `label`, `disabled`, `placeholder`).
+  `label`, `disabled`, `placeholder`), and `role` and `aria-*` work as in React DOM.
 - **Inputs.** `value` on `<input>` is controlled as in React DOM: the field shows what the
   component keeps, whatever was typed.
 - **Timing.** `root.render` commits before it returns, so the first frame of a window has
@@ -89,12 +111,19 @@ createRoot().render(<Counter />);
 - **JSX.** Set the JSX import source to `@silk/ui-react`, or use React's own runtime: both
   work.
 
-[examples/react-counter](examples/react-counter) bundles a counter with Vite into one ES
-module. From `modules/js`, `npm ci && npm run build`, then from the repository root:
+[examples/react-counter](examples/react-counter) is a starter page in React where the counter
+is the page: click anywhere and the number rolls, with rings, sparks and a field of dots
+that answer the click and the pointer. The count and the theme are React state;
+[motion.js](examples/react-counter/src/motion.js) draws every frame on nodes it gets by
+ref. It is bundled with Vite into one ES module. From `modules/js`, `npm ci && npm run build`, then from the repository root:
 
 ```sh
 silk run --manifest-path modules/js/demo/silk.toml modules/js/examples/react-counter/dist/app.js
 ```
+
+[examples/text-showcase](examples/text-showcase) is a magazine in five spreads that shows the
+tree's text layout (scripts, bidi, vertical writing modes, floats), each feature labelled, and
+runs in a browser from the same files for comparison.
 
 React 19.3 with react-reconciler 0.34 runs on the engine as it is: the bundle needs only
 the web globals below.
@@ -157,7 +186,7 @@ With `host` set the plugin starts that binary with `--dev <port>`; without it, i
 the port for a host you start yourself. Closing the window ends the session.
 
 How it works: the plugin adds a Vite environment named `silk` and listens on a local TCP
-port. The host connects when its window opens (`JsApp.dev(port)`), and the server sends one
+port. The host connects when its window opens (`DevTools.server(port)`), and the server sends one
 script first: Vite's module runner, bundled, with the host's line transport under it
 (`__ui.devSend` out, `__ui.devMessage` in). The runner asks the server for each module,
 already transformed, and evaluates it in the realm. Dependencies are pre-bundled by Vite,
@@ -177,11 +206,18 @@ the same code path as production, so it is the mode to check a bundle in.
 For the React example, from `modules/js/examples/react-counter`:
 
 ```sh
-silk build --manifest-path ../../demo/silk.toml
-export SILK_UI_HOST=$PWD/../../../../build/llvm/<target>/debug/ui-js-demo
+silk build --manifest-path ../../demo/silk.toml --profile dev
+export SILK_UI_HOST=$PWD/../../../../build/llvm/<target>/dev/ui-js-demo
 npm run dev     # dev server, Fast Refresh
 npm run watch   # rebuild and reload
 ```
+
+The `dev` profile is the development host with optimizations on. Use it for JavaScript
+work: in a plain debug build the engine itself is unoptimized, and JavaScript runs tens of
+times slower (the starter page's motion drops well under 60 frames a second there).
+`ui-js-bench-frames <bundle>`
+([bench/frames](bench/frames)) prints what a frame of an application costs in JavaScript,
+in applying its mutations and in the tree, without a window.
 
 ## The host
 
@@ -205,7 +241,7 @@ Provide the `RuntimeAllocator` that `memory` observes as the `Allocator` of thes
   after each event it delivers, before the mutations reach the tree.
 - **Nodes.** JavaScript calls native functions on the global `__ui` (`create`, `append`,
   `insertBefore`, `remove`, `destroy`, `root`, `setText`, `listen`, `style`, `clearStyle`,
-  `attribute`, `focus`, `scrollTo`, `select`). Each call appends a mutation to one
+  `attribute`, `focus`, `scrollTo`, `select`, `fontFamily`). Each call appends a mutation to one
   ui-protocol batch and returns. `JsHost.flush` applies the batch to the tree. `style` takes
   CSS text and parses it with css-style, so every property the tree knows is available.
 - **Events.** `JsHost.input` runs one input: the tree queues its event records (`begin`), the
@@ -221,7 +257,7 @@ Provide the `RuntimeAllocator` that `memory` observes as the `Allocator` of thes
 
 Every realm starts with the globals of [src/prelude.js](src/prelude.js) on top of the
 engine's ECMAScript: `setTimeout`, `setInterval`, `requestAnimationFrame`, `queueMicrotask`,
-`performance.now`, `console` and `reportError`. They sit on native timer, clock, frame and
+`performance.now`, `console`, `reportError` and `open`. They sit on native timer, clock, frame and
 log functions, and the host decides what those mean:
 
 - `JsHost.tick(seconds, animation)` moves the clock, runs the timers that are due, and with
@@ -230,6 +266,9 @@ log functions, and the host decides what those mean:
 - A promise that is still rejected with no handler once the promise jobs ran becomes a
   console error, `Uncaught (in promise) …`, as in a browser. A handler added later is too
   late. A module that fails is reported by `JsHost.module` alone.
+- `JsHost.takeOpened` hands over the addresses `open(url)` asked for (http, https and mailto
+  only). The window opens them with `xdg-open` on Linux and `open` on macOS, without waiting
+  for it; other systems print that they could not.
 
 `silk task embed-assets` regenerates `src/generated_prelude.silk` after an edit to
 `prelude.js`.
@@ -242,13 +281,46 @@ tree's `begin` and `finish`, runs timers and animation frames on the host's cloc
 prints console lines on standard error. An uncaught exception is printed as a browser
 console prints it, and the window keeps running.
 
-[demo](demo) is a counter in JavaScript:
+The window client takes the host's tools as a type: `JsClient.make(NoTools {})` runs the
+application as it was built, and `JsClient.make(DevTools.make())` adds the development ones
+from [window/dev](window/dev) (`ui-js-window-dev`): `DevTools.watch` for `--watch`,
+`DevTools.server` for the dev server. Only a client with `DevTools` serves the inspector
+(`WindowClient.servesInspector`).
+
+[demo](demo) is the starter page in plain JavaScript, the React example's twin. Its window
+has a transparent title bar (`JsClient.titleBar`, `titleBarHeight`): on macOS the page
+reaches the top edge and the window controls sit over the bar it draws; other systems keep
+their title bar.
 
 ```sh
 silk run --manifest-path modules/js/demo/silk.toml
 ```
 
-Run it from the repository root. `silk task native check` runs it with `--check`.
+`@silk/ui` and the starter page are part of the binary (`uiPackage()` from `ui_js.lib` and
+`Source.read("app.js")`), so the executable runs from any directory. After an edit to
+`packages/ui/src/index.js`, `silk task embed-assets` regenerates
+`src/generated_library.silk`. `silk task native check` runs the demo with `--check`.
+
+### Production builds
+
+A production build leaves out everything that is there for development: the dev server
+client, `--watch` reloading, and the inspector server. The demo's `production` profile
+builds [demo/src/production.silk](demo/src/production.silk), which runs `NoTools` and
+passes an inspector that is off; since its client answers `servesInspector` with a
+constant false, the window host's inspector code is not in the program either.
+
+```sh
+silk build --manifest-path modules/js/demo/silk.toml --profile production
+```
+
+Engine features are chosen per build too. The bridge answers
+`EngineServices.includesIntl` and `includesTemporal` with false (a realm here installs
+neither), so the engine's ECMA-402 and Temporal code and their CLDR and time zone tables
+are left out: `localeCompare`, `toLocaleString` and the like give their
+locale-independent results, and a local `Date` string ends at its offset. The production
+demo is 38.0 MB against 44.2 MB for the release build before these changes (5.2 MB from
+the engine features, 1.0 MB from the tools and the inspector). WebAssembly is not part of
+the engine here (it lives in the SilkJS runtime, which ui-js does not link).
 
 ## Status
 
@@ -258,7 +330,8 @@ Run it from the repository root. `silk task native check` runs it with `--check`
   `silk test --manifest-path modules/js/examples/tests/silk.toml --root src/tests.silk` for
   the bundled examples on the engine (build them first).
 - Not here yet: images and canvas commands from JavaScript,
-  source maps for errors under the dev server, and choosing engine features for each build.
+  source maps for errors under the dev server, and choosing engine features beyond Intl and
+  Temporal for each build.
 - Memory, release builds on Linux x86-64 under Xvfb with a software GPU, resident after six
   seconds: the Silk window demo 155 MB, the JavaScript counter 169 MB, the React counter
   174 MB. The GPU stack is most of each; the engine with `@silk/ui` adds about 14 MB and

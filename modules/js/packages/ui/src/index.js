@@ -17,36 +17,85 @@ const STATES = { base: 0, hover: 1, active: 2, focus: 3, focusVisible: 4 };
 const TYPES = [
   "pointerdown", "pointerup", "click", "pointermove", "pointerenter", "pointerleave", "wheel",
   "keydown", "keyup", "focus", "blur", "input", "scroll", "layout", "pointercancel",
-  "gotpointercapture", "lostpointercapture",
+  "gotpointercapture", "lostpointercapture", "load", "error",
 ];
 const KIND_OF = new Map(TYPES.map((type, kind) => [type, kind]));
+const CLICK = KIND_OF.get("click");
 // As on the web: these reach the target alone.
-const NO_BUBBLE = new Set(["pointerenter", "pointerleave", "focus", "blur", "scroll", "layout"]);
+const NO_BUBBLE = new Set(["pointerenter", "pointerleave", "focus", "blur", "scroll", "layout", "load", "error"]);
 // The tree has a default action to skip for these.
 const CANCELABLE = new Set(["pointerdown", "pointerup", "click", "wheel", "keydown", "keyup"]);
 
 // Properties whose numbers are not lengths. Every other number is CSS pixels.
 const UNITLESS = new Set([
   "opacity", "flexGrow", "flexShrink", "flex", "order", "zIndex", "fontWeight", "lineHeight",
-  "aspectRatio", "tabSize", "scale",
+  "aspectRatio", "tabSize", "scale", "gridRow", "gridRowStart", "gridRowEnd", "gridColumn",
+  "gridColumnStart", "gridColumnEnd", "gridArea",
 ]);
 
 const nodes = new Map();
+const NO_CHILDREN = Object.freeze([]);
 let nextId = 0;
 
+// Property names repeat across nodes: each is converted once.
+const CSS_NAMES = new Map();
+
 function cssName(name) {
-  return name.replace(/[A-Z]/g, (letter) => "-" + letter.toLowerCase());
+  let css = CSS_NAMES.get(name);
+  if (css === undefined) {
+    css = name.replace(/[A-Z]/g, (letter) => "-" + letter.toLowerCase());
+    CSS_NAMES.set(name, css);
+  }
+  return css;
+}
+
+// The tree names font family lists by number: each `fontFamily` text is defined once, as a
+// list of its own. The numbers start high, clear of the lists a host defines, and stay
+// small enough to be exact in the 32-bit float a style value is.
+const FAMILIES = new Map();
+let nextFamily = 0x10000;
+
+function familyOf(names) {
+  let id = FAMILIES.get(names);
+  if (id === undefined) {
+    id = nextFamily++;
+    FAMILIES.set(names, id);
+    native.fontFamily(id, names);
+  }
+  return String(id);
 }
 
 function cssValue(name, value) {
+  if (name === "fontFamily") return familyOf(String(value));
   return typeof value === "number" && !UNITLESS.has(name) ? value + "px" : String(value);
+}
+
+// ARIA states with a tree attribute of their own, by the name after `aria-`. The host takes
+// the other ARIA names as they are; one it does not know is ignored, with one warning.
+const ARIA_STATES = { checked: "checked", selected: "selected", expanded: "expanded" };
+const ARIA_RANGE = { valuemin: 0, valuemax: 1, valuenow: 2 };
+const warned = new Set();
+
+function warnOnce(message) {
+  if (warned.has(message)) return;
+  warned.add(message);
+  console.warn(message);
+}
+
+// The part of an ARIA attribute name after `aria`, lowercase: `aria-valuenow` (the DOM
+// attribute) and `ariaValueNow` (the DOM property) are both `valuenow`. Null for other names.
+function ariaName(name) {
+  if (name.startsWith("aria-")) return name.slice(5).toLowerCase();
+  if (name.length > 4 && name.startsWith("aria") && name[4] >= "A" && name[4] <= "Z") return name.slice(4).toLowerCase();
+  return null;
 }
 
 /** The declarations of one look of a node: the base look, or what a state lays over it. */
 class Look {
   #node;
   #state;
-  #values = new Map();
+  // Plain objects share their shape across nodes: a Map here costs four times the memory.
+  #values = Object.create(null);
 
   constructor(node, state) {
     this.#node = node;
@@ -64,12 +113,15 @@ class Look {
     for (const name of Object.keys(properties)) {
       const value = properties[name];
       if (value === null || value === undefined || value === "") {
-        if (this.#values.delete(name)) removed = true;
+        if (name in this.#values) {
+          delete this.#values[name];
+          removed = true;
+        }
         continue;
       }
       const text = cssValue(name, value);
-      if (this.#values.get(name) === text) continue;
-      this.#values.set(name, text);
+      if (this.#values[name] === text) continue;
+      this.#values[name] = text;
       css += cssName(name) + ":" + text + ";";
     }
     if (removed) {
@@ -84,17 +136,17 @@ class Look {
   /** Replaces the whole look. */
   replace(properties) {
     native.clearStyle(this.#node.id, this.#state);
-    this.#values.clear();
+    this.#values = Object.create(null);
     this.set(properties);
   }
 
   get(name) {
-    return this.#values.get(name);
+    return this.#values[name];
   }
 
   get cssText() {
     let css = "";
-    for (const [name, text] of this.#values) css += cssName(name) + ":" + text + ";";
+    for (const name in this.#values) css += cssName(name) + ":" + this.#values[name] + ";";
     return css;
   }
 }
@@ -102,14 +154,19 @@ class Look {
 /** A node of the tree. Make one with `createBox`, `createText`, `createInput` or `createNode`. */
 export class Node {
   #listeners = null;
+  // The base look, and the state looks by name: most nodes have the base alone.
+  #base = null;
   #looks = null;
   #flags = 0;
+  // aria-valuemin, aria-valuemax and aria-valuenow, which the tree takes as one range.
+  #range = null;
 
   constructor(kind) {
     this.id = ++nextId;
     this.kind = kind;
     this.parentNode = null;
-    this.childNodes = [];
+    // A text leaf has no children: they all share one empty list.
+    this.childNodes = kind === "text" ? NO_CHILDREN : [];
     nodes.set(this.id, this);
     native.create(this.id, KINDS[kind]);
   }
@@ -203,16 +260,62 @@ export class Node {
 
   /** The look the tree lays over the base in `state`: hover, active, focus or focusVisible. */
   look(state) {
+    if (state === "base") return (this.#base ??= new Look(this, 0));
     if (!(state in STATES)) throw new TypeError("the tree has no look '" + state + "'");
-    this.#looks ??= new Map();
-    let look = this.#looks.get(state);
-    if (!look) this.#looks.set(state, (look = new Look(this, STATES[state])));
-    return look;
+    this.#looks ??= Object.create(null);
+    return (this.#looks[state] ??= new Look(this, STATES[state]));
   }
 
-  /** Sets a tree attribute: tabIndex, disabled, label, testId, placeholder and so on. */
+  /**
+   * Sets a tree attribute: tabIndex, disabled, label, testId, placeholder and so on. A node
+   * with an `href` is a link: a click on it or inside it that no listener prevented opens
+   * the address with `open`, as a click on an `<a>` follows it.
+   *
+   * `role` and `aria-*` work as in the DOM, spelled `aria-checked` or `ariaChecked`. A role
+   * or ARIA name the tree does not know is ignored with a warning.
+   */
   setAttribute(name, value) {
+    if (name === "role") {
+      const words = value == null ? "" : String(value);
+      if (!native.attribute(this.id, "role", words)) warnOnce("the tree has no role '" + words + "': it is ignored");
+      return;
+    }
+    const aria = ariaName(name);
+    if (aria !== null) {
+      this.#aria(aria, value);
+      return;
+    }
+    if (name === "href") {
+      this._href = value ? String(value) : null;
+      this.#want(KIND_OF.get("click"));
+    }
     native.attribute(this.id, name, value);
+  }
+
+  #aria(name, value) {
+    if (name === "label") {
+      native.attribute(this.id, "label", value == null ? "" : String(value));
+    } else if (name in ARIA_STATES) {
+      // ARIA states are the words "true" and "false"; anything else is false.
+      if (name === "checked") native.attribute(this.id, "indeterminate", value === "mixed");
+      native.attribute(this.id, ARIA_STATES[name], value === true || value === "true");
+    } else if (name in ARIA_RANGE) {
+      const range = (this.#range ??= [undefined, undefined, undefined]);
+      range[ARIA_RANGE[name]] = value == null || value === "" ? undefined : Number(value);
+      const [min = 0, max = 100, now] = range;
+      if (now === undefined || Number.isNaN(now)) native.attribute(this.id, "valueRange");
+      else native.attribute(this.id, "valueRange", min, max, now);
+    } else if (!native.attribute(this.id, "aria-" + name, value == null ? "" : String(value))) {
+      warnOnce("the tree has no 'aria-" + name + "' yet: it is ignored");
+    }
+  }
+
+  // Tells the tree which events this node wants: its listeners', and clicks on a link.
+  #want(kind) {
+    const list = this.#listeners?.get(TYPES[kind]);
+    const wanted = (list && list.length > 0) || (kind === CLICK && this._href);
+    const flags = wanted ? this.#flags | (1 << kind) : this.#flags & ~(1 << kind);
+    if (flags !== this.#flags) native.listen(this.id, (this.#flags = flags));
   }
 
   set tabIndex(value) {
@@ -244,7 +347,7 @@ export class Node {
     if (!list) this.#listeners.set(type, (list = []));
     if (list.some((entry) => entry.listener === listener && entry.capture === capture)) return;
     list.push({ listener, capture, once: !!options?.once });
-    if (!(this.#flags & (1 << kind))) native.listen(this.id, (this.#flags |= 1 << kind));
+    this.#want(kind);
   }
 
   removeEventListener(type, listener, options) {
@@ -254,7 +357,7 @@ export class Node {
     const index = list.findIndex((entry) => entry.listener === listener && entry.capture === capture);
     if (index < 0) return;
     list.splice(index, 1);
-    if (list.length === 0) native.listen(this.id, (this.#flags &= ~(1 << KIND_OF.get(type))));
+    this.#want(KIND_OF.get(type));
   }
 
   /** Runs the capture or the bubble listeners of `event.type`. Used by the dispatcher. */
@@ -335,8 +438,65 @@ export class Input extends Node {
   }
 }
 
+// Inline SVG markup as icon resources: identical markup shares one, freed when no icon shows
+// it. The ids start high, clear of resources a host or a URL table numbers from 1.
+const ICONS = new Map();
+let nextIcon = 0x40000000;
+
+function holdIcon(markup) {
+  let entry = ICONS.get(markup);
+  if (!entry) {
+    entry = { id: nextIcon++, count: 0 };
+    ICONS.set(markup, entry);
+    native.defineIcon(entry.id, markup);
+  }
+  entry.count++;
+  return entry.id;
+}
+
+function dropIcon(markup) {
+  const entry = ICONS.get(markup);
+  if (entry && --entry.count === 0) {
+    ICONS.delete(markup);
+    native.release(entry.id);
+  }
+}
+
+/**
+ * An icon: SVG drawn at the node's CSS size, as an inline `<svg>` is. Its `currentColor` is
+ * the node's `color`, so an icon that paints only with it (Lucide's, for example) takes the
+ * text color, and any other keeps its own colors.
+ */
+export class Icon extends Node {
+  #svg = "";
+
+  constructor(svg = "") {
+    super("icon");
+    this.svg = svg;
+  }
+
+  /** The SVG markup, as `outerHTML` of an `<svg>` element would give it. */
+  get svg() {
+    return this.#svg;
+  }
+
+  set svg(markup) {
+    markup = markup == null ? "" : String(markup);
+    if (markup === this.#svg) return;
+    if (this.#svg) dropIcon(this.#svg);
+    this.#svg = markup;
+    native.source(this.id, markup ? holdIcon(markup) : 0);
+  }
+
+  _forget() {
+    if (this.#svg) dropIcon(this.#svg);
+    this.#svg = "";
+  }
+}
+
 function forget(node) {
   nodes.delete(node.id);
+  node._forget?.();
   for (const child of node.childNodes) {
     child.parentNode = null;
     forget(child);
@@ -348,6 +508,7 @@ export function createNode(kind) {
   if (!(kind in KINDS)) throw new TypeError("the tree has no node kind '" + kind + "'");
   if (kind === "text") return new Text();
   if (kind === "input") return new Input();
+  if (kind === "icon") return new Icon();
   return new Node(kind);
 }
 
@@ -361,6 +522,13 @@ export function createBox(style, ...children) {
 
 export function createText(data = "") {
   return new Text(data);
+}
+
+/** An icon showing `svg` markup, with `style` as its base look. */
+export function createIcon(svg, style) {
+  const icon = new Icon(svg);
+  if (style) icon.style.set(style);
+  return icon;
 }
 
 export function createInput(style) {
@@ -385,6 +553,25 @@ export function root() {
 /** The node with tree id `id`, for hosts and tools. */
 export function nodeById(id) {
   return nodes.get(id) ?? null;
+}
+
+// The option bits of `__ui.markdown`.
+const MARKDOWN_FLAGS = { tables: 1, strikethrough: 2, taskLists: 4, autolinkLiterals: 8, footnotes: 16, frontmatter: 32, alerts: 64 };
+const GFM = 1 | 2 | 4 | 8;
+
+/**
+ * The syntax tree of Markdown `text`, in the shape of mdast (what remark gives): plain
+ * objects with `type` and `children`. CommonMark, with GitHub's tables, strikethrough,
+ * task lists and autolinks unless `gfm` is false. `footnotes`, `frontmatter` and
+ * `alerts` (`> [!NOTE]`, a node of type `alert` with a `kind`) turn those on.
+ */
+export function parseMarkdown(text, options = {}) {
+  let flags = options.gfm === false ? 0 : GFM;
+  for (const name in MARKDOWN_FLAGS) {
+    if (options[name] === true) flags |= MARKDOWN_FLAGS[name];
+    else if (options[name] === false) flags &= ~MARKDOWN_FLAGS[name];
+  }
+  return JSON.parse(native.markdown(String(text), flags));
 }
 
 let errorHandler = null;
@@ -508,8 +695,23 @@ native.dispatch = function (kind, id, a, b, modifiers, d, e, first, second) {
   const event = new Event(TYPES[kind], target);
   fill(event, kind, a, b, modifiers, d, e, first, second);
   dispatchEvent(event);
+  if (kind === CLICK && !event.defaultPrevented) follow(target);
   return event.defaultPrevented;
 };
+
+// The default action of a click: the nearest link around the target opens.
+function follow(target) {
+  for (let node = target; node; node = node.parentNode) {
+    if (node._href) {
+      try {
+        globalThis.open(node._href);
+      } catch (error) {
+        reportError(error);
+      }
+      return;
+    }
+  }
+}
 
 // The host calls this before it replaces the realm, on a reload: every node goes, so the
 // next realm starts on an empty tree.

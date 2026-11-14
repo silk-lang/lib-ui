@@ -1,11 +1,12 @@
-//! Image body, fit, cropping and resource lifetime through the app/tree boundary.
+//! Image body, fit, cropping and resource lifetime through the app/tree boundary, and loading
+//! by URL: the first URL a view names is resource 1.
 import ui_app.heap { allocate }
 import ui_tree.css
 import ui_tree.css { px, percent }
 import ui_app.app { App, Context, NoCommand }
-import ui_app.runtime { Runtime }
+import ui_app.runtime { Runtime, pump }
 import ui_app.ui { Ui }
-import ui_tree.legacy { UiTree, TreeError, FrameInput, CpuSnapshot, Batch }
+import ui_tree.legacy { UiTree, TreeError, FrameInput, CpuSnapshot, Batch, Mutation }
 import ui_tree.mutation { ObjectFit }
 import ui_fixtures.fixtures as fixtures
 import codec.image { Image, ImageError }
@@ -14,6 +15,7 @@ import vector.pixmap { Pixmap }
 import silk.core.effect { Effect }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
 
 struct Example {
   fit: ObjectFit,
@@ -29,7 +31,7 @@ impl App<Message, NoCommand> for Example {
 
   fn view(self: &Self, ui: &mut Ui<Message>) -> () {
     ui.imageWith(
-      50,
+      "pixel.png",
       |ui| {
         ui.label("Photograph")
         ui.width(px(100.0))
@@ -67,7 +69,7 @@ effect fn picture(tree: &mut UiTree<'_>) -> ()
     i = i + 4
   }
   let mut batch = Batch.make()
-  run batch.decodedImage(50, move image)
+  run batch.decodedImage(1, move image)
   run tree.apply(run batch.take())
 }
 
@@ -115,7 +117,7 @@ effect fn body() -> ()
     "replacing a resource releases old decoded storage",
   )
   let mut batch = Batch.make()
-  run batch.releaseResource(50)
+  run batch.releaseResource(1)
   run tree.apply(run batch.take())
   let empty = run frame(&mut tree, &mut snapshot)
   run Testing.expect(
@@ -128,4 +130,81 @@ test effect fn fittedImagesAndLifetime() -> ()
   ! AssertionError<'static> | ImageError | TreeError | GeometryError | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   run body() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+struct Loading {
+  loaded: u32,
+  failed: u32,
+}
+
+enum Heard {
+  Loaded,
+  Failed
+}
+
+impl App<Heard, NoCommand> for Loading {
+  fn update(self: &mut Self, message: Heard, cx: &mut Context<NoCommand>) -> () {
+    match message {
+      Heard.Loaded => {
+        self.loaded = self.loaded + 1
+      }
+      Heard.Failed => {
+        self.failed = self.failed + 1
+      }
+    }
+  }
+
+  fn view(self: &Self, ui: &mut Ui<Heard>) -> () {
+    ui.imageWith("photos/a.png", |ui| {
+      ui.onLoad(|| Heard.Loaded)
+      ui.onError(|| Heard.Failed)
+    })
+    // The same URL again shares the resource and is loaded once.
+    ui.imageWith("photos/a.png", |ui| {
+      ui.onLoad(|| Heard.Loaded)
+    })
+    ui.iconWith("icons/b.svg", |ui| {
+      ui.onError(|| Heard.Failed)
+    })
+    if self.loaded > 0 {
+      // Named after the load ended: it hears `load` too, as an image from the cache does.
+      ui.imageWith("photos/a.png", |ui| {
+        ui.onLoad(|| Heard.Loaded)
+      })
+    }
+  }
+}
+
+effect fn loading() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut app = Runtime<Loading, Heard, NoCommand>.make(Loading { loaded: 0, failed: 0 })
+  run app.start(&mut tree, 0.0)
+  let loads = run tree.takeLoads()
+  run Testing.expect(loads.length() == 2, "each URL is loaded once")
+  let first = match &loads.asSlice()[0] {
+    Mutation.LoadImage { resource, url } => resource == 1 && String.view(&url) == "photos/a.png"
+    _ => false
+  }
+  let second = match &loads.asSlice()[1] {
+    Mutation.LoadIcon { resource, url } => resource == 2 && String.view(&url) == "icons/b.svg"
+    _ => false
+  }
+  run Testing.expect(first && second, "images and icons get their own loads, in order")
+  run tree.settleSource(1, true)
+  run tree.settleSource(2, false)
+  drop run pump(&mut app, &mut tree)
+  run Testing.expect(app.model.loaded == 2, "every image showing the source hears load")
+  run Testing.expect(app.model.failed == 1, "the icon hears error")
+  drop run pump(&mut app, &mut tree)
+  run Testing.expect(app.model.loaded == 3, "a node that shows a loaded source later hears load")
+  run Testing.expect((run tree.takeLoads()).length() == 0, "a known URL is not loaded again")
+}
+
+test effect fn imagesLoadByUrl() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run loading() |> Effect.provideMut<Allocator>(&mut allocator)
 }

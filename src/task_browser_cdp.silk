@@ -95,13 +95,22 @@ effect fn deadline(milliseconds: u64) -> Instant {
   let now = run MonotonicClock.now() |> Effect.provideMut<MonotonicClock>(&mut clock)
   return MonotonicClock.deadlineAfter(&now, milliseconds * 1000000)
 }
-effect fn ready(fd: i32, writing: bool, until: &Instant) -> () ! TaskError | OutOfMemoryError ? &mut Allocator {
+effect fn ready(fd: i32, writing: bool, until: &Instant, method: string, limit: u64) -> () ! TaskError | OutOfMemoryError ? &mut Allocator {
   let mut clock = OsMonotonicClock.make()
   let watch = if writing { ReadyWatch.forWrite(i32.toUsize(fd)) } else { ReadyWatch.forRead(i32.toUsize(fd)) }
   let mut watches = [watch]
   let copy = SystemClock.make(SystemClock.seconds(until), SystemClock.nanoseconds(until))
   let count = run MonotonicClock.waitReady(&mut watches, Option<Instant>.some(move copy)) |> Effect.provideMut<MonotonicClock>(&mut clock)
-  if count == 0 { run Task.abort("Chrome DevTools Protocol timed out") }
+  if count == 0 {
+    // Name the request and its limit, so a slow Chromium start reads differently from a hung page.
+    let milliseconds = Value.Number { value: JsonNumber.Unsigned { value: limit } }
+    let encoded = run Intrinsic.catchFailure<WriterError>(stringify(&milliseconds), writerFailure)
+    let mut message = run String.copy("Chrome DevTools Protocol timed out after ")
+    run String.append(&mut message, String.view(&encoded))
+    run String.append(&mut message, " ms waiting for ")
+    run String.append(&mut message, method)
+    fail TaskError { message: move message, status: 1 }
+  }
   if watches[0].invalid() { run Task.abort("Chrome DevTools Protocol descriptor closed") }
 }
 
@@ -116,7 +125,12 @@ pub struct Browser {
   profile: TemporaryDirectory,
   stopped: bool,
   pub errors: List<Value>,
+  // Each request's limit once the first page is attached.
   pub timeoutMs: u64,
+  // The limit until then. A fresh CI runner can take well over 30 s to bring Chromium's first
+  // page up (cold disk, first font scan), while later requests answer in milliseconds.
+  pub startupTimeoutMs: u64,
+  started: bool,
 }
 impl Drop for Browser {
   fn drop(self: &mut Self) -> () {
@@ -216,7 +230,9 @@ pub effect fn openWithEnvironment(executable: string, headless: bool, arguments:
   let mut profileArgument = run String.copy("--user-data-dir=")
   run String.append(&mut profileArgument, pathText(&profile.path))
   run ChildProcess.addArgument(&mut request, String.view(&profileArgument))
-  let defaults = ["--no-first-run", "--no-default-browser-check", "--disable-background-networking", "--disable-component-update", "--disable-extensions"]
+  // The password store flags keep Chromium off the keyring services: CI has no session bus, and the lookups run on its UI thread.
+  let defaults = ["--no-first-run", "--no-default-browser-check", "--disable-background-networking", "--disable-component-update", "--disable-extensions",
+    "--password-store=basic", "--use-mock-keychain"]
   let mut at: usize = 0
   while at < defaults.length { run ChildProcess.addArgument(&mut request, defaults[at]) at = at + 1 }
   at = 0
@@ -229,7 +245,7 @@ pub effect fn openWithEnvironment(executable: string, headless: bool, arguments:
   let mut child = run Intrinsic.catchFailure<SubprocessError>(Subprocess.spawn(&request, &options), processFailure)
   let input = child.takePipe(3) |> Option<i32>.unwrapOr(-1)
   let output = child.takePipe(4) |> Option<i32>.unwrapOr(-1)
-  return Browser { child: move child, input: input, output: output, pending: Bytes.make(), consumed: 0, scanned: 0, nextId: 0, profile: move profile, stopped: false, errors: List<Value>.make(), timeoutMs: 30000 }
+  return Browser { child: move child, input: input, output: output, pending: Bytes.make(), consumed: 0, scanned: 0, nextId: 0, profile: move profile, stopped: false, errors: List<Value>.make(), timeoutMs: 30000, startupTimeoutMs: 180000, started: false }
 }
 
 pub effect fn send(browser: &mut Browser, method: string, params: &Value, session: string) -> Value
@@ -248,18 +264,19 @@ pub effect fn send(browser: &mut Browser, method: string, params: &Value, sessio
   run wire.append(b",\"params\":")
   run wire.append(String.ownedUtf8Bytes(&data))
   run wire.append(b"}\0")
-  let until = run deadline(browser.timeoutMs)
+  let limit = if browser.started { browser.timeoutMs } else { browser.startupTimeoutMs }
+  let until = run deadline(limit)
   let bytes = wire.asSlice()
   let mut offset: usize = 0
   while offset < bytes.length {
-    run ready(browser.input, true, &until)
+    run ready(browser.input, true, &until, method, limit)
     let remaining = Slice.view<u8>(bytes, offset, bytes.length - offset)
     let count = writeSocket(browser.input, remaining)
     if count > 0 { offset = offset + isize.toUsize(count) }
     else if count == 0 || !transient(errno()) { return run Task.abort("Cannot write Chrome DevTools Protocol request") }
   }
   while true {
-    let message = run receive(&mut browser, &until)
+    let message = run receive(&mut browser, &until, method, limit)
     let responseId = Json.field(&message, "id") |> Json.asU64 |> Option<u64>.unwrapOr(0)
     if responseId == id {
       if let Option<&Value>.Some {value} = Json.field(&message, "error") {
@@ -313,7 +330,7 @@ fn takeField(document: Value, key: string) -> Value {
     _ => Value.Null
   }
 }
-effect fn receive(browser: &mut Browser, until: &Instant) -> Value ! TaskError | OutOfMemoryError ? &mut Allocator {
+effect fn receive(browser: &mut Browser, until: &Instant, method: string, limit: u64) -> Value ! TaskError | OutOfMemoryError ? &mut Allocator {
   while true {
     let all = Bytes.asSlice(&browser.pending)
     let mut at = browser.scanned
@@ -333,7 +350,7 @@ effect fn receive(browser: &mut Browser, until: &Instant) -> Value ! TaskError |
       browser.scanned = browser.scanned - browser.consumed
       browser.consumed = 0
     }
-    run ready(browser.output, false, until)
+    run ready(browser.output, false, until, method, limit)
     let mut buffer: [u8; 16384] = [0; 16384]
     let count = unsafe read(browser.output, Pointer.fromMutSlice(&mut buffer), buffer.length)
     if count == 0 { return run Task.abort("Chromium exited while waiting for a CDP response; see browser stderr") }
@@ -359,6 +376,7 @@ pub effect fn page(browser: &mut Browser) -> String ! TaskError | OutOfMemoryErr
   let empty = run parse(b"{}")
   let _runtime = run send(&mut browser, "Runtime.enable", &empty, String.view(&owned))
   let _page = run send(&mut browser, "Page.enable", &empty, String.view(&owned))
+  browser.started = true
   return move owned
 }
 pub effect fn evaluate(browser: &mut Browser, source: string, session: string) -> Value

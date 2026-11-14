@@ -26,7 +26,7 @@ Every element is a call on `h` that takes a list of attributes and a list of chi
 | `h.link` | A link to a path of the program. See [Routing](/core/routing/) |
 | `h.input` | A text field. See [Events and input](/core/events/) |
 | `h.grid` | A box laid out as a CSS grid |
-| `h.image`, `h.icon` | A picture the host gave a number to |
+| `h.image`, `h.icon` | A picture, by URL |
 
 `h.row` and `h.column` are flex containers, so the layout properties you know from CSS apply: `css.alignItems`, `css.justifyContent`, `css.columnGap`, `css.flexGrow`.
 

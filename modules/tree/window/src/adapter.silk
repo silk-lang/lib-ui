@@ -2,7 +2,7 @@
 //! pixels; wheel notches become [`LINE_PIXELS`] each. modules/platform/window's scroll deltas are
 //! positive when content moves down, the tree's when it scrolls down, so the sign flips.
 import accessibility
-import accessibility { AxAction, AxNode }
+import accessibility { Bridge, Publisher }
 import platform_thread { AccessLink, HostPlatform }
 import silk.core.effect { Effect }
 import keys { codeName, keyName }
@@ -220,7 +220,10 @@ pub effect fn feed(tree: &mut UiTree<'_>, event: &Event) -> bool
 pub struct HostState {
   pub ime: ImeArea,
   pub imeSet: bool,
-  accessibilityFrame: u64,
+  /// What the window's assistive technology was last sent.
+  publisher: Publisher,
+  /// The window's accessibility adapter, when this thread runs the platform.
+  bridge: Bridge,
   /// The platform thread's accessibility link, when the platform runs on its own thread.
   access: Option<AccessLink>,
 }
@@ -230,7 +233,8 @@ impl HostState {
     return HostState {
       ime: ImeArea.none(),
       imeSet: false,
-      accessibilityFrame: 18446744073709551615,
+      publisher: Publisher.make(),
+      bridge: Bridge.make(),
       access: Option<AccessLink>.None,
     }
   }
@@ -256,24 +260,21 @@ pub effect fn serve<P: Platform>(
   ? &mut Allocator {
   match &state.access {
     Option<AccessLink>.Some { value } => {
-      // The platform thread talks to the OS; this side sends snapshots and answers actions.
-      let mut actions = List<AxAction>.make()
-      run value.take(&mut actions)
-      run accessibility.apply(&mut tree, &mut actions)
-      if accessibility.supported() && state.accessibilityFrame != tree.semanticRevision
-        && !tree.layoutPending() {
-        let mut heap = Allocator.systemAllocatorProvider()
-        let mut nodes = List<AxNode>.make()
-        run accessibility.snapshot(&tree.*, &mut nodes) |> Effect.provideMut<Allocator>(&mut heap)
-        run value.publish(window, move nodes)
-        state.accessibilityFrame = tree.semanticRevision
+      // The platform thread talks to the OS; this side sends updates and answers actions.
+      let mut requests = run value.take(window)
+      run accessibility.apply(&mut tree, &mut requests)
+      match run state.publisher.next(&tree.*, value.wanted(window)) {
+        Option.Some { value: update } => run value.publish(window, move update)
+        Option.None => {}
       }
     }
     Option<AccessLink>.None => {
-      run accessibility.poll(&mut tree, window)
-      if state.accessibilityFrame != tree.semanticRevision && !tree.layoutPending() {
-        run accessibility.sync(&tree.*, window)
-        state.accessibilityFrame = tree.semanticRevision
+      state.bridge.attach(window, platform.rawSurface(window))
+      let mut requests = run state.bridge.takeRequests()
+      run accessibility.apply(&mut tree, &mut requests)
+      match run state.publisher.next(&tree.*, state.bridge.wanted()) {
+        Option.Some { value: update } => run state.bridge.update(move update, true)
+        Option.None => {}
       }
     }
   }
@@ -306,6 +307,10 @@ pub effect fn serveInput<P: Platform>(
           }
           Option<String>.None => {}
         }
+      }
+      HostRequest.LoadFontFace { .. } => {
+        // This host has no font loader yet: the face stays loading and its text keeps the
+        // fallback.
       }
     }
     i = i + 1

@@ -1,0 +1,371 @@
+//! The keyed entry of js-framework-benchmark (github.com/krausest/js-framework-benchmark) for
+//! Silk UI in a page: a ui-app program shown by ui-app-dom. It builds the markup every entry
+//! builds (a Bootstrap jumbotron with six buttons and a table of rows), so the page's
+//! stylesheet and the benchmark driver's selectors apply as they do to the others.
+import ui_app.css
+import ui_app.css { Keyword }
+import ui_app.lib { Document, Node, NoCommand, NoOutput, Program, Update, textKey }
+import ui_app_dom.page
+import ui_app_dom.dom { Dom }
+import ui_app.backend { TreeError }
+import ui_app.program { make }
+import ui_app.runtime { settle, drain }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.text.string { String }
+
+pub struct Row {
+  pub id: u64,
+  pub label: String,
+}
+
+pub struct Bench {
+  pub rows: List<Row>,
+  /// The id of the selected row, or 0.
+  pub selected: u64,
+  pub nextId: u64,
+  /// The state of the label generator.
+  pub seed: u64,
+}
+
+pub union Message {
+  Run,
+  RunLots,
+  Add,
+  Update,
+  Clear,
+  SwapRows,
+  Select { pub id: u64 },
+  Remove { pub id: u64 },
+}
+
+type Next = Update<Bench, NoCommand, NoOutput>
+
+const ADJECTIVES: [string<'static>; 25] = [
+  "pretty", "large", "big", "small", "tall", "short", "long", "handsome", "plain", "quaint",
+  "clean", "elegant", "easy", "angry", "crazy", "helpful", "mushy", "odd", "unsightly",
+  "adorable", "important", "inexpensive", "cheap", "expensive", "fancy",
+]
+
+const COLOURS: [string<'static>; 11] = [
+  "red", "yellow", "blue", "green", "pink", "brown", "purple", "brown", "white", "black",
+  "orange",
+]
+
+const NOUNS: [string<'static>; 13] = [
+  "table", "chair", "house", "bbq", "desk", "car", "pony", "cookie", "sandwich", "burger",
+  "pizza", "mouse", "keyboard",
+]
+
+/// A number below `bound` from the model's generator (xorshift64*).
+fn pick(model: &mut Bench, bound: usize) -> usize {
+  let mut x = model.seed
+  x = u64.bitXor(x, u64.shiftRight(x, 12))
+  x = u64.bitXor(x, u64.shiftLeft(x, 25))
+  x = u64.bitXor(x, u64.shiftRight(x, 27))
+  model.seed = x
+  return u64.toUsize(u64.shiftRight(x, 32) % usize.toU64(bound))
+}
+
+effect fn build(model: &mut Bench, count: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run model.rows.reserve(count)
+  let mut i: usize = 0
+  while i < count {
+    let mut label = run String.makeWithCapacity(32)
+    run label.append(ADJECTIVES[pick(&mut model, 25)])
+    run label.append(" ")
+    run label.append(COLOURS[pick(&mut model, 11)])
+    run label.append(" ")
+    run label.append(NOUNS[pick(&mut model, 13)])
+    run model.rows.append(Row { id: model.nextId, label: move label })
+    model.nextId = model.nextId + 1
+    i = i + 1
+  }
+}
+
+fn clear(model: &mut Bench) -> () {
+  model.rows = List<Row>.make()
+  model.selected = 0
+}
+
+fn find(model: &Bench, id: u64) -> usize {
+  let rows = model.rows.asSlice()
+  let mut i: usize = 0
+  while i < rows.length {
+    if rows[i].id == id {
+      return i
+    }
+    i = i + 1
+  }
+  return usize.MAX
+}
+
+impl Program<Message, NoCommand> for Bench {
+  effect fn init() -> Next
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return Next.of(Bench { rows: List<Row>.make(), selected: 0, nextId: 1, seed: 88172645463325252 })
+  }
+
+  effect fn update(mut model: Bench, message: Message) -> Next
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match move message {
+      Message.Run => {
+        clear(&mut model)
+        run build(&mut model, 1000)
+      }
+      Message.RunLots => {
+        clear(&mut model)
+        run build(&mut model, 10000)
+      }
+      Message.Add => {
+        run build(&mut model, 1000)
+      }
+      Message.Update => {
+        let rows = model.rows.asMutSlice()
+        let mut i: usize = 0
+        while i < rows.length {
+          run rows[i].label.append(" !!!")
+          i = i + 10
+        }
+      }
+      Message.Clear => {
+        clear(&mut model)
+      }
+      Message.SwapRows => {
+        if model.rows.length() > 998 {
+          let rows = model.rows.asMutSlice()
+          let first = Intrinsic.replace(rows[1], Row { id: 0, label: String.make() })
+          let last = Intrinsic.replace(rows[998], move first)
+          rows[1] = move last
+        }
+      }
+      Message.Select { id } => {
+        model.selected = id
+      }
+      Message.Remove { id } => {
+        let at = find(&model, id)
+        if at != usize.MAX {
+          drop model.rows.remove(at)
+        }
+      }
+    }
+    return Next.of(move model)
+  }
+
+  fn view(model: &Bench, h: &Document<Message>) -> Node {
+    // The root box is a flex column by default (an app filling a window); the benchmark's
+    // markup is a plain Bootstrap container.
+    return h.box(
+      &[h.className("container"), h.style(&[css.display(Keyword.Block)])],
+      &[
+        h.box(
+          &[h.className("jumbotron")],
+          &[
+            h.box(
+              &[h.className("row")],
+              &[
+                h.box(
+                  &[h.className("col-md-6")],
+                  &[h.box(&[h.element("h1")], &[h.text("Silk UI keyed")])],
+                ),
+                h.box(
+                  &[h.className("col-md-6")],
+                  &[
+                    h.box(
+                      &[h.className("row")],
+                      &[
+                        button(h, "run", "Create 1,000 rows", Message.Run),
+                        button(h, "runlots", "Create 10,000 rows", Message.RunLots),
+                        button(h, "add", "Append 1,000 rows", Message.Add),
+                        button(h, "update", "Update every 10th row", Message.Update),
+                        button(h, "clear", "Clear", Message.Clear),
+                        button(h, "swaprows", "Swap Rows", Message.SwapRows),
+                      ],
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ],
+        ),
+        h.box(
+          &[h.element("table"), h.className("table table-hover table-striped test-data")],
+          &[
+            h.box(
+              &[h.element("tbody"), h.id("tbody")],
+              &[h.each(model.rows.asSlice(), |row| h.lazy(row.id, rowHash(row, model.selected), || line(h, row, model.selected)))],
+            ),
+          ],
+        ),
+        h.box(
+          &[h.element("span"), h.className("preloadicon glyphicon glyphicon-remove")],
+          &[],
+        ),
+      ],
+    )
+  }
+}
+
+fn button(h: &Document<Message>, id: string, label: string, message: Message) -> Node {
+  return h.box(
+    &[h.className("col-sm-6 smallpad")],
+    &[
+      h.box(
+        &[
+          h.element("button"),
+          h.className("btn btn-primary btn-block"),
+          h.id(id),
+          h.onClick(move message),
+        ],
+        &[h.text(label)],
+      ),
+    ],
+  )
+}
+
+/// A hash of everything `line` reads but the id, which is the row's key.
+fn rowHash(row: &Row, selected: u64) -> u64 {
+  let hash = textKey(String.view(&row.label))
+  return if row.id == selected {
+    u64.bitXor(hash, 1)
+  } else {
+    hash
+  }
+}
+
+fn line(h: &Document<Message>, row: &Row, selected: u64) -> Node {
+  return h.box(
+    &[
+      h.element("tr"),
+      if row.id == selected {
+        h.className("danger")
+      } else {
+        h.none()
+      },
+    ],
+    &[
+      h.box(&[h.element("td"), h.className("col-md-1")], &[h.number(u64.toI64(row.id))]),
+      h.box(
+        &[h.element("td"), h.className("col-md-4")],
+        &[
+          h.box(
+            &[h.element("a"), h.onClick(Message.Select { id: row.id })],
+            &[h.text(String.view(&row.label))],
+          ),
+        ],
+      ),
+      h.box(
+        &[h.element("td"), h.className("col-md-1")],
+        &[
+          h.box(
+            &[h.element("a"), h.onClick(Message.Remove { id: row.id })],
+            &[h.box(&[h.element("span"), h.className("glyphicon glyphicon-remove")], &[])],
+          ),
+        ],
+      ),
+      h.box(&[h.element("td"), h.className("col-md-6")], &[]),
+    ],
+  )
+}
+
+static if Intrinsic.targetArchitecture() == "wasm32" {
+  /// Called once, when the page loads the program.
+  export "C" fn open() -> ?*mut u8 as "silk_ui_open" {
+    let mut allocator = Allocator.systemAllocatorProvider()
+    return run Effect.catchAll(page.open<Bench, Message, NoCommand>(), page.unopened)
+      |> Effect.provideMut<Allocator>(&mut allocator)
+  }
+
+  /// Called for everything after that.
+  export "C" fn call(token: ?*mut u8, op: u32, a: f64, b: f64, c: f64) -> f64 as "silk_ui_call" {
+    let mut allocator = Allocator.systemAllocatorProvider()
+    return run Effect.catchAll(page.call<Bench, Message, NoCommand>(token, op, a, b, c), page.failed)
+      |> Effect.provideMut<Allocator>(&mut allocator)
+  }
+}
+
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  import ui_app_dom.html { Html, render }
+  import silk.collections.bytes { Bytes }
+  import silk.core.option { Option }
+  import silk.io.writer { Writer, WriterError }
+  import silk.io.writer_native { StdoutWriter }
+  import silk.system.host_input { HostInput, HostInputError }
+
+  /// Prints the first view as markup. `build.sh` puts it inside the page's root element, so
+  /// the page shows the heading and the buttons before the program has loaded, and the
+  /// program adopts those nodes when it starts.
+  effect fn shell() -> ()
+    ! TreeError | OutOfMemoryError | WriterError
+    ? &mut Allocator {
+    let mut html = Html.make()
+    let markup = run render<Bench, Message, NoCommand>(&mut html, "/")
+    let mut out = StdoutWriter.make()
+    run Writer.writeAll(Bytes.asSlice(&markup)) |> Effect.provideMut<Writer>(&mut out)
+    run Writer.flush() |> Effect.provideMut<Writer>(&mut out)
+  }
+
+  /// What a profiler watches: 1,000 rows made, then `selects` selections.
+  effect fn profile(selects: u32) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut host = run make<Bench, Message, NoCommand>()
+    let mut dom = Dom.make()
+    dom.setViewport(1280.0, 800.0)
+    run host.sized(1280.0, 800.0)
+    drop run settle(&mut host)
+    drop host.takeWent()
+    run host.start(&mut dom, 0.0)
+    run drain(&mut host, &mut dom)
+    dom.cloning = true
+    host.send(Message.Run)
+    run drain(&mut host, &mut dom)
+    let mut i: u32 = 0
+    while i < selects {
+      host.send(Message.Select { id: u32.toU64(i % 50 + 2) })
+      run drain(&mut host, &mut dom)
+      i = i + 1
+    }
+  }
+
+  /// `ui-bench-web shell` prints the markup of the first view; with no argument it runs the
+  /// profile.
+  effect fn application() -> i32
+    ! TreeError | OutOfMemoryError | WriterError | HostInputError
+    ? &mut HostInput | &mut Allocator {
+    let wanted = match run HostInput.argument(1) {
+      Option<Bytes>.Some { value } => move value
+      Option<Bytes>.None => Bytes.make()
+    }
+    if Bytes.asSlice(&wanted) == b"shell" {
+      run shell()
+      return 0
+    }
+    run profile(200)
+    return 0
+  }
+
+  effect fn gaveUp<E>(error: E) -> i32 {
+    drop error
+    return 1
+  }
+
+  pub effect fn main() -> i32
+    ? &mut HostInput {
+    let mut allocator = Allocator.systemAllocatorProvider()
+    return run Effect.catchAll(application(), gaveUp)
+      |> Effect.provideMut<Allocator>(&mut allocator)
+  }
+} else {
+  pub fn main() -> i32 {
+    return 0
+  }
+}

@@ -1,0 +1,327 @@
+//! The terminal app: one terminal filling the window, on the user's shell. [`Session`] does
+//! the work (the PTY, the view, what flows between them), so a test can run it on a command
+//! of its own.
+import pty { Pty, PtyError }
+import ghostty_vt.terminal { GhosttyError }
+import ui_ghostty.view { TerminalView, TerminalMessage, Options, Outgoing }
+import ui_app.css
+import ui_app.css { percent, px, BoxSizing }
+import ui_app.lib {
+  CommandSet,
+  Document,
+  Node,
+  NoOutput,
+  Program,
+  Shell,
+  Subscriptions,
+  Update
+}
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.color.rgba { Rgba }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.i32
+import silk.num.u32
+import silk.text.string { String }
+
+/// The font family the terminal draws with; the window maps it to a monospace font.
+pub const MONO: u32 = 1
+
+/// How often the PTY is read while output flows or the user types, and while it is quiet.
+const BUSY_INTERVAL: f64 = 0.016
+
+const QUIET_INTERVAL: f64 = 0.25
+
+/// How long after the last output or input reading stays fast.
+const BUSY_FOR: f64 = 1.0
+
+/// Output read per poll at most, so a flood of output cannot stall input and drawing.
+const READS: u32 = 8
+
+const CHUNK: usize = 16384
+
+pub union Message {
+  Term { pub message: TerminalMessage },
+  /// Read what the program wrote. `time` is in seconds.
+  Poll { pub time: f64 },
+  /// A step of selection autoscroll.
+  Tick,
+  /// A command finished.
+  Done,
+}
+
+pub union Command {
+  Copy { pub text: String },
+  Title { pub text: String },
+  Quit,
+}
+
+impl CommandSet<Message ? &mut Shell | &mut Allocator> for Command {
+  effect fn execute(self: Self) -> Message
+    ! OutOfMemoryError
+    ? &mut Shell | &mut Allocator {
+    match move self {
+      Command.Copy { text } => {
+        run Shell.copy(text.view())
+      }
+      Command.Title { text } => {
+        run Shell.setTitle(text.view())
+      }
+      Command.Quit => {
+        run Shell.quit()
+      }
+    }
+    return Message.Done
+  }
+}
+
+/// A terminal view on a PTY.
+pub struct Session {
+  pub view: TerminalView,
+  pty: Option<Pty>,
+  /// The program's exit status, or -1 while it runs.
+  pub exit: i32,
+  /// Whether the window closes when the program exits.
+  pub quitOnExit: bool,
+  /// The time of the last poll, and until when to poll fast.
+  now: f64,
+  busyUntil: f64,
+}
+
+effect fn noView(error: GhosttyError) -> TerminalView {
+  drop error
+  return Intrinsic.trap("ui-ghostty-demo: could not make a terminal")
+}
+
+/// `value` in decimal.
+effect fn appendNumber(text: &mut String, value: i32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if value < 0 {
+    run text.append("-")
+    run appendNumber(&mut text, 0 - value)
+    return ()
+  }
+  if value >= 10 {
+    run appendNumber(&mut text, value / 10)
+  }
+  let digit = i32.toUsize(value % 10)
+  run text.append(String.slice("0123456789", digit, 1))
+}
+
+effect fn line(view: &mut TerminalView, text: string) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run view.write(String.utf8Bytes(text))
+}
+
+impl Session {
+  /// A session on `started`, or one that says why the program could not start.
+  pub effect fn make(started: Result<Pty, PtyError>) -> Session
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut view = run Effect.catch<GhosttyError>(TerminalView.make(80, 24, Options.defaults(MONO)), noView)
+    let mut exit: i32 = -1
+    let pty = match move started {
+      Result<Pty, PtyError>.Success { value } => Option<Pty>.Some { value: move value }
+      Result<Pty, PtyError>.Failure { error } => {
+        let mut text = run String.copy("could not start the shell (error ")
+        run appendNumber(&mut text, error.code)
+        run text.append(")\r\n")
+        run line(&mut view, text.view())
+        exit = 127
+        Option<Pty>.None
+      }
+    }
+    return Session {
+      view: move view,
+      pty: move pty,
+      exit: exit,
+      quitOnExit: true,
+      now: 0.0,
+      busyUntil: BUSY_FOR,
+    }
+  }
+
+  pub fn running(self: &Self) -> bool {
+    return self.pty.isSome()
+  }
+
+  /// Handles a message, and returns the commands it leads to.
+  pub effect fn step(self: &mut Self, message: Message) -> List<Command>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut commands = List<Command>.make()
+    match move message {
+      Message.Term { message: inner } => {
+        // An answer to input is on its way: read soon.
+        self.busyUntil = self.now + BUSY_FOR
+        run self.view.update(move inner)
+      }
+      Message.Poll { time } => {
+        self.now = time
+        run self.poll(&mut commands)
+      }
+      Message.Tick => {
+        run self.view.update(TerminalMessage.Ticked)
+      }
+      Message.Done => {}
+    }
+    run self.deliver(&mut commands)
+    return move commands
+  }
+
+  /// Reads what the program wrote into the terminal; notices when it has exited.
+  effect fn poll(self: &mut Self, commands: &mut List<Command>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut ended = false
+    let mut wrote = false
+    if let Option<Pty>.Some { value: pty } = &mut self.pty {
+      let mut buffer = run Bytes.zeroed(CHUNK)
+      let mut reads: u32 = 0
+      while reads < READS {
+        let read = run Effect.result(pty.read(buffer.asMutSlice()))
+        let count = match move read {
+          Result<usize, PtyError>.Success { value } => value
+          Result<usize, PtyError>.Failure { error: _error } => {
+            ended = true
+            0
+          }
+        }
+        if count == 0 {
+          break
+        }
+        self.view.terminal.write(Slice.view(buffer.asSlice(), 0, count))
+        wrote = true
+        reads = reads + 1
+      }
+      if pty.finished() {
+        ended = true
+        self.exit = pty.status()
+      }
+    }
+    if wrote {
+      self.busyUntil = self.now + BUSY_FOR
+      run self.view.refresh()
+    }
+    if !ended {
+      return ()
+    }
+    self.pty = Option<Pty>.None
+    if self.exit < 0 {
+      self.exit = 1
+    }
+    let mut text = run String.copy("\r\n[process exited with status ")
+    run appendNumber(&mut text, self.exit)
+    run text.append("]\r\n")
+    run line(&mut self.view, text.view())
+    if self.quitOnExit {
+      run commands.append(Command.Quit)
+    }
+  }
+
+  /// Passes on what the view has for the world: input to the PTY, the rest as commands.
+  effect fn deliver(self: &mut Self, commands: &mut List<Command>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut out = self.view.take()
+    while out.length() > 0 {
+      match out.remove(0) {
+        Outgoing.Send { bytes } => {
+          if let Option<Pty>.Some { value: pty } = &mut self.pty {
+            // A program that has stopped reading is noticed on the next poll.
+            drop run Effect.result(pty.write(bytes.asSlice()))
+          }
+        }
+        Outgoing.Resize { columns, rows } => {
+          if let Option<Pty>.Some { value: pty } = &mut self.pty {
+            drop run Effect.result(pty.resize(columns, rows))
+          }
+        }
+        Outgoing.Copy { text } => {
+          run commands.append(Command.Copy { text: move text })
+        }
+        Outgoing.Title { text } => {
+          run commands.append(Command.Title { text: move text })
+        }
+      }
+    }
+  }
+
+  pub fn draw(self: &Self, h: &Document<Message>) -> Node {
+    return h.box(
+      &[
+        h.style(
+          &[
+            css.width(percent(100.0)),
+            css.height(percent(100.0)),
+            css.boxSizing(BoxSizing.BorderBox),
+            css.padding(px(6.0)),
+            css.backgroundColor(background()),
+          ],
+        ),
+      ],
+      &[
+        h.map(
+          |inner: &Document<TerminalMessage>| self.view.view(inner),
+          |message| Message.Term { message: move message },
+        ),
+      ],
+    )
+  }
+
+  pub fn listen(self: &Self, subs: &mut Subscriptions<Message>) -> () {
+    if self.running() && self.now < self.busyUntil {
+      subs.every(1, BUSY_INTERVAL, |time| Message.Poll { time: time })
+    } else if self.running() {
+      subs.every(3, QUIET_INTERVAL, |time| Message.Poll { time: time })
+    }
+    if self.view.autoscrolling() {
+      subs.every(2, 0.05, |_time| Message.Tick)
+    }
+  }
+}
+
+fn background() -> Rgba<f32> {
+  let hex = Options.defaults(MONO).background
+  let r = u32.toF32(u32.bitAnd(u32.shiftRight(hex, 16), 255)) / 255.0
+  let g = u32.toF32(u32.bitAnd(u32.shiftRight(hex, 8), 255)) / 255.0
+  let b = u32.toF32(u32.bitAnd(hex, 255)) / 255.0
+  return Rgba<f32> { r: r, g: g, b: b, a: 1.0 }
+}
+
+type Next = Update<TerminalApp, Command, NoOutput>
+
+/// The app: the user's shell.
+pub struct TerminalApp {
+  session: Session,
+}
+
+impl Program<Message, Command> for TerminalApp {
+  effect fn init() -> Next
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let started = run Effect.result(Pty.shell(80, 24))
+    return Next.of(TerminalApp { session: run Session.make(move started) })
+  }
+
+  effect fn update(mut model: TerminalApp, message: Message) -> Next
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let commands = run model.session.step(move message)
+    return Next.batch(move model, move commands)
+  }
+
+  fn view(model: &TerminalApp, h: &Document<Message>) -> Node {
+    return model.session.draw(h)
+  }
+
+  fn subscriptions(model: &TerminalApp, subs: &mut Subscriptions<Message>) -> () {
+    model.session.listen(&mut subs)
+  }
+}

@@ -25,7 +25,7 @@ import diff { DiffState, diffFrom }
 import windows { Windows, WindowEvent, WindowRecord }
 import journal { Journal, MODEL_LIMIT, eventName }
 import show { Printer, show, showTree }
-import ui { Ui, Identity, AnchorRect, NO_ENTRY, ROOT_ID }
+import ui { Ui, Identity, AnchorRect, NO_ENTRY, ROOT_ID, Sources }
 import ui_protocol.mutation {
   Mutation,
   FIRST_ROOT,
@@ -376,13 +376,14 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
     ? &mut Allocator {
     run self.collectSubscriptions()
     self.batch.clear()
+    self.diffState.taken = 0
     let root = self.root
     run self.renderView(&mut tree, root)
     let nodes = self.ui.arena.entries.length()
     let reused = self.ui.reused
     run self.renderWindows(&mut tree)
     self.stats.renders = self.stats.renders + 1
-    self.stats.mutations = self.batch.length()
+    self.stats.mutations = self.batch.length() + self.diffState.taken
     self.stats.nodes = nodes
     self.stats.reused = reused
 
@@ -408,34 +409,66 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
       top.listeners = u32.bitOr(top.listeners, LISTEN_KEY_DOWN)
       self.ui.arena.setEntry(0, top)
     }
+    self.diffState.marked = self.ui.hasMarks()
+    self.diffState.transient = Backend.copiesBatches(&tree)
+    run self.sendLoads()
     run diffFrom(
       &mut self.ui.arena,
       &self.ui.previous,
       &mut self.diffState,
       &mut self.batch,
+      &mut tree,
       self.ui.rootId,
     )
+    // Anchored placement is rare: skip both passes when no entry, new or old, has it.
+    let mut placing = false
+    let mut scan: usize = if self.ui.hasMarks() {
+      0
+    } else {
+      self.ui.arena.entries.length()
+    }
+    while scan < self.ui.arena.entries.length() {
+      let here = &self.ui.arena.entries.asSlice()[scan]
+      let old = here.old
+      if (here.extra != 0 && self.ui.arena.extraCopy(here).hasPlacement)
+        || (old != NO_ENTRY && self.ui.previous.extraCopy(self.ui.previous.entryRef(old)).hasPlacement) {
+        placing = true
+        break
+      }
+      scan = scan + 1
+    }
     let mut anchors = HashMap<u64, u32>.make(Hash.seed(0x616e6368))
-    let mut entryIndex: u32 = 0
+    let mut entryIndex: u32 = if placing {
+      0
+    } else {
+      self.ui.arena.length()
+    }
     while entryIndex < self.ui.arena.length() {
       let entry = self.ui.arena.entry(entryIndex)
-      if entry.hasAnchor {
-        drop run anchors.insert(entry.anchor, entry.id)
+      let extra = self.ui.arena.extraCopy(&entry)
+      if extra.hasAnchor {
+        drop run anchors.insert(extra.anchor, entry.id)
       }
       entryIndex = entryIndex + 1
     }
-    entryIndex = 0
+    entryIndex = if placing {
+      0
+    } else {
+      self.ui.arena.length()
+    }
     while entryIndex < self.ui.arena.length() {
       let entry = self.ui.arena.entry(entryIndex)
-      if entry.hasPlacement {
-        let target = anchors.get(entry.placementTarget).unwrapOr(0)
+      let extra = self.ui.arena.extraCopy(&entry)
+      if extra.hasPlacement {
+        let target = anchors.get(extra.placementTarget).unwrapOr(0)
         if target == 0 {
           fail TreeError.UnknownNode { index: self.batch.length(), id: target }
         }
         run self.batch.append(
-          Mutation.SetAnchor { id: entry.id, target: target, options: entry.placementOptions },
+          Mutation.SetAnchor { id: entry.id, target: target, options: extra.placementOptions },
         )
-      } else if entry.old != NO_ENTRY && self.ui.previous.entry(entry.old).hasPlacement {
+      } else if entry.old != NO_ENTRY
+        && self.ui.previous.extraCopy(self.ui.previous.entryRef(entry.old)).hasPlacement {
         run self.batch.append(Mutation.ClearAnchor { id: entry.id })
       }
       entryIndex = entryIndex + 1
@@ -467,6 +500,25 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
     }
   }
 
+  /// Asks the host to load the image and icon URLs the views named for the first time, before
+  /// the mutations that show them.
+  effect fn sendLoads(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let pending = Intrinsic.replace(self.ui.sources.pending, List<u32>.make())
+    let mut at: usize = 0
+    while at < pending.length() {
+      let resource = pending.asSlice()[at]
+      at = at + 1
+      let url = self.ui.sources.url(resource)
+      if self.ui.sources.isIcon(resource) {
+        run self.batch.append(Mutation.LoadIcon { resource: resource, url: run String.copy(url) })
+      } else {
+        run self.batch.append(Mutation.LoadImage { resource: resource, url: run String.copy(url) })
+      }
+    }
+  }
+
   /// Runs the view whose builder `self.ui` is: the app's, or in a window, that window's.
   fn runView(self: &mut Self) -> () {
     if !self.inWindow {
@@ -488,9 +540,11 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
     let state = Intrinsic.replace(list[at].diffState, DiffState.make())
     let key = list[at].key
     drop list
-    let mainUi = Intrinsic.replace(self.ui, move ui)
+    let mut mainUi = Intrinsic.replace(self.ui, move ui)
     let mainState = Intrinsic.replace(self.diffState, move state)
     self.diffState.nextId = nextId
+    // The windows share one URL table, so a resource id means one URL everywhere.
+    self.ui.sources = Intrinsic.replace(mainUi.sources, Sources.make())
     let back = self.opened.asMutSlice()
     back[at].ui = move mainUi
     back[at].diffState = move mainState
@@ -505,9 +559,10 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
     let mainUi = Intrinsic.replace(list[at].ui, Ui<M>.make())
     let mainState = Intrinsic.replace(list[at].diffState, DiffState.make())
     drop list
-    let ui = Intrinsic.replace(self.ui, move mainUi)
+    let mut ui = Intrinsic.replace(self.ui, move mainUi)
     let state = Intrinsic.replace(self.diffState, move mainState)
     self.diffState.nextId = nextId
+    self.ui.sources = Intrinsic.replace(ui.sources, Sources.make())
     let back = self.opened.asMutSlice()
     back[at].ui = move ui
     back[at].diffState = move state
@@ -765,14 +820,27 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
     ? &mut Allocator {
     self.ui.viewportBounds = Backend.viewport(&tree, root)
     self.ui.anchors.clear()
-    let count = self.ui.arena.length()
+    // The arena still holds the last render: without marks, none of its nodes has an anchor.
+    let count = if self.ui.marked {
+      self.ui.arena.length()
+    } else {
+      0
+    }
     let mut i: u32 = 0
     while i < count {
+      // Read in place: an entry is large, and almost none has an anchor.
+      let here = self.ui.arena.entryRef(i)
+      let hasAnchor = here.extra != 0 && self.ui.arena.extraCopy(here).hasAnchor
+      if !hasAnchor {
+        i = i + 1
+        continue
+      }
       let entry = self.ui.arena.entry(i)
-      if entry.hasAnchor && entry.id != 0 {
+      let extra = self.ui.arena.extraCopy(&entry)
+      if extra.hasAnchor && entry.id != 0 {
         if let Option<Measured>.Some { value: node } = run Backend.measure(&tree, entry.id) {
           let anchor = AnchorRect {
-            key: entry.anchor,
+            key: extra.anchor,
             rect: node.bounds,
             pressed: node.pressed,
             hovered: node.hovered,
@@ -1102,18 +1170,23 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
 
     // The link the record is in, if any: the innermost one.
     let mut link = List<u8>.make()
+    // The entries on the path, root first, for `answerKept`.
+    let mut entries = run List<u32>.makeWithCapacity(ids.length)
+    run entries.append(0)
     let mut i: usize = 1
     while i < ids.length {
       let entry = run self.diffState.entryOf(&self.ui.arena, ids[i])
       if entry == NO_ENTRY {
         return ()
       }
+      run entries.append(entry)
       let found = self.ui.arena.entry(entry)
       run self.path.append(found.identity)
       typing = isTextInput(found.kind)
-      if found.href.length != 0 {
+      let href = self.ui.arena.extraCopy(&found).href
+      if href.length != 0 {
         link.clear()
-        run link.appendSlice(self.ui.arena.text(found.href))
+        run link.appendSlice(self.ui.arena.text(href))
       }
       i = i + 1
     }
@@ -1131,7 +1204,11 @@ impl<A: App<M, C>, M, C> Runtime<A, M, C> {
     let kind = record.kind
     let target = record.target
     run self.ui.beginDispatch(move record, self.path.asSlice())
-    self.runView()
+    // A record whose path only has handlers with fixed messages is answered from the replies
+    // the last render kept; any other runs the view to ask its handlers.
+    if !self.ui.answerKept(entries.asSlice()) {
+      self.runView()
+    }
     let before = self.queue.length()
     run self.ui.endDispatch(&mut self.queue)
     if self.journal.on && self.queue.length() != before {

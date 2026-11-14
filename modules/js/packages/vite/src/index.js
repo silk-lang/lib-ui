@@ -12,6 +12,8 @@ import { writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { missingApis, ownerOf, report } from "./apis.js";
 import { devPlugins } from "./dev.js";
+import { reconcilerPlugin } from "./reconciler.js";
+import { resolveOptions } from "./resolve.js";
 
 /**
  * @param {object} [options]
@@ -54,6 +56,7 @@ export default function silk(options = {}) {
 
     config(_user, { mode }) {
       const config = {
+        resolve: resolveOptions,
         // Libraries read it to pick their development or production build.
         define: { "process.env.NODE_ENV": JSON.stringify(mode === "development" ? "development" : "production") },
         build: {
@@ -127,5 +130,5 @@ export default function silk(options = {}) {
     },
   };
 
-  return [buildPlugin, apiPlugin, ...devPlugins({ entry, jsx, refresh: options.refresh ?? true, port: options.port ?? 0, host: options.host })];
+  return [buildPlugin, apiPlugin, reconcilerPlugin(), ...devPlugins({ entry, jsx, refresh: options.refresh ?? true, port: options.port ?? 0, host: options.host })];
 }

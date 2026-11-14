@@ -1,0 +1,333 @@
+#!/usr/bin/env python3
+"""Puts libghostty-vt 1.0.1 where ghostty-vt links it, in native/build/ (ignored by git).
+
+    python3 modules/ghostty/vt/scripts/prepare            # for this machine
+    python3 modules/ghostty/vt/scripts/prepare --wasm     # also for wasm32 (browser builds)
+
+macOS and Windows use the official prebuilt static libraries. Linux and wasm32 are built from
+the official source and dependency tarballs with Zig 0.17 (set ZIG to name the executable);
+the build is offline. Every download is checked against the SHA-256 the release publishes.
+
+The wasm32 build is patched to allocate from the module's own heap (see `share_heap`).
+"""
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import posixpath
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import urllib.request
+import zipfile
+
+VERSION = "1.0.1"
+BASE = f"https://release.files.ghostty.org/libghostty-vt/{VERSION}"
+PACKAGE = Path(__file__).resolve().parents[1]
+BUILD = PACKAGE / "native" / "build"
+CACHE = BUILD / "downloads"
+
+
+# From the release's SHA256SUMS (minisign-signed by the Ghostty release key).
+PINNED = {
+    f"libghostty-vt-{VERSION}.tar.gz": "333dfce97641ef9b536bb9e08907ad86abaaada50e8f7417b70d9284adef37aa",
+    f"libghostty-vt-{VERSION}-deps.tar.gz": "91a4e10960a52bf5bf4b15aa2a2cddaff8a89d6cd903d3055bda4fd17de3356d",
+    f"ghostty-vt-{VERSION}.xcframework.zip": "c0f9631277f726154c8f521954d17cdc41aac4626fc0df8cf925a19ee58e829b",
+    f"ghostty-vt-{VERSION}-x86_64-windows-gnu.zip": "8e2eb9e1822e85d786b456c8beb86f49d09c318c91f0c2913f91e7ffa12cda29",
+    f"ghostty-vt-{VERSION}-aarch64-windows-gnu.zip": "cc61da5f968ea0b08639bdf019c6b7da46bad1d985774fd8a2de57af32862892",
+}
+
+
+def download(name):
+    CACHE.mkdir(parents=True, exist_ok=True)
+    path = CACHE / name
+    expected = PINNED[name]
+    if path.is_file() and digest(path) == expected:
+        return path
+    print(f"Downloading {BASE}/{name}", file=sys.stderr)
+    request = urllib.request.Request(f"{BASE}/{name}", headers={"User-Agent": "ghostty-vt-prepare"})
+    with urllib.request.urlopen(request) as response, open(path, "wb") as out:
+        shutil.copyfileobj(response, out)
+    actual = digest(path)
+    if actual != expected:
+        path.unlink()
+        raise SystemExit(f"SHA-256 mismatch for {name}: {actual}, expected {expected}")
+    return path
+
+
+def digest(path):
+    with open(path, "rb") as data:
+        return hashlib.file_digest(data, "sha256").hexdigest()
+
+
+def zig():
+    executable = os.environ.get("ZIG", "zig")
+    try:
+        version = subprocess.check_output([executable, "version"], text=True).strip()
+    except FileNotFoundError:
+        raise SystemExit("Zig 0.17 is needed to build libghostty-vt here (set ZIG to its path)")
+    if not version.startswith("0.17."):
+        raise SystemExit(f"libghostty-vt {VERSION} needs Zig 0.17; found {version}")
+    return executable
+
+
+# A WebAssembly module has one linear memory. Silk's heap owns its end: it grows by adding the
+# new pages to its last chunk. Stock libghostty-vt grows the same memory itself (Zig's
+# WasmAllocator, and the WasmPagePool behind terminal pages), so the two would hand out the
+# same bytes. These edits
+# make the library allocate through `malloc` and `free`, which the Silk module exports from its
+# heap, terminal pages included, as the library already does on native freestanding targets.
+HOST_HEAP = """
+
+// Added by ghostty-vt's prepare script: the embedding module's heap, through the `malloc` and
+// `free` it exports, so the library and its host share one heap in one linear memory.
+const host = struct {
+    extern fn malloc(size: usize) ?[*]u8;
+    extern fn free(pointer: ?[*]u8) void;
+};
+
+pub const host_heap: std.mem.Allocator = .{ .ptr = undefined, .vtable = &HostHeap.vtable };
+
+const HostHeap = struct {
+    pub const vtable: std.mem.Allocator.VTable = .{
+        .alloc = hostAlloc,
+        .resize = hostResize,
+        .remap = hostRemap,
+        .free = hostFree,
+    };
+};
+
+fn hostResize(_: *anyopaque, memory: []u8, _: std.mem.Alignment, new_len: usize, _: usize) bool {
+    return new_len <= memory.len;
+}
+
+fn hostRemap(_: *anyopaque, memory: []u8, _: std.mem.Alignment, new_len: usize, _: usize) ?[*]u8 {
+    return if (new_len <= memory.len) memory.ptr else null;
+}
+
+// The heap aligns every block to 16; a stricter alignment over-allocates and keeps the
+// block's address just below the aligned one.
+fn hostAlloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, _: usize) ?[*]u8 {
+    const bytes = alignment.toByteUnits();
+    if (bytes <= 16) return host.malloc(len);
+    const raw = host.malloc(len + bytes + @sizeOf(usize)) orelse return null;
+    const base = @intFromPtr(raw);
+    const aligned = std.mem.alignForward(usize, base + @sizeOf(usize), bytes);
+    @as(*usize, @ptrFromInt(aligned - @sizeOf(usize))).* = base;
+    return @ptrFromInt(aligned);
+}
+
+fn hostFree(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, _: usize) void {
+    if (alignment.toByteUnits() <= 16) return host.free(memory.ptr);
+    host.free(@ptrFromInt(@as(*usize, @ptrFromInt(@intFromPtr(memory.ptr) - @sizeOf(usize))).*));
+}
+"""
+
+SHARE_HEAP = [
+    ("src/lib/allocator.zig",
+     "if (comptime builtin.target.cpu.arch.isWasm()) return std.heap.wasm_allocator;",
+     "if (comptime builtin.target.cpu.arch.isWasm()) return host_heap;"),
+    ("src/terminal/PageList.zig",
+     "const native_freestanding = builtin.target.os.tag == .freestanding and\n    !builtin.target.cpu.arch.isWasm();",
+     "const native_freestanding = builtin.target.os.tag == .freestanding;"),
+    ("src/terminal/PageList.zig",
+     "const wasm_page_pool = builtin.target.cpu.arch.isWasm() and !builtin.is_test;",
+     "const wasm_page_pool = false;"),
+    ("src/lib_vt.zig",
+     "    if (native_freestanding) {\n        // Freestanding targets don't have an OS page size.",
+     "    if (native_freestanding or builtin.target.cpu.arch.isWasm()) {\n        // Freestanding targets don't have an OS page size."),
+]
+
+
+def share_heap(source):
+    for name, old, new in SHARE_HEAP:
+        path = source / name
+        text = path.read_text()
+        if text.count(old) != 1:
+            raise SystemExit(f"Cannot patch {name} for wasm32: its source changed")
+        path.write_text(text.replace(old, new))
+    allocator = source / "src/lib/allocator.zig"
+    allocator.write_text(allocator.read_text() + HOST_HEAP)
+
+
+def build(target, destination):
+    """Builds the static library from source with Zig, offline, into `destination`."""
+    executable = zig()
+    with tempfile.TemporaryDirectory(prefix="ghostty-vt-") as temporary:
+        work = Path(temporary)
+        for name in (f"libghostty-vt-{VERSION}.tar.gz", f"libghostty-vt-{VERSION}-deps.tar.gz"):
+            with tarfile.open(download(name)) as tar:
+                tar.extractall(work, filter="data")
+        if target == "wasm32":
+            share_heap(work / f"libghostty-vt-{VERSION}")
+        command = [executable, "build", "-Demit-lib-vt", "--prefix", str(work / "out"),
+                   "--system", str(work / f"libghostty-vt-{VERSION}-deps")]
+        if target == "wasm32":
+            command += ["-Dtarget=wasm32-freestanding", "-Doptimize=ReleaseSmall"]
+        else:
+            command += ["-Doptimize=ReleaseFast", "-Dcpu=baseline"]
+        environment = dict(os.environ, ZIG_GLOBAL_CACHE_DIR=str(work / "cache"))
+        subprocess.run(command, cwd=work / f"libghostty-vt-{VERSION}", env=environment, check=True)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(work / "out" / "lib" / "libghostty-vt.a", destination)
+
+
+def headers():
+    """Puts the C headers in native/build/include, from the source tarball.
+
+    The headers include each other as <ghostty/...>, which needs an include path; Silk's
+    Windows build did not pass ours, so they are rewritten to quoted paths relative to each
+    header, and the bridge includes "build/include/ghostty/vt.h" by its own path.
+    """
+    destination = BUILD / "include"
+    stamp = destination / "prepared.json"
+    identity = {"version": VERSION, "includes": "relative"}
+    if stamp.is_file() and json.loads(stamp.read_text()) == identity:
+        return
+    prefix = f"libghostty-vt-{VERSION}/include/"
+    with tarfile.open(download(f"libghostty-vt-{VERSION}.tar.gz")) as tar:
+        for member in tar.getmembers():
+            if member.isfile() and member.name.startswith(prefix):
+                name = member.name[len(prefix):]
+                text = tar.extractfile(member).read().decode("utf-8")
+                here = posixpath.dirname(name)
+                text = re.sub(
+                    r"#include <(ghostty/[^>]+)>",
+                    lambda m: f'#include "{posixpath.relpath(m.group(1), here)}"',
+                    text)
+                target = destination / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(text, encoding="utf-8", newline="\n")
+    stamp.write_text(json.dumps(identity, indent=2) + "\n")
+
+
+def unzip(name, member, destination):
+    with zipfile.ZipFile(download(name)) as zipped:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with zipped.open(member) as data, open(destination, "wb") as out:
+            shutil.copyfileobj(data, out)
+
+
+def llvm_ar(clang=None):
+    """Finds llvm-ar beside Clang or on PATH."""
+    clang = clang or os.environ.get("SILK_CLANG") or shutil.which("clang")
+    if clang:
+        tools = Path(clang).parent
+        for tool in (tools / "llvm-ar.exe", tools / "llvm-ar"):
+            if tool.is_file():
+                return str(tool)
+    archiver = shutil.which("llvm-ar")
+    if not archiver:
+        raise SystemExit("ghostty-vt needs llvm-ar on Windows (beside SILK_CLANG or on PATH)")
+    return archiver
+
+
+def without_compiler_rt(library):
+    """Takes Zig's compiler_rt out of the Windows library (see native/windows.c)."""
+    archiver = llvm_ar()
+    members = subprocess.run([archiver, "t", str(library)], check=True, capture_output=True,
+                             text=True).stdout.splitlines()
+    for member in members:
+        if member.replace("\\", "/").rsplit("/", 1)[-1] == "compiler_rt.obj":
+            subprocess.run([archiver, "d", str(library), member], check=True)
+
+
+def system_libraries():
+    """Copies the import libraries the Windows library needs into native/build/lib/system.
+
+    They come from the LIB path that a Visual Studio developer environment sets (vcvars, or
+    ilammy/msvc-dev-cmd in CI).
+    """
+    directories = [Path(entry) for entry in os.environ.get("LIB", "").split(os.pathsep) if entry]
+    destination = BUILD / "lib" / "system"
+    destination.mkdir(parents=True, exist_ok=True)
+    for name in ("kernel32.lib", "ntdll.lib", "vcruntime.lib"):
+        found = next((directory / name for directory in directories if (directory / name).is_file()), None)
+        if found is None:
+            raise SystemExit(f"ghostty-vt needs {name}: run prepare from a Visual Studio developer "
+                             "prompt, which sets LIB")
+        shutil.copyfile(found, destination / name)
+
+
+def bridge():
+    """Compiles the C bridge into native/build/lib/ghostty-bridge.lib, for Windows.
+
+    Silk hands Clang the bridge by an extended-length path there, and Clang then finds no
+    header beside it, so the bridge is compiled here instead and linked as an archive.
+    """
+    clang = os.environ.get("SILK_CLANG") or shutil.which("clang")
+    if not clang:
+        raise SystemExit("ghostty-vt needs Clang to compile its bridge on Windows (set SILK_CLANG)")
+    archiver = llvm_ar(clang)
+    output = BUILD / "lib" / "ghostty-bridge.lib"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    objects = []
+    for name in ("bridge", "input", "windows"):
+        source = PACKAGE / "native" / f"{name}.c"
+        target = BUILD / "lib" / f"{name}.obj"
+        subprocess.run([clang, "-c", str(source), "-o", str(target), "-std=c11", "-O2", "-Wall",
+                        "-Wextra", "-Werror", "-fms-runtime-lib=dll",
+                        "-DGHOSTTY_STATIC"], check=True)
+        objects.append(str(target))
+    if output.exists():
+        output.unlink()
+    subprocess.run([archiver, "rcs", str(output), *objects], check=True)
+    print(f"Prepared: {output}")
+
+
+def prepare(target):
+    headers()
+    if target == "host" and platform.system() == "Windows":
+        bridge()
+        system_libraries()
+    system = platform.system()
+    machine = platform.machine().lower()
+    if target == "wasm32":
+        library = BUILD / "wasm32" / "libghostty-vt.a"
+    elif system == "Windows":
+        library = BUILD / "lib" / "ghostty-vt-static.lib"
+    else:
+        library = BUILD / "lib" / "libghostty-vt.a"
+    stamp = library.parent / "prepared.json"
+    identity = {"version": VERSION, "target": target, "os": system, "arch": machine}
+    if system == "Windows" and target == "host":
+        identity["compiler_rt"] = "removed"
+    if target == "wasm32":
+        # A change to the patch builds again.
+        patch = HOST_HEAP + repr(SHARE_HEAP)
+        identity["heap"] = hashlib.sha256(patch.encode()).hexdigest()[:16]
+    if library.is_file() and stamp.is_file() and json.loads(stamp.read_text()) == identity:
+        print(f"Already prepared: {library}")
+        return
+    if target == "wasm32" or system == "Linux":
+        build(target, library)
+    elif system == "Darwin":
+        unzip(f"ghostty-vt-{VERSION}.xcframework.zip",
+              "ghostty-vt.xcframework/macos-arm64_x86_64/libghostty-vt.a", library)
+    elif system == "Windows":
+        arch = "aarch64" if machine in ("arm64", "aarch64") else "x86_64"
+        name = f"ghostty-vt-{VERSION}-{arch}-windows-gnu"
+        unzip(f"{name}.zip", f"{name}/lib/ghostty-vt-static.lib", library)
+        without_compiler_rt(library)
+    else:
+        raise SystemExit(f"ghostty-vt has no libghostty-vt for {system}")
+    stamp.write_text(json.dumps(identity, indent=2) + "\n")
+    print(f"Prepared: {library}")
+
+
+def main():
+    targets = ["host"]
+    if "--wasm" in sys.argv[1:]:
+        targets.append("wasm32")
+    if "--wasm-only" in sys.argv[1:]:
+        targets = ["wasm32"]
+    for target in targets:
+        prepare(target)
+
+
+if __name__ == "__main__":
+    main()

@@ -3,9 +3,9 @@
 //! A text style (family list, size, weight, width, style) gets a font key for css-layout's
 //! `Style.fontKey`. When fallback draws some characters with another face, that face at the
 //! style's size gets a key of its own, so `Measure.font` can give its metrics too.
+import set { FontSet, Link }
 import font_collection.lib {
   FontCollection,
-  FontMatcher,
   Family,
   Request,
   Selection,
@@ -17,6 +17,7 @@ import font_collection.lib {
   AXIS_OPTICAL
 }
 import layout.lib { FontMetrics, BaselineSet }
+import properties.computed { TextTransform, WordBreak, OverflowWrap }
 import harfrust.lib {
   Buffer,
   ShaperData,
@@ -68,6 +69,32 @@ pub struct TextStyle {
   /// font-size in CSS pixels.
   pub size: f32,
   pub request: Request,
+  pub treatment: Treatment,
+}
+
+/// What a style does to its text besides choosing the font: CSS `letter-spacing`,
+/// `word-spacing` (CSS pixels), `text-transform`, `word-break` and `overflow-wrap`.
+pub struct Treatment {
+  pub letterSpacing: f32,
+  pub wordSpacing: f32,
+  pub transform: TextTransform,
+  pub wordBreak: WordBreak,
+  pub overflowWrap: OverflowWrap,
+}
+
+impl Copy for Treatment {}
+
+impl Treatment {
+  /// The initial values: no spacing or transform, normal breaking.
+  pub fn normal() -> Treatment {
+    return Treatment {
+      letterSpacing: 0.0,
+      wordSpacing: 0.0,
+      transform: TextTransform.None,
+      wordBreak: WordBreak.Normal,
+      overflowWrap: OverflowWrap.Normal,
+    }
+  }
 }
 
 impl TextStyle {
@@ -78,14 +105,18 @@ impl TextStyle {
       families: move families,
       size: size,
       request: Request { weight: 400.0, width: 100.0, style: Style.Normal },
+      treatment: Treatment.normal(),
     }
   }
 }
 
 struct StyleEntry {
   size: f32,
+  treatment: Treatment,
   request: Request,
-  chain: List<Selection>,
+  chain: List<Link>,
+  /// The first available font, or None when no face is there yet.
+  primary: Option<Selection>,
 }
 
 struct Instance {
@@ -147,7 +178,8 @@ impl Copy for Shaped {}
 const SHAPED_GLYPHS: usize = 262144
 
 pub struct FontState<'a> {
-  pub matcher: FontMatcher<'a>,
+  /// The faces: installed ones and those added at run time.
+  pub set: FontSet<'a>,
   styles: List<StyleEntry>,
   keys: List<KeyInfo>,
   metrics: List<FontMetrics>,
@@ -244,7 +276,7 @@ effect fn makePlan<'a>(data: &ShaperData<'a>, coords: &[F2Dot14], buffer: &Buffe
 impl<'a> FontState<'a> {
   pub fn make(collection: &'a FontCollection) -> FontState<'a> {
     return FontState {
-      matcher: FontMatcher.make(collection),
+      set: FontSet.make(collection),
       styles: List<StyleEntry>.make(),
       keys: List<KeyInfo>.make(),
       metrics: List<FontMetrics>.make(),
@@ -279,9 +311,14 @@ impl<'a> FontState<'a> {
     return self.instances.asSlice()[info.instance].coords.asSlice()
   }
 
-  /// The faces text in style `style` tries before fallback, primary first.
-  pub fn chain(self: &Self, style: usize) -> &[Selection] {
+  /// The faces text in style `style` tries before fallback, in order.
+  pub fn chain(self: &Self, style: usize) -> &[Link] {
     return self.styles.asSlice()[style].chain.asSlice()
+  }
+
+  /// The first available font of style `style`, or None when it has no face.
+  pub fn primary(self: &Self, style: usize) -> Option<Selection> {
+    return self.styles.asSlice()[style].primary
   }
 
   pub fn request(self: &Self, style: usize) -> Request {
@@ -314,33 +351,31 @@ impl<'a> FontState<'a> {
   pub effect fn addStyle(self: &mut Self, style: TextStyle) -> usize
     ! OutOfMemoryError
     ? &mut Allocator {
-    let mut chain = List<Selection>.make()
-    run self.matcher.fonts().chain(style.families.asSlice(), style.request, &mut chain)
-    if chain.length() == 0 {
-      // No requested family has faces: the fallbacks decide, starting with the first face.
-      if let Option<Selection>.Some { value } = run self.matcher.select(
-        chain.asSlice(),
-        style.request,
-        0x41,
-        Script.common(),
-      ) {
-        run chain.append(value)
-      }
+    let mut chain = List<Link>.make()
+    run self.set.chain(style.families.asSlice(), style.request, &mut chain)
+    let mut primary = self.set.primary(chain.asSlice())
+    if primary.isNone() {
+      // No requested family has a face yet: the fallbacks decide, starting with the first
+      // face that has a capital A.
+      primary = run self.set.fallback(style.request, 0x41, Script.common())
     }
     let index = self.styles.length()
     run self.styles.append(
-      StyleEntry { size: style.size, request: style.request, chain: move chain },
+      StyleEntry { size: style.size, treatment: style.treatment, request: style.request, chain: move chain, primary: primary },
     )
-    if self.styles.asSlice()[index].chain.length() == 0 {
-      // An empty collection: a key without a face, with zero metrics.
-      run self.keys.append(
-        KeyInfo { style: index, instance: usize.MAX, face: usize.MAX, size: style.size },
-      )
-      run self.metrics.append(FontMetrics.zero())
-      return self.keys.length() - 1
+    match primary {
+      Option<Selection>.Some { value } => {
+        return run self.keyFor(index, value)
+      }
+      Option<Selection>.None => {
+        // An empty collection: a key without a face, with zero metrics.
+        run self.keys.append(
+          KeyInfo { style: index, instance: usize.MAX, face: usize.MAX, size: style.size },
+        )
+        run self.metrics.append(FontMetrics.zero())
+        return self.keys.length() - 1
+      }
     }
-    let primary = self.styles.asSlice()[index].chain.get(0)
-    return run self.keyFor(index, primary)
   }
 
   effect fn loadFace(self: &mut Self, face: usize) -> bool
@@ -352,7 +387,7 @@ impl<'a> FontState<'a> {
     if self.data.asSlice()[face].isSome() {
       return true
     }
-    if let Option<FontRef<'a>>.Some { value: font } = self.matcher.fonts().font(face) {
+    if let Option<FontRef<'a>>.Some { value: font } = self.set.font(face) {
       self.data.set(face, Option<ShaperData<'a>>.Some { value: ShaperData.new(&font) })
       return true
     }
@@ -362,7 +397,7 @@ impl<'a> FontState<'a> {
   effect fn instanceFor(self: &mut Self, selection: Selection, size: f32) -> usize
     ! OutOfMemoryError
     ? &mut Allocator {
-    let opticalSize: f32 = if (self.matcher.fonts().face(selection.face).axes & AXIS_OPTICAL) != 0 {
+    let opticalSize: f32 = if (self.set.face(selection.face).axes & AXIS_OPTICAL) != 0 {
       size
     } else {
       0.0
@@ -378,7 +413,7 @@ impl<'a> FontState<'a> {
     let mut coords = List<F2Dot14>.make()
     let mut unitsPerEm: f32 = 1000.0
     if run self.loadFace(selection.face) {
-      let axes = self.matcher.fonts().face(selection.face).axes
+      let axes = self.set.face(selection.face).axes
       let mut wanted = List<Variation>.make()
       if opticalSize > 0.0 {
         run wanted.append(Variation { tag: Tag.fromU32(0x6f70737a), value: opticalSize })
@@ -435,7 +470,7 @@ impl<'a> FontState<'a> {
     let mut lineGap: f32 = 0.0
     let mut xHeight: f32 = size * 0.5
     let mut capHeight: f32 = size * 0.7
-    if let Option<FontRef<'a>>.Some { value: font } = self.matcher.fonts().font(face) {
+    if let Option<FontRef<'a>>.Some { value: font } = self.set.font(face) {
       let metrics = Metrics.fromSfnt(&font, self.instances.asSlice()[instance].coords.asSlice())
       if let Option<LineBox<F48Dot16>>.Some { value: line } = metrics.hLine() {
         ascent = metric(line.ascender) * scale
@@ -684,6 +719,14 @@ impl<'a> FontState<'a> {
       }
       index = index + 1
     }
+  }
+
+  /// What the style behind key `key` does to its text.
+  pub fn treatment(self: &Self, key: usize) -> Treatment {
+    if key >= self.keys.length() {
+      return Treatment.normal()
+    }
+    return self.styles.asSlice()[self.keys.get(key).style].treatment
   }
 
   /// CSS pixels per font unit for key `key`.

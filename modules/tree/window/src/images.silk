@@ -1,412 +1,626 @@
-//! Managed native images. Queue a file or URL, call `poll` in the host loop, and draw the
+//! Managed native images and icons. Queue a file or URL, call `poll` in the host loop, and draw the
 //! resource with ordinary image nodes. Reading and decoding happen off the UI thread.
 //! Two workers run at most; replacements cancel older generations. Keep polling while
 //! `pending()` is true. `release` cancels work and frees the installed image and GPU tile.
-import background { Background, Cancellation }
-import ui_tree.legacy { UiTree, TreeError, Batch }
-import codec.image { Image }
-import codec.decode
-import silk.collections.bytes { Bytes }
-import silk.collections.list { List }
-import silk.concurrency.thread { Transferable }
-import silk.core.effect { Effect }
-import silk.core.option { Option }
-import silk.core.result { Result }
-import silk.mem.allocator { Allocator, OutOfMemoryError }
-import silk.system.filesystem { FileSystem, Path, FileError }
-import silk.system.host_input { HostInput, HostInputError }
+// Native only: a WebAssembly host has no files or HTTP client here (see `remote`).
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  import background { Background, Cancellation }
+  import ui_tree.legacy { UiTree, TreeError, Batch, Mutation }
+  import codec.image { Image }
+  import codec.decode
+  import font_web.lib { decode as decodeFont, WebFontError }
+  import font_web.fetch
+  import silk.collections.bytes { Bytes }
+  import silk.collections.list { List }
+  import silk.concurrency.thread { Transferable }
+  import silk.core.effect { Effect }
+  import silk.core.option { Option }
+  import silk.core.result { Result }
+  import silk.mem.allocator { Allocator, OutOfMemoryError }
+  import silk.system.filesystem { FileSystem, Path, FileError }
+  import silk.system.host_input { HostInput, HostInputError }
 
-static if Intrinsic.targetOperatingSystem() == "windows" {
-  import silk.platform.windows.host_input { WindowsHostInput }
-  import silk.platform.windows.path { WindowsPath }
-} else {
-  import silk.platform.native.host_input { NativeHostInput }
-}
-
-import silk.system.filesystem_machine { MachineFileSystem }
-import silk.http.client { Http, Request }
-import silk.http.client_native { NativeHttp }
-import silk.text.string { String }
-pub import ui_tree.image_load { ImageState, ImageError }
-import ui_tree.image_load { ImageLoad }
-
-union Source {
-  File { path: String },
-  Url { url: String }
-}
-
-struct LoadInput {
-  source: Source,
-  cancel: Cancellation
-}
-
-impl Transferable for LoadInput {}
-
-union Loaded {
-  Ready { image: Image },
-  Failed { error: ImageError },
-  Cancelled
-}
-
-struct LoadOutput {
-  value: Loaded
-}
-
-impl Transferable for LoadOutput {}
-
-struct Entry {
-  load: ImageLoad,
-  source: Option<Source>,
-}
-
-struct Load {
-  resource: u32,
-  generation: u64,
-  cancel: Cancellation,
-  task: Background<LoadOutput>,
-}
-
-/// Resource ids belong to the caller. Use a different id for each concurrently displayed image.
-pub struct Images {
-  entries: List<Entry>,
-  running: List<Load>
-}
-
-impl Images {
-  /// Creates an empty native image loader.
-  pub fn make() -> Images {
-    return Images { entries: List<Entry>.make(), running: List<Load>.make() }
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    import silk.platform.windows.host_input { WindowsHostInput }
+    import silk.platform.windows.path { WindowsPath }
+  } else {
+    import silk.platform.native.host_input { NativeHostInput }
   }
 
-  /// Queues local file reading and decoding. The string is copied before this returns.
-  pub effect fn file(self: &mut Self, resource: u32, path: string) -> ()
-    ! OutOfMemoryError
-    ? &mut Allocator {
-    let mut owned = Allocator.systemAllocatorProvider()
-    let resolved = run Effect.result(resolveFile(path)) |> Effect.provideMut<Allocator>(&mut owned)
-    let canonical = match move resolved {
-      Result.Success { value } => move value
-      Result.Failure { error } => {
-        drop error
-        String.make()
-      }
-    }
-    run self.request(resource, Source.File { path: move canonical })
+  import silk.system.filesystem_machine { MachineFileSystem }
+  import silk.http.client { Http, Request }
+  import silk.http.client_native { NativeHttp }
+  import silk.text.string { String }
+  pub import ui_tree.image_load { ImageState, ImageError }
+  import ui_tree.image_load { ImageLoad }
+
+  union Source {
+    File { path: String },
+    Url { url: String },
+    /// A font stylesheet at an HTTP(S) URL, asked for as a desktop browser asks for one.
+    Sheet { url: String }
   }
 
-  /// Queues an HTTP(S) image. Redirects and TLS use the standard library HTTP client.
-  /// Requests have a 15-second HTTP deadline and a 16 MiB encoded body limit.
-  pub effect fn url(self: &mut Self, resource: u32, url: string) -> ()
-    ! OutOfMemoryError
-    ? &mut Allocator {
-    let mut owned = Allocator.systemAllocatorProvider()
-    let url = run String.copy(url) |> Effect.provideMut<Allocator>(&mut owned)
-    run self.request(resource, Source.Url { url: move url })
+  struct LoadInput {
+    source: Source,
+    icon: bool,
+    /// Whether the file is a font: WOFF and WOFF2 are decoded to sfnt on the worker.
+    font: bool,
+    /// Whether the file is a font stylesheet, handed back as it is (see `forSheets`).
+    sheet: bool,
+    cancel: Cancellation
   }
 
-  effect fn request(self: &mut Self, resource: u32, source: Source) -> ()
-    ! OutOfMemoryError
-    ? &mut Allocator {
-    self.cancel(resource)
-    let entries = self.entries.asMutSlice()
-    let mut i: usize = 0
-    while i < entries.length {
-      if entries[i].load.resource == resource {
-        drop entries[i].load.begin()
-        entries[i].source = Option<Source>.some(move source)
-        return ()
-      }
-      i = i + 1
-    }
-    drop entries
-    let mut state = ImageLoad.make(resource)
-    drop state.begin()
-    run self.entries.append(Entry { load: state, source: Option<Source>.some(move source) })
+  impl Transferable for LoadInput {}
+
+  union Loaded {
+    Ready { image: Image },
+    /// An icon's SVG bytes, parsed by the tree when installed.
+    Svg { data: Bytes },
+    /// A font file as TrueType or OpenType (WOFF and WOFF2 decoded), for `loadFontFace`.
+    Font { data: Bytes },
+    /// A stylesheet's bytes, for `takeSheets`.
+    Sheet { data: Bytes },
+    Failed { error: ImageError },
+    Cancelled
   }
 
-  /// Returns the resource request state, or Empty for an unknown ID.
-  pub fn state(self: &Self, resource: u32) -> ImageState {
-    let entries = self.entries.asSlice()
-    let mut i: usize = 0
-    while i < entries.length {
-      if entries[i].load.resource == resource {
-        return entries[i].load.state
-      }
-      i = i + 1
-    }
-    return ImageState.Empty
+  struct LoadOutput {
+    value: Loaded
   }
 
-  /// Returns the resource failure category, or None.
-  pub fn error(self: &Self, resource: u32) -> ImageError {
-    let entries = self.entries.asSlice()
-    let mut i: usize = 0
-    while i < entries.length {
-      if entries[i].load.resource == resource {
-        return entries[i].load.error
-      }
-      i = i + 1
-    }
-    return ImageError.None
+  impl Transferable for LoadOutput {}
+
+  struct Entry {
+    load: ImageLoad,
+    source: Option<Source>,
+    icon: bool,
   }
 
-  /// Prevents publication of an in-flight result. A blocking read finishes in its worker.
-  pub fn cancel(self: &mut Self, resource: u32) -> () {
-    let running = self.running.asSlice()
-    let mut j: usize = 0
-    while j < running.length {
-      if running[j].resource == resource {
-        running[j].cancel.cancel()
-      }
-      j = j + 1
-    }
-    let entries = self.entries.asMutSlice()
-    let mut i: usize = 0
-    while i < entries.length {
-      if entries[i].load.resource == resource && entries[i].load.state == ImageState.Loading {
-        entries[i].load.cancel()
-        entries[i].source = Option<Source>.None
-      }
-      i = i + 1
-    }
+  struct Load {
+    resource: u32,
+    generation: u64,
+    cancel: Cancellation,
+    task: Background<LoadOutput>,
   }
 
-  /// Cancels outstanding work and releases the installed tree resource.
-  pub effect fn release(self: &mut Self, tree: &mut UiTree<'_>, resource: u32) -> ()
-    ! TreeError | OutOfMemoryError
-    ? &mut Allocator {
-    self.cancel(resource)
-    let mut i: usize = 0
-    while i < self.entries.length() {
-      if self.entries.asSlice()[i].load.resource == resource {
-        drop self.entries.remove(i)
-        break
-      }
-      i = i + 1
-    }
-    let mut batch = Batch.make()
-    run batch.releaseResource(resource)
-    run tree.apply(run batch.take())
+  /// Resource ids belong to the caller. Use a different id for each concurrently displayed image.
+  pub struct Images {
+    entries: List<Entry>,
+    running: List<Load>,
+    /// Whether the ids are font faces (`forFonts`) rather than image and icon resources.
+    fonts: bool,
+    /// Whether the ids are font stylesheets (`forSheets`).
+    sheets: bool,
+    /// Stylesheets read and not yet taken.
+    finished: List<SheetData>,
   }
 
-  /// Whether the loop should wake again to collect or start work, including cancelled workers.
-  pub fn pending(self: &Self) -> bool {
-    if self.running.length() > 0 {
-      return true
-    }
-    let entries = self.entries.asSlice()
-    let mut i: usize = 0
-    while i < entries.length {
-      if entries[i].load.state == ImageState.Loading {
-        return true
-      }
-      i = i + 1
-    }
-    return false
+  /// A font stylesheet a worker read (see `Images.forSheets`).
+  pub struct SheetData {
+    pub id: u32,
+    pub css: Bytes,
   }
 
-  /// Starts queued work and installs finished images. Returns true when a public state changes.
-  pub effect fn poll(self: &mut Self, tree: &mut UiTree<'_>) -> bool
-    ! TreeError | OutOfMemoryError
-    ? &mut Allocator {
-    let mut changed = false
-    let mut i: usize = 0
-    while i < self.running.length() {
-      if !self.running.asSlice()[i].task.ready() {
-        i = i + 1
-        continue
+  impl Images {
+    /// Creates an empty native image loader.
+    pub fn make() -> Images {
+      return Images {
+        entries: List<Entry>.make(),
+        running: List<Load>.make(),
+        fonts: false,
+        sheets: false,
+        finished: List<SheetData>.make(),
       }
-      let mut job = self.running.remove(i)
-      let completed = job.task.poll()
-      if job.cancel.cancelled() {
-        continue
+    }
+
+    /// A loader of font files for the tree's declared faces (`UiTree.loadFontFace`), by face
+    /// id. Queue them with `fontFile` and `fontUrl`.
+    pub fn forFonts() -> Images {
+      return Images {
+        entries: List<Entry>.make(),
+        running: List<Load>.make(),
+        fonts: true,
+        sheets: false,
+        finished: List<SheetData>.make(),
       }
+    }
+
+    /// A loader of font stylesheets by id: queue them with `sheetFile` and `sheetUrl`, then
+    /// take what was read with `takeSheets` after each `poll`.
+    pub fn forSheets() -> Images {
+      return Images {
+        entries: List<Entry>.make(),
+        running: List<Load>.make(),
+        fonts: false,
+        sheets: true,
+        finished: List<SheetData>.make(),
+      }
+    }
+
+    /// Queues reading the stylesheet at local `path` as sheet `id` (see `forSheets`).
+    pub effect fn sheetFile(self: &mut Self, id: u32, path: string) -> ()
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      run self.fileIcon(id, path)
+    }
+
+    /// Queues fetching the stylesheet at HTTP(S) `url` as sheet `id`, with a desktop
+    /// browser's `User-Agent` so Google Fonts answers with WOFF2 faces (see `forSheets`).
+    pub effect fn sheetUrl(self: &mut Self, id: u32, url: string) -> ()
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      let mut owned = Allocator.systemAllocatorProvider()
+      let url = run fetch.encode(url) |> Effect.provideMut<Allocator>(&mut owned)
+      run self.request(id, Source.Sheet { url: move url }, true)
+    }
+
+    /// Moves the stylesheets read since the last call to `out`.
+    pub effect fn takeSheets(self: &mut Self, out: &mut List<SheetData>) -> ()
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      let finished = Intrinsic.replace(self.finished, List<SheetData>.make())
+      let mut values = move finished
+      while values.length() > 0 {
+        run out.append(values.remove(0))
+      }
+    }
+
+    /// Queues reading the font file at local `path` for face `face` (see `forFonts`).
+    pub effect fn fontFile(self: &mut Self, face: u32, path: string) -> ()
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      run self.fileIcon(face, path)
+    }
+
+    /// Queues fetching the font file at HTTP(S) `url` for face `face` (see `forFonts`).
+    pub effect fn fontUrl(self: &mut Self, face: u32, url: string) -> ()
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      run self.urlIcon(face, url)
+    }
+
+    /// Queues local file reading and decoding. The string is copied before this returns.
+    pub effect fn file(self: &mut Self, resource: u32, path: string) -> ()
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      let mut owned = Allocator.systemAllocatorProvider()
+      let resolved = run Effect.result(resolveFile(path)) |> Effect.provideMut<Allocator>(&mut owned)
+      let canonical = match move resolved {
+        Result.Success { value } => move value
+        Result.Failure { error } => {
+          drop error
+          String.make()
+        }
+      }
+      run self.request(resource, Source.File { path: move canonical }, false)
+    }
+
+    /// Queues reading the SVG icon at local `path` (relative to the working directory).
+    pub effect fn fileIcon(self: &mut Self, resource: u32, path: string) -> ()
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      let mut owned = Allocator.systemAllocatorProvider()
+      let resolved = run Effect.result(resolveFile(path)) |> Effect.provideMut<Allocator>(&mut owned)
+      let canonical = match move resolved {
+        Result.Success { value } => move value
+        Result.Failure { error } => {
+          drop error
+          String.make()
+        }
+      }
+      run self.request(resource, Source.File { path: move canonical }, true)
+    }
+
+    /// Queues fetching the SVG icon at HTTP(S) `url`, with the limits of `url`.
+    pub effect fn urlIcon(self: &mut Self, resource: u32, url: string) -> ()
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      let mut owned = Allocator.systemAllocatorProvider()
+      let url = run String.copy(url) |> Effect.provideMut<Allocator>(&mut owned)
+      run self.request(resource, Source.Url { url: move url }, true)
+    }
+
+    /// Queues an HTTP(S) image. Redirects and TLS use the standard library HTTP client.
+    /// Requests have a 15-second HTTP deadline and a 16 MiB encoded body limit.
+    pub effect fn url(self: &mut Self, resource: u32, url: string) -> ()
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      let mut owned = Allocator.systemAllocatorProvider()
+      let url = run String.copy(url) |> Effect.provideMut<Allocator>(&mut owned)
+      run self.request(resource, Source.Url { url: move url }, false)
+    }
+
+    effect fn request(self: &mut Self, resource: u32, source: Source, icon: bool) -> ()
+      ! OutOfMemoryError
+      ? &mut Allocator {
+      self.cancel(resource)
       let entries = self.entries.asMutSlice()
+      let mut i: usize = 0
+      while i < entries.length {
+        if entries[i].load.resource == resource {
+          drop entries[i].load.begin()
+          entries[i].source = Option<Source>.some(move source)
+          entries[i].icon = icon
+          return ()
+        }
+        i = i + 1
+      }
+      drop entries
+      let mut state = ImageLoad.make(resource)
+      drop state.begin()
+      run self.entries.append(
+        Entry { load: state, source: Option<Source>.some(move source), icon: icon },
+      )
+    }
+
+    /// Returns the resource request state, or Empty for an unknown ID.
+    pub fn state(self: &Self, resource: u32) -> ImageState {
+      let entries = self.entries.asSlice()
+      let mut i: usize = 0
+      while i < entries.length {
+        if entries[i].load.resource == resource {
+          return entries[i].load.state
+        }
+        i = i + 1
+      }
+      return ImageState.Empty
+    }
+
+    /// Returns the resource failure category, or None.
+    pub fn error(self: &Self, resource: u32) -> ImageError {
+      let entries = self.entries.asSlice()
+      let mut i: usize = 0
+      while i < entries.length {
+        if entries[i].load.resource == resource {
+          return entries[i].load.error
+        }
+        i = i + 1
+      }
+      return ImageError.None
+    }
+
+    /// Prevents publication of an in-flight result. A blocking read finishes in its worker.
+    pub fn cancel(self: &mut Self, resource: u32) -> () {
+      let running = self.running.asSlice()
       let mut j: usize = 0
-      while j < entries.length {
-        if entries[j].load.resource == job.resource && entries[j].load.accepts(job.generation) {
-          if let Option<LoadOutput>.Some { value: output } = move completed {
-            match move output.value {
-              Loaded.Ready { image } => {
-                let mut batch = Batch.make()
-                run batch.decodedImage(job.resource, move image)
-                run tree.apply(run batch.take())
-                drop entries[j].load.finish(job.generation, ImageError.None)
-              }
-              Loaded.Failed { error } => {
-                drop entries[j].load.finish(job.generation, error)
-              }
-              Loaded.Cancelled => {
-                entries[j].load.cancel()
-              }
-            }
-            changed = true
-          }
-          break
+      while j < running.length {
+        if running[j].resource == resource {
+          running[j].cancel.cancel()
         }
         j = j + 1
       }
-    }
-    let entries = self.entries.asMutSlice()
-    i = 0
-    while i < entries.length && self.running.length() < 2 {
-      if let Option<Source>.Some { value: source } = move Intrinsic.replace(
-        entries[i].source,
-        Option<Source>.None,
-      ) {
-        let mut allocator = Allocator.systemAllocatorProvider()
-        let cancel = run Cancellation.make() |> Effect.provideMut<Allocator>(&mut allocator)
-        let input = LoadInput { source: move source, cancel: cancel.clone() }
-        let start = run Effect.result(
-          Background<LoadOutput>.start(
-            fn() -> LoadOutput {
-              return LoadOutput { value: load(move input.source, move input.cancel) }
-            },
-          ),
-        )
-        match move start {
-          Result.Success { value: task } => {
-            run self.running.append(
-              Load {
-                resource: entries[i].load.resource,
-                generation: entries[i].load.generation,
-                cancel: move cancel,
-                task: move task,
-              },
-            )
-          }
-          Result.Failure { error } => {
-            drop error
-            let generation = entries[i].load.generation
-            drop entries[i].load.finish(generation, ImageError.Start)
-            changed = true
-          }
+      let entries = self.entries.asMutSlice()
+      let mut i: usize = 0
+      while i < entries.length {
+        if entries[i].load.resource == resource && entries[i].load.state == ImageState.Loading {
+          entries[i].load.cancel()
+          entries[i].source = Option<Source>.None
         }
+        i = i + 1
       }
-      i = i + 1
     }
-    return changed
-  }
-}
 
-effect fn read(source: &Source) -> Bytes
-  ! ImageError | OutOfMemoryError
-  ? &mut Allocator {
-  return match &source.* {
-    Source.File { path } => {
-      let made = run Effect.result(MachineFileSystem.make())
-      match move made {
-        Result.Success { value } => {
-          let mut fs = move value
-          let parsed = run Effect.result(Path.fromBytes(String.utf8Bytes(String.view(&path))))
-          match move parsed {
-            Result.Success { value: file } => {
-              let read = run Effect.result(FileSystem.readFile(&file))
-                |> Effect.provideMut<FileSystem>(&mut fs)
-              match move read {
-                Result.Success { value: bytes } => move bytes
-                Result.Failure { error } => {
-                  drop error
-                  fail ImageError.File
+    /// Cancels outstanding work and releases the installed tree resource.
+    pub effect fn release(self: &mut Self, tree: &mut UiTree<'_>, resource: u32) -> ()
+      ! TreeError | OutOfMemoryError
+      ? &mut Allocator {
+      self.cancel(resource)
+      let mut i: usize = 0
+      while i < self.entries.length() {
+        if self.entries.asSlice()[i].load.resource == resource {
+          drop self.entries.remove(i)
+          break
+        }
+        i = i + 1
+      }
+      let mut batch = Batch.make()
+      run batch.releaseResource(resource)
+      run tree.apply(run batch.take())
+    }
+
+    /// Whether the loop should wake again to collect or start work, including cancelled workers.
+    pub fn pending(self: &Self) -> bool {
+      if self.running.length() > 0 {
+        return true
+      }
+      let entries = self.entries.asSlice()
+      let mut i: usize = 0
+      while i < entries.length {
+        if entries[i].load.state == ImageState.Loading {
+          return true
+        }
+        i = i + 1
+      }
+      return false
+    }
+
+    /// Starts queued work and installs finished images. Returns true when a public state changes.
+    pub effect fn poll(self: &mut Self, tree: &mut UiTree<'_>) -> bool
+      ! TreeError | OutOfMemoryError
+      ? &mut Allocator {
+      let fonts = self.fonts
+      let sheets = self.sheets
+      let mut changed = false
+      let mut i: usize = 0
+      while i < self.running.length() {
+        if !self.running.asSlice()[i].task.ready() {
+          i = i + 1
+          continue
+        }
+        let mut job = self.running.remove(i)
+        let completed = job.task.poll()
+        if job.cancel.cancelled() {
+          continue
+        }
+        let entries = self.entries.asMutSlice()
+        let mut j: usize = 0
+        while j < entries.length {
+          if entries[j].load.resource == job.resource && entries[j].load.accepts(job.generation) {
+            if let Option<LoadOutput>.Some { value: output } = move completed {
+              match move output.value {
+                Loaded.Ready { image } => {
+                  let mut batch = Batch.make()
+                  run batch.decodedImage(job.resource, move image)
+                  run tree.apply(run batch.take())
+                  drop entries[j].load.finish(job.generation, ImageError.None)
+                }
+                Loaded.Font { data } => {
+                  let loaded = run tree.loadFontFace(job.resource, move data, 0)
+                  let error = if loaded {
+                    ImageError.None
+                  } else {
+                    ImageError.Decode
+                  }
+                  drop entries[j].load.finish(job.generation, error)
+                }
+                Loaded.Sheet { data } => {
+                  run self.finished.append(SheetData { id: job.resource, css: move data })
+                  drop entries[j].load.finish(job.generation, ImageError.None)
+                }
+                Loaded.Svg { data } => {
+                  let mut batch = Batch.make()
+                  run batch.icon(job.resource, data.asSlice())
+                  let installed = run Effect.catch<TreeError>(applyIcon(&mut tree, run batch.take()), badIcon)
+                  let error = if installed {
+                    ImageError.None
+                  } else {
+                    ImageError.Decode
+                  }
+                  drop entries[j].load.finish(job.generation, error)
+                }
+                Loaded.Failed { error } => {
+                  drop entries[j].load.finish(job.generation, error)
+                }
+                Loaded.Cancelled => {
+                  entries[j].load.cancel()
                 }
               }
+              changed = true
+            }
+            break
+          }
+          j = j + 1
+        }
+      }
+      let entries = self.entries.asMutSlice()
+      i = 0
+      while i < entries.length && self.running.length() < 2 {
+        if let Option<Source>.Some { value: source } = move Intrinsic.replace(
+          entries[i].source,
+          Option<Source>.None,
+        ) {
+          let mut allocator = Allocator.systemAllocatorProvider()
+          let cancel = run Cancellation.make() |> Effect.provideMut<Allocator>(&mut allocator)
+          let input = LoadInput {
+            source: move source,
+            icon: entries[i].icon,
+            font: fonts,
+            sheet: sheets,
+            cancel: cancel.clone(),
+          }
+          let start = run Effect.result(
+            Background<LoadOutput>.start(
+              fn() -> LoadOutput {
+                return LoadOutput { value: load(move input.source, input.icon, input.font, input.sheet, move input.cancel) }
+              },
+            ),
+          )
+          match move start {
+            Result.Success { value: task } => {
+              run self.running.append(
+                Load {
+                  resource: entries[i].load.resource,
+                  generation: entries[i].load.generation,
+                  cancel: move cancel,
+                  task: move task,
+                },
+              )
             }
             Result.Failure { error } => {
               drop error
-              fail ImageError.File
+              let generation = entries[i].load.generation
+              drop entries[i].load.finish(generation, ImageError.Start)
+              changed = true
             }
           }
         }
-        Result.Failure { error } => {
-          drop error
-          fail ImageError.File
-        }
+        i = i + 1
       }
+      return changed
     }
-    Source.Url { url } => {
-      let mut http = NativeHttp.make()
-      let response = run Effect.result(
-        Http.send(Request.get(String.view(&url)).timeoutSeconds(15).maxBodyBytes(16777216)),
-      )
-        |> Effect.provideMut<Http>(&mut http)
-      match move response {
-        Result.Success { value } => {
-          if !value.ok() {
-            fail ImageError.HttpStatus
+  }
+
+  effect fn read(source: &Source) -> Bytes
+    ! ImageError | OutOfMemoryError
+    ? &mut Allocator {
+    return match &source.* {
+      Source.File { path } => {
+        let made = run Effect.result(MachineFileSystem.make())
+        match move made {
+          Result.Success { value } => {
+            let mut fs = move value
+            let parsed = run Effect.result(Path.fromBytes(String.utf8Bytes(String.view(&path))))
+            match move parsed {
+              Result.Success { value: file } => {
+                let read = run Effect.result(FileSystem.readFile(&file))
+                  |> Effect.provideMut<FileSystem>(&mut fs)
+                match move read {
+                  Result.Success { value: bytes } => move bytes
+                  Result.Failure { error } => {
+                    drop error
+                    fail ImageError.File
+                  }
+                }
+              }
+              Result.Failure { error } => {
+                drop error
+                fail ImageError.File
+              }
+            }
           }
-          value.intoBody()
+          Result.Failure { error } => {
+            drop error
+            fail ImageError.File
+          }
         }
-        Result.Failure { error } => {
-          drop error
-          fail ImageError.Network
+      }
+      Source.Url { url } => {
+        let mut http = NativeHttp.make()
+        let response = run Effect.result(
+          Http.send(Request.get(String.view(&url)).timeoutSeconds(15).maxBodyBytes(16777216)),
+        )
+          |> Effect.provideMut<Http>(&mut http)
+        match move response {
+          Result.Success { value } => {
+            if !value.ok() {
+              fail ImageError.HttpStatus
+            }
+            value.intoBody()
+          }
+          Result.Failure { error } => {
+            drop error
+            fail ImageError.Network
+          }
+        }
+      }
+      Source.Sheet { url } => {
+        let mut request = Request.get(String.view(&url)).timeoutSeconds(15).maxBodyBytes(16777216)
+        run request.header("User-Agent", fetch.USER_AGENT)
+        run request.header("Accept", "text/css,*/*;q=0.1")
+        let mut http = NativeHttp.make()
+        let response = run Effect.result(Http.send(move request)) |> Effect.provideMut<Http>(&mut http)
+        match move response {
+          Result.Success { value } => {
+            if !value.ok() {
+              fail ImageError.HttpStatus
+            }
+            value.intoBody()
+          }
+          Result.Failure { error } => {
+            drop error
+            fail ImageError.Network
+          }
         }
       }
     }
   }
-}
 
-effect fn decodeSource(source: Source, cancel: Cancellation) -> Loaded
-  ! ImageError | OutOfMemoryError
-  ? &mut Allocator {
-  if cancel.cancelled() {
-    return Loaded.Cancelled
+  effect fn applyIcon(tree: &mut UiTree<'_>, mutations: List<Mutation>) -> bool
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    run tree.apply(move mutations)
+    return true
   }
-  let bytes = run read(&source)
-  if bytes.length() > 16777216 {
-    fail ImageError.TooLarge
+
+  effect fn badIcon(error: TreeError) -> bool {
+    drop error
+    return false
   }
-  if cancel.cancelled() {
-    return Loaded.Cancelled
-  }
-  let decoded = run Effect.result(decode.decodeSrgb(bytes.asSlice()))
-  if cancel.cancelled() {
-    return Loaded.Cancelled
-  }
-  return match move decoded {
-    Result.Success { value: image } => Loaded.Ready { image: move image }
-    Result.Failure { error } => {
-      drop error
-      Loaded.Failed { error: ImageError.Decode }
+
+  effect fn decodeSource(source: Source, icon: bool, font: bool, sheet: bool, cancel: Cancellation) -> Loaded
+    ! ImageError | OutOfMemoryError
+    ? &mut Allocator {
+    if cancel.cancelled() {
+      return Loaded.Cancelled
     }
-  }
-}
-
-fn load(source: Source, cancel: Cancellation) -> Loaded {
-  let mut allocator = Allocator.systemAllocatorProvider()
-  let result = run Effect.result(decodeSource(move source, move cancel))
-    |> Effect.provideMut<Allocator>(&mut allocator)
-  return match move result {
-    Result.Success { value } => move value
-    Result.Failure { error } => match move error {
-      ImageError failure => Loaded.Failed { error: failure }
-      OutOfMemoryError failure => {
-        drop failure
-        Loaded.Failed { error: ImageError.TooLarge }
+    let bytes = run read(&source)
+    if bytes.length() > 16777216 {
+      fail ImageError.TooLarge
+    }
+    if sheet {
+      return Loaded.Sheet { data: move bytes }
+    }
+    if font {
+      return match move run Effect.result(decodeFont(bytes.asSlice())) {
+        Result.Success { value: data } => Loaded.Font { data: move data }
+        Result.Failure { error } => match move error {
+          WebFontError failure => {
+            drop failure
+            Loaded.Failed { error: ImageError.Decode }
+          }
+          OutOfMemoryError failure => {
+          fail move failure
+        }
+        }
+      }
+    }
+    if icon {
+      return Loaded.Svg { data: move bytes }
+    }
+    if cancel.cancelled() {
+      return Loaded.Cancelled
+    }
+    let decoded = run Effect.result(decode.decodeSrgb(bytes.asSlice()))
+    if cancel.cancelled() {
+      return Loaded.Cancelled
+    }
+    return match move decoded {
+      Result.Success { value: image } => Loaded.Ready { image: move image }
+      Result.Failure { error } => {
+        drop error
+        Loaded.Failed { error: ImageError.Decode }
       }
     }
   }
-}
 
-// Resolve relative paths at submission time, before a worker can observe a changed cwd.
-effect fn resolveFile(value: string) -> String
-  ! FileError | HostInputError | OutOfMemoryError
-  ? &mut Allocator {
-  static if Intrinsic.targetOperatingSystem() == "windows" {
-    let mut inputs = run WindowsHostInput.capture()
-    let cwd = run HostInput.workingDirectory() |> Effect.provideMut<HostInput>(&mut inputs)
-    let base = run WindowsPath.fromNativeBytes(cwd.asSlice())
-    let path = run WindowsPath.resolve(&base, value)
-    return run String.copy(path.view().unwrapOr(""))
-  } else {
-    let cwd = run NativeHostInput.workingDirectory()
-    let base = run Path.fromBytes(cwd.asSlice())
-    let bytes = String.utf8Bytes(value)
-    if bytes.length > 0 && bytes[0] == 47 {
-      let root = run Path.root()
-      let path = run Path.resolve(&root, String.slice(value, 1, bytes.length - 1))
+  fn load(source: Source, icon: bool, font: bool, sheet: bool, cancel: Cancellation) -> Loaded {
+    let mut allocator = Allocator.systemAllocatorProvider()
+    let result = run Effect.result(decodeSource(move source, icon, font, sheet, move cancel))
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    return match move result {
+      Result.Success { value } => move value
+      Result.Failure { error } => match move error {
+        ImageError failure => Loaded.Failed { error: failure }
+        OutOfMemoryError failure => {
+          drop failure
+          Loaded.Failed { error: ImageError.TooLarge }
+        }
+      }
+    }
+  }
+
+  // Resolve relative paths at submission time, before a worker can observe a changed cwd.
+  pub effect fn resolveFile(value: string) -> String
+    ! FileError | HostInputError | OutOfMemoryError
+    ? &mut Allocator {
+    static if Intrinsic.targetOperatingSystem() == "windows" {
+      let mut inputs = run WindowsHostInput.capture()
+      let cwd = run HostInput.workingDirectory() |> Effect.provideMut<HostInput>(&mut inputs)
+      let base = run WindowsPath.fromNativeBytes(cwd.asSlice())
+      let path = run WindowsPath.resolve(&base, value)
+      return run String.copy(path.view().unwrapOr(""))
+    } else {
+      let cwd = run NativeHostInput.workingDirectory()
+      let base = run Path.fromBytes(cwd.asSlice())
+      let bytes = String.utf8Bytes(value)
+      if bytes.length > 0 && bytes[0] == 47 {
+        let root = run Path.root()
+        let path = run Path.resolve(&root, String.slice(value, 1, bytes.length - 1))
+        return run String.copy(path.view().unwrapOr(""))
+      }
+      let path = run Path.resolve(&base, value)
       return run String.copy(path.view().unwrapOr(""))
     }
-    let path = run Path.resolve(&base, value)
-    return run String.copy(path.view().unwrapOr(""))
   }
 }

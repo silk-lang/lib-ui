@@ -5,6 +5,9 @@ real DOM nodes, or written out as markup. The browser does layout, text, focus a
 
 - `src/dom.silk`: `Dom`, a `Backend`. Each render's mutations are encoded into one buffer
   (`src/wire.silk`) and handed to the page; events come back one record at a time.
+- `src/templates.silk`: repeated subtrees. A subtree like one the page already made (a row of
+  a list) is sent as a copy of it with the texts that differ, and the page makes it with one
+  `cloneNode` in place of a call per node and attribute.
 - `src/page.silk`: `open` and `call`, the two functions a program exports.
 - `src/html.silk`: `Html`, a `Backend` that keeps the document as text, and `render`, which
   renders a program at a path to markup: for a server, or a static build.
@@ -39,8 +42,9 @@ const page = await mount({
   wasm: "./app.wasm",
   root: document.getElementById("app"),
   fonts: { 1: "Inter, system-ui, sans-serif" }, // css.fontFamily(1)
-  images: { 1: "/logo.png" }, // h.image(1)
-  icons: { 1: "/chevron.svg" }, // h.icon(1), drawn in the text color
+  // h.image("logo.png") and h.icon("chevron.svg") load relative to the app's root;
+  // loaders add schemes of the app's own.
+  loaders: { db: async (url) => new Blob([await read(url)]) }, // h.image("db:42")
   base: "", // "/docs" when the site is under /docs
   imports: { app: { share: (pointer, length) => {} } }, // the program's own host imports
 });

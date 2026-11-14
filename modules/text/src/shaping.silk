@@ -8,11 +8,14 @@
 import layout.lib { WritingMode, TextOrientation }
 import silk.text.vertical_text { Orientation, OrientationRun }
 import silk.text.vertical_text
-import fonts { FontState, RawGlyph }
+import fonts { FontState, RawGlyph, Treatment }
+import transform
+import properties.computed { TextTransform }
 import glyphs { GlyphStore, PositionedGlyph }
 import analysis { tokenLength }
-import layout.lib { TextTokenKind, TextCursor, TextShapeRequest, TextRun, TextError, TextJustify }
+import layout.lib { TextToken, TextTokenKind, TextCursor, TextShapeRequest, TextRun, TextError, TextJustify }
 import font_collection.lib { Selection, continuesCluster }
+import set { Link }
 import silk.text.script_itemization
 import silk.text.script_itemization { ScriptRun }
 import silk.text.unicode_script { Script }
@@ -99,7 +102,9 @@ pub struct Shaping {
   segment: String,
   scripts: List<ScriptRun>,
   orientations: List<OrientationRun>,
-  chain: List<Selection>,
+  chain: List<Link>,
+  /// The font set generation `choices` were made at.
+  generation: u64,
   items: List<Item>,
   raw: List<RawGlyph>,
   pending: List<Pending>,
@@ -118,7 +123,8 @@ impl Shaping {
       segment: String.make(),
       scripts: List<ScriptRun>.make(),
       orientations: List<OrientationRun>.make(),
-      chain: List<Selection>.make(),
+      chain: List<Link>.make(),
+      generation: 0,
       items: List<Item>.make(),
       raw: List<RawGlyph>.make(),
       pending: List<Pending>.make(),
@@ -149,6 +155,33 @@ fn separatorClass(cp: u32) -> bool {
 }
 
 /// CSS Text 3 §7.1 word-separator characters.
+// The character before `offset` in token `unit`, looking back into the token before it, for
+// `text-transform: capitalize`; 0 where a word starts.
+fn before(tokens: &[TextToken<'_>], unit: usize, offset: usize) -> u32 {
+  let mut token = unit
+  let mut at = offset
+  while true {
+    let kind = tokens[token].kind
+    if kind != TextTokenKind.Text && token != unit {
+      return 0
+    }
+    if at > 0 {
+      let bytes = String.utf8Bytes(tokens[token].text)
+      let mut start = at - 1
+      while start > 0 && (bytes[start] & 0xC0) == 0x80 {
+        start = start - 1
+      }
+      return utf8_scan.decode(bytes, start).scalar
+    }
+    if token == 0 {
+      return 0
+    }
+    token = token - 1
+    at = String.byteLength(tokens[token].text)
+  }
+  return 0
+}
+
 fn wordSeparator(cp: u32) -> bool {
   return cp == 0x20 || cp == 0xA0 || cp == 0x1361 || cp == 0x10100 || cp == 0x10101 || cp == 0x1039F
     || cp == 0x1091F
@@ -368,6 +401,17 @@ effect fn itemize<'a>(
   let request = fonts.request(style)
   state.chain.clear()
   run state.chain.appendSlice(fonts.chain(style))
+  if state.generation != fonts.set.generation {
+    // Faces were added or declared: a face chosen before may no longer be the one.
+    state.choices.clear()
+    state.generation = fonts.set.generation
+  }
+  let primary = match fonts.primary(style) {
+    Option<Selection>.Some { value } => value
+    Option<Selection>.None => {
+      return
+    }
+  }
   let mut runIndex: usize = 0
   while runIndex < state.scripts.length() {
     let scriptRun = state.scripts.get(runIndex)
@@ -376,7 +420,7 @@ effect fn itemize<'a>(
     let mut face = usize.MAX
     let mut upright = false
     let mut orientationIndex: usize = 0
-    let mut selection = state.chain.get(0)
+    let mut selection = primary
     while at < scriptRun.end {
       let decoded = utf8_scan.decode(String.utf8Bytes(state.segment.view()), at)
       while orientationIndex + 1 < state.orientations.length()
@@ -412,7 +456,7 @@ effect fn itemize<'a>(
         let kept = state.choices.get(slot)
         if kept.style == style && kept.script == script && kept.scalar == decoded.scalar {
           chosen = kept.selection
-        } else if let Option<Selection>.Some { value } = run fonts.matcher.select(
+        } else if let Option<Selection>.Some { value } = run fonts.set.select(
           state.chain.asSlice(),
           request,
           decoded.scalar,
@@ -499,6 +543,19 @@ effect fn shapeItem<'a>(
   )
 }
 
+// The letter-spacing and word-spacing after raw glyph `index`: letter-spacing follows the last
+// glyph of each cluster, and word-spacing follows a word separator's.
+fn spacing(state: &Shaping, bytes: &[u8], treatment: Treatment, index: usize, end: usize, rawCluster: u32, cluster: usize) -> f32 {
+  if index + 1 < end && state.raw.get(index + 1).cluster == rawCluster {
+    return 0.0
+  }
+  let mut extra = treatment.letterSpacing
+  if treatment.wordSpacing != 0.0 && cluster < bytes.length && wordSeparator(utf8_scan.decode(bytes, cluster).scalar) {
+    extra = extra + treatment.wordSpacing
+  }
+  return extra
+}
+
 // Moves the glyphs of `piece` that item `item` shaped into a pending run.
 effect fn emit<'a>(
   state: &mut Shaping,
@@ -525,6 +582,8 @@ effect fn emit<'a>(
   }
   let token = &request.context.tokens[piece.unit]
   let scale = fonts.scale(item.key)
+  let treatment = fonts.treatment(item.key)
+  let spaced = treatment.letterSpacing != 0.0 || treatment.wordSpacing != 0.0
   let bytes = String.utf8Bytes(state.segment.view())
   let glyphStart = state.glyphs.length()
   let mut pen: f32 = 0.0
@@ -534,7 +593,7 @@ effect fn emit<'a>(
     let raw = state.raw.get(index)
     let cluster = u32.toUsize(raw.cluster)
     if cluster >= low && cluster < high {
-      let advance = i32.toF32(
+      let mut advance = i32.toF32(
         if item.upright {
           -raw.yAdvance
         } else {
@@ -542,6 +601,9 @@ effect fn emit<'a>(
         },
       )
         * scale
+      if spaced {
+        advance = advance + spacing(&state, bytes, treatment, index, item.glyphEnd, raw.cluster, cluster)
+      }
       let offset = piece.start + cluster - piece.segmentStart
       run state.glyphs.append(
         PositionedGlyph {
@@ -640,12 +702,22 @@ effect fn shapeSegments<'a>(
     // Gather the segment.
     let mut last = index
     state.segment.clear()
+    let change = fonts.treatment(piece.fontKey).transform
+    let mut previous: u32 = 0
+    if change != TextTransform.None {
+      previous = before(tokens, piece.unit, piece.start)
+    }
     while last < state.pieces.length() && state.pieces.get(last).segment == piece.segment {
       let mut member = state.pieces.get(last)
       member.segmentStart = String.byteLength(state.segment.view())
       state.pieces.set(last, member)
       let text = tokens[member.unit].text
-      run state.segment.append(String.slice(text, member.start, member.end - member.start))
+      let part = String.slice(text, member.start, member.end - member.start)
+      if change == TextTransform.None {
+        run state.segment.append(part)
+      } else {
+        previous = run transform.append(&mut state.segment, part, change, previous)
+      }
       last = last + 1
     }
     run itemize(
@@ -714,7 +786,9 @@ fn justify(state: &mut Shaping, space: f32, characterJustify: bool) -> () {
   }
 }
 
-effect fn hyphenate<'a>(state: &mut Shaping, fonts: &mut FontState<'a>) -> ()
+/// Appends `mark` (or `fallback` where the font has no glyph for it) after the logical end
+/// of the last text run: the hyphen of a hyphenated line, or the ellipsis of a cut one.
+effect fn appendMark<'a>(state: &mut Shaping, fonts: &mut FontState<'a>, mark: string, fallback: string) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   let mut index = state.pending.length()
@@ -726,10 +800,10 @@ effect fn hyphenate<'a>(state: &mut Shaping, fonts: &mut FontState<'a>) -> ()
       let instance = fonts.instanceOf(pending.key)
       let scale = fonts.scale(pending.key)
       state.raw.clear()
-      run fonts.shapeText(instance, "\u{2010}", 0, 3, false, Script.common(), &mut state.raw)
+      run fonts.shapeText(instance, mark, 0, String.byteLength(mark), false, Script.common(), &mut state.raw)
       if state.raw.length() == 0 || state.raw.get(0).glyph == 0 {
         state.raw.clear()
-        run fonts.shapeText(instance, "-", 0, 1, false, Script.common(), &mut state.raw)
+        run fonts.shapeText(instance, fallback, 0, String.byteLength(fallback), false, Script.common(), &mut state.raw)
       }
 
       // Rebuild the run's glyphs with the hyphen after its logical end.
@@ -827,7 +901,10 @@ pub effect fn shapeLine<'a>(
     justify(&mut state, request.justificationSpace, characterJustify)
   }
   if request.hyphenated {
-    run hyphenate(&mut state, &mut fonts)
+    run appendMark(&mut state, &mut fonts, "\u{2010}", "-")
+  }
+  if request.ellipsis {
+    run appendMark(&mut state, &mut fonts, "\u{2026}", "...")
   }
   let mut index: usize = 0
   while index < state.pending.length() {

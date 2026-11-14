@@ -1,0 +1,172 @@
+//! A real shell on a real PTY behind the terminal view: output, typing, resize, replies to
+//! the program's queries, Ctrl+C, and exit. Linux and macOS.
+//! `silk test --manifest-path modules/ghostty/demo/silk.toml --root src/tests.silk`
+import app { Session, Message, Command }
+import pty { Pty, PtyError }
+import ui_ghostty.view { TerminalMessage }
+import ui_app.keys { MOD_CONTROL }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.geometry.rect { Rect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+import ghostty_vt.terminal { GhosttyError }
+
+type Failure = GhosttyError | PtyError | OutOfMemoryError | AssertionError<'static>
+
+effect fn session(command: string) -> Session
+  ! PtyError | OutOfMemoryError
+  ? &mut Allocator {
+  let pty = run Pty.command(80, 24, command)
+  let mut made = run Session.make(Result<Pty, PtyError>.Success { value: move pty })
+  made.quitOnExit = false
+  return move made
+}
+
+/// Steps `message` and keeps whether a Quit came back.
+effect fn step(session: &mut Session, message: Message) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut commands = run session.step(move message)
+  let mut quit = false
+  while commands.length() > 0 {
+    if let Command.Quit = commands.remove(0) {
+      quit = true
+    }
+  }
+  return quit
+}
+
+effect fn term(session: &mut Session, message: TerminalMessage) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  drop run step(&mut session, Message.Term { message: move message })
+}
+
+effect fn awaitText(session: &mut Session, wanted: string) -> ()
+  ! Failure
+  ? &mut Allocator | &mut MonotonicClock {
+  let mut count: u32 = 0
+  while count < 3000 {
+    drop run step(&mut session, Message.Poll { time: 0.0 })
+    let text = run session.view.terminal.plainText()
+    if String.contains(text.view(), wanted) {
+      return ()
+    }
+    run MonotonicClock.waitFor(1000000)
+    count = count + 1
+  }
+  run Testing.expect(false, "the PTY output arrived in time")
+}
+
+effect fn awaitExit(session: &mut Session) -> ()
+  ! Failure
+  ? &mut Allocator | &mut MonotonicClock {
+  let mut count: u32 = 0
+  while session.running() && count < 3000 {
+    drop run step(&mut session, Message.Poll { time: 0.0 })
+    run MonotonicClock.waitFor(1000000)
+    count = count + 1
+  }
+  run Testing.expect(!session.running(), "the program exited in time")
+}
+
+effect fn typed(text: string) -> TerminalMessage
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return TerminalMessage.Typed { text: run String.copy(text) }
+}
+
+effect fn key(name: string, modifiers: u32) -> TerminalMessage
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return TerminalMessage.Key { key: run String.copy(name), modifiers: modifiers }
+}
+
+effect fn roundTripBody() -> ()
+  ! Failure
+  ? &mut Allocator | &mut MonotonicClock {
+  let mut shell = run session(
+    "stty -echo; printf 'READY\\n'; read line; stty size; printf '\\033[32m%s\\033[0m\\n' \"$line\"; exit 7",
+  )
+  run awaitText(&mut shell, "READY")
+  // The view measures a cell of 8 by 18 pixels and is laid out at 400 by 160: 50 by 8 cells.
+  run term(&mut shell, TerminalMessage.Measured { width: 160.0, height: 18.0 })
+  run term(&mut shell, TerminalMessage.Laid { bounds: Rect<f32>.new(0.0, 0.0, 400.0, 160.0) })
+  let geometry = shell.view.geometry()
+  run Testing.expect(geometry.columns == 50 && geometry.rows == 8, "the grid fits the layout")
+  run term(&mut shell, run typed("round trip"))
+  run term(&mut shell, run key("Enter", 0))
+  run awaitText(&mut shell, "round trip")
+  let text = run shell.view.terminal.plainText()
+  run Testing.expect(String.contains(text.view(), "8 50"), "the new size reaches the program")
+  run awaitExit(&mut shell)
+  run Testing.expect(shell.exit == 7, "the exit status is kept")
+  let after = run shell.view.terminal.plainText()
+  run Testing.expect(String.contains(after.view(), "round trip"), "final output is not lost")
+  run Testing.expect(
+    String.contains(after.view(), "[process exited with status 7]"),
+    "the exit is shown",
+  )
+}
+
+test effect fn outputTypingResizeAndExit() -> ()
+  ! Failure {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut clock = OsMonotonicClock.make()
+  run roundTripBody()
+    |> Effect.provideMut<Allocator>(&mut allocator)
+    |> Effect.provideMut<MonotonicClock>(&mut clock)
+}
+
+effect fn protocolsBody() -> ()
+  ! Failure
+  ? &mut Allocator | &mut MonotonicClock {
+  // A cursor position query: the terminal's reply goes back to the program unprompted.
+  let mut query = run session(
+    "stty -echo -icanon min 1 time 0; printf '\\033[6n'; dd bs=1 count=6 >/dev/null 2>&1; printf '\\r\\nREPLY_OK\\r\\n'",
+  )
+  run awaitText(&mut query, "REPLY_OK")
+
+  let mut interrupt = run session("printf 'INTERRUPT_READY\\r\\n'; exec sleep 30")
+  run awaitText(&mut interrupt, "INTERRUPT_READY")
+  run term(&mut interrupt, run key("c", MOD_CONTROL))
+  run awaitExit(&mut interrupt)
+  run Testing.expect(interrupt.exit == 130, "Ctrl+C interrupts the program")
+}
+
+test effect fn repliesAndInterrupt() -> ()
+  ! Failure {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut clock = OsMonotonicClock.make()
+  run protocolsBody()
+    |> Effect.provideMut<Allocator>(&mut allocator)
+    |> Effect.provideMut<MonotonicClock>(&mut clock)
+}
+
+effect fn quitBody() -> ()
+  ! Failure
+  ? &mut Allocator | &mut MonotonicClock {
+  let pty = run Pty.command(80, 24, "exit 0")
+  let mut shell = run Session.make(Result<Pty, PtyError>.Success { value: move pty })
+  let mut quit = false
+  let mut count: u32 = 0
+  while !quit && count < 3000 {
+    quit = run step(&mut shell, Message.Poll { time: 0.0 })
+    run MonotonicClock.waitFor(1000000)
+    count = count + 1
+  }
+  run Testing.expect(quit, "the window closes when the shell exits")
+}
+
+test effect fn closesWhenTheShellExits() -> ()
+  ! Failure {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut clock = OsMonotonicClock.make()
+  run quitBody()
+    |> Effect.provideMut<Allocator>(&mut allocator)
+    |> Effect.provideMut<MonotonicClock>(&mut clock)
+}

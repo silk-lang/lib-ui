@@ -1,0 +1,609 @@
+//! Every property of the shared CSS catalog has an answer on the tree path: a row below whose
+//! value changes how the node lays out or paints, or a place in a list of what the tree does
+//! not do yet. A property the tree stops reading fails its row; a property new to the catalog
+//! fails until it is given one.
+import ui_tree.lib { Tree, TreeError, Viewport, BoxNode, TextNode, Node, Input, Cursor }
+import ui_tree.css { Property }
+import ui_tree.css
+import ui_fixtures.fixtures as fixtures
+import svg_css.written as written
+import svg_css.tokens { CssError }
+import properties.catalog
+import silk.collections.hash { Hash }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+/// A property and the styles that make its value matter: the root's, the leading sibling's,
+/// and the target's own before `sample` is set on it.
+struct Row {
+  root: &'static [u8],
+  lead: &'static [u8],
+  setup: &'static [u8],
+  sample: &'static [u8],
+}
+
+impl Copy for Row {}
+
+fn rows() -> [Row; 193] {
+  return [
+    Row { root: b"", lead: b"", setup: b"display:flex;flex-wrap:wrap;height:200px", sample: b"align-content:center" },
+    Row { root: b"", lead: b"", setup: b"display:flex;height:100px", sample: b"align-items:center" },
+    Row { root: b"display:flex;height:300px", lead: b"", setup: b"", sample: b"align-self:center" },
+    Row { root: b"", lead: b"", setup: b"width:100px", sample: b"aspect-ratio:1" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"backdrop-filter:blur(4px)" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"background-color:red" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"background-image:linear-gradient(90deg, red, blue)" },
+    Row { root: b"", lead: b"", setup: b"border-style:solid;border-width:4px", sample: b"border-top-color:red" },
+    Row { root: b"", lead: b"", setup: b"border-style:solid;border-width:4px", sample: b"border-right-color:red" },
+    Row { root: b"", lead: b"", setup: b"border-style:solid;border-width:4px", sample: b"border-bottom-color:red" },
+    Row { root: b"", lead: b"", setup: b"border-style:solid;border-width:4px", sample: b"border-left-color:red" },
+    Row { root: b"", lead: b"", setup: b"border-style:solid;border-width:4px", sample: b"border-color:red" },
+    Row { root: b"", lead: b"", setup: b"border-width:4px", sample: b"border-top-style:dashed" },
+    Row { root: b"", lead: b"", setup: b"border-width:4px", sample: b"border-right-style:dashed" },
+    Row { root: b"", lead: b"", setup: b"border-width:4px", sample: b"border-bottom-style:dashed" },
+    Row { root: b"", lead: b"", setup: b"border-width:4px", sample: b"border-left-style:dashed" },
+    Row { root: b"", lead: b"", setup: b"border-width:4px", sample: b"border-style:dashed" },
+    Row { root: b"", lead: b"", setup: b"border-style:dashed", sample: b"border-top-width:7px" },
+    Row { root: b"", lead: b"", setup: b"display:inline-block", sample: b"border-right-width:7px" },
+    Row { root: b"", lead: b"", setup: b"border-style:dashed", sample: b"border-bottom-width:7px" },
+    Row { root: b"", lead: b"", setup: b"border-style:dashed", sample: b"border-left-width:7px" },
+    Row { root: b"", lead: b"", setup: b"border-style:dashed", sample: b"border-width:7px" },
+    Row { root: b"", lead: b"", setup: b"background-color:red", sample: b"border-top-left-radius:5px" },
+    Row { root: b"", lead: b"", setup: b"background-color:red", sample: b"border-top-right-radius:5px" },
+    Row { root: b"", lead: b"", setup: b"background-color:red", sample: b"border-bottom-right-radius:5px" },
+    Row { root: b"", lead: b"", setup: b"background-color:red", sample: b"border-bottom-left-radius:5px" },
+    Row { root: b"", lead: b"", setup: b"background-color:red", sample: b"border-radius:5px" },
+    Row { root: b"", lead: b"", setup: b"position:relative", sample: b"top:5px" },
+    Row { root: b"", lead: b"", setup: b"position:relative", sample: b"right:5px" },
+    Row { root: b"", lead: b"", setup: b"position:relative", sample: b"bottom:5px" },
+    Row { root: b"", lead: b"", setup: b"position:relative", sample: b"left:5px" },
+    Row { root: b"", lead: b"", setup: b"position:absolute", sample: b"inset:5px" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"box-shadow:2px 2px 4px black" },
+    Row { root: b"", lead: b"", setup: b"width:100px;padding:10px", sample: b"box-sizing:border-box" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"caret-color:red" },
+    Row { root: b"", lead: b"float:left;width:50px;height:50px", setup: b"", sample: b"clear:left" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"color:red" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"cursor:pointer" },
+    Row { root: b"", lead: b"", setup: b"display:flex", sample: b"column-gap:10px" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"direction:rtl" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"display:none" },
+    Row { root: b"display:flex", lead: b"", setup: b"", sample: b"flex-basis:300px" },
+    Row { root: b"", lead: b"", setup: b"display:flex", sample: b"flex-direction:column" },
+    Row { root: b"display:flex", lead: b"", setup: b"", sample: b"flex-grow:1" },
+    Row { root: b"display:flex", lead: b"", setup: b"width:500px", sample: b"flex-shrink:0" },
+    Row { root: b"", lead: b"", setup: b"display:flex;width:100px", sample: b"flex-wrap:wrap" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"float:left" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"font-size:30px" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"font-weight:700" },
+    Row { root: b"", lead: b"", setup: b"display:flex", sample: b"gap:10px" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"height:50px" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"width:50px" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"min-height:200px" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"min-width:450px" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"max-width:50px" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"max-height:5px" },
+    Row { root: b"", lead: b"", setup: b"display:flex", sample: b"justify-content:center" },
+    Row { root: b"", lead: b"", setup: b"display:grid", sample: b"justify-items:center" },
+    Row { root: b"display:grid", lead: b"", setup: b"", sample: b"justify-self:center" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"line-height:40px" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"margin-top:5px" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"margin-right:5px" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"margin-bottom:5px" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"margin-left:5px" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"margin:5px" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"object-fit:cover" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"object-position:10px 10px" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"opacity:0.5" },
+    Row { root: b"display:flex", lead: b"", setup: b"", sample: b"order:5" },
+    Row { root: b"", lead: b"float:left;width:50px;height:50px", setup: b"", sample: b"overflow:hidden" },
+    Row { root: b"", lead: b"float:left;width:50px;height:50px", setup: b"", sample: b"overflow-x:hidden" },
+    Row { root: b"", lead: b"float:left;width:50px;height:50px", setup: b"", sample: b"overflow-y:hidden" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"padding-top:5px" },
+    Row { root: b"", lead: b"", setup: b"width:60px", sample: b"padding-right:5px" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"padding-bottom:5px" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"padding-left:5px" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"padding:5px" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"pointer-events:none" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"position:absolute" },
+    Row { root: b"", lead: b"", setup: b"display:flex;flex-direction:column", sample: b"row-gap:10px" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"-silk-placeholder-color:red" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"-silk-selection-color:red" },
+    Row { root: b"", lead: b"", setup: b"white-space:pre", sample: b"tab-size:20" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"letter-spacing:3px" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"word-spacing:10px" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"text-transform:uppercase" },
+    Row { root: b"", lead: b"", setup: b"width:60px", sample: b"word-break:break-all" },
+    Row { root: b"", lead: b"", setup: b"width:30px", sample: b"overflow-wrap:anywhere" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"text-align:center" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"text-align-last:center" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"text-decoration-line:underline" },
+    Row { root: b"", lead: b"", setup: b"text-decoration-line:underline", sample: b"text-decoration-color:red" },
+    Row { root: b"", lead: b"", setup: b"text-decoration-line:underline", sample: b"text-decoration-style:wavy" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"text-indent:20px" },
+    Row { root: b"", lead: b"", setup: b"text-align:justify;width:100px", sample: b"text-justify:inter-character" },
+    Row { root: b"", lead: b"", setup: b"writing-mode:vertical-rl", sample: b"text-orientation:upright" },
+    Row { root: b"", lead: b"", setup: b"width:50px", sample: b"text-wrap-mode:nowrap" },
+    Row { root: b"", lead: b"", setup: b"direction:rtl", sample: b"unicode-bidi:plaintext" },
+    Row { root: b"line-height:50px", lead: b"", setup: b"display:inline-block;line-height:16px", sample: b"vertical-align:top" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"visibility:hidden" },
+    Row { root: b"", lead: b"", setup: b"width:50px", sample: b"white-space:nowrap" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"white-space-collapse:preserve" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"writing-mode:vertical-rl" },
+    Row { root: b"display:flex", lead: b"", setup: b"", sample: b"flex:1" },
+    Row { root: b"", lead: b"", setup: b"display:flex", sample: b"flex-flow:column" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"border:2px solid red" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"border-top:2px solid red" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"border-right:2px solid red" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"border-bottom:2px solid red" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"border-left:2px solid red" },
+    Row { root: b"", lead: b"", setup: b"display:grid;height:200px;width:200px", sample: b"place-content:center" },
+    Row { root: b"", lead: b"", setup: b"display:grid;height:200px", sample: b"place-items:center" },
+    Row { root: b"display:grid;height:300px", lead: b"", setup: b"", sample: b"place-self:center" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"background:red" },
+    Row { root: b"", lead: b"", setup: b"display:grid", sample: b"grid-template-columns:100px 100px" },
+    Row { root: b"", lead: b"", setup: b"display:grid", sample: b"grid-template-rows:100px" },
+    Row { root: b"", lead: b"", setup: b"display:grid", sample: b"grid-template-areas:\"a b\"" },
+    Row { root: b"", lead: b"", setup: b"display:grid;grid-auto-flow:column", sample: b"grid-auto-columns:50px" },
+    Row { root: b"", lead: b"", setup: b"display:grid", sample: b"grid-auto-rows:50px" },
+    Row { root: b"", lead: b"", setup: b"display:grid", sample: b"grid-auto-flow:column" },
+    Row { root: b"", lead: b"", setup: b"display:grid", sample: b"grid-template:100px / 100px 100px" },
+    Row { root: b"", lead: b"", setup: b"display:grid", sample: b"grid:auto-flow / 100px 100px" },
+    Row { root: b"display:grid;grid-template-columns:100px 100px", lead: b"", setup: b"", sample: b"grid-row-start:2" },
+    Row { root: b"display:grid;grid-template-columns:100px 100px", lead: b"", setup: b"", sample: b"grid-row-end:3" },
+    Row { root: b"display:grid;grid-template-columns:100px 100px", lead: b"", setup: b"", sample: b"grid-column-start:1" },
+    Row { root: b"display:grid;grid-template-columns:100px 100px", lead: b"", setup: b"", sample: b"grid-column-end:2" },
+    Row { root: b"display:grid;grid-template-columns:100px 100px", lead: b"", setup: b"", sample: b"grid-row:2" },
+    Row { root: b"display:grid;grid-template-columns:100px 100px", lead: b"", setup: b"", sample: b"grid-column:1" },
+    Row { root: b"display:grid;grid-template-columns:100px 100px", lead: b"", setup: b"", sample: b"grid-area:2 / 2" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"margin-block-start:5px" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"margin-block-end:5px" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"margin-inline-start:5px" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"margin-inline-end:5px" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"margin-block:5px" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"margin-inline:5px" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"padding-block-start:5px" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"padding-block-end:5px" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"padding-inline-start:5px" },
+    Row { root: b"", lead: b"", setup: b"width:60px", sample: b"padding-inline-end:5px" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"padding-block:5px" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"padding-inline:5px" },
+    Row { root: b"", lead: b"", setup: b"position:relative", sample: b"inset-block-start:5px" },
+    Row { root: b"", lead: b"", setup: b"position:relative", sample: b"inset-block-end:5px" },
+    Row { root: b"", lead: b"", setup: b"position:relative", sample: b"inset-inline-start:5px" },
+    Row { root: b"", lead: b"", setup: b"position:relative", sample: b"inset-inline-end:5px" },
+    Row { root: b"", lead: b"", setup: b"position:relative", sample: b"inset-block:5px" },
+    Row { root: b"", lead: b"", setup: b"position:relative", sample: b"inset-inline:5px" },
+    Row { root: b"", lead: b"", setup: b"border-style:dashed", sample: b"border-block-start-width:7px" },
+    Row { root: b"", lead: b"", setup: b"border-width:4px", sample: b"border-block-start-style:dashed" },
+    Row { root: b"", lead: b"", setup: b"border-style:solid;border-width:4px", sample: b"border-block-start-color:red" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"border-block-start:4px solid red" },
+    Row { root: b"", lead: b"", setup: b"border-style:dashed", sample: b"border-block-end-width:7px" },
+    Row { root: b"", lead: b"", setup: b"border-width:4px", sample: b"border-block-end-style:dashed" },
+    Row { root: b"", lead: b"", setup: b"border-style:solid;border-width:4px", sample: b"border-block-end-color:red" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"border-block-end:4px solid red" },
+    Row { root: b"", lead: b"", setup: b"border-style:dashed", sample: b"border-inline-start-width:7px" },
+    Row { root: b"", lead: b"", setup: b"border-width:4px", sample: b"border-inline-start-style:dashed" },
+    Row { root: b"", lead: b"", setup: b"border-style:solid;border-width:4px", sample: b"border-inline-start-color:red" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"border-inline-start:4px solid red" },
+    Row { root: b"", lead: b"", setup: b"display:inline-block;border-style:dashed", sample: b"border-inline-end-width:7px" },
+    Row { root: b"", lead: b"", setup: b"border-width:4px", sample: b"border-inline-end-style:dashed" },
+    Row { root: b"", lead: b"", setup: b"border-style:solid;border-width:4px", sample: b"border-inline-end-color:red" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"border-inline-end:4px solid red" },
+    Row { root: b"", lead: b"", setup: b"border-style:dashed", sample: b"border-block-width:7px" },
+    Row { root: b"", lead: b"", setup: b"border-width:4px", sample: b"border-block-style:dashed" },
+    Row { root: b"", lead: b"", setup: b"border-style:solid;border-width:4px", sample: b"border-block-color:red" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"border-block:4px solid red" },
+    Row { root: b"", lead: b"", setup: b"border-style:dashed", sample: b"border-inline-width:7px" },
+    Row { root: b"", lead: b"", setup: b"border-width:4px", sample: b"border-inline-style:dashed" },
+    Row { root: b"", lead: b"", setup: b"border-style:solid;border-width:4px", sample: b"border-inline-color:red" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"border-inline:4px solid red" },
+    Row { root: b"", lead: b"", setup: b"background-color:red", sample: b"border-start-start-radius:5px" },
+    Row { root: b"", lead: b"", setup: b"background-color:red", sample: b"border-start-end-radius:5px" },
+    Row { root: b"", lead: b"", setup: b"background-color:red", sample: b"border-end-start-radius:5px" },
+    Row { root: b"", lead: b"", setup: b"background-color:red", sample: b"border-end-end-radius:5px" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"block-size:50px" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"min-block-size:50px" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"max-block-size:5px" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"min-inline-size:450px" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"max-inline-size:50px" },
+    Row { root: b"", lead: b"float:left;width:50px;height:50px", setup: b"", sample: b"overflow-block:hidden" },
+    Row { root: b"", lead: b"float:left;width:50px;height:50px", setup: b"", sample: b"overflow-inline:hidden" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"outline:2px solid red" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"outline-style:solid" },
+    Row { root: b"", lead: b"", setup: b"outline-style:solid", sample: b"outline-width:5px" },
+    Row { root: b"", lead: b"", setup: b"outline-style:solid", sample: b"outline-color:red" },
+    Row { root: b"", lead: b"", setup: b"outline-style:solid", sample: b"outline-offset:4px" },
+    Row { root: b"", lead: b"", setup: b"width:40px", sample: b"max-lines:1" },
+    Row { root: b"", lead: b"", setup: b"width:40px", sample: b"line-clamp:1" },
+    Row { root: b"", lead: b"", setup: b"width:40px", sample: b"-webkit-line-clamp:1" },
+    Row { root: b"", lead: b"", setup: b"width:40px;max-lines:1", sample: b"block-ellipsis:auto" },
+    Row { root: b"", lead: b"", setup: b"width:40px;white-space:nowrap;overflow:hidden", sample: b"text-overflow:ellipsis" },
+    Row { root: b"", lead: b"", setup: b"width:50px", sample: b"text-wrap:nowrap" },
+  ]
+}
+
+/// What the tree leaves to others for now, with who owns it.
+fn unsupported(property: Property) -> bool {
+  return fragmentation(property) || svgOnly(property) || later(property)
+}
+
+/// Read by layout only when content is split into pages or columns: the pagination tests
+/// cover them.
+fn fragmentation(property: Property) -> bool {
+  return property == Property.BreakBefore || property == Property.BreakAfter
+    || property == Property.BreakInside
+    || property == Property.BoxDecorationBreak
+    || property == Property.MarginBreak
+    || property == Property.Orphans
+    || property == Property.Widows
+}
+
+/// SVG presentation attributes: lib-svg reads them, a tree node has no SVG content.
+fn svgOnly(property: Property) -> bool {
+  return property == Property.Fill || property == Property.FillRule || property == Property.FillOpacity
+    || property == Property.Stroke || property == Property.StrokeOpacity || property == Property.StrokeWidth
+    || property == Property.StrokeLinecap || property == Property.StrokeLinejoin
+    || property == Property.StrokeMiterlimit || property == Property.StrokeDasharray
+    || property == Property.StrokeDashoffset || property == Property.MarkerStart
+    || property == Property.MarkerMid || property == Property.MarkerEnd || property == Property.Marker
+    || property == Property.PaintOrder || property == Property.ColorInterpolation
+    || property == Property.ColorInterpolationFilters || property == Property.ColorRendering
+    || property == Property.ShapeRendering || property == Property.Cx || property == Property.Cy
+    || property == Property.R || property == Property.Rx || property == Property.Ry
+    || property == Property.X || property == Property.Y || property == Property.D
+    || property == Property.VectorEffect || property == Property.FloodColor
+    || property == Property.FloodOpacity || property == Property.LightingColor
+    || property == Property.StopColor || property == Property.StopOpacity
+    || property == Property.EnableBackground || property == Property.ColorProfile
+    || property == Property.Kerning || property == Property.GlyphOrientationHorizontal
+    || property == Property.GlyphOrientationVertical || property == Property.TextAnchor
+    || property == Property.ClipRule || property == Property.MaskType
+    || property == Property.BaselineShift || property == Property.AlignmentBaseline
+    || property == Property.DominantBaseline || property == Property.ShapeInside
+    || property == Property.ShapeSubtract || property == Property.InlineSize
+}
+
+/// Not on the tree path yet. Each group names who is adding it; move a property to `rows`
+/// when it works.
+fn later(property: Property) -> bool {
+  // "Paint CSS effects in the tree".
+  return property == Property.Filter || property == Property.TextShadow || property == Property.ClipPath
+    || property == Property.Clip || property == Property.MixBlendMode || property == Property.Isolation
+    || property == Property.BackgroundBlendMode || property == Property.BackgroundPosition
+    || property == Property.BackgroundSize || property == Property.BackgroundRepeat
+    || property == Property.BackgroundAttachment || property == Property.BackgroundOrigin
+    || property == Property.BackgroundClip || property == Property.Mask || property == Property.MaskImage
+    || property == Property.MaskMode || property == Property.MaskRepeat || property == Property.MaskPosition
+    || property == Property.MaskClip || property == Property.MaskOrigin || property == Property.MaskSize
+    || property == Property.MaskComposite || property == Property.MaskBorder
+    || property == Property.MaskBorderSource || property == Property.MaskBorderMode
+    || property == Property.MaskBorderSlice || property == Property.MaskBorderWidth
+    || property == Property.MaskBorderOutset || property == Property.MaskBorderRepeat
+    || property == Property.ImageRendering || property == Property.ImageOrientation
+    // "Add CSS transforms to the tree".
+    || property == Property.Transform || property == Property.TransformOrigin
+    || property == Property.Perspective || property == Property.PerspectiveOrigin
+    || property == Property.TransformBox || property == Property.TransformStyle
+    || property == Property.BackfaceVisibility || property == Property.Translate
+    || property == Property.Rotate || property == Property.Scale
+    // "Add CSS transitions, animations and vh units".
+    || property == Property.Animation || property == Property.AnimationName
+    || property == Property.AnimationDuration || property == Property.AnimationTimingFunction
+    || property == Property.AnimationDelay || property == Property.AnimationIterationCount
+    || property == Property.AnimationDirection || property == Property.AnimationFillMode
+    || property == Property.AnimationPlayState
+    // "Support all CSS properties on every backend": text and stacking.
+    || property == Property.ZIndex || property == Property.All
+    || property == Property.Font || property == Property.FontSizeAdjust || property == Property.FontStretch
+    || property == Property.FontWidth || property == Property.FontVariant
+    || property == Property.FontVariantLigatures || property == Property.FontVariantCaps
+    || property == Property.FontVariantNumeric || property == Property.FontVariantEastAsian
+    || property == Property.FontVariantPosition || property == Property.FontVariantAlternates
+    || property == Property.FontVariantEmoji || property == Property.FontFeatureSettings
+    || property == Property.FontVariationSettings || property == Property.FontKerning
+    || property == Property.FontOpticalSizing || property == Property.FontLanguageOverride
+    || property == Property.FontSynthesis || property == Property.FontSynthesisWeight
+    || property == Property.FontSynthesisStyle || property == Property.FontSynthesisSmallCaps
+    || property == Property.FontSynthesisPosition || property == Property.FontPalette
+    || property == Property.TextDecoration || property == Property.TextDecorationThickness
+    || property == Property.TextDecorationFill || property == Property.TextDecorationStroke
+    || property == Property.TextUnderlinePosition
+    || property == Property.TextRendering || property == Property.LineBreak
+    || property == Property.TextAlignAll || property == Property.TextCombineUpright
+    || property == Property.HangingPunctuation || property == Property.TextEmphasis
+    || property == Property.TextEmphasisStyle || property == Property.TextEmphasisColor
+    || property == Property.TextEmphasisPosition || property == Property.Hyphens
+    || property == Property.WhiteSpaceTrim || property == Property.ShapeMargin
+    // "Add CSS transitions, animations and vh units", continued.
+    || property == Property.Transition || property == Property.TransitionProperty
+    || property == Property.TransitionDuration || property == Property.TransitionTimingFunction
+    || property == Property.TransitionDelay || property == Property.TransitionBehavior
+    // "Add missing CSS properties to lib-css": parsed, with nothing in the tree behind them
+    // yet. The tree reads overscroll-behavior, scroll-behavior, scroll-margin and
+    // scroll-padding, but only when scrolling (interaction tests), not in layout or paint.
+    || property == Property.UserSelect
+    || property == Property.AccentColor || property == Property.Appearance
+    || property == Property.Resize
+    || property == Property.Continue || property == Property.ScrollbarColor
+    || property == Property.OverflowAnchor || property == Property.OverflowClipMargin
+    || property == Property.TextWrapStyle
+    || property == Property.HyphenateCharacter || property == Property.TextSizeAdjust
+    || property == Property.TextUnderlineOffset || property == Property.TextDecorationSkipInk
+    || property == Property.OverscrollBehavior || property == Property.OverscrollBehaviorX
+    || property == Property.OverscrollBehaviorY || property == Property.OverscrollBehaviorInline
+    || property == Property.OverscrollBehaviorBlock || property == Property.ScrollBehavior
+    || property == Property.ScrollSnapType || property == Property.ScrollSnapAlign
+    || property == Property.ScrollSnapStop || property == Property.ScrollMarginTop
+    || property == Property.ScrollMarginRight || property == Property.ScrollMarginBottom
+    || property == Property.ScrollMarginLeft || property == Property.ScrollMarginBlockStart
+    || property == Property.ScrollMarginBlockEnd || property == Property.ScrollMarginInlineStart
+    || property == Property.ScrollMarginInlineEnd || property == Property.ScrollMargin
+    || property == Property.ScrollMarginBlock || property == Property.ScrollMarginInline
+    || property == Property.ScrollPaddingTop || property == Property.ScrollPaddingRight
+    || property == Property.ScrollPaddingBottom || property == Property.ScrollPaddingLeft
+    || property == Property.ScrollPaddingBlockStart || property == Property.ScrollPaddingBlockEnd
+    || property == Property.ScrollPaddingInlineStart || property == Property.ScrollPaddingInlineEnd
+    || property == Property.ScrollPadding || property == Property.ScrollPaddingBlock
+    || property == Property.ScrollPaddingInline || property == Property.TouchAction
+    || property == Property.Contain || property == Property.ContentVisibility
+    || property == Property.ContainIntrinsicWidth || property == Property.ContainIntrinsicHeight
+    || property == Property.ContainIntrinsicBlockSize
+    || property == Property.ContainIntrinsicInlineSize || property == Property.ContainIntrinsicSize
+    || property == Property.ContainerType || property == Property.ContainerName
+    || property == Property.Container || property == Property.WillChange
+    || property == Property.ListStylePosition || property == Property.ListStyleImage
+    || property == Property.ListStyleType || property == Property.ListStyle
+    || property == Property.CounterReset || property == Property.CounterIncrement
+    || property == Property.CounterSet || property == Property.Content
+    || property == Property.Quotes || property == Property.BorderCollapse
+    || property == Property.BorderSpacing || property == Property.TableLayout
+    || property == Property.CaptionSide || property == Property.EmptyCells
+    || property == Property.ColumnCount || property == Property.ColumnWidth
+    || property == Property.Columns || property == Property.ColumnRuleWidth
+    || property == Property.ColumnRuleStyle || property == Property.ColumnRuleColor
+    || property == Property.ColumnRule || property == Property.ColumnSpan
+    || property == Property.ColumnFill || property == Property.BorderImageSource
+    || property == Property.BorderImageSlice || property == Property.BorderImageWidth
+    || property == Property.BorderImageOutset || property == Property.BorderImageRepeat
+    || property == Property.BorderImage || property == Property.ColorScheme
+    || property == Property.PrintColorAdjust || property == Property.ForcedColorAdjust
+    || property == Property.ShapeOutside || property == Property.ShapeImageThreshold
+    || property == Property.FieldSizing
+    // Read, but without effect yet: no oblique synthesis without an italic face, overlay
+    // scrollbars take no space, and a block's last baseline is not used for alignment.
+    || property == Property.FontStyle || property == Property.ScrollbarGutter
+    || property == Property.ScrollbarWidth || property == Property.BaselineSource
+    // Font families are ids made by `Tree.fontFamily`; the font tests cover them.
+    || property == Property.FontFamily
+}
+
+struct Fixture {
+  root: BoxNode,
+  lead: BoxNode,
+  target: BoxNode,
+  text: TextNode,
+  inner: BoxNode,
+  after: BoxNode,
+}
+
+impl Copy for Fixture {}
+
+effect fn restyle(tree: &mut Tree<'_>, node: BoxNode, css: &[u8]) -> ()
+  ! TreeError | CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let declarations = run written.declarations(css)
+  run tree.setStyle(node, declarations.asSlice())
+}
+
+/// A 400 by 300 root holding a leading box, the target (text, then a 20px box) and a 10px
+/// tall box after it.
+effect fn fixture(tree: &mut Tree<'_>, row: Row) -> Fixture
+  ! TreeError | CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let root = run tree.box(&[])
+  run restyle(&mut tree, root, b"width: 400px; height: 300px")
+  run restyle(&mut tree, root, row.root)
+  let lead = run tree.box(&[])
+  run restyle(&mut tree, lead, row.lead)
+  let sans = run tree.fontFamily("Noto Sans, sans-serif")
+  let target = run tree.box(&[css.fontFamily(sans.raw())])
+  run restyle(&mut tree, target, row.setup)
+  let text = run tree.text("Hello\twide  world of text")
+  let inner = run tree.box(&[])
+  run restyle(&mut tree, inner, b"width: 20px; height: 20px")
+  let after = run tree.box(&[])
+  run restyle(&mut tree, after, b"height: 10px")
+  run tree.append(root, lead)
+  run tree.append(root, target)
+  run tree.append(target, text)
+  run tree.append(target, inner)
+  run tree.append(root, after)
+  run tree.setRoot(root)
+  return Fixture { root: root, lead: lead, target: target, text: text, inner: inner, after: after }
+}
+
+effect fn geometry<N: Node>(tree: &Tree<'_>, node: N, out: &mut List<f32>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let fragments = run tree.fragments(move node)
+  run out.append(-1.0)
+  let mut i: usize = 0
+  while i < fragments.length() {
+    let box = fragments.get(i).border
+    run out.append(box.xMin)
+    run out.append(box.yMin)
+    run out.append(box.xMax)
+    run out.append(box.yMax)
+    i = i + 1
+  }
+}
+
+/// What the fixture shows: every fragment's border box, and how the target and its text
+/// paint.
+effect fn look(tree: &Tree<'_>, f: Fixture, paint: &mut List<u64>) -> List<f32>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = List<f32>.make()
+  run geometry(tree, f.lead, &mut out)
+  run geometry(tree, f.target, &mut out)
+  run geometry(tree, f.text, &mut out)
+  run geometry(tree, f.inner, &mut out)
+  run geometry(tree, f.after, &mut out)
+  let seed = Hash.seed(1)
+  match tree.view(f.target) {
+    Option.Some { value } => {
+      run paint.append(value.computed().paintHash(&seed))
+      run paint.append(if value.computed().cursor.isSome() { 1 } else { 0 })
+    }
+    Option.None => {}
+  }
+  match tree.view(f.text) {
+    Option.Some { value } => {
+      run paint.append(value.computed().paintHash(&seed))
+      run paint.append(if value.computed().text.visible { 1 } else { 0 })
+    }
+    Option.None => {}
+  }
+  return move out
+}
+
+fn sameFloats(a: &List<f32>, b: &List<f32>) -> bool {
+  if a.length() != b.length() { return false }
+  let mut i: usize = 0
+  while i < a.length() {
+    if a.get(i) != b.get(i) { return false }
+    i = i + 1
+  }
+  return true
+}
+
+fn sameHashes(a: &List<u64>, b: &List<u64>) -> bool {
+  if a.length() != b.length() { return false }
+  let mut i: usize = 0
+  while i < a.length() {
+    if a.get(i) != b.get(i) { return false }
+    i = i + 1
+  }
+  return true
+}
+
+fn viewport() -> Viewport {
+  return Viewport { width: 800.0, height: 600.0, scale: 1.0 }
+}
+
+/// Whether setting `row.sample` changes how the fixture lays out or paints.
+effect fn changes(row: Row) -> bool
+  ! TreeError | CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run Tree.make(&fonts)
+  let f = run fixture(&mut tree, row)
+  drop run tree.frame(viewport(), 0.0)
+  let mut paintBefore = List<u64>.make()
+  let before = run look(&tree, f, &mut paintBefore)
+  run restyle(&mut tree, f.target, row.sample)
+  drop run tree.frame(viewport(), 0.0)
+  let mut paintAfter = List<u64>.make()
+  let after = run look(&tree, f, &mut paintAfter)
+  return !sameFloats(&before, &after) || !sameHashes(&paintBefore, &paintAfter)
+}
+
+effect fn sampled(property: Property) -> bool
+  ! CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let table = rows()
+  let mut i: usize = 0
+  while i < table.length {
+    let declarations = run written.declarations(table[i].sample)
+    if declarations.length() == 1 && declarations.asSlice()[0].property == property {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+/// Fails naming the first row whose sample changes nothing.
+effect fn everyRowChangesSomething() -> ()
+  ! TreeError | CssError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let table = rows()
+  let mut i: usize = 0
+  while i < table.length {
+    let declarations = run written.declarations(table[i].sample)
+    let changed = declarations.length() == 1 && run changes(table[i])
+    run Testing.expect(changed, unsafe String.fromUtf8Unchecked(table[i].sample))
+    i = i + 1
+  }
+}
+
+/// Fails naming the first catalog property with neither a row nor a reason, or with both.
+effect fn everyPropertyHasAnAnswer() -> ()
+  ! CssError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let all = catalog.all()
+  let mut i: usize = 0
+  while i < all.length {
+    let property = all[i]
+    let row = run sampled(property)
+    run Testing.expect(row != unsupported(property), unsafe String.fromUtf8Unchecked(catalog.name(property)))
+    i = i + 1
+  }
+}
+
+effect fn shownCursor(tree: &mut Tree<'_>) -> Cursor
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let frame = run tree.frame(viewport(), 0.0)
+  return frame.cursor
+}
+
+/// The CSS cursor of the hovered node shows; `auto` takes its ancestor's.
+effect fn cursorsFromStyle() -> ()
+  ! TreeError | CssError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run Tree.make(&fonts)
+  let root = run tree.box(&[])
+  run restyle(&mut tree, root, b"width: 200px; height: 200px; cursor: pointer")
+  let text = run tree.box(&[])
+  run restyle(&mut tree, text, b"height: 50px; cursor: text")
+  let plain = run tree.box(&[])
+  run restyle(&mut tree, plain, b"height: 50px; cursor: auto")
+  run tree.append(root, text)
+  run tree.append(root, plain)
+  run tree.setRoot(root)
+  drop run tree.frame(viewport(), 0.0)
+  run tree.dispatch(Input.moveTo(10.0, 10.0))
+  let shown1 = run shownCursor(&mut tree)
+  run Testing.expect(shown1 == Cursor.Text, "the hovered node's cursor shows")
+  run tree.dispatch(Input.moveTo(10.0, 60.0))
+  let shown2 = run shownCursor(&mut tree)
+  run Testing.expect(shown2 == Cursor.Pointer, "auto takes the ancestor's cursor")
+  run tree.dispatch(Input.moveTo(10.0, 150.0))
+  let shown3 = run shownCursor(&mut tree)
+  run Testing.expect(shown3 == Cursor.Pointer, "and so does the ancestor itself")
+}
+
+test effect fn cssCoverageCursorsFromStyle() -> ()
+  ! TreeError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run cursorsFromStyle() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn cssCoverageEveryRowChangesSomething() -> ()
+  ! TreeError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run everyRowChangesSomething() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn cssCoverageEveryPropertyHasAnAnswer() -> ()
+  ! CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run everyPropertyHasAnAnswer() |> Effect.provideMut<Allocator>(&mut allocator)
+}

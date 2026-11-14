@@ -1,0 +1,758 @@
+//! `Dom` writes a subtree like one made before as a copy of it (`ui_app_dom.templates`). The
+//! page the copies give must be the page the single mutations give: a small stand-in for
+//! `silk-ui-dom.js` applies the batches both ways and the two are compared after every step.
+import ui_app.css
+import ui_app.css { Keyword }
+import ui_app.lib { Document, drain, NoCommand, Node, NoOutput, Program, Update, textKey }
+import ui_app.program as program
+import ui_app.backend { Backend, Measured, TreeError }
+import ui_app_dom.dom { Dom }
+import ui_app_dom.wire { readByte, readWord }
+import ui_protocol.mutation { Mutation }
+import ui_protocol.record { Event }
+import ui_protocol.root { RootSupport }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.geometry.rect { Rect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+// The app: a list of rows, and groups of three parts each.
+
+struct Row {
+  id: u64,
+  label: String,
+}
+
+struct Group {
+  id: u64,
+  name: String,
+}
+
+struct Board {
+  rows: List<Row>,
+  groups: List<Group>,
+  selected: u64,
+  nextId: u64,
+}
+
+union Message {
+  AddRows,
+  AddMany,
+  AddGroup { kind: u32 },
+  Select { id: u64 },
+  Rename { id: u64 },
+  Remove { id: u64 },
+}
+
+type Next = Update<Board, NoCommand, NoOutput>
+
+effect fn digits(out: &mut Bytes, value: u64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if value >= 10 {
+    run digits(&mut out, value / 10)
+  }
+  run out.append(&[u64.toU8(value % 10) + 48])
+}
+
+effect fn named(prefix: string, number: u64) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut bytes = Bytes.make()
+  run bytes.append(String.utf8Bytes(prefix))
+  run digits(&mut bytes, number)
+  return run String.copy(unsafe String.fromUtf8Unchecked(bytes.asSlice()))
+}
+
+impl Program<Message, NoCommand> for Board {
+  effect fn init() -> Next
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut rows = List<Row>.make()
+    run rows.append(Row { id: 1, label: run named("row ", 1) })
+    run rows.append(Row { id: 2, label: run named("row ", 2) })
+    return Next.of(Board { rows: move rows, groups: List<Group>.make(), selected: 0, nextId: 3 })
+  }
+
+  effect fn update(mut model: Board, message: Message) -> Next
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match move message {
+      Message.AddRows => {
+        let mut i: u32 = 0
+        while i < 3 {
+          run model.rows.append(Row { id: model.nextId, label: run named("row ", model.nextId) })
+          model.nextId = model.nextId + 1
+          i = i + 1
+        }
+      }
+      Message.AddMany => {
+        let mut i: u32 = 0
+        while i < 500 {
+          run model.rows.append(Row { id: model.nextId, label: run named("row ", model.nextId) })
+          model.nextId = model.nextId + 1
+          i = i + 1
+        }
+      }
+      Message.AddGroup { kind } => {
+        run model.groups.append(Group { id: model.nextId, name: run named("kind-", u32.toU64(kind)) })
+        model.nextId = model.nextId + 1
+      }
+      Message.Select { id } => {
+        model.selected = id
+      }
+      Message.Rename { id } => {
+        let rows = model.rows.asMutSlice()
+        let mut i: usize = 0
+        while i < rows.length {
+          if rows[i].id == id {
+            run rows[i].label.append(" renamed")
+          }
+          i = i + 1
+        }
+      }
+      Message.Remove { id } => {
+        let mut at = usize.MAX
+        let rows = model.rows.asSlice()
+        let mut i: usize = 0
+        while i < rows.length {
+          if rows[i].id == id {
+            at = i
+          }
+          i = i + 1
+        }
+        if at != usize.MAX {
+          drop model.rows.remove(at)
+        }
+      }
+    }
+    return Next.of(move model)
+  }
+
+  fn view(model: &Board, h: &Document<Message>) -> Node {
+    return h.column(
+      &[],
+      &[
+        h.box(
+          &[h.element("ul")],
+          &[
+            h.each(
+              model.rows.asSlice(),
+              |row| h.lazy(row.id, rowHash(row, model.selected), || item(h, row, model.selected)),
+            ),
+          ],
+        ),
+        h.box(
+          &[h.element("div")],
+          &[
+            h.each(
+              model.groups.asSlice(),
+              |group| h.lazy(group.id, textKey(String.view(&group.name)), || groupView(h, group)),
+            ),
+          ],
+        ),
+      ],
+    )
+  }
+}
+
+fn rowHash(row: &Row, selected: u64) -> u64 {
+  let hash = textKey(String.view(&row.label))
+  return if row.id == selected {
+    u64.bitXor(hash, 1)
+  } else {
+    hash
+  }
+}
+
+/// Six nodes: an element with a class, text, a listener, and a box with a style and no
+/// element of its own.
+fn item(h: &Document<Message>, row: &Row, selected: u64) -> Node {
+  return h.box(
+    &[
+      h.element("li"),
+      if row.id == selected {
+        h.className("picked")
+      } else {
+        h.none()
+      },
+    ],
+    &[
+      h.box(&[h.element("span"), h.className("id")], &[h.number(u64.toI64(row.id))]),
+      h.box(
+        &[h.element("a"), h.onClick(Message.Select { id: row.id })],
+        &[h.text(String.view(&row.label))],
+      ),
+      h.box(&[h.style(&[css.display(Keyword.Block)])], &[]),
+    ],
+  )
+}
+
+/// Thirteen nodes, three of them subtrees of one shape.
+fn groupView(h: &Document<Message>, group: &Group) -> Node {
+  let name = String.view(&group.name)
+  return h.box(
+    &[h.element("section"), h.className(name)],
+    &[part(h, name, "one"), part(h, name, "two"), part(h, name, "three")],
+  )
+}
+
+fn part(h: &Document<Message>, name: string, label: string) -> Node {
+  return h.box(
+    &[h.element("p"), h.className("part")],
+    &[h.box(&[h.element("b")], &[h.text(name)]), h.text(label)],
+  )
+}
+
+// The stand-in page: what `silk-ui-dom.js` keeps of a node, for the mutations this app makes.
+
+struct Piece {
+  kind: u8,
+  tag: Bytes,
+  class: Bytes,
+  style: Bytes,
+  text: Bytes,
+  listeners: u32,
+  parent: u32,
+  kids: List<u32>,
+}
+
+impl Piece {
+  fn make(kind: u8) -> Piece {
+    return Piece {
+      kind: kind,
+      tag: Bytes.make(),
+      class: Bytes.make(),
+      style: Bytes.make(),
+      text: Bytes.make(),
+      listeners: 0,
+      parent: 0,
+      kids: List<u32>.make(),
+    }
+  }
+}
+
+/// A node of a template: what a copy of the page's node carries, and how many children.
+struct Shape {
+  kind: u8,
+  tag: Bytes,
+  class: Bytes,
+  style: Bytes,
+  text: Bytes,
+  listeners: u32,
+  kids: u32,
+}
+
+struct Page {
+  pieces: List<Piece>,
+  templates: List<List<Shape>>,
+  root: u32,
+  /// How many copies were made.
+  copies: usize,
+  /// Whether a batch held something the stand-in does not know, or named a template or a
+  /// node that is not there.
+  broken: bool,
+}
+
+effect fn readBytes(bytes: &[u8], at: &mut usize) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let length = u32.toUsize(readWord(bytes, &mut at))
+  let value = run Bytes.copy(Slice.view(bytes, at.*, length))
+  at.* = at.* + length
+  return move value
+}
+
+impl Page {
+  fn make() -> Page {
+    return Page {
+      pieces: List<Piece>.make(),
+      templates: List<List<Shape>>.make(),
+      root: 0,
+      copies: 0,
+      broken: false,
+    }
+  }
+
+  effect fn room(self: &mut Self, id: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    while self.pieces.length() <= u32.toUsize(id) {
+      run self.pieces.append(Piece.make(255))
+    }
+  }
+
+  fn has(self: &Self, id: u32) -> bool {
+    return u32.toUsize(id) < self.pieces.length() && self.pieces.asSlice()[u32.toUsize(id)].kind != 255
+  }
+
+  fn detach(self: &mut Self, id: u32) -> () {
+    let parent = self.pieces.asSlice()[u32.toUsize(id)].parent
+    if parent == 0 {
+      return ()
+    }
+    let pieces = self.pieces.asMutSlice()
+    let up = &mut pieces[u32.toUsize(parent)]
+    let mut i: usize = 0
+    while i < up.kids.length() {
+      if up.kids.get(i) == id {
+        drop up.kids.remove(i)
+      } else {
+        i = i + 1
+      }
+    }
+    let piece = &mut pieces[u32.toUsize(id)]
+    piece.parent = 0
+  }
+
+  /// The subtree of `id` in document order, as a copy of it would be made.
+  effect fn snapshot(self: &Self, id: u32, out: &mut List<Shape>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let piece = &self.pieces.asSlice()[u32.toUsize(id)]
+    run out.append(
+      Shape {
+        kind: piece.kind,
+        tag: run Bytes.copy(piece.tag.asSlice()),
+        class: run Bytes.copy(piece.class.asSlice()),
+        style: run Bytes.copy(piece.style.asSlice()),
+        text: run Bytes.copy(piece.text.asSlice()),
+        listeners: piece.listeners,
+        kids: usize.toU32(piece.kids.length()),
+      },
+    )
+    let kids = piece.kids.asSlice()
+    let mut i: usize = 0
+    while i < kids.length {
+      run self.snapshot(kids[i], &mut out)
+      i = i + 1
+    }
+  }
+
+  /// A copy of template `template`: its nodes take the ids from `top` on, in document order.
+  effect fn copy(self: &mut Self, template: usize, top: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let count = self.templates.asSlice()[template].length()
+    run self.room(top + usize.toU32(count))
+    let mut open = List<u32>.make()
+    let mut left = List<u32>.make()
+    let mut k: usize = 0
+    while k < count {
+      let id = top + usize.toU32(k)
+      let shape = &self.templates.asSlice()[template].asSlice()[k]
+      let mut piece = Piece.make(shape.kind)
+      piece.tag = run Bytes.copy(shape.tag.asSlice())
+      piece.class = run Bytes.copy(shape.class.asSlice())
+      piece.style = run Bytes.copy(shape.style.asSlice())
+      piece.text = run Bytes.copy(shape.text.asSlice())
+      piece.listeners = shape.listeners
+      let kids = shape.kids
+      if open.length() != 0 {
+        let last = open.length() - 1
+        let parent = open.get(last)
+        piece.parent = parent
+        let remaining = left.get(last) - 1
+        left.set(last, remaining)
+        let pieces = self.pieces.asMutSlice()
+        let up = &mut pieces[u32.toUsize(parent)]
+        run up.kids.append(id)
+      }
+      self.pieces.set(u32.toUsize(id), move piece)
+      run open.append(id)
+      run left.append(kids)
+      while open.length() != 0 && left.get(open.length() - 1) == 0 {
+        let last = open.length() - 1
+        drop open.remove(last)
+        drop left.remove(last)
+      }
+      k = k + 1
+    }
+    self.copies = self.copies + 1
+  }
+
+  /// Applies one batch as the page does.
+  effect fn apply(self: &mut Self, bytes: &[u8]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut at: usize = 0
+    while at < bytes.length && !self.broken {
+      let op = readByte(bytes, &mut at)
+      if op == 1 {
+        let id = readWord(bytes, &mut at)
+        let kind = readByte(bytes, &mut at)
+        run self.room(id)
+        self.pieces.set(u32.toUsize(id), Piece.make(kind))
+      } else if op == 2 {
+        let parent = readWord(bytes, &mut at)
+        let child = readWord(bytes, &mut at)
+        let before = readWord(bytes, &mut at)
+        if !self.has(parent) || !self.has(child) {
+          self.broken = true
+          return ()
+        }
+        self.detach(child)
+        let pieces = self.pieces.asMutSlice()
+        let up = &mut pieces[u32.toUsize(parent)]
+        let mut where = up.kids.length()
+        let mut i: usize = 0
+        while i < up.kids.length() {
+          if before != 0 && up.kids.get(i) == before {
+            where = i
+          }
+          i = i + 1
+        }
+        run up.kids.insert(where, child)
+        let piece = &mut pieces[u32.toUsize(child)]
+        piece.parent = parent
+      } else if op == 3 || op == 4 {
+        let id = readWord(bytes, &mut at)
+        if self.has(id) {
+          self.detach(id)
+        }
+      } else if op == 5 {
+        let id = readWord(bytes, &mut at)
+        let state = readByte(bytes, &mut at)
+        let mut count = readWord(bytes, &mut at)
+        while count > 0 {
+          let line = run readBytes(bytes, &mut at)
+          if state == 0 && self.has(id) {
+            let pieces = self.pieces.asMutSlice()
+            let piece = &mut pieces[u32.toUsize(id)]
+            run piece.style.append(line.asSlice())
+            run piece.style.append(&[59])
+          }
+          count = count - 1
+        }
+      } else if op == 7 || op == 28 {
+        let id = readWord(bytes, &mut at)
+        let value = run readBytes(bytes, &mut at)
+        if !self.has(id) {
+          self.broken = true
+          return ()
+        }
+        let pieces = self.pieces.asMutSlice()
+        let piece = &mut pieces[u32.toUsize(id)]
+        if op == 7 {
+          piece.text = move value
+        } else {
+          piece.tag = move value
+        }
+      } else if op == 9 {
+        let id = readWord(bytes, &mut at)
+        let code = readByte(bytes, &mut at)
+        if code != 18 || !self.has(id) {
+          self.broken = true
+          return ()
+        }
+        let value = run readBytes(bytes, &mut at)
+        let pieces = self.pieces.asMutSlice()
+        let piece = &mut pieces[u32.toUsize(id)]
+        piece.class = move value
+      } else if op == 10 {
+        let id = readWord(bytes, &mut at)
+        let flags = readWord(bytes, &mut at)
+        if !self.has(id) {
+          self.broken = true
+          return ()
+        }
+        let pieces = self.pieces.asMutSlice()
+        let piece = &mut pieces[u32.toUsize(id)]
+        piece.listeners = flags
+      } else if op == 11 {
+        drop readWord(bytes, &mut at)
+        self.root = readWord(bytes, &mut at)
+      } else if op == 29 {
+        let template = u32.toUsize(readWord(bytes, &mut at))
+        let top = readWord(bytes, &mut at)
+        let count = readWord(bytes, &mut at)
+        let mut shapes = List<Shape>.make()
+        if self.has(top) {
+          run self.snapshot(top, &mut shapes)
+        }
+        if shapes.length() != u32.toUsize(count) {
+          self.broken = true
+          return ()
+        }
+        while self.templates.length() <= template {
+          run self.templates.append(List<Shape>.make())
+        }
+        self.templates.set(template, move shapes)
+      } else if op == 30 {
+        let template = u32.toUsize(readWord(bytes, &mut at))
+        let top = readWord(bytes, &mut at)
+        if template >= self.templates.length() || self.templates.asSlice()[template].length() == 0 {
+          self.broken = true
+          return ()
+        }
+        run self.copy(template, top)
+        let mut count = readWord(bytes, &mut at)
+        while count > 0 {
+          let id = top + readWord(bytes, &mut at)
+          let value = run readBytes(bytes, &mut at)
+          let pieces = self.pieces.asMutSlice()
+          let piece = &mut pieces[u32.toUsize(id)]
+          if piece.kind != 1 {
+            self.broken = true
+            return ()
+          }
+          piece.text = move value
+          count = count - 1
+        }
+      } else {
+        self.broken = true
+      }
+    }
+  }
+
+  /// The page under node `id` as text: every node with its id and what it carries.
+  effect fn show(self: &Self, id: u32, out: &mut Bytes) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let piece = &self.pieces.asSlice()[u32.toUsize(id)]
+    run out.append(String.utf8Bytes("<"))
+    run out.append(piece.tag.asSlice())
+    run out.append(String.utf8Bytes("#"))
+    run digits(&mut out, u32.toU64(id))
+    run out.append(String.utf8Bytes(" kind="))
+    run digits(&mut out, u8.toU64(piece.kind))
+    run out.append(String.utf8Bytes(" class="))
+    run out.append(piece.class.asSlice())
+    run out.append(String.utf8Bytes(" style="))
+    run out.append(piece.style.asSlice())
+    run out.append(String.utf8Bytes(" hears="))
+    run digits(&mut out, u32.toU64(piece.listeners))
+    run out.append(String.utf8Bytes(">"))
+    run out.append(piece.text.asSlice())
+    let kids = piece.kids.asSlice()
+    let mut i: usize = 0
+    while i < kids.length {
+      run self.show(kids[i], &mut out)
+      i = i + 1
+    }
+    run out.append(String.utf8Bytes("</>"))
+  }
+}
+
+/// `Dom`, with every batch it writes applied to a stand-in page.
+struct Watched {
+  dom: Dom,
+  page: Page,
+  /// Whether `Dom` gets the start of a long render early (`Backend.mutateEarly`).
+  parts: bool,
+  /// How many mutations it got that way.
+  early: usize,
+}
+
+impl Watched {
+  fn make(parts: bool) -> Watched {
+    return Watched { dom: Dom.make(), page: Page.make(), parts: parts, early: 0 }
+  }
+}
+
+impl Backend for Watched {
+  fn copiesBatches(self: &Self) -> bool {
+    return Backend.copiesBatches(&self.dom)
+  }
+
+  effect fn mutate(self: &mut Self, batch: List<Mutation>) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    run Backend.mutate(&mut self.dom, move batch)
+    run self.page.apply(self.dom.out.asSlice())
+  }
+
+  effect fn mutateEarly(self: &mut Self, batch: &mut List<Mutation>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.parts {
+      self.early = self.early + batch.length()
+      run Backend.mutateEarly(&mut self.dom, &mut batch)
+    }
+  }
+
+  effect fn events(self: &mut Self, out: &mut List<Event>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run Backend.events(&mut self.dom, &mut out)
+  }
+
+  fn viewport(self: &Self, root: u32) -> Rect<f32> {
+    return Backend.viewport(&self.dom, root)
+  }
+
+  fn roots(self: &Self) -> RootSupport {
+    return Backend.roots(&self.dom)
+  }
+
+  effect fn measure(self: &Self, id: u32) -> Option<Measured>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run Backend.measure(&self.dom, id)
+  }
+}
+
+fn sameBytes(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < a.length {
+    if a[i] != b[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+/// The messages of the test, in order.
+effect fn plan() -> List<Message>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut steps = List<Message>.make()
+  // Rows: the third is the first of its shape after the start, the fourth the template, the
+  // rest copies. Then changes to copies: a class on the top node, a text inside, a removal.
+  run steps.append(Message.AddRows)
+  run steps.append(Message.AddRows)
+  run steps.append(Message.Select { id: 7 })
+  run steps.append(Message.Rename { id: 8 })
+  run steps.append(Message.Remove { id: 6 })
+  run steps.append(Message.AddRows)
+  run steps.append(Message.Select { id: 9 })
+  // Groups: copies inside a subtree that is new, that becomes a template, and that is a
+  // copy itself. Thirty-two kinds twice over fill the page's templates, so the oldest (the
+  // part inside every group) is replaced; a kind made again then defines it inside a copy.
+  let mut kind: u32 = 0
+  while kind < 32 {
+    run steps.append(Message.AddGroup { kind: kind })
+    run steps.append(Message.AddGroup { kind: kind })
+    kind = kind + 1
+  }
+  run steps.append(Message.AddGroup { kind: 5 })
+  run steps.append(Message.AddGroup { kind: 5 })
+  run steps.append(Message.AddGroup { kind: 40 })
+  run steps.append(Message.AddGroup { kind: 40 })
+  run steps.append(Message.AddGroup { kind: 40 })
+  run steps.append(Message.AddRows)
+  return move steps
+}
+
+effect fn copiesBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut plain = Watched.make(false)
+  let mut copied = Watched.make(true)
+  let mut first = run program.make<Board, Message, NoCommand>()
+  let mut second = run program.make<Board, Message, NoCommand>()
+  run first.start(&mut plain, 0.0)
+  run drain(&mut first, &mut plain)
+  run second.start(&mut copied, 0.0)
+  run drain(&mut second, &mut copied)
+  // As the page does once the first render is over.
+  copied.dom.cloning = true
+
+  let mut steps = run plan()
+  let mut again = run plan()
+  while steps.length() != 0 {
+    first.send(steps.remove(0))
+    run drain(&mut first, &mut plain)
+    second.send(again.remove(0))
+    run drain(&mut second, &mut copied)
+    run Testing.expect(!plain.page.broken, "the stand-in reads every batch")
+    run Testing.expect(!copied.page.broken, "and every batch with copies")
+    let mut built = Bytes.make()
+    run plain.page.show(plain.page.root, &mut built)
+    let mut cloned = Bytes.make()
+    run copied.page.show(copied.page.root, &mut cloned)
+    run Testing.expect(sameBytes(built.asSlice(), cloned.asSlice()), "copies give the same page")
+  }
+  run Testing.expect(plain.page.copies == 0, "no copies unless the page asked")
+  run Testing.expect(copied.page.copies > 40, "rows and groups are copies")
+}
+
+/// A render with more mutations than `Dom` is given at once: the page is the one a single
+/// batch gives, with copies and without.
+effect fn partsBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut whole = Watched.make(false)
+  let mut parts = Watched.make(true)
+  let mut copied = Watched.make(true)
+  let mut first = run program.make<Board, Message, NoCommand>()
+  let mut second = run program.make<Board, Message, NoCommand>()
+  let mut third = run program.make<Board, Message, NoCommand>()
+  run first.start(&mut whole, 0.0)
+  run drain(&mut first, &mut whole)
+  run second.start(&mut parts, 0.0)
+  run drain(&mut second, &mut parts)
+  run third.start(&mut copied, 0.0)
+  run drain(&mut third, &mut copied)
+  copied.dom.cloning = true
+
+  let mut round: u32 = 0
+  while round < 3 {
+    // 500 rows, then changes to rows made in different parts of that render.
+    let mut step: u32 = 0
+    while step < 4 {
+      // Ids start at 3 (`init` makes two rows), and each round adds 500.
+      let last: u64 = 2 + 500 * (u32.toU64(round) + 1)
+      first.send(partStep(step, last))
+      run drain(&mut first, &mut whole)
+      second.send(partStep(step, last))
+      run drain(&mut second, &mut parts)
+      third.send(partStep(step, last))
+      run drain(&mut third, &mut copied)
+      run Testing.expect(!whole.page.broken && !parts.page.broken && !copied.page.broken, "every batch reads")
+      let mut one = Bytes.make()
+      run whole.page.show(whole.page.root, &mut one)
+      let mut two = Bytes.make()
+      run parts.page.show(parts.page.root, &mut two)
+      let mut three = Bytes.make()
+      run copied.page.show(copied.page.root, &mut three)
+      run Testing.expect(sameBytes(one.asSlice(), two.asSlice()), "parts give the same page")
+      run Testing.expect(sameBytes(one.asSlice(), three.asSlice()), "and so do parts with copies")
+      run Testing.expect(first.stats.mutations == second.stats.mutations, "the count has the parts")
+      step = step + 1
+    }
+    round = round + 1
+  }
+  run Testing.expect(whole.early == 0, "a backend that is not asked gets one batch")
+  run Testing.expect(parts.early >= 3 * 4096, "each long render went in parts")
+  run Testing.expect(copied.early >= 3 * 4096, "with copies too")
+  run Testing.expect(copied.page.copies > 1200, "nearly every row is a copy")
+}
+
+fn partStep(step: u32, last: u64) -> Message {
+  if step == 0 {
+    return Message.AddMany
+  }
+  if step == 1 {
+    return Message.Rename { id: last - 250 }
+  }
+  if step == 2 {
+    return Message.Select { id: last - 20 }
+  }
+  return Message.Remove { id: last - 400 }
+}
+
+test effect fn longRendersGoInParts() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run partsBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn copiedSubtreesGiveTheSamePage() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run copiesBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}

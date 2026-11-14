@@ -1,0 +1,677 @@
+//! Serves the image, icon and font face URLs a tree asks for (`Mutation.LoadImage`, `LoadIcon`
+//! and `LoadFontFace`, taken with `UiTree.takeLoads`) on a native host. The URL's scheme picks
+//! the loader:
+//!
+//! - a relative URL (`"photos/dusk.png"`) is one of the app's own files: one the app embedded
+//!   with [`Loader.file`] (bytes the program carries, from `Source.read`), or else the file at
+//!   that path from the working directory;
+//! - `file:` reads a local file, and `http:` and `https:` fetch with the standard HTTP client,
+//!   both off the UI thread (see `images`; not in a WebAssembly host, see `remote`);
+//! - `data:` holds the bytes in the URL itself, base64 or percent-encoded.
+//!
+//! When a load ends, the tree tells the nodes showing it (`UiTree.settleSource`): each that
+//! listens gets a `load` or `error` record, as an `img` element does on the web. A font face
+//! gets its file (`UiTree.loadFontFace`; WOFF and WOFF2 are decoded to TrueType or OpenType
+//! with `font_web`) or fails, and its text keeps the fallback.
+//!
+//! A font stylesheet (`Mutation.LoadFontStylesheet`, such as a Google Fonts `css2` URL) is read
+//! or fetched the same way (`Images.forSheets`, parsed by `sheets`), and each of its `@font-face` rules is declared into
+//! the tree (`UiTree.declareHostFontFace`), whose file the tree asks for once text needs it.
+import remote { Remote, ImageState, SheetData }
+import sheets { rulesOf }
+import ui_tree.legacy { UiTree, TreeError, Batch, Mutation }
+import ui_tree.lib { FaceRule, FaceStyle, Range, UnicodeRange }
+import font_web.lib { decode as decodeFont, WebFontError }
+import font_web.stylesheet { FontFaceRule, FaceStyle as SheetStyle, Range as SheetRange }
+import codec.decode
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.encoding.base64 { Base64 }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.string { String }
+import silk.url.percent { UrlPercent }
+
+/// A font stylesheet being read: where its relative `src` URLs resolve.
+struct SheetLoad {
+  id: u32,
+  /// The sheet's directory, for a local sheet.
+  directory: String,
+  /// The sheet's URL, for one fetched over HTTP(S).
+  base: String,
+}
+
+/// A file the program carries, served for the relative URL `path`.
+struct File {
+  path: string<'static>,
+  data: &'static [u8],
+}
+
+/// How a load ended.
+struct Settled {
+  resource: u32,
+  /// Whether the resource is an icon rather than an image.
+  icon: bool,
+  ok: bool,
+}
+
+impl Copy for Settled {}
+
+/// Loads the sources of one tree by URL scheme. See the module documentation.
+pub struct Loader {
+  files: List<File>,
+  remote: Remote,
+  /// Resources handed to `remote` that have not settled, and whether each is an icon.
+  waiting: List<Settled>,
+  settled: List<Settled>,
+  /// Font files, by face id.
+  faces: Remote,
+  /// Faces handed to `faces` that have not settled.
+  waitingFaces: List<u32>,
+  /// Font stylesheets, by an id of the loader's own.
+  sheets: Remote,
+  waitingSheets: List<SheetLoad>,
+  nextSheet: u32,
+}
+
+impl Loader {
+  pub fn make() -> Loader {
+    return Loader {
+      files: List<File>.make(),
+      remote: Remote.make(),
+      waiting: List<Settled>.make(),
+      settled: List<Settled>.make(),
+      faces: Remote.forFonts(),
+      waitingFaces: List<u32>.make(),
+      sheets: Remote.forSheets(),
+      waitingSheets: List<SheetLoad>.make(),
+      nextSheet: 1,
+    }
+  }
+
+  /// Serves the relative URL `path` (`"photos/dusk.png"`) from `data`, bytes the program
+  /// carries: `loader.file("photos/dusk.png", Source.read("assets/photos/dusk.png"))`.
+  pub effect fn file(self: &mut Self, path: string<'static>, data: &'static [u8]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.files.append(File { path: path, data: data })
+  }
+
+  /// Starts the loads `tree` asked for since the last call and installs the ones that
+  /// finished. Returns whether a resource changed or a load ended, so the host takes the
+  /// tree's records and draws again.
+  pub effect fn serve(self: &mut Self, tree: &mut UiTree<'_>) -> bool
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut changed = false
+    let loads = run tree.takeLoads()
+    let list = loads.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      match &list[i] {
+        Mutation.LoadImage { resource, url } => {
+          changed = (run self.start(&mut tree, resource, false, String.view(&url))) || changed
+        }
+        Mutation.LoadIcon { resource, url } => {
+          changed = (run self.start(&mut tree, resource, true, String.view(&url))) || changed
+        }
+        Mutation.LoadFontFace { face, url } => {
+          changed = (run self.startFace(&mut tree, face, String.view(&url))) || changed
+        }
+        Mutation.LoadFontStylesheet { url } => {
+          changed = (run self.startSheet(&mut tree, String.view(&url))) || changed
+        }
+        _ => {}
+      }
+      i = i + 1
+    }
+    if self.waitingSheets.length() > 0 {
+      changed = (run self.sheets.poll(&mut tree)) || changed
+      let mut read = List<SheetData>.make()
+      run self.sheets.takeSheets(&mut read)
+      let done = read.asSlice()
+      let mut d: usize = 0
+      while d < done.length {
+        let loads = self.waitingSheets.asSlice()
+        let mut l: usize = 0
+        while l < loads.length {
+          if loads[l].id == done[d].id {
+            let rules = run rulesOf(done[d].css.asSlice(), String.view(&loads[l].base))
+            drop run declareRules(&mut tree, rules.asSlice(), String.view(&loads[l].directory))
+            changed = true
+          }
+          l = l + 1
+        }
+        d = d + 1
+      }
+      // A sheet that was read or failed is done, as a failed stylesheet link is.
+      let mut w: usize = 0
+      while w < self.waitingSheets.length() {
+        if self.sheets.state(self.waitingSheets.asSlice()[w].id) == ImageState.Loading {
+          w = w + 1
+          continue
+        }
+        drop self.waitingSheets.remove(w)
+      }
+    }
+    if self.waiting.length() > 0 {
+      changed = (run self.remote.poll(&mut tree)) || changed
+      let mut w: usize = 0
+      while w < self.waiting.length() {
+        let entry = self.waiting.asSlice()[w]
+        let state = self.remote.state(entry.resource)
+        if state == ImageState.Loading {
+          w = w + 1
+          continue
+        }
+        drop self.waiting.remove(w)
+        run self.settle(entry.resource, entry.icon, state == ImageState.Ready)
+      }
+    }
+    if self.waitingFaces.length() > 0 {
+      changed = (run self.faces.poll(&mut tree)) || changed
+      let mut w: usize = 0
+      while w < self.waitingFaces.length() {
+        let face = self.waitingFaces.get(w)
+        let state = self.faces.state(face)
+        if state == ImageState.Loading {
+          w = w + 1
+          continue
+        }
+        drop self.waitingFaces.remove(w)
+        if state != ImageState.Ready {
+          tree.failFontFace(face)
+        }
+        changed = true
+      }
+    }
+    // The nodes showing a settled source hear `load` or `error`.
+    let settled = Intrinsic.replace(self.settled, List<Settled>.make())
+    let ended = settled.asSlice()
+    changed = changed || ended.length > 0
+    let mut e: usize = 0
+    while e < ended.length {
+      run tree.settleSource(ended[e].resource, ended[e].ok)
+      e = e + 1
+    }
+    return changed
+  }
+
+  /// Whether loads are still running, so the host keeps polling.
+  pub fn pending(self: &Self) -> bool {
+    return self.waiting.length() > 0 || self.remote.pending() || self.waitingFaces.length() > 0
+      || self.faces.pending() || self.waitingSheets.length() > 0 || self.sheets.pending()
+  }
+
+  /// Starts loading the font stylesheet at `url`, by scheme as for images. Returns whether
+  /// faces were declared at once (the sheet was at hand).
+  effect fn startSheet(self: &mut Self, tree: &mut UiTree<'_>, url: string) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let bytes = String.utf8Bytes(url)
+    let scheme = schemeLength(bytes)
+    if scheme == 0 {
+      let path = relative(bytes)
+      let directory = String.slice(url, bytes.length - path.length, directoryLength(path))
+      let files = self.files.asSlice()
+      let mut f: usize = 0
+      while f < files.length {
+        if same(String.utf8Bytes(files[f].path), path) {
+          let rules = run rulesOf(files[f].data, "")
+          return run declareRules(&mut tree, rules.asSlice(), directory)
+        }
+        f = f + 1
+      }
+      drop files
+      let id = run self.sheetLoad(directory, "")
+      run self.sheets.sheetFile(id, String.slice(url, bytes.length - path.length, path.length))
+      return false
+    }
+    if lowered(bytes, scheme, "data") {
+      let mut decoded = Bytes.make()
+      if run dataBytes(&mut decoded, Slice.view(bytes, scheme + 1, bytes.length - scheme - 1)) {
+        let rules = run rulesOf(decoded.asSlice(), "")
+        return run declareRules(&mut tree, rules.asSlice(), "")
+      }
+      return false
+    }
+    if lowered(bytes, scheme, "file") {
+      let mut path = String.make()
+      run UrlPercent.appendDecodedText(&mut path, filePath(bytes, scheme), false)
+      let directory = String.slice(url, 0, directoryLength(bytes))
+      let id = run self.sheetLoad(directory, "")
+      run self.sheets.sheetFile(id, String.view(&path))
+      return false
+    }
+    if lowered(bytes, scheme, "http") || lowered(bytes, scheme, "https") {
+      let id = run self.sheetLoad("", url)
+      run self.sheets.sheetUrl(id, url)
+    }
+    return false
+  }
+
+  /// Records a stylesheet about to be read, and returns its id.
+  effect fn sheetLoad(self: &mut Self, directory: string, base: string) -> u32
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let id = self.nextSheet
+    self.nextSheet = id + 1
+    run self.waitingSheets.append(
+      SheetLoad { id: id, directory: run String.copy(directory), base: run String.copy(base) },
+    )
+    return id
+  }
+
+  /// Starts loading the file of font face `face` from `url`. Returns whether the face changed
+  /// at once (it loaded or failed).
+  effect fn startFace(self: &mut Self, tree: &mut UiTree<'_>, face: u32, url: string) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let bytes = String.utf8Bytes(url)
+    let scheme = schemeLength(bytes)
+    if scheme == 0 {
+      let path = relative(bytes)
+      let mut found = Option<&'static [u8]>.None
+      let files = self.files.asSlice()
+      let mut f: usize = 0
+      while f < files.length {
+        if same(String.utf8Bytes(files[f].path), path) {
+          found = Option<&'static [u8]>.some(files[f].data)
+          break
+        }
+        f = f + 1
+      }
+      drop files
+      if let Option<&'static [u8]>.Some { value: data } = found {
+        return run installFace(&mut tree, face, data)
+      }
+      run self.faces.fontFile(face, String.slice(url, bytes.length - path.length, path.length))
+      run self.waitingFaces.append(face)
+      return false
+    }
+    if lowered(bytes, scheme, "data") {
+      let mut decoded = Bytes.make()
+      if run dataBytes(&mut decoded, Slice.view(bytes, scheme + 1, bytes.length - scheme - 1)) {
+        return run installFace(&mut tree, face, decoded.asSlice())
+      }
+      tree.failFontFace(face)
+      return true
+    }
+    if lowered(bytes, scheme, "file") {
+      let mut path = String.make()
+      run UrlPercent.appendDecodedText(&mut path, filePath(bytes, scheme), false)
+      run self.faces.fontFile(face, String.view(&path))
+      run self.waitingFaces.append(face)
+      return false
+    }
+    if lowered(bytes, scheme, "http") || lowered(bytes, scheme, "https") {
+      run self.faces.fontUrl(face, url)
+      run self.waitingFaces.append(face)
+      return false
+    }
+    tree.failFontFace(face)
+    return true
+  }
+
+  effect fn settle(self: &mut Self, resource: u32, icon: bool, ok: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.settled.append(Settled { resource: resource, icon: icon, ok: ok })
+  }
+
+  effect fn wait(self: &mut Self, resource: u32, icon: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.waiting.append(Settled { resource: resource, icon: icon, ok: false })
+  }
+
+  /// Starts loading `url` as `resource`. Returns whether it was installed at once.
+  effect fn start(self: &mut Self, tree: &mut UiTree<'_>, resource: u32, icon: bool, url: string) -> bool
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let bytes = String.utf8Bytes(url)
+    let scheme = schemeLength(bytes)
+    if scheme == 0 {
+      let path = relative(bytes)
+      let mut found = Option<&'static [u8]>.None
+      let files = self.files.asSlice()
+      let mut f: usize = 0
+      while f < files.length {
+        if same(String.utf8Bytes(files[f].path), path) {
+          found = Option<&'static [u8]>.some(files[f].data)
+          break
+        }
+        f = f + 1
+      }
+      drop files
+      if let Option<&'static [u8]>.Some { value: data } = found {
+        return run self.install(&mut tree, resource, icon, data)
+      }
+      let local = String.slice(url, bytes.length - path.length, path.length)
+      if icon {
+        run self.remote.fileIcon(resource, local)
+      } else {
+        run self.remote.file(resource, local)
+      }
+      run self.wait(resource, icon)
+      return false
+    }
+    if lowered(bytes, scheme, "data") {
+      let mut decoded = Bytes.make()
+      if run dataBytes(&mut decoded, Slice.view(bytes, scheme + 1, bytes.length - scheme - 1)) {
+        return run self.install(&mut tree, resource, icon, decoded.asSlice())
+      }
+      run self.settle(resource, icon, false)
+      return false
+    }
+    if lowered(bytes, scheme, "file") {
+      let mut path = String.make()
+      run UrlPercent.appendDecodedText(&mut path, filePath(bytes, scheme), false)
+      if icon {
+        run self.remote.fileIcon(resource, String.view(&path))
+      } else {
+        run self.remote.file(resource, String.view(&path))
+      }
+      run self.wait(resource, icon)
+      return false
+    }
+    if lowered(bytes, scheme, "http") || lowered(bytes, scheme, "https") {
+      if icon {
+        run self.remote.urlIcon(resource, url)
+      } else {
+        run self.remote.url(resource, url)
+      }
+      run self.wait(resource, icon)
+      return false
+    }
+    // No loader for this scheme.
+    run self.settle(resource, icon, false)
+    return false
+  }
+
+  /// Installs bytes the loader has at hand. A file that does not decode fails its load only.
+  effect fn install(self: &mut Self, tree: &mut UiTree<'_>, resource: u32, icon: bool, data: &[u8]) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut batch = Batch.make()
+    if icon {
+      run batch.icon(resource, data)
+    } else {
+      let decoded = run Effect.result(decode.decodeSrgb(data))
+      match move decoded {
+        Result.Success { value } => run batch.decodedImage(resource, move value)
+        Result.Failure { error } => {
+          drop error
+          run self.settle(resource, icon, false)
+          return false
+        }
+      }
+    }
+    let ok = run Effect.catch<TreeError>(applied(&mut tree, run batch.take()), notApplied)
+    run self.settle(resource, icon, ok)
+    return ok
+  }
+}
+
+/// Gives face `face` the font file `data` the loader has at hand: TrueType, OpenType, or WOFF
+/// and WOFF2, decoded.
+effect fn installFace(tree: &mut UiTree<'_>, face: u32, data: &[u8]) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let decoded = run Effect.result(decodeFont(data))
+  match move decoded {
+    Result.Success { value } => {
+      if !(run tree.loadFontFace(face, move value, 0)) {
+        tree.failFontFace(face)
+      }
+    }
+    Result.Failure { error } => match move error {
+      WebFontError failure => {
+        drop failure
+        tree.failFontFace(face)
+      }
+      OutOfMemoryError failure => {
+          fail move failure
+        }
+    }
+  }
+  return true
+}
+
+/// Declares the `@font-face` rules of a stylesheet into the tree, each with its first source
+/// in a format the loader reads; a rule without one is skipped, as a browser skips it. A
+/// relative source URL is resolved against `directory`, the sheet's own. Returns whether a
+/// face was declared.
+pub effect fn declareRules(tree: &mut UiTree<'_>, rules: &[FontFaceRule], directory: string) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut declared = false
+  let mut i: usize = 0
+  while i < rules.length {
+    if let Option<string>.Some { value: url } = rules[i].url() {
+      let rule = run faceRule(&rules[i])
+      let bytes = String.utf8Bytes(url)
+      if String.byteLength(directory) > 0 && schemeLength(bytes) == 0
+        && (bytes.length == 0 || bytes[0] != 47) {
+        let mut joined = String.make()
+        run String.append(&mut joined, directory)
+        run String.append(&mut joined, url)
+        drop run tree.declareHostFontFace(move rule, String.view(&joined))
+      } else {
+        drop run tree.declareHostFontFace(move rule, url)
+      }
+      declared = true
+    }
+    i = i + 1
+  }
+  return declared
+}
+
+/// The tree's rule for a stylesheet rule. A descriptor left `auto` takes what a browser
+/// assumes before the file is there: weight 400, width 100%, upright.
+pub effect fn faceRule(rule: &FontFaceRule) -> FaceRule
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let weight = match &rule.weight {
+    Option<SheetRange>.Some { value } => Range { min: value.min, max: value.max }
+    Option<SheetRange>.None => Range { min: 400.0, max: 400.0 }
+  }
+  let mut made = run FaceRule.make(rule.family.asSlice(), weight)
+  if let Option<SheetRange>.Some { value } = &rule.width {
+    made.width = Range { min: value.min, max: value.max }
+  }
+  made.style = match &rule.style {
+    Option<SheetStyle>.Some { value } => match value {
+      SheetStyle.Normal => FaceStyle.Normal
+      SheetStyle.Italic => FaceStyle.Italic
+      SheetStyle.Oblique { min, max } => FaceStyle.Oblique { min: min, max: max }
+    }
+    Option<SheetStyle>.None => FaceStyle.Normal
+  }
+  let ranges = rule.ranges.asSlice()
+  let mut r: usize = 0
+  while r < ranges.length {
+    run made.ranges.append(UnicodeRange { first: ranges[r].start, last: ranges[r].end })
+    r = r + 1
+  }
+  return move made
+}
+
+/// The length of `path` up to and with its last `/`: the directory a relative URL in the
+/// file resolves against.
+fn directoryLength(path: &[u8]) -> usize {
+  let mut end = path.length
+  while end > 0 {
+    if path[end - 1] == 47 {
+      return end
+    }
+    end = end - 1
+  }
+  return 0
+}
+
+effect fn applied(tree: &mut UiTree<'_>, mutations: List<Mutation>) -> bool
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  run tree.apply(move mutations)
+  return true
+}
+
+effect fn notApplied(error: TreeError) -> bool {
+  drop error
+  return false
+}
+
+/// The length of the URL's scheme (`https` in `https://…`), or 0 for a relative URL. A
+/// single letter before `:` is a Windows drive, not a scheme.
+pub fn schemeLength(bytes: &[u8]) -> usize {
+  let mut i: usize = 0
+  while i < bytes.length {
+    let c = bytes[i]
+    let letter = (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+    if c == 58 {
+      return if i > 1 { i } else { 0 }
+    }
+    if i == 0 && !letter {
+      return 0
+    }
+    if !letter && !(c >= 48 && c <= 57) && c != 43 && c != 45 && c != 46 {
+      return 0
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+/// Whether the first `length` bytes are `name`, ignoring ASCII case.
+fn lowered(bytes: &[u8], length: usize, name: string) -> bool {
+  let wanted = String.utf8Bytes(name)
+  if wanted.length != length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < length {
+    let mut c = bytes[i]
+    if c >= 65 && c <= 90 {
+      c = c + 32
+    }
+    if c != wanted[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < left.length {
+    if left[i] != right[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+/// A relative URL without its leading `./` or `/`, query and fragment.
+fn relative(bytes: &[u8]) -> &[u8] {
+  let mut start: usize = 0
+  while true {
+    if bytes.length - start >= 2 && bytes[start] == 46 && bytes[start + 1] == 47 {
+      start = start + 2
+    } else if bytes.length - start >= 1 && bytes[start] == 47 {
+      start = start + 1
+    } else {
+      break
+    }
+  }
+  let mut end = start
+  while end < bytes.length && bytes[end] != 63 && bytes[end] != 35 {
+    end = end + 1
+  }
+  return Slice.view(bytes, start, end - start)
+}
+
+/// The path of a `file:` URL: after `file://` and its host, still percent-encoded.
+fn filePath(bytes: &[u8], scheme: usize) -> &[u8] {
+  let mut start = scheme + 1
+  if bytes.length >= start + 2 && bytes[start] == 47 && bytes[start + 1] == 47 {
+    start = start + 2
+    while start < bytes.length && bytes[start] != 47 {
+      start = start + 1
+    }
+  }
+  let mut end = start
+  while end < bytes.length && bytes[end] != 63 && bytes[end] != 35 {
+    end = end + 1
+  }
+  // `file:///C:/x` names `C:/x` on Windows.
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    if end - start >= 3 && bytes[start] == 47 && bytes[start + 2] == 58 {
+      start = start + 1
+    }
+  }
+  return Slice.view(bytes, start, end - start)
+}
+
+/// Decodes the part of a `data:` URL after `data:` into `output`: `[type][;base64],payload`.
+/// Returns false when it is malformed.
+effect fn dataBytes(output: &mut Bytes, rest: &[u8]) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut comma: usize = 0
+  while comma < rest.length && rest[comma] != 44 {
+    comma = comma + 1
+  }
+  if comma == rest.length {
+    return false
+  }
+  let header = Slice.view(rest, 0, comma)
+  let payload = Slice.view(rest, comma + 1, rest.length - comma - 1)
+  let base64 = header.length >= 7
+    && lowered(Slice.view(header, header.length - 7, 7), 7, ";base64")
+  let mut text = Bytes.make()
+  run UrlPercent.appendDecoded(&mut text, payload, false)
+  if !base64 {
+    run Bytes.append(&mut output, text.asSlice())
+    return true
+  }
+  // Base64 in a URL may carry spaces or line breaks; they are not part of the data.
+  let mut packed = Bytes.make()
+  let raw = text.asSlice()
+  let mut i: usize = 0
+  while i < raw.length {
+    let c = raw[i]
+    if c != 32 && c != 9 && c != 10 && c != 13 && c != 12 {
+      let one: [u8; 1] = [c]
+      run packed.append(&one)
+    }
+    i = i + 1
+  }
+  let size = match Base64.decodedLength(packed.asSlice()) {
+    Result.Success { value } => value
+    Result.Failure { error } => {
+      drop error
+      return false
+    }
+  }
+  let mut decoded = run Bytes.zeroed(size)
+  return match Base64.decodeInto(decoded.asMutSlice(), packed.asSlice()) {
+    Result.Success { value } => {
+      run Bytes.append(&mut output, Slice.view(decoded.asSlice(), 0, value))
+      true
+    }
+    Result.Failure { error } => {
+      drop error
+      false
+    }
+  }
+}

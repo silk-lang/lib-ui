@@ -1,0 +1,136 @@
+//! What the development and the production host share: the realm, the window, and the
+//! command line's entry path and `--check`.
+import ui_js.lib { JsError, uiPackage }
+import ui_js_window.lib { JsApp, JsClient, JsTools }
+import ui_tree.legacy { TreeError, Mutation }
+import ui_tree_window.host { RunOptions, runWindow, StartedGpu, startGpu }
+import ui_tree_window.platform_thread { Launched }
+import ui_tree_window.console { StderrWriter }
+import font_collection.lib { Generic, FontCollection }
+import font_collection.system as systemFonts
+import font_collection.system { Options as FontOptions, Report as FontReport }
+import ui_fixtures.fixtures as fixtures
+import ui_inspect_server.lib { Inspector }
+import silkjs.js_atomics_native { WaiterDomain, SynchronizationError }
+import silkjs.runtime_memory { RuntimeAllocator }
+import silkjs.js_libc_platform as platform
+import window.types { WindowError, TitleBar }
+import webgpu.runtime { GpuError }
+import atlas.atlas { AtlasError }
+import vector.geometry_error { GeometryError }
+import silk.build.source { Source }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.filesystem { FileSystem, FileError, Path }
+import silk.system.filesystem_machine { MachineFileSystem }
+import silk.system.host_input { HostInput }
+
+/// Runs the entry at `entry` (the demo counter when empty) in a window with `tools`. The font
+/// files under `fontDirectory`, when it is not empty, join the bundled fonts.
+pub effect fn program<T: JsTools>(check: bool, entry: &[u8], fontDirectory: &[u8], tools: T, inspector: Inspector, launched: Option<Launched>) -> i32
+  ! TreeError | WindowError | GpuError | AtlasError | GeometryError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError
+  ? &mut Allocator {
+  // The GPU first: it takes longer than the fonts, the script and the realm together.
+  let gpu = run startGpu(check)
+  let mut fonts = run fixtures.fonts()
+  // CSS generic families, for `fontFamily: "monospace"` and nodes that name no family.
+  run fonts.addGeneric(Generic.SansSerif, b"Noto Sans")
+  run fonts.addGeneric(Generic.SystemUi, b"Noto Sans")
+  run fonts.addGeneric(Generic.Monospace, b"Geist Mono")
+  if fontDirectory.length != 0 {
+    if let Result.Failure { error } = run Effect.result(addFonts(&mut fonts, fontDirectory)) {
+      drop error
+      StderrWriter.print("The --fonts directory could not be read\n", &())
+    }
+  }
+  // `@silk/ui` and the starter page are part of the binary, so it runs from any directory.
+  let domain = run WaiterDomain.make()
+  let allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let memory = run allocator.observe()
+  let mut app = run JsApp.open(&memory, move allocator, domain.handle())
+  run app.define(b"@silk/ui", uiPackage())
+  if entry.length == 0 {
+    run app.entry(b"app.js", Source.read("app.js"))
+  } else {
+    let source = run Effect.catchAll(platform.readFile(entry), unreadable)
+    run app.entry(b"app.js", source.asSlice())
+  }
+  let mut client = JsClient.make(move tools)
+  // The page draws its own bar, 56 pixels tall: on macOS the window controls sit in it.
+  client.titleBar = TitleBar.Transparent
+  client.titleBarHeight = 56.0
+  let options = RunOptions {
+    title: "Silk UI",
+    width: 1040.0,
+    height: 720.0,
+    check: check,
+    checkClick: "counter",
+    checkExpect: "CLICKED",
+    lowestLatency: false,
+    platform: move launched,
+    gpu: Option<StartedGpu>.some(move gpu),
+  }
+  let status = run Effect.result(runWindow(&mut app, &fonts, List<Mutation>.make(), move options, move inspector, &mut client))
+  run app.close()
+  return match move status {
+    Result<i32, WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError>.Success { value } => value
+    Result<i32, WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError>.Failure { error } => { fail move error }
+  }
+}
+
+effect fn addFonts(fonts: &mut FontCollection, directory: &[u8]) -> () ! FileError | OutOfMemoryError ? &mut Allocator {
+  let mut files = run MachineFileSystem.make()
+  let path = run Path.fromBytes(directory)
+  let options = FontOptions { maxFiles: 256, maxBytes: 268435456, maxDepth: 4 }
+  let mut report = FontReport.empty()
+  run systemFonts.directory(&mut fonts, &path, &options, &mut report, 0)
+    |> Effect.provideMut<FileSystem>(&mut files)
+  if report.files == 0 {
+    StderrWriter.print("No font files were found in the --fonts directory\n", &())
+  }
+}
+
+effect fn unreadable<E>(error: E) -> List<u8> ! E {
+  StderrWriter.print("The entry module could not be read: check the path given on the command line\n", &())
+  fail move error
+}
+
+pub effect fn failed<E>(error: E) -> i32 {
+  drop error
+  StderrWriter.print("The JavaScript window host failed\n", &())
+  return 2
+}
+
+effect fn noArgument<E>(error: E) -> Option<Bytes> {
+  drop error
+  return Option<Bytes>.None
+}
+
+pub fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut i: usize = 0
+  while i < left.length {
+    if left[i] != right[i] { return false }
+    i = i + 1
+  }
+  return true
+}
+
+/// Command line argument `i`, or none.
+pub effect fn argument(i: usize) -> Option<Bytes> ? &mut HostInput | &mut Allocator {
+  return run Effect.catchAll(HostInput.argument(i), noArgument)
+}
+
+effect fn noArguments<E>(error: E) -> usize {
+  drop error
+  return 0
+}
+
+/// How many command line arguments there are, the program's name included.
+pub effect fn argumentCount() -> usize ? &mut HostInput {
+  return run Effect.catchAll(HostInput.argumentCount(), noArguments)
+}

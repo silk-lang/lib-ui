@@ -10,11 +10,16 @@ import cssom_view
 import cssom_view { ScrollAnimation }
 import svg_css.cssom_view_window { ScrollState, ViewTarget, ViewTargetKind }
 import svg_css.cssom_error { CssomError }
+import ui_protocol.grid { Grid }
+import grid_css
+import expand
 import ui_protocol.options { RootOptions }
 import ui_protocol.root { RootEvent, RootEventKind, RootSupport, ExtraRoot }
 import mutation {
   Mutation,
   FIRST_ROOT,
+  FACE_ITALIC,
+  FACE_OBLIQUE,
   NodeKind,
   StyleState,
   Declaration,
@@ -29,6 +34,8 @@ import mutation {
   LISTEN_FOCUS,
   LISTEN_BLUR,
   LISTEN_LAYOUT,
+  LISTEN_LOAD,
+  LISTEN_ERROR,
   NOT_FOCUSABLE
 }
 import css
@@ -50,6 +57,7 @@ import node {
   Event,
   PaintCache,
   Node,
+  Semantics,
   FaceSlot,
   Pending
 }
@@ -57,7 +65,10 @@ import paint { TextInk, Painter, paintRoots, hashFragments, inkFragments }
 import resources { Families, Resources, Resource, ResourceError }
 import provider { Provider }
 import ui_text.system { TextSystem }
-import ui_text.fonts { TextStyle as FontStyleRequest }
+import ui_text.fonts { TextStyle as FontStyleRequest, Treatment }
+import ui_text.set { FaceRule, UnicodeRange }
+import svg_fonts.database { FaceStyle as RuleStyle, Range as RuleRange }
+import svg_fonts.names { same as sameFamilyName }
 import font_collection.lib { FontCollection, Family, Request, Style as FaceStyle }
 import font_raster.cache { GlyphCache }
 import font_raster.face { FontFace }
@@ -83,10 +94,12 @@ import silk.collections.hash_map { HashMap }
 import silk.collections.list { List }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
+import silk.mem.box { Box }
 import silk.core.ownership { Copy }
 import silk.geometry.rect { Rect }
 import silk.geometry.vector { Vector2 }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.box { Box }
 import silk.num.f32
 import silk.num.u32
 import silk.num.u64
@@ -297,15 +310,41 @@ fn reachesEveryRoot(mutation: &Mutation) -> bool {
   }
 }
 
+/// Where the file of a face declared with a URL is, and whether the host was asked for it.
+struct FaceSource {
+  id: u32,
+  url: String,
+  asked: bool,
+}
+
+/// The first id of the faces a host declares (`declareHostFontFace`), above the ids clients
+/// choose.
+const FIRST_HOST_FACE: u32 = 0x80000000
+
+/// A font face a client declared, by the client's id.
+struct FontFaceEntry {
+  id: u32,
+  /// Its index in the text system's font set.
+  declared: usize,
+}
+
+impl Copy for FontFaceEntry {}
+
 struct FontKeyEntry {
   family: u32,
   size: f32,
   weight: f32,
   italic: bool,
+  treatment: Treatment,
   key: usize,
 }
 
 impl Copy for FontKeyEntry {}
+
+fn sameTreatment(a: Treatment, b: Treatment) -> bool {
+  return a.letterSpacing == b.letterSpacing && a.wordSpacing == b.wordSpacing && a.transform == b.transform
+    && a.wordBreak == b.wordBreak && a.overflowWrap == b.overflowWrap
+}
 
 effect fn layoutFailed<E>(error: E) -> never
   ! TreeError {
@@ -366,6 +405,10 @@ pub struct StyleOverride {
   pub replace: bool,
 }
 
+const SOURCE_PENDING: u8 = 0
+const SOURCE_LOADED: u8 = 1
+const SOURCE_FAILED: u8 = 2
+
 /// The retained tree.
 ///
 /// It borrows the fonts it draws with. Each frame: [`UiTree.apply`] the client's batches, call
@@ -403,7 +446,19 @@ pub struct UiTree<'a> {
   pub focused: u32,
   families: Families,
   pub resources: Resources,
+  /// `LoadImage`, `LoadIcon`, `LoadFontFace` and `LoadFontStylesheet` mutations waiting for
+  /// the host's loaders (`takeLoads`). The tree does no I/O: a host reads, fetches or looks up
+  /// the URL, then defines the resource or gives the face its file.
+  pub loads: List<Mutation>,
+  /// What became of each loaded resource, by id: `SOURCE_*`.
+  sourceStates: List<u8>,
+  /// Nodes that were given a source that already settled, told after the batch.
+  sourceTells: List<u32>,
   fontKeys: List<FontKeyEntry>,
+  fontFaces: List<FontFaceEntry>,
+  /// The files of faces declared with a URL (`Mutation.DeclareFontFace`).
+  faceSources: List<FaceSource>,
+  nextHostFace: u32,
   pub faces: List<FaceSlot<'a>>,
   pub atlas: Atlas,
   pub glyphs: GlyphCache,
@@ -565,7 +620,13 @@ impl<'a> UiTree<'a> {
       focused: NONE,
       families: Families.make(),
       resources: move resources,
+      loads: List<Mutation>.make(),
+      sourceStates: List<u8>.make(),
+      sourceTells: List<u32>.make(),
       fontKeys: List<FontKeyEntry>.make(),
+      fontFaces: List<FontFaceEntry>.make(),
+      faceSources: List<FaceSource>.make(),
+      nextHostFace: FIRST_HOST_FACE,
       faces: List<FaceSlot<'a>>.make(),
       atlas: Atlas.make(AtlasOptions.default()),
       glyphs: GlyphCache.make(),
@@ -645,6 +706,66 @@ impl<'a> UiTree<'a> {
 
   // Nodes.
 
+  /// Says that resource `resource` (from a `LoadImage` or `LoadIcon`) loaded or failed: each
+  /// image or icon showing it that listens gets a `Load` or `Error` record, and so does any
+  /// node that shows it later.
+  pub effect fn settleSource(self: &mut Self, resource: u32, ok: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let at = u32.toUsize(resource)
+    let have = self.sourceStates.length()
+    if at >= have {
+      run self.sourceStates.appendRepeated(SOURCE_PENDING, at + 1 - have)
+    }
+    let states = self.sourceStates.asMutSlice()
+    states[at] = if ok { SOURCE_LOADED } else { SOURCE_FAILED }
+    drop states
+    let mut i: usize = 0
+    while i < self.nodes.length() {
+      let node = &self.nodes.asSlice()[i]
+      if node.live && node.resource == resource
+        && (node.kind == NodeKind.Image || node.kind == NodeKind.Icon) {
+        run self.tellSource(usize.toU32(i), ok)
+      }
+      i = i + 1
+    }
+  }
+
+  fn sourceState(self: &Self, resource: u32) -> u8 {
+    let at = u32.toUsize(resource)
+    if at >= self.sourceStates.length() {
+      return SOURCE_PENDING
+    }
+    return self.sourceStates.asSlice()[at]
+  }
+
+  /// Queues the `Load` or `Error` record of node `slot`, if it listens.
+  effect fn tellSource(self: &mut Self, slot: u32, ok: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let node = self.node(slot)
+    let flag = if ok { LISTEN_LOAD } else { LISTEN_ERROR }
+    if u32.bitAnd(node.listeners, flag) == 0 {
+      return ()
+    }
+    let id = node.id
+    let mut path = List<u32>.make()
+    run self.pathTo(slot, &mut path)
+    let kind = if ok { EventKind.Load } else { EventKind.Error }
+    run self.queueEvent(Event.make(kind, id, move path))
+  }
+
+  /// The `LoadImage`, `LoadIcon`, `LoadFontFace` and `LoadFontStylesheet` requests since the
+  /// last call, for the host to serve: it loads each URL and answers with `DefineImage` or
+  /// `DefineIcon`, `loadFontFace` or `failFontFace`, and `declareHostFontFace` for each rule
+  /// of a stylesheet. A face declared with a URL is asked for once text needs it.
+  pub effect fn takeLoads(self: &mut Self) -> List<Mutation>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.requestFontFaces()
+    return Intrinsic.replace(self.loads, List<Mutation>.make())
+  }
+
   /// The slot of node `id`, or NONE.
   pub fn slotOf(self: &Self, id: u32) -> u32 {
     return match self.ids.get(Word { value: u32.toU64(id) }) {
@@ -666,6 +787,17 @@ impl<'a> UiTree<'a> {
   /// parent, its hover, press or focus state): the next resolve restyles it, and its
   /// descendants as far as what they inherit changed. Its ancestors are marked so the resolve
   /// finds it from the root.
+  /// Installs the grid the base look's grid properties describe, replacing any earlier
+  /// template, as `Mutation.SetGrid` does.
+  effect fn styleGrid(self: &mut Self, slot: u32) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let grid = run grid_css.gridOf(self.node(slot).base.asSlice())
+    let css = self.node(slot).css
+    run Effect.catchAll(grid.install(&mut self.layout, NodeId { index: css }), layoutFailed)
+    self.paintDirty = true
+  }
+
   pub fn restyle(self: &mut Self, slot: u32) -> () {
     self.stylesPending = true
     let nodes = self.nodes.asMutSlice()
@@ -751,6 +883,21 @@ impl<'a> UiTree<'a> {
     run self.applyAll(move batch)
     if self.current != before && self.rootOpen(before) {
       drop run self.useRoot(before)
+    }
+    if self.sourceTells.length() > 0 {
+      let tells = Intrinsic.replace(self.sourceTells, List<u32>.make())
+      let ids = tells.asSlice()
+      let mut i: usize = 0
+      while i < ids.length {
+        let slot = self.slotOf(ids[i])
+        if slot != NONE {
+          let state = self.sourceState(self.node(slot).resource)
+          if state != SOURCE_PENDING {
+            run self.tellSource(slot, state == SOURCE_LOADED)
+          }
+        }
+        i = i + 1
+      }
     }
   }
 
@@ -839,7 +986,11 @@ impl<'a> UiTree<'a> {
       }
       Mutation.SetStyle { id, state, declarations } => {
         let slot = run self.require(index, id)
-        let values = declarations.asSlice()
+        let prepared = run expand.prepared(declarations.asSlice())
+        let values = match &prepared {
+          Option.Some { value } => value.asSlice()
+          Option.None => declarations.asSlice()
+        }
         let node = self.nodeMut(slot)
         let mut i: usize = 0
         while i < values.length {
@@ -863,10 +1014,14 @@ impl<'a> UiTree<'a> {
           i = i + 1
         }
         self.restyle(slot)
+        if state == StyleState.Base && grid_css.mentionsGrid(values) {
+          run self.styleGrid(slot)
+        }
       }
       Mutation.ClearStyle { id, state } => {
         let slot = run self.require(index, id)
         let node = self.nodeMut(slot)
+        let hadGrid = state == StyleState.Base && grid_css.mentionsGrid(node.base.asSlice())
         match state {
           StyleState.Base => {
             node.base.clear()
@@ -885,6 +1040,9 @@ impl<'a> UiTree<'a> {
           }
         }
         self.restyle(slot)
+        if hadGrid {
+          run self.styleGrid(slot)
+        }
       }
       Mutation.SetText { id, value } => {
         let slot = run self.require(index, id)
@@ -937,8 +1095,78 @@ impl<'a> UiTree<'a> {
           Attribute.Expanded { value } => {
             node.expanded = value
           }
+          Attribute.Level { value } => {
+            let semantics = run node.semanticsMut()
+            semantics.level = value
+          }
+          Attribute.Description { value } => {
+            let semantics = run node.semanticsMut()
+            semantics.description = move value
+          }
+          Attribute.RoleDescription { value } => {
+            let semantics = run node.semanticsMut()
+            semantics.roleDescription = move value
+          }
+          Attribute.ValueText { value } => {
+            let semantics = run node.semanticsMut()
+            semantics.valueText = move value
+          }
+          Attribute.Hidden { value } => {
+            let semantics = run node.semanticsMut()
+            semantics.hidden = value
+          }
+          Attribute.Live { value } => {
+            let semantics = run node.semanticsMut()
+            semantics.live = value
+          }
+          Attribute.Atomic { value } => {
+            let semantics = run node.semanticsMut()
+            semantics.atomic = value
+          }
+          Attribute.Busy { value } => {
+            let semantics = run node.semanticsMut()
+            semantics.busy = value
+          }
+          Attribute.Pressed { value } => {
+            let semantics = run node.semanticsMut()
+            semantics.pressed = value
+          }
+          Attribute.Indeterminate { value } => {
+            let semantics = run node.semanticsMut()
+            semantics.indeterminate = value
+          }
+          Attribute.Required { value } => {
+            let semantics = run node.semanticsMut()
+            semantics.required = value
+          }
+          Attribute.Invalid { value } => {
+            let semantics = run node.semanticsMut()
+            semantics.invalid = value
+          }
+          Attribute.MultiSelectable { value } => {
+            let semantics = run node.semanticsMut()
+            semantics.multiSelectable = value
+          }
+          Attribute.Orientation { value } => {
+            let semantics = run node.semanticsMut()
+            semantics.orientation = value
+          }
+          Attribute.PosInSet { value } => {
+            let semantics = run node.semanticsMut()
+            semantics.posInSet = value
+          }
+          Attribute.SetSize { value } => {
+            let semantics = run node.semanticsMut()
+            semantics.setSize = value
+          }
+          Attribute.Modal { value } => {
+            let semantics = run node.semanticsMut()
+            semantics.modal = value
+          }
           Attribute.Multiline { value } => {
-            node.edit.multiline = value
+            run node.ensureEdit()
+            let edited = node.editMut()
+            edited.multiline = value
             let isInput = node.kind == NodeKind.Input
             self.restyle(slot)
             if isInput {
@@ -946,12 +1174,16 @@ impl<'a> UiTree<'a> {
             }
           }
           Attribute.ReadOnly { value } => {
-            node.edit.readOnly = value
+            run node.ensureEdit()
+            let edited = node.editMut()
+            edited.readOnly = value
             node.content = node.content + 1
             self.paintDirty = true
           }
           Attribute.Placeholder { value } => {
-            node.edit.placeholder = move value
+            run node.ensureEdit()
+            let edited = node.editMut()
+            edited.placeholder = move value
             let isInput = node.kind == NodeKind.Input
             if isInput {
               run edit.syncDisplay(&mut self, slot)
@@ -962,6 +1194,16 @@ impl<'a> UiTree<'a> {
             drop value
           }
           Attribute.Transition { value } => {
+            drop value
+          }
+          Attribute.Element { name } => {
+            // Document backends only.
+            drop name
+          }
+          Attribute.ClassName { value } => {
+            drop value
+          }
+          Attribute.ElementId { value } => {
             drop value
           }
         }
@@ -1040,7 +1282,8 @@ impl<'a> UiTree<'a> {
       Mutation.SetGrid { id, value } => {
         let slot = run self.require(index, id)
         let css = self.node(slot).css
-        run Effect.catchAll(value.install(&mut self.layout, NodeId { index: css }), layoutFailed)
+        let grid = Box<Grid>.into(move value)
+        run Effect.catchAll(grid.install(&mut self.layout, NodeId { index: css }), layoutFailed)
         self.paintDirty = true
       }
       Mutation.SetSource { id, resource } => {
@@ -1059,14 +1302,19 @@ impl<'a> UiTree<'a> {
               fail TreeError.WrongKind { index: index, id: id }
             }
           }
-          Option<Resource>.None => {
-            fail TreeError.UnknownResource { index: index, resource: resource }
-          }
+          // Not loaded yet: the node shows nothing until it is (see `Mutation.LoadImage`).
+          Option<Resource>.None => {}
         }
         let node = self.nodeMut(slot)
         node.resource = resource
         node.content = node.content + 1
         run self.updateNatural(slot)
+        // A source that already settled still tells a new node, as an image from the cache
+        // does on the web.
+        // Told once the batch is applied, when the node is in place.
+        if self.sourceState(resource) != SOURCE_PENDING {
+          run self.sourceTells.append(id)
+        }
       }
       Mutation.SetCanvas { id, commands } => {
         let slot = run self.require(index, id)
@@ -1125,7 +1373,84 @@ impl<'a> UiTree<'a> {
         }
         run self.refreshSources(resource)
       }
+      Mutation.LoadImage { resource, url } => {
+        run self.loads.append(Mutation.LoadImage { resource: resource, url: move url })
+      }
+      Mutation.LoadIcon { resource, url } => {
+        run self.loads.append(Mutation.LoadIcon { resource: resource, url: move url })
+      }
+      Mutation.DeclareFontFace {
+        face,
+        family,
+        url,
+        weightMin,
+        weightMax,
+        widthMin,
+        widthMax,
+        style,
+        ranges,
+      } => {
+        let mut rule = run FaceRule.make(
+          String.utf8Bytes(String.view(&family)),
+          RuleRange { min: f32.toF64(weightMin), max: f32.toF64(weightMax) },
+        )
+        rule.width = RuleRange { min: f32.toF64(widthMin), max: f32.toF64(widthMax) }
+        rule.style = if style == FACE_ITALIC {
+          RuleStyle.Italic
+        } else if style == FACE_OBLIQUE {
+          RuleStyle.Oblique { min: 14.0, max: 14.0 }
+        } else {
+          RuleStyle.Normal
+        }
+        let pairs = ranges.asSlice()
+        let mut r: usize = 0
+        while r + 1 < pairs.length {
+          run rule.ranges.append(UnicodeRange { first: pairs[r], last: pairs[r + 1] })
+          r = r + 2
+        }
+        run self.declareFaceAt(face, move rule, move url)
+      }
+      Mutation.LoadFontFace { face, url } => {
+        let sources = self.faceSources.asMutSlice()
+        let mut f: usize = 0
+        while f < sources.length {
+          if sources[f].id == face {
+            sources[f].asked = true
+          }
+          f = f + 1
+        }
+        run self.loads.append(Mutation.LoadFontFace { face: face, url: move url })
+      }
+      Mutation.LoadFontStylesheet { url } => {
+        run self.loads.append(Mutation.LoadFontStylesheet { url: move url })
+      }
     }
+  }
+
+  /// Declares face `id` from `rule` with its file at `url` (none when empty).
+  effect fn declareFaceAt(self: &mut Self, id: u32, rule: FaceRule, url: String) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.fontFaceIndex(id) != usize.MAX {
+      return
+    }
+    if String.byteLength(String.view(&url)) > 0 {
+      run self.faceSources.append(FaceSource { id: id, url: move url, asked: false })
+    }
+    run self.declareFontFace(id, move rule)
+  }
+
+  /// Declares a face a host found, such as a rule of a stylesheet it loaded for
+  /// `LoadFontStylesheet`, with its file at `url` (resolved against the stylesheet). Its id,
+  /// returned, is above any a client chooses. The tree asks for the file in `takeLoads`, as a
+  /// `LoadFontFace`, once text needs one of its characters.
+  pub effect fn declareHostFontFace(self: &mut Self, rule: FaceRule, url: string) -> u32
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let id = self.nextHostFace
+    self.nextHostFace = id + 1
+    run self.declareFaceAt(id, move rule, run String.copy(url))
+    return id
   }
 
   effect fn require(self: &Self, index: usize, id: u32) -> u32
@@ -1166,6 +1491,10 @@ impl<'a> UiTree<'a> {
     }
     let mut computed = Computed.inheriting(TextStyle.initial())
     computed.layout.display = defaultDisplay(kind)
+    let mut editing = Option<Box<EditState>>.None
+    if kind == NodeKind.Input {
+      editing = Option<Box<EditState>>.Some { value: run Box<EditState>.make(EditState.make()) }
+    }
     let node = Node {
       id: id,
       kind: kind,
@@ -1213,7 +1542,8 @@ impl<'a> UiTree<'a> {
       resource: NONE,
       canvas: List<CanvasCommand>.make(),
       content: 1,
-      edit: EditState.make(),
+      editing: move editing,
+      semantics: Option<Box<Semantics>>.None,
       cache: PaintCache.empty(),
     }
     let mut slot: u32 = 0
@@ -2282,10 +2612,12 @@ impl<'a> UiTree<'a> {
     return Vector2<f32> { x: self.node(slot).scrollX, y: self.node(slot).scrollY }
   }
 
-  /// Moves the queued host requests (clipboard reads and writes) to `out`, oldest first.
+  /// Moves the queued host requests (clipboard reads and writes, font faces to load) to `out`,
+  /// oldest first.
   pub effect fn takeRequests(self: &mut Self, out: &mut List<HostRequest>) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
+    run self.requestFontFaces()
     let mut reversed = List<HostRequest>.make()
     while true {
       match self.requests.pop() {
@@ -2330,7 +2662,10 @@ impl<'a> UiTree<'a> {
     if slot == NONE {
       return Vector2<usize> { x: 0, y: 0 }
     }
-    let e = &self.node(slot).edit
+    if !self.node(slot).hasEdit() {
+      return Vector2<usize> { x: 0, y: 0 }
+    }
+    let e = self.node(slot).edit()
     return Vector2<usize> { x: e.anchor, y: e.focus }
   }
 
@@ -2500,12 +2835,19 @@ impl<'a> UiTree<'a> {
     ! OutOfMemoryError
     ? &mut Allocator {
     let italic = text.style == FontStyle.Italic
+    let treatment = Treatment {
+      letterSpacing: text.letterSpacing,
+      wordSpacing: text.wordSpacing,
+      transform: text.textTransform,
+      wordBreak: text.wordBreak,
+      overflowWrap: text.overflowWrap,
+    }
     let entries = self.fontKeys.asSlice()
     let mut i: usize = 0
     while i < entries.length {
       let entry = entries[i]
       if entry.family == text.family && entry.size == text.size && entry.weight == text.weight
-        && entry.italic == italic {
+        && entry.italic == italic && sameTreatment(entry.treatment, treatment) {
         return entry.key
       }
       i = i + 1
@@ -2522,6 +2864,7 @@ impl<'a> UiTree<'a> {
         FaceStyle.Normal
       },
     }
+    request.treatment = treatment
     let key = run self.provider.text.addStyle(move request)
     run self.fontKeys.append(
       FontKeyEntry {
@@ -2529,10 +2872,169 @@ impl<'a> UiTree<'a> {
         size: text.size,
         weight: text.weight,
         italic: italic,
+        treatment: treatment,
         key: key,
       },
     )
     return key
+  }
+
+  // Font faces added at run time.
+
+  /// Text whose font-family list names `family` lays out again: its styles get new font
+  /// keys, so css-layout measures it with the faces the font set has now.
+  effect fn fontFamilyChanged(self: &mut Self, family: &[u8]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut changed = false
+    let mut names = List<Family>.make()
+    let mut i: usize = 0
+    while i < self.fontKeys.length() {
+      let list = self.fontKeys.get(i).family
+      if list != NONE {
+        names.clear()
+        run self.families.copyOf(list, &mut names)
+        let mut j: usize = 0
+        while j < names.length() {
+          if let Family.Named { name } = &names.asSlice()[j] {
+            if sameFamilyName(Bytes.asSlice(&name), family) {
+              let entries = self.fontKeys.asMutSlice()
+              entries[i].family = NONE
+              changed = true
+              break
+            }
+          }
+          j = j + 1
+        }
+      }
+      i = i + 1
+    }
+    if !changed {
+      return
+    }
+    self.stylesDirty = true
+    let parked = self.parked.asMutSlice()
+    let mut p: usize = 0
+    while p < parked.length {
+      parked[p].touched = true
+      p = p + 1
+    }
+  }
+
+  /// Adds the faces of a font file (TTF, OTF or a collection) under the family names the file
+  /// gives, and returns how many it had. Text in those families lays out again with them.
+  pub effect fn addFont(self: &mut Self, data: Bytes) -> usize
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let set = &mut self.provider.text.fonts.set
+    let first = set.declaredCount()
+    let added = run set.addFont(move data)
+    let mut i = first
+    while i < first + added {
+      let mut family = Bytes.make()
+      run Bytes.append(&mut family, self.provider.text.fonts.set.familyOf(i))
+      run self.fontFamilyChanged(Bytes.asSlice(&family))
+      i = i + 1
+    }
+    return added
+  }
+
+  fn fontFaceIndex(self: &Self, id: u32) -> usize {
+    let entries = self.fontFaces.asSlice()
+    let mut i: usize = 0
+    while i < entries.length {
+      if entries[i].id == id {
+        return entries[i].declared
+      }
+      i = i + 1
+    }
+    return usize.MAX
+  }
+
+  /// Declares font face `id` as an `@font-face` rule does, before its file is there. Its
+  /// family hides installed faces of the same name at once. When text laid out needs a
+  /// character in its `unicode-range`, `takeRequests` gives `HostRequest.LoadFontFace`; the
+  /// text draws with the next family that has the character until `loadFontFace`, then lays
+  /// out again with the face (`font-display: swap`). Declaring an id again does nothing.
+  pub effect fn declareFontFace(self: &mut Self, id: u32, rule: FaceRule) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.fontFaceIndex(id) != usize.MAX {
+      return
+    }
+    let mut family = Bytes.make()
+    run Bytes.append(&mut family, Bytes.asSlice(&rule.family))
+    let declared = run self.provider.text.fonts.set.declare(move rule)
+    run self.fontFaces.append(FontFaceEntry { id: id, declared: declared })
+    run self.fontFamilyChanged(Bytes.asSlice(&family))
+  }
+
+  /// Gives declared font face `id` its file, face `index` of a TTF, OTF or collection.
+  /// Text in its family lays out again. Returns false when the id is unknown or the data is
+  /// no usable font; the face then counts as failed and the fallback stays.
+  pub effect fn loadFontFace(self: &mut Self, id: u32, data: Bytes, index: u32) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let declared = self.fontFaceIndex(id)
+    if declared == usize.MAX {
+      return false
+    }
+    let ok = run self.provider.text.fonts.set.load(declared, move data, index)
+    if ok {
+      let mut family = Bytes.make()
+      run Bytes.append(&mut family, self.provider.text.fonts.set.familyOf(declared))
+      run self.fontFamilyChanged(Bytes.asSlice(&family))
+    }
+    return ok
+  }
+
+  /// Records that font face `id` could not load: its text keeps the fallback.
+  pub fn failFontFace(self: &mut Self, id: u32) -> () {
+    let declared = self.fontFaceIndex(id)
+    if declared != usize.MAX {
+      self.provider.text.fonts.set.markFailed(declared)
+    }
+  }
+
+  /// Moves the font faces text needed in the last layouts to the host requests.
+  effect fn requestFontFaces(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.provider.text.fonts.set.hasWanted() {
+      return
+    }
+    let mut wanted = List<usize>.make()
+    run self.provider.text.fonts.set.takeWanted(&mut wanted)
+    let mut i: usize = 0
+    while i < wanted.length() {
+      let entries = self.fontFaces.asSlice()
+      let mut j: usize = 0
+      while j < entries.length {
+        if entries[j].declared == wanted.get(i) {
+          let id = entries[j].id
+          let sources = self.faceSources.asMutSlice()
+          let mut found = false
+          let mut f: usize = 0
+          while f < sources.length {
+            if sources[f].id == id {
+              found = true
+              if !sources[f].asked {
+                sources[f].asked = true
+                let url = run String.copy(String.view(&sources[f].url))
+                run self.loads.append(Mutation.LoadFontFace { face: id, url: move url })
+              }
+            }
+            f = f + 1
+          }
+          drop sources
+          if !found {
+            run self.requests.append(HostRequest.LoadFontFace { face: id })
+          }
+        }
+        j = j + 1
+      }
+      i = i + 1
+    }
   }
 
   /// Recomputes every node's style from its patches, variants and parent.
@@ -2618,7 +3120,7 @@ impl<'a> UiTree<'a> {
     computed.layout.display = defaultDisplay(node.kind)
     if node.kind == NodeKind.Input {
       // Inputs keep their spaces; one line scrolls sideways, several wrap and scroll down.
-      if node.edit.multiline {
+      if node.edit().multiline {
         computed.apply(&declare.whiteSpace(WhiteSpace.PreWrap))
         computed.layout.overflowX = Overflow.Hidden
         computed.layout.overflowY = Overflow.Auto

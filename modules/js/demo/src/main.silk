@@ -1,20 +1,22 @@
-//! A counter written in JavaScript, in a native window with the SilkJS engine embedded.
-//! Run it from the repository root: it reads `@silk/ui` and `modules/js/demo/app.js` from
-//! there, as the fixture fonts are. Pass --check for a GPU smoke test, and the path of
-//! another entry module (a bundle, for example) to run that instead. With --watch the entry
-//! is reloaded whenever the file `<entry>.stamp` changes, which `@silk/vite` writes after
-//! each build. With --dev <port> the application comes from the development server at
-//! that port on this machine, as `vite` with `@silk/vite` runs one.
-import ui_js.lib { JsError }
-import ui_js_window.lib { JsApp, JsClient }
-import ui_tree.legacy { TreeError, Mutation }
-import ui_tree_window.host { RunOptions, runWindow, startInspector }
+//! A counter written in JavaScript, in a native window with the SilkJS engine embedded: the
+//! development host. `@silk/ui`, the starter page (`app.js`) and the fonts are part of the
+//! binary, so it runs from any directory. Pass --check for a GPU smoke test, and the path
+//! of another entry module (a bundle, for example) to run that instead. With --watch the entry is reloaded whenever the file `<entry>.stamp` changes,
+//! which `@silk/vite` writes after each build. With --dev <port> the application comes from
+//! the development server at that port on this machine, as `vite` with `@silk/vite` runs
+//! one. --fonts <directory> adds the font files in it to the bundled ones. A debug build
+//! serves the inspector when SILK_UI_INSPECT is set.
+//!
+//! `silk build --profile production` builds `production.silk` instead: the same host
+//! without these tools.
+import app { program, failed, same, argument, argumentCount }
+import ui_js_window_dev.lib { DevTools }
+import ui_tree_window.host { startInspector }
 import ui_tree_window.platform_thread { Launched, launch }
-import ui_tree_window.console { StderrWriter }
-import ui_fixtures.fixtures as fixtures
 import ui_inspect_server.lib { InspectorOptions }
-import silkjs.js_atomics_native { WaiterDomain, SynchronizationError }
-import silkjs.runtime_memory { RuntimeAllocator }
+import ui_js.lib { JsError }
+import ui_tree.legacy { TreeError }
+import silkjs.js_atomics_native { SynchronizationError }
 import silkjs.js_libc_platform as platform
 import window.types { WindowError }
 import webgpu.runtime { GpuError }
@@ -30,81 +32,6 @@ import silk.num.u8
 import silk.num.u32
 import silk.system.host_input { HostInput }
 
-effect fn program(check: bool, watch: bool, port: u16, entry: &[u8], launched: Option<Launched>) -> i32
-  ! TreeError | WindowError | GpuError | AtlasError | GeometryError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError
-  ? &mut Allocator {
-  let fonts = run fixtures.fonts()
-  let library = run platform.readFile(b"modules/js/packages/ui/src/index.js")
-  let source = if entry.length == 0 {
-    run platform.readFile(b"modules/js/demo/app.js")
-  } else {
-    run platform.readFile(entry)
-  }
-  let domain = run WaiterDomain.make()
-  let allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
-  let memory = run allocator.observe()
-  let mut app = run JsApp.open(&memory, move allocator, domain.handle())
-  run app.define(b"@silk/ui", library.asSlice())
-  run app.entry(b"app.js", source.asSlice())
-  if port != 0 { app.dev(port) }
-  if watch && entry.length != 0 {
-    let mut stamp = List<u8>.make()
-    run stamp.appendSlice(entry)
-    run stamp.appendSlice(b".stamp")
-    run app.watch(entry, stamp.asSlice())
-  }
-  let mut client = JsClient {}
-  let options = RunOptions {
-    title: "JavaScript on the tree",
-    width: 400.0,
-    height: 250.0,
-    check: check,
-    checkClick: "counter",
-    checkExpect: "Clicked",
-    lowestLatency: false,
-    platform: move launched,
-  }
-  let inspector = run startInspector(InspectorOptions.make())
-  let status = run Effect.result(runWindow(&mut app, &fonts, List<Mutation>.make(), move options, move inspector, &mut client))
-  run app.close()
-  return match move status {
-    Result<i32, WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError>.Success { value } => value
-    Result<i32, WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError>.Failure { error } => { fail move error }
-  }
-}
-
-effect fn failed<E>(error: E) -> i32 {
-  drop error
-  StderrWriter.print("The JavaScript window host failed\n", &())
-  return 2
-}
-
-fn runApp(check: bool, watch: bool, port: u16, entry: Bytes, launched: Option<Launched>) -> i32 {
-  let mut allocator = Allocator.systemAllocatorProvider()
-  return run Effect.catchAll(program(check, watch, port, Bytes.asSlice(&entry), move launched), failed)
-    |> Effect.provideMut<Allocator>(&mut allocator)
-}
-
-effect fn noArguments<E>(error: E) -> usize {
-  drop error
-  return 0
-}
-
-effect fn noArgument<E>(error: E) -> Option<Bytes> {
-  drop error
-  return Option<Bytes>.None
-}
-
-fn same(left: &[u8], right: &[u8]) -> bool {
-  if left.length != right.length { return false }
-  let mut i: usize = 0
-  while i < left.length {
-    if left[i] != right[i] { return false }
-    i = i + 1
-  }
-  return true
-}
-
 /// The port number `text` spells, or 0 when it is not one.
 fn portOf(text: &[u8]) -> u16 {
   let mut value: u32 = 0
@@ -118,22 +45,63 @@ fn portOf(text: &[u8]) -> u16 {
   return u32.toU16(value)
 }
 
+fn runApp(check: bool, watch: bool, port: u16, entry: Bytes, fonts: Bytes, launched: Option<Launched>) -> i32 {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(develop(check, watch, port, Bytes.asSlice(&entry), Bytes.asSlice(&fonts), move launched), failed)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn develop(check: bool, watch: bool, port: u16, entry: &[u8], fonts: &[u8], launched: Option<Launched>) -> i32
+  ! TreeError | WindowError | GpuError | AtlasError | GeometryError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError
+  ? &mut Allocator {
+  let mut tools = DevTools.make()
+  if port != 0 { tools.server(port) }
+  if watch && entry.length != 0 {
+    let mut stamp = List<u8>.make()
+    run stamp.appendSlice(entry)
+    run stamp.appendSlice(b".stamp")
+    run tools.watch(entry, stamp.asSlice())
+  }
+  let inspector = run startInspector(InspectorOptions.make())
+  return run program(check, entry, fonts, move tools, move inspector, move launched)
+}
+
+/// `path` from the working directory when it is relative.
+effect fn absolute(path: Bytes) -> Bytes ? &mut HostInput | &mut Allocator {
+  let bytes = Bytes.asSlice(&path)
+  if bytes.length == 0 || bytes[0] == 47 || (bytes.length > 1 && bytes[1] == 58) { return move path }
+  if let Result.Success { value: cwd } = run Effect.result(HostInput.workingDirectory()) {
+    let mut joined = move cwd
+    if let Result.Success { value } = run Effect.result(Bytes.append(&mut joined, b"/")) { drop value }
+    if let Result.Success { value } = run Effect.result(Bytes.append(&mut joined, bytes)) { drop value }
+    return move joined
+  }
+  return move path
+}
+
 /// Opens the JavaScript counter, or verifies its GPU output with --check.
 pub effect fn main() -> i32
   ? &mut HostInput {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let count = run Effect.catchAll(HostInput.argumentCount(), noArguments)
+  let count = run argumentCount()
   let mut check = false
   let mut watch = false
   let mut port: u16 = 0
   let mut portNext = false
+  let mut fontsNext = false
+  let mut fonts = Bytes.make()
   let mut entry = Bytes.make()
   let mut i: usize = 1
   while i < count {
-    if let Option<Bytes>.Some { value } = run Effect.catchAll(HostInput.argument(i), noArgument) |> Effect.provideMut<Allocator>(&mut allocator) {
+    if let Option<Bytes>.Some { value } = run argument(i) |> Effect.provideMut<Allocator>(&mut allocator) {
       if portNext {
         portNext = false
         port = portOf(Bytes.asSlice(&value))
+      } else if fontsNext {
+        fontsNext = false
+        fonts = move value
+      } else if same(Bytes.asSlice(&value), b"--fonts") {
+        fontsNext = true
       } else if same(Bytes.asSlice(&value), b"--dev") {
         portNext = true
       } else if same(Bytes.asSlice(&value), b"--check") {
@@ -150,11 +118,12 @@ pub effect fn main() -> i32
   let watching = watch
   let serving = port
   let path = move entry
+  let directory = run absolute(move fonts) |> Effect.provideMut<Allocator>(&mut allocator)
   // The main thread keeps the OS event loop; the app runs on its own thread.
   return run Effect.catchAll(
     launch(
       fn(launched: Option<Launched>) -> i32 {
-        return runApp(checking, watching, serving, move path, move launched)
+        return runApp(checking, watching, serving, move path, move directory, move launched)
       },
     ),
     failed,
