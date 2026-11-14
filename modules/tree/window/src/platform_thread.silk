@@ -109,6 +109,39 @@ union Reply {
   Failed { error: WindowError },
 }
 
+/// An accessibility action and the window it is for.
+struct WindowAction {
+  window: u32,
+  request: ActionRequest,
+}
+
+/// A window's accessibility bridge, on the platform thread.
+struct WindowBridge {
+  window: u32,
+  bridge: Bridge,
+}
+
+/// The bridge of `window` in `bridges`, made and attached when it has none.
+fn bridgeOf(
+  platform: &NativePlatform,
+  bridges: &mut List<WindowBridge>,
+  window: u32,
+) -> usize {
+  let mut i: usize = 0
+  while i < bridges.length() {
+    if bridges.asSlice()[i].window == window {
+      return i
+    }
+    i = i + 1
+  }
+  let mut bridge = Bridge.make()
+  bridge.attach(WindowId { value: window }, platform.rawSurface(WindowId { value: window }))
+  let mut heap = Allocator.systemAllocatorProvider()
+  drop run Effect.result(bridges.append(WindowBridge { window: window, bridge: move bridge }))
+    |> Effect.provideMut<Allocator>(&mut heap)
+  return bridges.length() - 1
+}
+
 /// The content size and scale of a window past the first, as the platform thread last saw
 /// them.
 struct Metrics {
@@ -125,9 +158,9 @@ struct Link {
   commands: List<Command>,
   reply: Option<Reply>,
   /// Accessibility actions the OS asked for, for the UI thread.
-  actions: List<ActionRequest>,
-  /// Whether assistive technology asked the first window for its elements.
-  accessWanted: bool,
+  actions: List<WindowAction>,
+  /// The windows whose elements assistive technology asked for.
+  accessWanted: List<u32>,
   /// The first window the app opened, for polling accessibility actions and for the
   /// compositor; 0 before.
   window: u32,
@@ -391,8 +424,8 @@ effect fn makeLink(appearance: Appearance) -> Arc<Mutex<Link>>
     events: List<Event>.make(),
     commands: List<Command>.make(),
     reply: Option<Reply>.None,
-    actions: List<ActionRequest>.make(),
-    accessWanted: false,
+    actions: List<WindowAction>.make(),
+    accessWanted: List<u32>.make(),
     window: 0,
     size: Size2<f64>.new(0.0, 0.0),
     scale: 1.0,
@@ -439,14 +472,14 @@ effect fn servePlatform(
 ) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
-  let mut bridge = Bridge.make()
+  let mut bridges = List<WindowBridge>.make()
   while true {
     let mut commands = takeCommands(link)
     let list = commands.asMutSlice()
     let mut i: usize = 0
     while i < list.length {
       let command = Intrinsic.replace(list[i], Command.ReadClipboard)
-      run execute(&mut platform, link, wakeUi, &mut bridge, move command)
+      run execute(&mut platform, link, wakeUi, &mut bridges, move command)
       i = i + 1
     }
     drop commands
@@ -462,25 +495,46 @@ effect fn servePlatform(
     if handled {
       next = Option<Event>.None
     }
-    let window = link.get().lock().get().window
-    let mut actions = List<ActionRequest>.make()
-    if window != 0 {
-      bridge.attach(WindowId { value: window }, platform.rawSurface(WindowId { value: window }))
-      actions = run bridge.takeRequests()
+    // Every open window's bridge: attach new ones, collect their actions and requests.
+    let mut windows = List<u32>.make()
+    let mut seen = link.get().lock()
+    let open = seen.get()
+    if open.window != 0 {
+      run windows.append(open.window)
     }
-    let wanted = bridge.wanted()
+    let mut o: usize = 0
+    while o < open.others.length() {
+      run windows.append(open.others.asSlice()[o].window)
+      o = o + 1
+    }
+    drop seen
+    let mut actions = List<WindowAction>.make()
+    let mut wanted = List<u32>.make()
+    let mut w: usize = 0
+    while w < windows.length() {
+      let window = windows.get(w)
+      let at = bridgeOf(&platform, &mut bridges, window)
+      let slot = &mut bridges.asMutSlice()[at]
+      let mut taken = run slot.bridge.takeRequests()
+      while taken.length() != 0 {
+        let request = taken.remove(0)
+        run actions.append(WindowAction { window: window, request: move request })
+      }
+      if slot.bridge.wanted() {
+        run wanted.append(window)
+      }
+      w = w + 1
+    }
     let mut forUi = actions.length() != 0 || handled
     let mut guard = link.get().lock()
     let state = guard.getMut()
-    if wanted && !state.accessWanted {
-      state.accessWanted = true
+    if wanted.length() != state.accessWanted.length() {
       forUi = true
     }
+    state.accessWanted = move wanted
     while actions.length() != 0 {
-      match actions.pop() {
-        Option.Some { value } => run state.actions.insert(0, move value)
-        Option.None => {}
-      }
+      let action = actions.remove(0)
+      run state.actions.append(move action)
     }
     match move next {
       Option<Event>.Some { value } => {
@@ -626,7 +680,7 @@ effect fn execute(
   platform: &mut NativePlatform,
   link: &Arc<Mutex<Link>>,
   wakeUi: &Unparker,
-  bridge: &mut Bridge,
+  bridges: &mut List<WindowBridge>,
   command: Command,
 ) -> ()
   ! OutOfMemoryError
@@ -688,6 +742,14 @@ effect fn execute(
       }
     }
     Command.CloseWindow { window } => {
+      let mut b: usize = 0
+      while b < bridges.length() {
+        if bridges.asSlice()[b].window == window.value {
+          drop bridges.remove(b)
+        } else {
+          b = b + 1
+        }
+      }
       platform.closeWindow(window)
       let mut guard = link.get().lock()
       let state = guard.getMut()
@@ -765,8 +827,8 @@ effect fn execute(
       run platform.writeClipboard(String.view(&text))
     }
     Command.Accessibility { window, update } => {
-      drop window
-      run bridge.update(move update, true)
+      let at = bridgeOf(&platform.*, &mut bridges, window.value)
+      run bridges.asMutSlice()[at].bridge.update(move update, true)
     }
   }
 }
@@ -1447,14 +1509,35 @@ impl AccessLink {
     self.waker.wake()
   }
 
-  /// Whether assistive technology asked for the window's elements.
-  pub fn wanted(self: &Self) -> bool {
-    return self.link.get().lock().get().accessWanted
+  /// Whether assistive technology asked for `window`'s elements.
+  pub fn wanted(self: &Self, window: WindowId) -> bool {
+    let guard = self.link.get().lock()
+    let windows = guard.get().accessWanted.asSlice()
+    let mut i: usize = 0
+    while i < windows.length {
+      if windows[i] == window.value {
+        return true
+      }
+      i = i + 1
+    }
+    return false
   }
 
-  /// The actions the OS asked for since the last call.
-  pub fn take(self: &Self) -> List<ActionRequest> {
+  /// The actions the OS asked for on `window` since the last call.
+  pub effect fn take(self: &Self, window: WindowId) -> List<ActionRequest>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut taken = List<ActionRequest>.make()
     let mut guard = self.link.get().lock()
-    return Intrinsic.replace(guard.getMut().actions, List<ActionRequest>.make())
-  }
-}
+    let actions = &mut guard.getMut().actions
+    let mut i: usize = 0
+    while i < actions.length() {
+      if actions.asSlice()[i].window == window.value {
+        let action = actions.remove(i)
+        run taken.append(move action.request)
+      } else {
+        i = i + 1
+      }
+    }
+    return move taken
+  }}
