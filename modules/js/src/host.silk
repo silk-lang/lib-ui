@@ -37,7 +37,9 @@ import silkjs.js_promise as promise
 import silkjs.native_stack as stack
 import bridge
 import bridge { Timer }
-import bridge { Bridge, ModuleSource, LogEntry }
+import bridge { Bridge, ModuleSource, LogEntry, Rejected }
+import silkjs.js_core_types { HostHook }
+import silkjs.js_proxy_core as core
 import generated_prelude { prelude }
 
 /// How much native stack JavaScript may use below the frame that opened the host.
@@ -188,10 +190,46 @@ effect fn thrown<'a, 'm>(engine: &mut Engine<'m, Bridge>, realm: Realm<'a>) -> J
 /// Runs promise jobs until none is queued, as the microtask checkpoint after a script or a
 /// callback. A job that throws fails with what it threw.
 effect fn drainIn<'a, 'm>(engine: &mut Engine<'m, Bridge>, realm: Realm<'a>) -> () ! OutOfMemoryError | JsError ? &mut Allocator {
+  run runJobs(&mut engine, realm)
+  run reportRejections(&mut engine, realm)
+}
+
+/// The promise jobs alone, for a caller that reports one of the rejections itself.
+effect fn runJobs<'a, 'm>(engine: &mut Engine<'m, Bridge>, realm: Realm<'a>) -> () ! OutOfMemoryError | JsError ? &mut Allocator {
   let rt = realm.runtime()
   while unsafe jobs.isJobPending(rt) {
     let job = run unsafe jobs.executePendingJob(&mut engine, rt)
     if job.status < 0 { fail run thrown(&mut engine, realm) }
+  }
+}
+
+/// Takes `promise` out of the unhandled rejections: its caller reports the failure.
+fn forget<'a, 'v, 'm>(engine: &mut Engine<'m, Bridge>, realm: Realm<'a>, promise: ValueRef<'v>) -> () {
+  let items = engine.services.rejections.asSlice()
+  let mut i: usize = 0
+  while i < items.length {
+    if unsafe core.sameValue(items[i].promise.view(), promise.view()) {
+      let Rejected { promise: kept, reason } = engine.services.rejections.remove(i)
+      realm.release(&mut engine, move kept)
+      realm.release(&mut engine, move reason)
+      return
+    }
+    i = i + 1
+  }
+}
+
+/// Writes a console error for each promise that is still rejected with no handler now that
+/// the promise jobs ran, and forgets them: a handler added later is too late, as on the web.
+effect fn reportRejections<'a, 'm>(engine: &mut Engine<'m, Bridge>, realm: Realm<'a>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let rejections = Intrinsic.replace(engine.services.rejections, List<Rejected>.make())
+  let mut rest = move rejections
+  while rest.length() > 0 {
+    let Rejected { promise: rejected, reason } = rest.remove(0)
+    realm.release(&mut engine, move rejected)
+    let JsError { message } = run describe(&mut engine, realm, move reason)
+    let mut line = run String.copy("Uncaught (in promise) ")
+    run line.append(String.view(&message))
+    run engine.services.logs.append(LogEntry { level: 3, text: move line })
   }
 }
 
@@ -290,6 +328,7 @@ impl<'m> JsHost<'m> {
         fail JsError { message: run String.copy("the JavaScript realm could not be created") }
       }
     }
+    unsafe runtime.setPromiseRejectionTracker(rt, HostHook { callback: Option<NativeFunctionId>.some(NativeFunctionId.Host { id: bridge.REJECTION }), opaque: Pointer.null<u8>() })
     unsafe loader.setLoader(rt, Option<NativeFunctionId>.none(), Option<NativeFunctionId>.some(NativeFunctionId.Host { id: bridge.MODULE_LOAD }), Pointer.null<u8>())
     let mut host = JsHost { engine: move engine, runtime: rt, context: context, closed: false }
     let installed = run Effect.result(install(&mut host.engine, unsafe lendRealm(&context, context)))
@@ -357,7 +396,10 @@ impl<'m> JsHost<'m> {
       Result<Value, JsException>.Success { value } => move value
       Result<Value, JsException>.Failure { .. } => { fail run thrown(&mut self.engine, realm) }
     }
-    let drained = run Effect.result(drainIn(&mut self.engine, realm))
+    let drained = run Effect.result(runJobs(&mut self.engine, realm))
+    // The module's own failure is this call's failure, not an unhandled rejection.
+    forget(&mut self.engine, realm, completion.borrow())
+    run reportRejections(&mut self.engine, realm)
     let rejected = promise.stateOf(completion.borrow()) == promise.REJECTED
     let reason = promise.resultOf(completion.borrow())
     realm.release(&mut self.engine, move completion)
@@ -619,6 +661,14 @@ impl<'m> JsHost<'m> {
   /// Frees the realm and the runtime. Safe to call twice.
   pub effect fn close(self: &mut Self) -> () ? &mut Allocator {
     if self.closed { return }
+    let context = self.context
+    let realm = unsafe lendRealm(&context, context)
+    let mut rest = Intrinsic.replace(self.engine.services.rejections, List<Rejected>.make())
+    while rest.length() > 0 {
+      let Rejected { promise: rejected, reason } = rest.remove(0)
+      realm.release(&mut self.engine, move rejected)
+      realm.release(&mut self.engine, move reason)
+    }
     unsafe gc.releaseHeader(&mut self.engine, self.runtime, self.context)
     run unsafe gc.destroyRuntime(&mut self.engine, self.runtime)
     self.closed = true

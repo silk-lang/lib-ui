@@ -2,7 +2,8 @@
 //! coverage, line breaking with real advances, glyph runs behind fragments, run sharing and
 //! hyphenation. `silk task browser chrome-text` checks positions in Chrome.
 import system { TextSystem }
-import fonts { TextStyle }
+import fonts { TextStyle, Treatment }
+import properties.computed { TextTransform, WordBreak, OverflowWrap }
 import set { FaceRule, FaceState, UnicodeRange }
 import font_collection.lib { FontCollection, Family, Range }
 import layout.lib as Engine
@@ -662,4 +663,106 @@ test effect fn unicodeRangeSplitsAFamily() -> ()
     | FragmentationError {
   let mut allocator = Allocator.systemAllocatorProvider()
   run unicodeRangeSplitsAFamilyBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// The width of `output`'s text (the sum of its runs) and its line count.
+effect fn extent(system: &TextSystem<'_>, output: &LayoutTree, lines: &mut usize) -> f32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut found = List<TextFragment>.make()
+  let mut ys = List<f32>.make()
+  run texts(&output, &mut found, &mut ys)
+  let mut total: f32 = 0.0
+  lines.* = 0
+  let mut index: usize = 0
+  while index < found.length() {
+    total = total + system.glyphRun(found.get(index).shapeKey).advance
+    if index == 0 || ys.get(index) > ys.get(index - 1) {
+      lines.* = lines.* + 1
+    }
+    index = index + 1
+  }
+  return total
+}
+
+effect fn measure(system: &mut TextSystem<'_>, key: usize, width: f32, text: string, lines: &mut usize) -> f32
+  ! OutOfMemoryError | InvalidNode | TextError | FragmentationError
+  ? &mut Allocator {
+  let output = run layout(&mut system, key, width, text)
+  return run extent(&system, &output, &mut lines)
+}
+
+effect fn treated(treatment: Treatment) -> TextStyle
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut style = run sans(16.0)
+  style.treatment = treatment
+  return move style
+}
+
+effect fn textTreatmentsBody() -> ()
+  ! AssertionError<'static>
+    | FileError
+    | HostInputError
+    | OutOfMemoryError
+    | InvalidNode
+    | TextError
+    | FragmentationError
+  ? &mut Allocator {
+  let collection = run fonts()
+  let mut system = TextSystem.make(&collection)
+  let plain = run system.addStyle(run sans(16.0))
+  let mut spacing = Treatment.normal()
+  spacing.letterSpacing = 2.0
+  let lettered = run system.addStyle(run treated(spacing))
+  spacing = Treatment.normal()
+  spacing.wordSpacing = 10.0
+  let worded = run system.addStyle(run treated(spacing))
+  let mut lines: usize = 0
+  let base = run measure(&mut system, plain, 1000.0, "ab cd", &mut lines)
+  let wide = run measure(&mut system, lettered, 1000.0, "ab cd", &mut lines)
+  run Testing.expect(near(wide, base + 10.0), "letter-spacing follows each of the five characters")
+  let apart = run measure(&mut system, worded, 1000.0, "ab cd", &mut lines)
+  run Testing.expect(near(apart, base + 10.0), "word-spacing widens the one space")
+
+  spacing = Treatment.normal()
+  spacing.transform = TextTransform.Uppercase
+  let upper = run system.addStyle(run treated(spacing))
+  let shouted = run measure(&mut system, upper, 1000.0, "abc", &mut lines)
+  let capitals = run measure(&mut system, plain, 1000.0, "ABC", &mut lines)
+  run Testing.expect(near(shouted, capitals), "uppercase shapes capitals")
+  spacing.transform = TextTransform.Capitalize
+  let titled = run system.addStyle(run treated(spacing))
+  let capitalized = run measure(&mut system, titled, 1000.0, "ab cd", &mut lines)
+  let written = run measure(&mut system, plain, 1000.0, "Ab Cd", &mut lines)
+  run Testing.expect(near(capitalized, written), "capitalize raises the first letter of each word")
+
+  // One long word in a narrow block.
+  let word = "abcdefghijklmnopqrstuvwxyz"
+  drop run measure(&mut system, plain, 60.0, word, &mut lines)
+  run Testing.expect(lines == 1, "a word without break opportunities overflows")
+  spacing = Treatment.normal()
+  spacing.wordBreak = WordBreak.BreakAll
+  let breakAll = run system.addStyle(run treated(spacing))
+  drop run measure(&mut system, breakAll, 60.0, word, &mut lines)
+  run Testing.expect(lines > 3, "break-all breaks between letters")
+  spacing = Treatment.normal()
+  spacing.overflowWrap = OverflowWrap.BreakWord
+  let wrapping = run system.addStyle(run treated(spacing))
+  drop run measure(&mut system, wrapping, 60.0, word, &mut lines)
+  run Testing.expect(lines > 3, "overflow-wrap breaks the word that does not fit")
+  drop run measure(&mut system, wrapping, 60.0, "ab cd ef", &mut lines)
+  run Testing.expect(lines == 1, "and leaves words that fit alone")
+}
+
+test effect fn textTreatmentsSpaceTransformAndBreak() -> ()
+  ! AssertionError<'static>
+    | FileError
+    | HostInputError
+    | OutOfMemoryError
+    | InvalidNode
+    | TextError
+    | FragmentationError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run textTreatmentsBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }

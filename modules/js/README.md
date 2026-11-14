@@ -53,12 +53,21 @@ mount(createBox({ width: 400, height: 300 }, button));
   `not-allowed` and the resize ones); the `cursor` style property does the same, and a node
   without one shows its nearest ancestor's.
 - **Accessibility.** `role` and `aria-*` work as in the DOM, as `aria-label` or `ariaLabel`.
-  `role` takes the first word that names a role the tree has (`"switch checkbox"`), and
-  `aria-label`, `aria-checked`, `aria-selected`, `aria-expanded` and `aria-valuemin`,
-  `aria-valuemax`, `aria-valuenow` set the tree's attributes. Other roles and ARIA names are
-  ignored with one console warning each, until the tree has them.
+  `role` takes the first word that names a role the tree has (`"switch checkbox"`). The
+  tree has the ARIA states and properties for names, values, levels, sets, toggles, validity
+  and live regions (`aria-level`, `aria-pressed`, `aria-live`, `aria-checked="mixed"` and so
+  on). Other roles and ARIA names are ignored with one console warning each.
 - **Links.** A node with an `href` is a link, as an `<a>` is: a click on it or inside it that
   no listener prevented calls `open(href)`, which hands the address to the host.
+- **Markdown.** `parseMarkdown(text, options)` returns the syntax tree of the text in
+  the shape of [mdast](https://github.com/syntax-tree/mdast), the tree remark gives, so
+  renderers written for remark's tree work on it, and an application needs no Markdown
+  parser in its bundle. The parser is the Silk standard library's (`silk.markdown`):
+  CommonMark with GitHub's tables, strikethrough, task lists and autolinks. `gfm: false`
+  turns those four off, each can be set alone (`tables`, `strikethrough`, `taskLists`,
+  `autolinkLiterals`), and `footnotes`, `frontmatter` (a `yaml` or `toml` node) and
+  `alerts` (`> [!NOTE]`, a node of type `alert` with a `kind`) turn on more. Nodes have no
+  `position`.
 - **Errors.** A listener that throws does not stop the dispatch. `setErrorHandler` receives
   the exception. Without a handler the host reports the first one after the input.
 
@@ -254,6 +263,9 @@ log functions, and the host decides what those mean:
 - `JsHost.tick(seconds, animation)` moves the clock, runs the timers that are due, and with
   `animation` the frame callbacks. `nextDeadline` and `wantsFrame` tell a loop when to wake.
 - `JsHost.takeLogs` hands over the console lines.
+- A promise that is still rejected with no handler once the promise jobs ran becomes a
+  console error, `Uncaught (in promise) …`, as in a browser. A handler added later is too
+  late. A module that fails is reported by `JsHost.module` alone.
 - `JsHost.takeOpened` hands over the addresses `open(url)` asked for (http, https and mailto
   only). The window opens them with `xdg-open` on Linux and `open` on macOS, without waiting
   for it; other systems print that they could not.
@@ -317,7 +329,7 @@ the engine here (it lives in the SilkJS runtime, which ui-js does not link).
   against a stand-in for the native functions, and
   `silk test --manifest-path modules/js/examples/tests/silk.toml --root src/tests.silk` for
   the bundled examples on the engine (build them first).
-- Not here yet: unhandled rejection reports, images and canvas commands from JavaScript,
+- Not here yet: images and canvas commands from JavaScript,
   source maps for errors under the dev server, and choosing engine features beyond Intl and
   Temporal for each build.
 - Memory, release builds on Linux x86-64 under Xvfb with a software GPU, resident after six

@@ -6,6 +6,7 @@ export function installMock() {
     calls.push([name, ...args]);
     // The host says whether a role is one the tree has.
     if (name === "attribute" && args[1] === "role") return !/\bunknown\b/.test(args[2]);
+    if (name === "attribute" && args[1].startsWith("aria-")) return args[1] !== "aria-describedby";
   };
   const native = {};
   for (const name of [
@@ -15,6 +16,10 @@ export function installMock() {
   ]) {
     native[name] = record(name);
   }
+  native.markdown = (text, flags) => {
+    calls.push(["markdown", text, flags]);
+    return '{"type":"root","children":[]}';
+  };
   globalThis.__ui = native;
   return {
     calls,

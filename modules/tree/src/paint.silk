@@ -13,6 +13,8 @@ import resources { Resources, Resource }
 import scrollbar { thumbOf, Thumb, rangeOf, scrolls, usedOverflow }
 import layers
 import layers { Sticky }
+import stacking
+import stacking { Stacking, IN_FLOW }
 import edit
 import ui_text.system { TextSystem }
 import layout.lib { Tree, LayoutTree, Fragment, FragmentKind, TextFragmentKind }
@@ -110,6 +112,8 @@ pub struct Painter<'p, 'a> {
   pub ink: &'p List<Rect<f32>>,
   /// Per fragment: whether its subtree holds a scroll container, which paint never replays.
   pub scrollers: &'p List<bool>,
+  /// Per fragment: where stacking paints it, from `stacking.stackFragments`.
+  pub stacking: &'p Stacking,
   /// What paint keeps, in device pixels of the current scroll group: subtrees whose ink misses it
   /// are skipped. Inside a scroll container it reaches `lead` past the scrollport, so a renderer
   /// that scrolls on its own has content to show.
@@ -973,37 +977,77 @@ effect fn paintChildren(p: &mut Painter<'_, '_>, index: usize, mask: ContentMask
   ? &mut Allocator {
   // A zero-area inherited clip cannot expose any descendant, including overflow
   // or positioned content. Skip the subtree before glyph processing and decoration.
-  if mask.bounds.xMax <= mask.bounds.xMin || mask.bounds.yMax <= mask.bounds.yMin {
+  if empty(mask) {
     return ()
   }
 
-  // Sticky children paint after their siblings, as CSS paints positioned boxes after in-flow
-  // content: a stuck heading covers what scrolls under it.
-  let mut deferred = false
+  // Positioned children and child stacking contexts paint from their context's lists
+  // (`paintStack`), except in a snapshot of one node.
+  let walking = p.only != NONE
   let mut child = p.output.fragments.values.asSlice()[index].firstChild
   while child != NO_INDEX {
-    if isSticky(&p.*, child) {
-      deferred = true
-    } else {
-      run paintFragment(&mut p, child, mask)
-    }
-    child = p.output.fragments.values.asSlice()[child].nextSibling
-  }
-  if !deferred {
-    return ()
-  }
-  child = p.output.fragments.values.asSlice()[index].firstChild
-  while child != NO_INDEX {
-    if isSticky(&p.*, child) {
+    if walking || !p.stacking.hoisted(child) {
       run paintFragment(&mut p, child, mask)
     }
     child = p.output.fragments.values.asSlice()[child].nextSibling
   }
 }
 
-/// Whether fragment `index` is a sticky box.
-fn isSticky(p: &Painter<'_, '_>, index: usize) -> bool {
-  let f = &p.output.fragments.values.asSlice()[index]
+fn empty(mask: ContentMask) -> bool {
+  return mask.bounds.xMax <= mask.bounds.xMin || mask.bounds.yMax <= mask.bounds.yMin
+}
+
+/// Paints what is inside fragment `index`: in CSS 2 Appendix E order when it makes a stacking
+/// context, else its children in tree order. A snapshot of one node paints in tree order.
+effect fn paintStack(p: &mut Painter<'_, '_>, index: usize, mask: ContentMask) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if p.only == NONE && p.output.fragments.values.asSlice()[index].parent == NO_INDEX {
+    run paintRootElements(&mut p, index, mask)
+  }
+  if p.only != NONE || !p.stacking.stacks(index) || empty(mask) {
+    run paintChildren(&mut p, index, mask)
+    return ()
+  }
+  let steps = p.stacking.steps(index)
+  let mut k: usize = 0
+  while k < steps {
+    let step = p.stacking.step(index, k, false)
+    if step == IN_FLOW {
+      run paintChildren(&mut p, index, mask)
+    } else {
+      run paintHoisted(&mut p, index, step, mask)
+    }
+    k = k + 1
+  }
+}
+
+/// Paints the background and border of the root elements below fragment root `root`, which
+/// their own paint leaves out (see `stacking.ROOT`).
+effect fn paintRootElements(p: &mut Painter<'_, '_>, root: usize, mask: ContentMask) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut i: usize = 0
+  while i < p.stacking.elements.length() {
+    let index = p.stacking.elements.get(i)
+    i = i + 1
+    if stacking.rootOf(p.output, index) != root {
+      continue
+    }
+    let f = p.output.fragments.values.asSlice()[index]
+    let slot = slotIn(p.slotOfCss, f.source)
+    let c = p.nodes.asSlice()[u32.toUsize(slot)].computed
+    if c.paint.opacity > 0.0 && c.text.visible && !f.nonpainting && c.decorated() {
+      run decorate(&mut p, &c, borderBox(&f), f.decorationEdges, mask)
+    }
+  }
+}
+
+/// Whether box fragment `at` between a stacking context and one of its entries changes what
+/// the entry paints into: a clip, or a scroll group. Nothing else can sit there: a box with
+/// opacity, or sticky, makes a context of its own.
+fn clipsBelow(p: &Painter<'_, '_>, at: usize) -> bool {
+  let f = &p.output.fragments.values.asSlice()[at]
   if f.kind != FragmentKind.Box || f.positioningShell {
     return false
   }
@@ -1011,7 +1055,75 @@ fn isSticky(p: &Painter<'_, '_>, index: usize) -> bool {
   if slot == NONE {
     return false
   }
-  return p.nodes.asSlice()[u32.toUsize(slot)].computed.layout.position == Position.Sticky
+  let node = &p.nodes.asSlice()[u32.toUsize(slot)]
+  return node.kind != NodeKind.Text && node.computed.clips()
+}
+
+/// Paints `entry` of the lists of stacking context `root` inside the clips and scroll groups
+/// of the boxes between them, as if it painted where it sits in the tree.
+effect fn paintHoisted(p: &mut Painter<'_, '_>, root: usize, entry: usize, mask: ContentMask) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut path = List<usize>.make()
+  let mut at = p.output.fragments.values.asSlice()[entry].parent
+  while at != root && at != NO_INDEX {
+    if clipsBelow(&p.*, at) {
+      run path.append(at)
+    }
+    at = p.output.fragments.values.asSlice()[at].parent
+  }
+  run paintThrough(&mut p, &path, path.length(), entry, mask)
+}
+
+/// Opens the clip and scroll group of `path[count - 1]` (the path runs bottom up), then the
+/// rest of the path, then paints `entry`.
+effect fn paintThrough(
+  p: &mut Painter<'_, '_>,
+  path: &List<usize>,
+  count: usize,
+  entry: usize,
+  mask: ContentMask,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if count == 0 {
+    run paintFragment(&mut p, entry, mask)
+    return ()
+  }
+  let at = path.get(count - 1)
+  let f = p.output.fragments.values.asSlice()[at]
+  let slot = slotIn(p.slotOfCss, f.source)
+  let c = p.nodes.asSlice()[u32.toUsize(slot)].computed
+  let mut inner = mask.intersect(ContentMask.new(device(overflowClip(&c, &f), p.scale)))
+  if empty(inner) {
+    return ()
+  }
+  let saved = p.cull
+  let scrolled = layers.scroller(&c)
+  if scrolled {
+    inner = run openScroller(&mut p, slot, &c, &f, inner)
+  }
+  run paintThrough(&mut p, path, count - 1, entry, inner)
+  if scrolled {
+    p.cull = saved
+    run p.scene.popScrollGroup()
+  }
+}
+
+/// `mask` cut by the clips between stacking context `root` and its entry `entry`.
+fn hoistedMask(p: &Painter<'_, '_>, root: usize, entry: usize, mask: ContentMask) -> ContentMask {
+  let mut inner = mask
+  let mut at = p.output.fragments.values.asSlice()[entry].parent
+  while at != root && at != NO_INDEX {
+    if clipsBelow(p, at) {
+      let f = &p.output.fragments.values.asSlice()[at]
+      let slot = slotIn(p.slotOfCss, f.source)
+      let c = &p.nodes.asSlice()[u32.toUsize(slot)].computed
+      inner = inner.intersect(ContentMask.new(device(overflowClip(c, f), p.scale)))
+    }
+    at = p.output.fragments.values.asSlice()[at].parent
+  }
+  return inner
 }
 
 effect fn noteOrder(p: &mut Painter<'_, '_>, f: &Fragment) -> ()
@@ -1169,6 +1281,57 @@ pub effect fn inkFragments(
         scrollers.set(parent, true)
       }
     }
+  }
+}
+
+/// Adds each fixed box's root to the hashes, ink and scrollers of the roots that paint it
+/// (see [`Stacking.rootContext`]), so their caches and culls cover it.
+pub effect fn foldLiftedRoots(
+  stacking: &Stacking,
+  hashes: &mut List<u64>,
+  ink: &mut List<Rect<f32>>,
+  scrollers: &mut List<bool>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let count = hashes.length()
+  let mut lifted = List<usize>.make()
+  let mut index: usize = 0
+  while index < count {
+    if stacking.rootContext(index) != NO_INDEX {
+      run lifted.append(index)
+    }
+    index = index + 1
+  }
+  if lifted.length() == 0 {
+    return ()
+  }
+  // Read every subtree before folding any, since lifted roots can nest.
+  let mut ownHashes = List<u64>.make()
+  let mut ownInks = List<Rect<f32>>.make()
+  let mut i: usize = 0
+  while i < lifted.length() {
+    run ownHashes.append(hashes.get(lifted.get(i)))
+    run ownInks.append(ink.get(lifted.get(i)))
+    i = i + 1
+  }
+  i = 0
+  while i < lifted.length() {
+    let root = lifted.get(i)
+    let mut at = stacking.rootContext(root)
+    let mut steps: usize = 0
+    while at != NO_INDEX && at < count && steps < count {
+      let hash = Hash.combine(hashes.get(at), ownHashes.get(i))
+      hashes.set(at, hash)
+      let bounds = unite(ink.get(at), ownInks.get(i))
+      ink.set(at, bounds)
+      if scrollers.get(root) {
+        scrollers.set(at, true)
+      }
+      at = stacking.rootContext(at)
+      steps = steps + 1
+    }
+    i = i + 1
   }
 }
 
@@ -1335,25 +1498,54 @@ effect fn shiftCaches(
   }
 
   // Replay must expose the same paint order as the original clipped traversal.
-  if inner.bounds.xMax <= inner.bounds.xMin || inner.bounds.yMax <= inner.bounds.yMin {
+  if empty(inner) {
     return ()
   }
+  if !p.stacking.stacks(index) {
+    run shiftChildren(&mut p, index, from, to, inner)
+    return ()
+  }
+  let steps = p.stacking.steps(index)
+  let mut k: usize = 0
+  while k < steps {
+    let step = p.stacking.step(index, k, false)
+    if step == IN_FLOW {
+      run shiftChildren(&mut p, index, from, to, inner)
+    } else {
+      let entryMask = hoistedMask(&p.*, index, step, inner)
+      run shiftOne(&mut p, step, from, to, entryMask)
+    }
+    k = k + 1
+  }
+}
+
+effect fn shiftChildren(p: &mut Painter<'_, '_>, index: usize, from: usize, to: usize, mask: ContentMask) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
   let mut child = p.output.fragments.values.asSlice()[index].firstChild
   while child != NO_INDEX {
-    let f = p.output.fragments.values.asSlice()[child]
-    run noteOrder(&mut p, &f)
-    let slot = slotIn(p.slotOfCss, f.source)
-    if slot != NONE && f.kind == FragmentKind.Box {
-      let node = &mut p.nodes.asMutSlice()[u32.toUsize(slot)]
-      if node.cache.frame == p.previousFrame && node.cache.start >= from {
-        node.cache.start = node.cache.start - from + to
-        node.cache.end = node.cache.end - from + to
-        node.cache.frame = p.frame
-      }
+    if !p.stacking.hoisted(child) {
+      run shiftOne(&mut p, child, from, to, mask)
     }
-    run shiftCaches(&mut p, child, from, to, inner)
     child = p.output.fragments.values.asSlice()[child].nextSibling
   }
+}
+
+effect fn shiftOne(p: &mut Painter<'_, '_>, child: usize, from: usize, to: usize, mask: ContentMask) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let f = p.output.fragments.values.asSlice()[child]
+  run noteOrder(&mut p, &f)
+  let slot = slotIn(p.slotOfCss, f.source)
+  if slot != NONE && f.kind == FragmentKind.Box {
+    let node = &mut p.nodes.asMutSlice()[u32.toUsize(slot)]
+    if node.cache.frame == p.previousFrame && node.cache.start >= from {
+      node.cache.start = node.cache.start - from + to
+      node.cache.end = node.cache.end - from + to
+      node.cache.frame = p.frame
+    }
+  }
+  run shiftCaches(&mut p, child, from, to, mask)
 }
 
 effect fn paintBox(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: ContentMask) -> ()
@@ -1361,7 +1553,7 @@ effect fn paintBox(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Con
   ? &mut Allocator {
   let slot = slotIn(p.slotOfCss, f.source)
   if slot == NONE {
-    run paintChildren(&mut p, index, mask)
+    run paintStack(&mut p, index, mask)
     return ()
   }
   let holdsScroller = index < p.scrollers.length() && p.scrollers.get(index)
@@ -1417,7 +1609,8 @@ effect fn paintBox(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Con
       )
     }
     if c.text.visible && !f.nonpainting {
-      if c.decorated() {
+      let rootPaints = p.only == NONE && p.stacking.rootElement(index)
+      if c.decorated() && !rootPaints {
         run decorate(&mut p, &c, borderBox(&f), f.decorationEdges, mask)
       }
       if kind == NodeKind.Image || kind == NodeKind.Icon || kind == NodeKind.Canvas {
@@ -1439,7 +1632,7 @@ effect fn paintBox(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Con
       if input {
         run edit.paintSelection(&mut p, slot, index, inner)
       }
-      run paintChildren(&mut p, index, inner)
+      run paintStack(&mut p, index, inner)
       if input {
         run edit.paintCaret(&mut p, slot, index, inner)
       }
@@ -1612,7 +1805,9 @@ pub effect fn paintRoots(p: &mut Painter<'_, '_>, window: ContentMask) -> ()
   let count = p.output.fragments.values.length()
   let mut index: usize = 0
   while index < count {
-    if p.output.fragments.values.asSlice()[index].parent == NO_INDEX {
+    // A fixed box's root paints from the lists of the root context it stacks in.
+    if p.output.fragments.values.asSlice()[index].parent == NO_INDEX
+      && (p.only != NONE || !p.stacking.hoisted(index)) {
       run paintFragment(&mut p, index, window)
     }
     index = index + 1

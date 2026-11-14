@@ -70,8 +70,8 @@ function cssValue(name, value) {
   return typeof value === "number" && !UNITLESS.has(name) ? value + "px" : String(value);
 }
 
-// ARIA states the tree has, by the name after `aria-`, and the tree attribute each sets. Other
-// ARIA names are accepted and ignored until the tree has them, with one warning each.
+// ARIA states with a tree attribute of their own, by the name after `aria-`. The host takes
+// the other ARIA names as they are; one it does not know is ignored, with one warning.
 const ARIA_STATES = { checked: "checked", selected: "selected", expanded: "expanded" };
 const ARIA_RANGE = { valuemin: 0, valuemax: 1, valuenow: 2 };
 const warned = new Set();
@@ -271,10 +271,8 @@ export class Node {
    * with an `href` is a link: a click on it or inside it that no listener prevented opens
    * the address with `open`, as a click on an `<a>` follows it.
    *
-   * `role` and `aria-*` work as in the DOM, spelled `aria-checked` or `ariaChecked`:
-   * aria-label, aria-checked, aria-selected, aria-expanded, aria-valuemin, aria-valuemax and
-   * aria-valuenow reach the tree. A role the tree does not know, and other ARIA names, are
-   * ignored with a warning.
+   * `role` and `aria-*` work as in the DOM, spelled `aria-checked` or `ariaChecked`. A role
+   * or ARIA name the tree does not know is ignored with a warning.
    */
   setAttribute(name, value) {
     if (name === "role") {
@@ -299,7 +297,7 @@ export class Node {
       native.attribute(this.id, "label", value == null ? "" : String(value));
     } else if (name in ARIA_STATES) {
       // ARIA states are the words "true" and "false"; anything else is false.
-      if (name === "checked" && value === "mixed") warnOnce("the tree has no mixed checked state yet: aria-checked='mixed' is false");
+      if (name === "checked") native.attribute(this.id, "indeterminate", value === "mixed");
       native.attribute(this.id, ARIA_STATES[name], value === true || value === "true");
     } else if (name in ARIA_RANGE) {
       const range = (this.#range ??= [undefined, undefined, undefined]);
@@ -307,7 +305,7 @@ export class Node {
       const [min = 0, max = 100, now] = range;
       if (now === undefined || Number.isNaN(now)) native.attribute(this.id, "valueRange");
       else native.attribute(this.id, "valueRange", min, max, now);
-    } else {
+    } else if (!native.attribute(this.id, "aria-" + name, value == null ? "" : String(value))) {
       warnOnce("the tree has no 'aria-" + name + "' yet: it is ignored");
     }
   }
@@ -555,6 +553,25 @@ export function root() {
 /** The node with tree id `id`, for hosts and tools. */
 export function nodeById(id) {
   return nodes.get(id) ?? null;
+}
+
+// The option bits of `__ui.markdown`.
+const MARKDOWN_FLAGS = { tables: 1, strikethrough: 2, taskLists: 4, autolinkLiterals: 8, footnotes: 16, frontmatter: 32, alerts: 64 };
+const GFM = 1 | 2 | 4 | 8;
+
+/**
+ * The syntax tree of Markdown `text`, in the shape of mdast (what remark gives): plain
+ * objects with `type` and `children`. CommonMark, with GitHub's tables, strikethrough,
+ * task lists and autolinks unless `gfm` is false. `footnotes`, `frontmatter` and
+ * `alerts` (`> [!NOTE]`, a node of type `alert` with a `kind`) turn those on.
+ */
+export function parseMarkdown(text, options = {}) {
+  let flags = options.gfm === false ? 0 : GFM;
+  for (const name in MARKDOWN_FLAGS) {
+    if (options[name] === true) flags |= MARKDOWN_FLAGS[name];
+    else if (options[name] === false) flags &= ~MARKDOWN_FLAGS[name];
+  }
+  return JSON.parse(native.markdown(String(text), flags));
 }
 
 let errorHandler = null;

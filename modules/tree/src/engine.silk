@@ -57,14 +57,16 @@ import node {
   Event,
   PaintCache,
   Node,
+  Semantics,
   FaceSlot,
   Pending
 }
-import paint { TextInk, Painter, paintRoots, hashFragments, inkFragments }
+import paint { TextInk, Painter, paintRoots, hashFragments, inkFragments, foldLiftedRoots }
+import stacking { Stacking }
 import resources { Families, Resources, Resource, ResourceError }
 import provider { Provider }
 import ui_text.system { TextSystem }
-import ui_text.fonts { TextStyle as FontStyleRequest }
+import ui_text.fonts { TextStyle as FontStyleRequest, Treatment }
 import ui_text.set { FaceRule, UnicodeRange }
 import svg_fonts.database { FaceStyle as RuleStyle, Range as RuleRange }
 import svg_fonts.names { same as sameFamilyName }
@@ -171,6 +173,7 @@ pub struct RootState {
   fragmentHashes: List<u64>,
   fragmentInk: List<Rect<f32>>,
   fragmentScrollers: List<bool>,
+  fragmentStacking: Stacking,
   fragmentOf: List<usize>,
   nextSourceFragment: List<usize>,
   paintIndexOf: List<u32>,
@@ -228,6 +231,7 @@ impl RootState {
       fragmentHashes: List<u64>.make(),
       fragmentInk: List<Rect<f32>>.make(),
       fragmentScrollers: List<bool>.make(),
+      fragmentStacking: Stacking.make(),
       fragmentOf: List<usize>.make(),
       nextSourceFragment: List<usize>.make(),
       paintIndexOf: List<u32>.make(),
@@ -334,10 +338,16 @@ struct FontKeyEntry {
   size: f32,
   weight: f32,
   italic: bool,
+  treatment: Treatment,
   key: usize,
 }
 
 impl Copy for FontKeyEntry {}
+
+fn sameTreatment(a: Treatment, b: Treatment) -> bool {
+  return a.letterSpacing == b.letterSpacing && a.wordSpacing == b.wordSpacing && a.transform == b.transform
+    && a.wordBreak == b.wordBreak && a.overflowWrap == b.overflowWrap
+}
 
 effect fn layoutFailed<E>(error: E) -> never
   ! TreeError {
@@ -490,6 +500,8 @@ pub struct UiTree<'a> {
   pub fragmentInk: List<Rect<f32>>,
   /// Per fragment of the last layout: whether its subtree holds a scroll container.
   pub fragmentScrollers: List<bool>,
+  /// Per fragment of the last layout: where stacking paints it (see `stacking`).
+  pub fragmentStacking: Stacking,
   /// Whether the fragment hashes and ink are out of date: layout, styles or mutations changed
   /// since they were computed. Scrolling leaves them as they are.
   paintCachesStale: bool,
@@ -646,6 +658,7 @@ impl<'a> UiTree<'a> {
       fragmentHashes: List<u64>.make(),
       fragmentInk: List<Rect<f32>>.make(),
       fragmentScrollers: List<bool>.make(),
+      fragmentStacking: Stacking.make(),
       paintCachesStale: true,
       scrolled: false,
       offsets: false,
@@ -1088,6 +1101,74 @@ impl<'a> UiTree<'a> {
           Attribute.Expanded { value } => {
             node.expanded = value
           }
+          Attribute.Level { value } => {
+            let semantics = run node.semanticsMut()
+            semantics.level = value
+          }
+          Attribute.Description { value } => {
+            let semantics = run node.semanticsMut()
+            semantics.description = move value
+          }
+          Attribute.RoleDescription { value } => {
+            let semantics = run node.semanticsMut()
+            semantics.roleDescription = move value
+          }
+          Attribute.ValueText { value } => {
+            let semantics = run node.semanticsMut()
+            semantics.valueText = move value
+          }
+          Attribute.Hidden { value } => {
+            let semantics = run node.semanticsMut()
+            semantics.hidden = value
+          }
+          Attribute.Live { value } => {
+            let semantics = run node.semanticsMut()
+            semantics.live = value
+          }
+          Attribute.Atomic { value } => {
+            let semantics = run node.semanticsMut()
+            semantics.atomic = value
+          }
+          Attribute.Busy { value } => {
+            let semantics = run node.semanticsMut()
+            semantics.busy = value
+          }
+          Attribute.Pressed { value } => {
+            let semantics = run node.semanticsMut()
+            semantics.pressed = value
+          }
+          Attribute.Indeterminate { value } => {
+            let semantics = run node.semanticsMut()
+            semantics.indeterminate = value
+          }
+          Attribute.Required { value } => {
+            let semantics = run node.semanticsMut()
+            semantics.required = value
+          }
+          Attribute.Invalid { value } => {
+            let semantics = run node.semanticsMut()
+            semantics.invalid = value
+          }
+          Attribute.MultiSelectable { value } => {
+            let semantics = run node.semanticsMut()
+            semantics.multiSelectable = value
+          }
+          Attribute.Orientation { value } => {
+            let semantics = run node.semanticsMut()
+            semantics.orientation = value
+          }
+          Attribute.PosInSet { value } => {
+            let semantics = run node.semanticsMut()
+            semantics.posInSet = value
+          }
+          Attribute.SetSize { value } => {
+            let semantics = run node.semanticsMut()
+            semantics.setSize = value
+          }
+          Attribute.Modal { value } => {
+            let semantics = run node.semanticsMut()
+            semantics.modal = value
+          }
           Attribute.Multiline { value } => {
             run node.ensureEdit()
             let edited = node.editMut()
@@ -1468,6 +1549,7 @@ impl<'a> UiTree<'a> {
       canvas: List<CanvasCommand>.make(),
       content: 1,
       editing: move editing,
+      semantics: Option<Box<Semantics>>.None,
       cache: PaintCache.empty(),
     }
     let mut slot: u32 = 0
@@ -1914,6 +1996,7 @@ impl<'a> UiTree<'a> {
       fragmentHashes: Intrinsic.replace(self.fragmentHashes, List<u64>.make()),
       fragmentInk: Intrinsic.replace(self.fragmentInk, List<Rect<f32>>.make()),
       fragmentScrollers: Intrinsic.replace(self.fragmentScrollers, List<bool>.make()),
+      fragmentStacking: Intrinsic.replace(self.fragmentStacking, Stacking.make()),
       fragmentOf: Intrinsic.replace(self.fragmentOf, List<usize>.make()),
       nextSourceFragment: Intrinsic.replace(self.nextSourceFragment, List<usize>.make()),
       paintIndexOf: Intrinsic.replace(self.paintIndexOf, List<u32>.make()),
@@ -1971,6 +2054,7 @@ impl<'a> UiTree<'a> {
     self.fragmentHashes = Intrinsic.replace(s.fragmentHashes, List<u64>.make())
     self.fragmentInk = Intrinsic.replace(s.fragmentInk, List<Rect<f32>>.make())
     self.fragmentScrollers = Intrinsic.replace(s.fragmentScrollers, List<bool>.make())
+    self.fragmentStacking = Intrinsic.replace(s.fragmentStacking, Stacking.make())
     self.fragmentOf = Intrinsic.replace(s.fragmentOf, List<usize>.make())
     self.nextSourceFragment = Intrinsic.replace(s.nextSourceFragment, List<usize>.make())
     self.paintIndexOf = Intrinsic.replace(s.paintIndexOf, List<u32>.make())
@@ -2759,12 +2843,19 @@ impl<'a> UiTree<'a> {
     ! OutOfMemoryError
     ? &mut Allocator {
     let italic = text.style == FontStyle.Italic
+    let treatment = Treatment {
+      letterSpacing: text.letterSpacing,
+      wordSpacing: text.wordSpacing,
+      transform: text.textTransform,
+      wordBreak: text.wordBreak,
+      overflowWrap: text.overflowWrap,
+    }
     let entries = self.fontKeys.asSlice()
     let mut i: usize = 0
     while i < entries.length {
       let entry = entries[i]
       if entry.family == text.family && entry.size == text.size && entry.weight == text.weight
-        && entry.italic == italic {
+        && entry.italic == italic && sameTreatment(entry.treatment, treatment) {
         return entry.key
       }
       i = i + 1
@@ -2781,6 +2872,7 @@ impl<'a> UiTree<'a> {
         FaceStyle.Normal
       },
     }
+    request.treatment = treatment
     let key = run self.provider.text.addStyle(move request)
     run self.fontKeys.append(
       FontKeyEntry {
@@ -2788,6 +2880,7 @@ impl<'a> UiTree<'a> {
         size: text.size,
         weight: text.weight,
         italic: italic,
+        treatment: treatment,
         key: key,
       },
     )
@@ -3589,7 +3682,7 @@ impl<'a> UiTree<'a> {
     ? &mut Allocator {
     let count = self.output.fragments.values.length()
     if !self.paintCachesStale && self.fragmentHashes.length() == count
-      && self.fragmentInk.length() == count {
+      && self.fragmentInk.length() == count && self.fragmentStacking.covers(count) {
       return ()
     }
     run hashFragments(
@@ -3607,6 +3700,13 @@ impl<'a> UiTree<'a> {
       &self.nodes,
       self.input.width,
       self.input.height,
+      &mut self.fragmentInk,
+      &mut self.fragmentScrollers,
+    )
+    run self.fragmentStacking.update(&self.output, &self.slotOfCss, &self.layout, &self.nodes)
+    run foldLiftedRoots(
+      &self.fragmentStacking,
+      &mut self.fragmentHashes,
       &mut self.fragmentInk,
       &mut self.fragmentScrollers,
     )
@@ -3679,6 +3779,7 @@ impl<'a> UiTree<'a> {
         hashes: &self.fragmentHashes,
         ink: &self.fragmentInk,
         scrollers: &self.fragmentScrollers,
+        stacking: &self.fragmentStacking,
         cull: window.bounds,
         lead: self.input.height * self.input.scale,
         width: self.input.width,
@@ -3718,6 +3819,7 @@ impl<'a> UiTree<'a> {
         hashes: &self.fragmentHashes,
         ink: &self.fragmentInk,
         scrollers: &self.fragmentScrollers,
+        stacking: &self.fragmentStacking,
         cull: window.bounds,
         lead: self.input.height * self.input.scale,
         width: self.input.width,
@@ -3786,6 +3888,7 @@ impl<'a> UiTree<'a> {
       hashes: &self.fragmentHashes,
       ink: &self.fragmentInk,
       scrollers: &self.fragmentScrollers,
+      stacking: &self.fragmentStacking,
       cull: window.bounds,
       lead: 0.0,
       width: self.input.width,

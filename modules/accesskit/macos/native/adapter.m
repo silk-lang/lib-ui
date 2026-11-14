@@ -224,6 +224,8 @@ static id read_color(SilkAKReader *r) {
 @property(nonatomic) uint64_t focusId;
 @property(nonatomic, strong) NSMutableArray<SilkAKAction *> *queue;
 @property(nonatomic, strong) SilkAKAction *current;
+// Set once assistive technology has asked the view for its elements.
+@property(nonatomic) BOOL requested;
 @end
 
 @implementation SilkAKAdapter
@@ -865,16 +867,19 @@ static SilkAKAdapter *adapter_for(uint64_t handle) { return adapters[@(handle)];
 static NSArray *view_children(id self, SEL _cmd) {
     SilkAKAdapter *adapter = adapter_of_view(self);
     if (!adapter) return @[];
+    adapter.requested = YES;
     return [adapter elements:adapter.rootIds];
 }
 
 static id view_focused(id self, SEL _cmd) {
     SilkAKAdapter *adapter = adapter_of_view(self);
+    if (adapter) adapter.requested = YES;
     return adapter ? [adapter focusedElement] : nil;
 }
 
 static id view_hit_test(id self, SEL _cmd, NSPoint point) {
     SilkAKAdapter *adapter = adapter_of_view(self);
+    if (adapter) adapter.requested = YES;
     return adapter ? [adapter hitTest:point] : self;
 }
 
@@ -1011,6 +1016,13 @@ void silk_ak_macos_announce(uint64_t handle, const uint8_t *text, size_t length,
         NSAccessibilityPriorityKey : @(assertive ? NSAccessibilityPriorityHigh : NSAccessibilityPriorityMedium),
     };
     NSAccessibilityPostNotificationWithUserInfo(window, NSAccessibilityAnnouncementRequestedNotification, info);
+}
+
+uint32_t silk_ak_macos_requested(uint64_t handle) {
+    @autoreleasepool {
+        SilkAKAdapter *adapter = adapter_for(handle);
+        return adapter && adapter.requested ? 1 : 0;
+    }
 }
 
 uint32_t silk_ak_macos_poll(uint64_t handle, uint64_t *nodeId, double *number, uint32_t *start, uint32_t *end) {

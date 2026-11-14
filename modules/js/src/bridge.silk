@@ -14,13 +14,15 @@ import silk.num.i32
 import silk.num.f64
 import ui_tree.css { Declaration }
 import ui_tree.legacy { Batch, NodeKind, Attribute, Mutation, StyleState, Cursor, Role }
+import ui_tree.mutation { ariaAttribute }
 import css_style.tokens { CssError }
 import css_style.written as written
 import silkjs.js_engine { Engine }
 import silkjs.js_engine_host { EngineServices }
 import silkjs.js_value { ValueBits }
 import silkjs.js_realm { Realm, Arguments }
-import silkjs.js_owned_value { ValueRef }
+import silkjs.js_owned_value { Value, ValueRef }
+import silkjs.js_proxy_core as core
 import silkjs.js_exceptions { JsException }
 import silkjs.js_strings { Strings }
 import silkjs.js_core_types { NativeFunctionId, NativeErrorKind, ModuleDef }
@@ -28,6 +30,8 @@ import silkjs.js_heap { CellRef }
 import silkjs.js_coercion_host { CoercionHooks }
 import silkjs.js_eval as evaluation
 import silkjs.js_eval_compile as flags
+import silkjs.js_string_types { StringLengthError }
+import markdown
 
 /// `__ui.create(id, kind)`: kind 0 is a box, 1 text, 2 an input, 3 an image, 4 an icon,
 /// 5 a canvas.
@@ -51,7 +55,8 @@ pub const CLEAR_STYLE: u32 = 8
 /// `__ui.attribute(id, name, value)`. Throws a `TypeError` for a name the tree does not have.
 /// `role` takes ARIA role text and returns whether one of its words is a role the tree has
 /// (the node has no role otherwise). `__ui.attribute(id, "valueRange", min, max, now)` sets
-/// the value range, and without numbers clears it.
+/// the value range, and without numbers clears it. An `aria-` name takes ARIA value text
+/// (`"aria-level", "2"`) and returns whether the tree has that attribute.
 pub const ATTRIBUTE: u32 = 9
 /// `__ui.focus(id)`.
 pub const FOCUS: u32 = 10
@@ -89,8 +94,15 @@ pub const DEFINE_ICON: u32 = 24
 pub const SOURCE: u32 = 25
 /// `__ui.release(resource)`: forgets a resource no node shows any more.
 pub const RELEASE: u32 = 26
+/// `__ui.markdown(text, flags)`: the mdast JSON of `text`, with the extensions of the
+/// [`markdown`] option bits in `flags`.
+pub const MARKDOWN: u32 = 27
 /// The number of native functions, for the installer.
-pub const LAST: u32 = 26
+pub const LAST: u32 = 27
+
+/// The runtime's promise rejection tracker callback: [`Bridge`] keeps the promises that
+/// were rejected with no handler until one is added.
+pub const REJECTION: u32 = 101
 
 /// The runtime's module loader callback: [`Bridge`] answers it from the defined modules.
 pub const MODULE_LOAD: u32 = 100
@@ -127,12 +139,21 @@ pub struct Bridge {
   /// Whether JavaScript asked for an animation frame callback.
   pub frame: bool,
   pub logs: List<LogEntry>,
+  /// Promises rejected with no handler so far, with what they were rejected with. The
+  /// host reports the ones still here after the promise jobs ran, as a browser does.
+  pub rejections: List<Rejected>,
   /// Lines JavaScript sent to the development server, oldest first.
   pub outbox: List<String>,
   /// Whether JavaScript asked for a new realm.
   pub reload: bool,
   /// Addresses JavaScript asked the host to open, oldest first.
   pub opened: List<String>,
+}
+
+/// A rejected promise nothing handles yet. Both values are owned.
+pub struct Rejected {
+  pub promise: Value,
+  pub reason: Value,
 }
 
 impl Bridge {
@@ -144,6 +165,7 @@ impl Bridge {
       timers: List<Timer>.make(),
       frame: false,
       logs: List<LogEntry>.make(),
+      rejections: List<Rejected>.make(),
       outbox: List<String>.make(),
       reload: false,
       opened: List<String>.make(),
@@ -212,6 +234,7 @@ pub fn name(id: u32) -> &'static [u8] {
   if id == DEFINE_ICON { return b"defineIcon" }
   if id == SOURCE { return b"source" }
   if id == RELEASE { return b"release" }
+  if id == MARKDOWN { return b"markdown" }
   return b"requestFrame"
 }
 
@@ -285,6 +308,7 @@ effect fn attributeOf<'v>(name: string, value: ValueRef<'v>) -> Option<Attribute
   if name == "checked" { return Option<Attribute>.some(Attribute.Checked { value: truthy(bits) }) }
   if name == "selected" { return Option<Attribute>.some(Attribute.Selected { value: truthy(bits) }) }
   if name == "expanded" { return Option<Attribute>.some(Attribute.Expanded { value: truthy(bits) }) }
+  if name == "indeterminate" { return Option<Attribute>.some(Attribute.Indeterminate { value: truthy(bits) }) }
   if name == "label" { return Option<Attribute>.some(Attribute.Label { value: run text(value) }) }
   if name == "testId" { return Option<Attribute>.some(Attribute.TestId { value: run text(value) }) }
   if name == "placeholder" { return Option<Attribute>.some(Attribute.Placeholder { value: run text(value) }) }
@@ -349,6 +373,41 @@ fn namedRole(word: &[u8]) -> Option<Role> {
   if same(word, b"listbox") { return Option<Role>.some(Role.ListBox) }
   if same(word, b"option") { return Option<Role>.some(Role.Option) }
   if same(word, b"tooltip") { return Option<Role>.some(Role.Tooltip) }
+  if same(word, b"alert") { return Option<Role>.some(Role.Alert) }
+  if same(word, b"alertdialog") { return Option<Role>.some(Role.AlertDialog) }
+  if same(word, b"status") { return Option<Role>.some(Role.Status) }
+  if same(word, b"log") { return Option<Role>.some(Role.Log) }
+  if same(word, b"timer") { return Option<Role>.some(Role.Timer) }
+  if same(word, b"progressbar") { return Option<Role>.some(Role.ProgressBar) }
+  if same(word, b"separator") { return Option<Role>.some(Role.Separator) }
+  if same(word, b"combobox") { return Option<Role>.some(Role.ComboBox) }
+  if same(word, b"searchbox") { return Option<Role>.some(Role.SearchBox) }
+  if same(word, b"spinbutton") { return Option<Role>.some(Role.SpinButton) }
+  if same(word, b"table") { return Option<Role>.some(Role.Table) }
+  if same(word, b"rowgroup") { return Option<Role>.some(Role.RowGroup) }
+  if same(word, b"row") { return Option<Role>.some(Role.Row) }
+  if same(word, b"cell") { return Option<Role>.some(Role.Cell) }
+  if same(word, b"columnheader") { return Option<Role>.some(Role.ColumnHeader) }
+  if same(word, b"rowheader") { return Option<Role>.some(Role.RowHeader) }
+  if same(word, b"grid") { return Option<Role>.some(Role.Grid) }
+  if same(word, b"gridcell") { return Option<Role>.some(Role.GridCell) }
+  if same(word, b"tree") { return Option<Role>.some(Role.Tree) }
+  if same(word, b"treegrid") { return Option<Role>.some(Role.TreeGrid) }
+  if same(word, b"treeitem") { return Option<Role>.some(Role.TreeItem) }
+  if same(word, b"menubar") { return Option<Role>.some(Role.MenuBar) }
+  if same(word, b"menuitemcheckbox") { return Option<Role>.some(Role.MenuItemCheckbox) }
+  if same(word, b"menuitemradio") { return Option<Role>.some(Role.MenuItemRadio) }
+  if same(word, b"radiogroup") { return Option<Role>.some(Role.RadioGroup) }
+  if same(word, b"region") { return Option<Role>.some(Role.Region) }
+  if same(word, b"banner") { return Option<Role>.some(Role.Banner) }
+  if same(word, b"contentinfo") { return Option<Role>.some(Role.ContentInfo) }
+  if same(word, b"complementary") { return Option<Role>.some(Role.Complementary) }
+  if same(word, b"search") { return Option<Role>.some(Role.Search) }
+  if same(word, b"article") { return Option<Role>.some(Role.Article) }
+  if same(word, b"figure") { return Option<Role>.some(Role.Figure) }
+  if same(word, b"document") { return Option<Role>.some(Role.Document) }
+  if same(word, b"application") { return Option<Role>.some(Role.Application) }
+  if same(word, b"note") { return Option<Role>.some(Role.Note) }
   return Option<Role>.none()
 }
 
@@ -419,6 +478,17 @@ pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) 
       run bridge.batch.attribute(first, move range)
       return Outcome.Returned { value: ValueBits.Undefined }
     }
+    if String.startsWith(String.view(&attribute), "aria-") {
+      let words = run text(argv.get(2))
+      let known = match run ariaAttribute(String.utf8Bytes(String.view(&attribute)), String.utf8Bytes(String.view(&words))) {
+        Option<Attribute>.Some { value } => {
+          run bridge.batch.attribute(first, move value)
+          true
+        }
+        Option<Attribute>.None => false
+      }
+      return Outcome.Returned { value: ValueBits.Bool { value: known } }
+    }
     if String.view(&attribute) == "role" {
       let words = run text(argv.get(2))
       let bytes = String.utf8Bytes(String.view(&words))
@@ -483,6 +553,21 @@ pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) 
     run bridge.batch.source(first, id(argv.get(1).view()))
   } else if function == RELEASE {
     run bridge.batch.releaseResource(first)
+  } else if function == MARKDOWN {
+    let source = run text(argv.get(0))
+    let json = run markdown.json(String.view(&source), id(argv.get(1).view()))
+    let made = run Effect.result(Strings.fromUtf8(json.asSlice()))
+    return match move made {
+      Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value } => Outcome.Returned { value: value }
+      Result<ValueBits, OutOfMemoryError | StringLengthError>.Failure { error } => match move error {
+        OutOfMemoryError allocation => { fail move allocation }
+        StringLengthError _ => {
+          let mut message = List<u8>.make()
+          run message.appendSlice(b"the markdown tree is too long for a string")
+          Outcome.TypeError { message: move message }
+        }
+      }
+    }
   } else if function == SELECT {
     run bridge.batch.select(first, f64.toUsize(number(argv.get(1).view())), f64.toUsize(number(argv.get(2).view())))
   }
@@ -508,6 +593,28 @@ impl EngineServices for Bridge {
       Outcome.Returned { value } => value
       Outcome.TypeError { message } => run engine.throwError(realm, NativeErrorKind.Type, message.asSlice())
     }
+  }
+
+  /// Keeps a promise rejected with no handler, and lets go of it when a handler is added.
+  unsafe effect fn promiseRejection<'r, 'v, 'w, 'm>(engine: &mut Engine<'m, Self>, realm: Realm<'r>,
+    callback: NativeFunctionId, promise: ValueRef<'v>, reason: ValueRef<'w>, handled: bool, opaque: ?*mut u8) -> () ? &mut Allocator {
+    let items = engine.services.rejections.asSlice()
+    let mut i: usize = 0
+    while i < items.length {
+      if unsafe core.sameValue(items[i].promise.view(), promise.view()) {
+        if handled {
+          let Rejected { promise: kept, reason: why } = engine.services.rejections.remove(i)
+          realm.release(&mut engine, move kept)
+          realm.release(&mut engine, move why)
+        }
+        return
+      }
+      i = i + 1
+    }
+    if handled { return }
+    // Without memory for the entry the rejection goes unreported.
+    let entry = Rejected { promise: promise.dup(), reason: reason.dup() }
+    drop run Effect.result(engine.services.rejections.append(move entry))
   }
 
   /// A module the application defined, compiled when something first imports it.

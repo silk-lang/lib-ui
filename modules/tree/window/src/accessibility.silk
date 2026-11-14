@@ -1,297 +1,381 @@
-//! Publishes the actual UI hierarchy, labels, state and measured bounds to the OS.
-import window.accessibility as native
-import window.types { WindowId }
-import ui_tree.legacy { UiTree, Input, Event, EventKind, NONE, NodeInfo }
-import ui_tree.inspect
-import ui_tree.edit
-import ui_tree.mutation { Role, NodeKind, LISTEN_CLICK, NOT_FOCUSABLE }
+//! Publishes the tree to assistive technology through the AccessKit adapters of
+//! `modules/accesskit`: NSAccessibility on macOS and UI Automation on Windows. A window's
+//! [`Bridge`] lives on the thread that runs the platform; its [`Publisher`] lives with the
+//! tree. Nothing is built until a screen reader or another client asks the window for its
+//! elements, and after that only the nodes that changed are sent.
+import accesskit.lib { TreeUpdate, ActionRequest }
+import accesskit_macos.adapter { NativeSink as MacSink, Adapter as MacAdapter }
+import accesskit_windows.adapter { NativeSink as WinSink, Adapter as WinAdapter }
+import accesskit_unix.lib { App, WindowBounds, accessibilityBusAddress, accessibilityEnabled }
+import dbus.lib { DBusError }
+import window.native { Waker }
+import window.types { WindowId, RawSurface }
+import ui_tree.legacy { UiTree }
+import ui_tree.access { AccessTree, doAction }
 import silk.collections.list { List }
+import silk.concurrency.sync { Arc, Mutex }
+import silk.concurrency.thread { Transferable }
+import silk.concurrency.thread_native { NativeThread, JoinHandle }
+import silk.core.ownership { Drop }
+import silk.core.result { Result }
+import silk.system.host_input { HostInput }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
+
+static if Intrinsic.targetOperatingSystem() == "linux" {
+  import silk.platform.native.host_input { NativeHostInput }
+  import silk.system.host_input_native { OsHostInput }
+}
+import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
-import silk.num.f32
-import silk.num.u8
-import silk.num.u32
-import silk.text.string { String }
+import silk.mem.pointer { Pointer }
+import silk.num.usize
 
-fn scope(tree: &UiTree<'_>) -> u32 {
-  let mut at = tree.focused
-  while at != NONE {
-    if tree.node(at).focusTrap {
-      return at
+/// The OS side of one window's accessibility, on the thread that runs the platform.
+pub union Bridge {
+  /// Not attached to the window yet.
+  Detached,
+  /// Attached, and waiting for assistive technology to ask for the window's elements.
+  MacWaiting { sink: MacSink },
+  WinWaiting { sink: WinSink },
+  /// Publishing.
+  Mac { adapter: MacAdapter<MacSink> },
+  Win { adapter: WinAdapter<WinSink> },
+  /// The AT-SPI adapter, on a thread of its own (D-Bus traffic does not wake the platform).
+  Unix { link: UnixLink },
+  /// This platform or window publishes nothing.
+  Unsupported,
+}
+
+impl Bridge {
+  pub fn make() -> Bridge {
+    return Bridge.Detached
+  }
+
+  /// Attaches to `window`, whose surface is `raw`, unless it already is.
+  pub fn attach(self: &mut Self, window: WindowId, raw: RawSurface) -> () {
+    match &self.* {
+      Bridge.Detached => {}
+      _ => {
+        return ()
+      }
     }
-    at = tree.node(at).parent
-  }
-  return tree.root
-}
-
-fn within(tree: &UiTree<'_>, slot: u32, root: u32) -> bool {
-  let mut at = slot
-  while at != NONE {
-    if at == root {
-      return true
+    static if Intrinsic.targetOperatingSystem() == "darwin" {
+      drop raw
+      self.* = match MacSink.forWindow(window.value) {
+        Option.Some { value } => Bridge.MacWaiting { sink: move value }
+        Option.None => Bridge.Unsupported
+      }
+    } else {
+      static if Intrinsic.targetOperatingSystem() == "windows" {
+        drop window
+        let hwnd = match raw {
+          RawSurface.Win32 { hwnd, hinstance: _ } => usize.toU64(Pointer.address<u8>(hwnd))
+          _ => 0
+        }
+        if hwnd == 0 {
+          self.* = Bridge.Unsupported
+          return ()
+        }
+        self.* = match WinSink.forWindow(hwnd) {
+          Option.Some { value } => Bridge.WinWaiting { sink: move value }
+          Option.None => Bridge.Unsupported
+        }
+      } else {
+        drop window
+        drop raw
+        static if Intrinsic.targetOperatingSystem() == "linux" {
+          self.* = match startUnix() {
+            Option.Some { value } => Bridge.Unix { link: move value }
+            Option.None => Bridge.Unsupported
+          }
+        } else {
+          self.* = Bridge.Unsupported
+        }
+      }
     }
-    at = tree.node(at).parent
   }
-  return false
-}
 
-fn disabled(tree: &UiTree<'_>, slot: u32) -> bool {
-  let mut at = slot
-  while at != NONE {
-    if tree.node(at).disabled {
-      return true
+  /// Whether assistive technology has asked for the window's elements, so updates are
+  /// wanted.
+  pub fn wanted(self: &Self) -> bool {
+    return match &self.* {
+      Bridge.MacWaiting { sink } => sink.requested()
+      Bridge.WinWaiting { sink } => sink.requested()
+      Bridge.Mac { adapter: _ } => true
+      Bridge.Win { adapter: _ } => true
+      Bridge.Unix { link } => link.shared.get().lock().get().enabled
+      _ => false
     }
-    at = tree.node(at).parent
   }
-  return false
-}
 
-/// One node of an accessibility snapshot, as the OS sees it.
-pub struct AxNode {
-  pub id: u32,
-  pub parent: u32,
-  pub accessRole: u32,
-  pub flags: u32,
-  pub x: f64,
-  pub y: f64,
-  pub width: f64,
-  pub height: f64,
-  pub label: String,
-  pub value: String,
-  pub hasRange: bool,
-  pub min: f64,
-  pub max: f64,
-  pub now: f64,
-}
+  /// Hands `update` to the adapter, making it from the first one (which must be full).
+  pub effect fn update(self: &mut Self, update: TreeUpdate, focused: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let current = Intrinsic.replace(self.*, Bridge.Unsupported)
+    self.* = match move current {
+      Bridge.MacWaiting { sink } => Bridge.Mac { adapter: run MacAdapter<MacSink>.make(move sink, move update, focused) }
+      Bridge.WinWaiting { sink } => Bridge.Win { adapter: run WinAdapter<WinSink>.make(move sink, move update, focused) }
+      Bridge.Mac { adapter } => {
+        let mut a = move adapter
+        run a.update(move update)
+        Bridge.Mac { adapter: move a }
+      }
+      Bridge.Win { adapter } => {
+        let mut a = move adapter
+        run a.update(move update)
+        Bridge.Win { adapter: move a }
+      }
+      Bridge.Unix { link } => {
+        let mut heap = Allocator.systemAllocatorProvider()
+        let mut guard = link.shared.get().lock()
+        run guard.getMut().updates.append(move update) |> Effect.provideMut<Allocator>(&mut heap)
+        drop guard
+        drop focused
+        Bridge.Unix { link: move link }
+      }
+      Bridge other => {
+        drop update
+        move other
+      }
+    }
+  }
 
-/// An action the OS asked for: 1 press, 2 focus, 3 replace text (`text`), 4 increment, 5
-/// decrement.
-pub struct AxAction {
-  pub kind: u32,
-  pub target: u32,
-  pub text: String,
-}
+  /// Tells the adapter whether the window has keyboard focus.
+  pub effect fn setFocused(self: &mut Self, focused: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match &mut self.* {
+      Bridge.Mac { adapter } => run adapter.updateViewFocus(focused)
+      Bridge.Win { adapter } => run adapter.updateWindowFocus(focused)
+      _ => {}
+    }
+  }
 
-impl AxAction {
-  pub fn none() -> AxAction {
-    return AxAction { kind: 0, target: 0, text: String.make() }
+  /// The actions assistive technology asked for since the last call.
+  pub effect fn takeRequests(self: &mut Self) -> List<ActionRequest>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match &mut self.* {
+      Bridge.Mac { adapter } => {
+        run adapter.pump()
+        run adapter.takeRequests()
+      }
+      Bridge.Win { adapter } => {
+        run adapter.pump()
+        run adapter.takeRequests()
+      }
+      Bridge.Unix { link } => {
+        let mut guard = link.shared.get().lock()
+        Intrinsic.replace(guard.getMut().requests, List<ActionRequest>.make())
+      }
+      _ => List<ActionRequest>.make()
+    }
   }
 }
 
-/// Whether this platform has an accessibility tree to publish.
-pub fn supported() -> bool {
-  return native.supported()
+/// What the platform thread and the AT-SPI thread share.
+pub struct UnixShared {
+  /// Updates for the bus, oldest first.
+  updates: List<TreeUpdate>,
+  /// What assistive technology asked for, oldest first.
+  requests: List<ActionRequest>,
+  /// The desktop has accessibility on and the bus took the app.
+  enabled: bool,
+  /// The platform side is gone: the thread ends.
+  stopped: bool,
 }
 
-/// Publishes the tree's accessibility snapshot to the OS for `window`, on the thread that
-/// runs the platform.
-pub effect fn sync(tree: &UiTree<'_>, window: WindowId) -> ()
+/// The platform side of the AT-SPI thread. Dropping it stops the thread and waits for it.
+pub struct UnixLink {
+  shared: Arc<Mutex<UnixShared>>,
+  thread: JoinHandle<i32>,
+}
+
+impl Drop for UnixLink {
+  fn drop(self: &mut Self) -> () {
+    let mut guard = self.shared.get().lock()
+    let state = guard.getMut()
+    state.stopped = true
+  }
+}
+
+fn stopped(shared: &Arc<Mutex<UnixShared>>) -> bool {
+  return shared.get().lock().get().stopped
+}
+
+impl Transferable for UnixShared {}
+
+/// Starts the AT-SPI thread, or none when it cannot start.
+fn startUnix() -> Option<UnixLink> {
+  let mut heap = Allocator.systemAllocatorProvider()
+  let made = run Effect.result(
+    makeShared(),
+  ) |> Effect.provideMut<Allocator>(&mut heap)
+  let shared = match move made {
+    Result.Success { value } => move value
+    Result.Failure { error } => {
+      drop error
+      return Option.None
+    }
+  }
+  let theirs = shared.clone()
+  let spawned = run Effect.result(
+    NativeThread.spawn(
+      fn() -> i32 {
+        let link = move theirs
+        unixThread(&link)
+        return 0
+      },
+    ),
+  ) |> Effect.provideMut<Allocator>(&mut heap)
+  return match move spawned {
+    Result.Success { value } => Option.Some { value: UnixLink { shared: move shared, thread: move value } }
+    Result.Failure { error } => {
+      drop error
+      Option.None
+    }
+  }
+}
+
+effect fn makeShared() -> Arc<Mutex<UnixShared>>
   ! OutOfMemoryError
   ? &mut Allocator {
-  if !native.supported() {
-    return ()
-  }
-  let mut nodes = List<AxNode>.make()
-  run snapshot(tree, &mut nodes)
-  publish(window, nodes.asSlice())
+  return run Arc<Mutex<UnixShared>>.make(
+    run Mutex<UnixShared>.make(
+      UnixShared {
+        updates: List<TreeUpdate>.make(),
+        requests: List<ActionRequest>.make(),
+        enabled: false,
+        stopped: false,
+      },
+    ),
+  )
 }
 
-/// Hands `nodes` to the OS for `window`.
-pub fn publish(window: WindowId, nodes: &[AxNode]) -> () {
-  if !native.supported() {
-    return ()
-  }
-  native.begin(window)
-  let mut i: usize = 0
-  while i < nodes.length {
-    let n = &nodes[i]
-    native.node(
-      window,
-      n.id,
-      n.parent,
-      n.accessRole,
-      n.flags,
-      n.x,
-      n.y,
-      n.width,
-      n.height,
-      String.view(&n.label),
-      String.view(&n.value),
-    )
-    if n.hasRange {
-      native.range(window, n.id, n.min, n.max, n.now)
+/// The AT-SPI thread: joins the accessibility bus once the desktop has accessibility on, then
+/// sends the updates and collects the requests every 10 ms. It ends quietly when the bus
+/// fails.
+fn unixThread(shared: &Arc<Mutex<UnixShared>>) -> () {
+  static if Intrinsic.targetOperatingSystem() == "linux" {
+    let mut heap = Allocator.systemAllocatorProvider()
+    let mut clock = OsMonotonicClock.make()
+    let captured = run Effect.result(unsafe NativeHostInput.environmentSnapshot())
+      |> Effect.provideMut<Allocator>(&mut heap)
+    let snapshot = match move captured {
+      Result.Success { value } => move value
+      Result.Failure { error } => {
+        drop error
+        return ()
+      }
     }
+    let mut inputs = OsHostInput.make(move snapshot)
+    let ran = run Effect.result(unixLoop(shared))
+      |> Effect.provideMut<Allocator>(&mut heap)
+      |> Effect.provideMut<MonotonicClock>(&mut clock)
+      |> Effect.provideMut<HostInput>(&mut inputs)
+    drop ran
+  } else {
+    drop shared
+  }
+}
+
+effect fn notEnabled(error: DBusError) -> bool {
+  drop error
+  return false
+}
+
+effect fn unixLoop(shared: &Arc<Mutex<UnixShared>>) -> ()
+  ! DBusError | OutOfMemoryError
+  ? &mut Allocator | &mut HostInput | &mut MonotonicClock {
+  // A screen reader may start after the app: look again every five seconds.
+  while !run Effect.catch<DBusError>(accessibilityEnabled(Option.None), notEnabled) {
+    let mut wait: u32 = 0
+    while wait < 50 {
+      if stopped(shared) {
+        return ()
+      }
+      run Effect.sleep(100000000)
+      wait = wait + 1
+    }
+  }
+  let address = run accessibilityBusAddress(Option.None)
+  let mut app = run App.connect("Silk UI", address.view(), Option.None)
+  run app.setToolkit("Silk UI", "0.1.0")
+  let mut opened = shared.get().lock()
+  let state = opened.getMut()
+  state.enabled = true
+  drop opened
+  let mut added = false
+  while !stopped(shared) {
+    let mut guard = shared.get().lock()
+    let mut updates = Intrinsic.replace(guard.getMut().updates, List<TreeUpdate>.make())
+    drop guard
+    while updates.length() != 0 {
+      let update = updates.remove(0)
+      if added {
+        run app.updateWindow(1, move update)
+      } else {
+        run app.addWindow(1, move update, true, WindowBounds.zero())
+        added = true
+      }
+    }
+    run app.pump()
+    let mut requests = run app.takeRequests()
+    if requests.length() != 0 {
+      let mut guard = shared.get().lock()
+      while requests.length() != 0 {
+        let request = requests.remove(0)
+        run guard.getMut().requests.append(move request.request)
+      }
+      drop guard
+      Waker.make().wake()
+    }
+    run Effect.sleep(10000000)
+  }
+}
+
+/// The tree side of a window's accessibility: what was sent, and when.
+pub struct Publisher {
+  tree: AccessTree,
+  /// The tree's semantic revision when it last built an update.
+  revision: u64,
+}
+
+impl Publisher {
+  pub fn make() -> Publisher {
+    return Publisher { tree: AccessTree.make(), revision: 18446744073709551615 }
+  }
+
+  /// The update to send when the tree changed since the last one, built only when `wanted`.
+  /// The first is the whole tree. Its values use the system allocator, so it can move to
+  /// the platform thread.
+  pub effect fn next(self: &mut Self, tree: &UiTree<'_>, wanted: bool) -> Option<TreeUpdate>
+    ! OutOfMemoryError {
+    if !wanted || tree.semanticRevision == self.revision || tree.layoutPending() {
+      return Option<TreeUpdate>.None
+    }
+    self.revision = tree.semanticRevision
+    let mut heap = Allocator.systemAllocatorProvider()
+    if !self.tree.hasStarted() {
+      let full = run self.tree.fullUpdate(tree) |> Effect.provideMut<Allocator>(&mut heap)
+      return Option<TreeUpdate>.Some { value: move full }
+    }
+    return run self.tree.update(tree) |> Effect.provideMut<Allocator>(&mut heap)
+  }
+}
+
+/// Answers the requests assistive technology made, which it empties.
+pub effect fn apply(tree: &mut UiTree<'_>, requests: &mut List<ActionRequest>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let list = requests.asSlice()
+  let mut i: usize = 0
+  while i < list.length {
+    drop run doAction(&mut tree, &list[i])
     i = i + 1
   }
-  native.end(window)
-}
-
-/// The tree's accessibility snapshot, in the order the OS reads it, appended to `out`. Its
-/// strings use the selected allocator.
-pub effect fn snapshot(tree: &UiTree<'_>, out: &mut List<AxNode>) -> ()
-  ! OutOfMemoryError
-  ? &mut Allocator {
-  let mut stack = List<u32>.make()
-  let mut children = List<u32>.make()
-  let root = scope(tree)
-  if root != NONE {
-    run stack.append(root)
-  }
-  while stack.length() > 0 {
-    let slot = stack.pop().unwrapOr(NONE)
-    let node = tree.node(slot)
-    if !node.live || !node.computed.text.visible {
-      continue
-    }
-    run tree.childSlots(slot, &mut children)
-    let mut child = children.length()
-    while child > 0 {
-      child = child - 1
-      run stack.append(children.get(child))
-    }
-    if let Option<NodeInfo>.Some { value: geometry } = run inspect.info(tree, node.id) {
-      let bounds = geometry.bounds
-      if !geometry.laidOut {
-        continue
-      }
-      let mut accessRole = node.accessRole
-      if accessRole == Role.None && node.kind == NodeKind.Text {
-        accessRole = Role.Paragraph
-      }
-      if accessRole == Role.None && node.kind == NodeKind.Input {
-        accessRole = Role.TextBox
-      }
-      let mut flags: u32 = 0
-      if disabled(tree, slot) {
-        flags = flags | 1
-      }
-      if tree.focused == slot {
-        flags = flags | 2
-      }
-      if node.checked {
-        flags = flags | 4
-      }
-      if node.selected {
-        flags = flags | 8
-      }
-      if node.expanded {
-        flags = flags | 16
-      }
-      if node.hasEdit() && node.edit().readOnly {
-        flags = flags | 32
-      }
-      if (node.listeners & LISTEN_CLICK) != 0 {
-        flags = flags | 64
-      }
-      let label = run String.copy(String.view(&node.label))
-      let value = run String.copy(String.view(&node.text))
-      run out.append(
-        AxNode {
-          id: node.id,
-          parent: if slot == root {
-            0
-          } else {
-            geometry.parent
-          },
-          accessRole: u8.toU32(Role.value(accessRole)),
-          flags: flags,
-          x: f32.toF64(bounds.xMin),
-          y: f32.toF64(bounds.yMin),
-          width: f32.toF64(bounds.width()),
-          height: f32.toF64(bounds.height()),
-          label: move label,
-          value: move value,
-          hasRange: node.hasValueRange,
-          min: f32.toF64(node.valueMin),
-          max: f32.toF64(node.valueMax),
-          now: f32.toF64(node.valueNow),
-        },
-      )
-    }
-  }
-}
-
-/// Moves the actions the OS asked for on `window` into `out`, on the thread that runs the
-/// platform.
-pub effect fn nativeActions(window: WindowId, out: &mut List<AxAction>) -> ()
-  ! OutOfMemoryError
-  ? &mut Allocator {
-  while true {
-    let action = native.poll(window)
-    if action.kind == 0 {
-      return ()
-    }
-    let text = if action.kind == 3 {
-      run native.actionText(window)
-    } else {
-      String.make()
-    }
-    run out.append(AxAction { kind: action.kind, target: action.target, text: move text })
-  }
-}
-
-/// Answers the actions the OS asked for on `window`.
-pub effect fn poll(tree: &mut UiTree<'_>, window: WindowId) -> ()
-  ! OutOfMemoryError
-  ? &mut Allocator {
-  let mut actions = List<AxAction>.make()
-  run nativeActions(window, &mut actions)
-  run apply(&mut tree, &mut actions)
-}
-
-/// Answers `actions`, which it empties.
-pub effect fn apply(tree: &mut UiTree<'_>, actions: &mut List<AxAction>) -> ()
-  ! OutOfMemoryError
-  ? &mut Allocator {
-  let list = actions.asMutSlice()
-  let mut index: usize = 0
-  while index < list.length {
-    let action = Intrinsic.replace(list[index], AxAction.none())
-    index = index + 1
-    let slot = tree.slotOf(action.target)
-    if slot == NONE || !within(&tree.*, slot, scope(&tree.*)) || disabled(&tree.*, slot)
-      || !tree.node(slot).computed.text.visible {
-      continue
-    }
-    if let Option<NodeInfo>.Some { value } = run inspect.info(&tree.*, action.target) {
-      if !value.laidOut {
-        continue
-      }
-    } else {
-      continue
-    }
-    if action.kind == 1 {
-      let mut path = List<u32>.make()
-      run tree.pathTo(slot, &mut path)
-      run tree.queueEvent(Event.make(EventKind.Click, action.target, move path))
-    } else if action.kind == 2 {
-      if tree.node(slot).tabIndex != NOT_FOCUSABLE {
-        run tree.focusSlot(slot)
-      }
-    } else if action.kind == 3 {
-      if tree.node(slot).kind != NodeKind.Input || tree.node(slot).edit().readOnly {
-        continue
-      }
-      run tree.focusSlot(slot)
-      run edit.selectAll(&mut tree, slot)
-      let text = run String.copy(String.view(&action.text))
-      run tree.dispatch(Input.TextInput { text: move text })
-    } else if action.kind == 4 || action.kind == 5 {
-      run tree.focusSlot(slot)
-      run tree.dispatch(
-        Input.KeyDown {
-          key: run String.copy(
-            if action.kind == 4 {
-              "ArrowUp"
-            } else {
-              "ArrowDown"
-            },
-          ),
-          code: String.make(),
-          modifiers: 0,
-          repeat: false,
-        },
-      )
-    }
-  }
+  requests.clear()
 }
