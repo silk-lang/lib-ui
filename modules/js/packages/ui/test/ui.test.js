@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { installMock } from "./mock.js";
 
 const mock = installMock();
-const { createBox, createText, createInput, mount, nodeById, setErrorHandler } = await import("../src/index.js");
+const { createBox, createText, createInput, mount, nodeById, setErrorHandler, parseMarkdown } = await import("../src/index.js");
 
 test("nodes queue their mutations", () => {
   mock.take();
@@ -160,4 +160,12 @@ test("a click inside a link opens its address unless a listener prevents it", ()
   link.setAttribute("href", "");
   assert.deepEqual(mock.take(), [["listen", link.id, 0], ["attribute", link.id, "href", ""]]);
   delete globalThis.open;
+});
+
+test("parseMarkdown turns GFM on unless told otherwise", () => {
+  mock.take();
+  assert.deepEqual(parseMarkdown("# hi"), { type: "root", children: [] });
+  parseMarkdown("x", { gfm: false, footnotes: true });
+  parseMarkdown("x", { tables: false, alerts: true });
+  assert.deepEqual(mock.take().map((call) => call[2]), [15, 16, 78]);
 });

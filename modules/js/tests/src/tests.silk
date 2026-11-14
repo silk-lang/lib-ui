@@ -13,6 +13,8 @@ import silk.core.result { Result }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.testing.testing { Testing, AssertionError }
 import silk.text.string { String }
+import silk.io.writer_native { StderrWriter }
+import silk.io.writer { Writer }
 
 fn viewport() -> Viewport {
   return Viewport { width: 400.0, height: 300.0, scale: 1.0 }
@@ -217,6 +219,14 @@ effect fn globals(host: &mut JsHost<'_>) -> ()
   run Testing.expect(host.takeReload() && !host.takeReload(), "devReload asked once, from a promise job")
 }
 
+/// `__ui.markdown` gives the tree remark gives for a sample with every construct of GFM.
+effect fn markdown(host: &mut JsHost<'_>) -> ()
+  ! OutOfMemoryError | JsError | platform.PlatformError
+  ? &mut Allocator {
+  let source = run platform.readFile(b"modules/js/tests/fixtures/markdown.js")
+  run host.evaluate(source.asSlice(), b"markdown.js")
+}
+
 effect fn withHost(scenario: u32) -> ()
   ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static>
   ? &mut Allocator {
@@ -236,7 +246,22 @@ effect fn withHost(scenario: u32) -> ()
   } else {
     run Effect.result(errors(&mut host)) |> Effect.provideMut<Allocator>(&mut allocator)
   }
+  let parsed = if scenario == 2 {
+    run Effect.result(markdown(&mut host)) |> Effect.provideMut<Allocator>(&mut allocator)
+  } else {
+    Result<(), OutOfMemoryError | JsError | platform.PlatformError>.Success { value: () }
+  }
   run host.close() |> Effect.provideMut<Allocator>(&mut allocator)
+  match move parsed {
+    Result<(), OutOfMemoryError | JsError | platform.PlatformError>.Success { .. } => ()
+    Result<(), OutOfMemoryError | JsError | platform.PlatformError>.Failure { error } => {
+      match &error { JsError { message } => {
+        let mut writer = StderrWriter.make()
+        drop run Effect.result(Writer.writeString(String.view(&message))) |> Effect.provideMut<Writer>(&mut writer)
+      } _ => () }
+      fail move error
+    }
+  }
   match move ran {
     Result<(), TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>>.Success { .. } => ()
     Result<(), TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>>.Failure { error } => { fail move error }
@@ -259,7 +284,7 @@ test effect fn libraryModuleRunsDomStyleEvents() -> ()
   run withHost(1) |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
-test effect fn timersFramesAndConsoleReachTheHost() -> ()
+test effect fn timersFramesConsoleAndMarkdownReachTheHost() -> ()
   ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run withHost(2) |> Effect.provideMut<Allocator>(&mut allocator)
