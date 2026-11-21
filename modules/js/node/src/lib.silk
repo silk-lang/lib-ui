@@ -55,6 +55,7 @@ import silkjs.js_object_allocate as objects
 import silkjs.js_intl_common as common
 import silkjs.js_eval as evaluation
 import silkjs.js_errors as errors
+import silkjs.js_runtime as engineRuntime
 import silkjs.js_eval_compile as flags
 import window.types { WindowError, WindowId, WindowOptions, TitleBar }
 import window.event { Event, MouseButton }
@@ -147,7 +148,17 @@ pub struct NodeApp<'r, 'e, 'm, C> {
   zoom: f32,
   /// What 2D canvases show their bitmaps through, once the window gave it.
   presenter: Option<CanvasPresenter>,
+  /// JavaScript's bytes in use when the last quiet moment ended ([`NodeApp.releaseIdle`]).
+  settled: usize,
+  /// Whether SILK_UI_TRACE_JS asked for a line for each quiet moment that did something.
+  quietTraced: bool,
 }
+
+/// A quiet moment collects garbage when JavaScript's memory moved at least this much since
+/// the last one, and at least a quarter of what was in use then: a launch, a screen built or
+/// taken down. A full collection walks the whole heap, so a large application pays for one
+/// only after a change of its own size; smaller changes are the engine's own business.
+const RELEASE_MOVED_BYTES: usize = 4194304
 
 
 impl<'r, 'e, 'm, C: Composition> NodeApp<'r, 'e, 'm, C> {
@@ -161,11 +172,33 @@ impl<'r, 'e, 'm, C: Composition> NodeApp<'r, 'e, 'm, C> {
 
   /// Installs `__ui` and the prelude in `runtime`'s realm; `api` is the runtime's [`HostApi`].
   pub effect fn make(runtime: &'r mut Runtime<'e, 'm, C>, api: UiApi) -> NodeApp<'r, 'e, 'm, C> ! OutOfMemoryError | JsException ? &mut Allocator {
-    let mut app = NodeApp { runtime: move runtime, api: api, bridge: Bridge.make(), openers: Openers.make(), finished: false, status: 0, zoom: 1.0, presenter: Option<CanvasPresenter>.None }
+    let mut app = NodeApp { runtime: move runtime, api: api, bridge: Bridge.make(), openers: Openers.make(), finished: false, status: 0, zoom: 1.0, presenter: Option<CanvasPresenter>.None, settled: 0, quietTraced: false }
     app.lend()
     run app.install()
     run app.script(prelude(), b"ui-js:node-prelude")
     return move app
+  }
+
+  /// Hands back what JavaScript no longer uses, for a window gone quiet
+  /// (`WindowClient.quiet`): a full collection when its memory moved enough since the last
+  /// one ([`RELEASE_MOVED_BYTES`]) or `shed` says a large subtree went, then the pooled
+  /// arenas left wholly idle go back to the system, keeping an eighth of what is in use for
+  /// what comes next. What parsing and starting a large bundle left behind goes this way.
+  effect fn releaseIdle(self: &mut Self, shed: bool) -> () ? &mut Allocator {
+    let context = self.runtime.rawContext()
+    let engine = self.runtime.rawEngine()
+    let memory = engine.memory
+    let heap = unsafe engineRuntime.contextRuntime(context)
+    let used = memory.usedBytes()
+    let moved = if used > self.settled { used - self.settled } else { self.settled - used }
+    let collected = shed || (moved >= RELEASE_MOVED_BYTES && moved >= self.settled / 4)
+    if collected { drop run unsafe engineRuntime.triggerGC(memory, &mut engine.*, heap, 0, true) }
+    let live = memory.usedBytes()
+    let released = unsafe engineRuntime.releaseIdle(memory, heap, live / 8)
+    if collected { self.settled = live }
+    if self.quietTraced && (collected || released != 0) {
+      StderrWriter.print("silkui: quiet, javascript used {} then {} bytes, {} released\n", &(used, live, released))
+    }
   }
 
   /// Points the runtime's [`UiApi`] at this app's bridge, which may have moved since.
@@ -781,6 +814,12 @@ impl<'c, 'r, 'e, 'm, C: Composition> WindowClient<NodeApp<'r, 'e, 'm, C>, never,
     ? &mut Allocator {
     run state.bridge.presented(intervals, dropped)
   }
+
+  effect fn quiet(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm, C>, tree: &mut UiTree<'_>, shed: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run state.releaseIdle(shed)
+  }
 }
 
 /// A module for [`NodeWindow.define`].
@@ -840,7 +879,8 @@ impl<'f> NodeWindow<'f> {
   pub effect fn entry(self: &mut Self, name: &[u8], source: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
     self.name.clear()
     run self.name.appendSlice(name)
-    self.source.clear()
+    self.source = List<u8>.make()
+    run self.source.reserveExact(source.length)
     run self.source.appendSlice(source)
   }
 
@@ -930,7 +970,11 @@ impl<'f> Host for NodeWindow<'f> {
       run app.define(items[i].name.asSlice(), items[i].source.asSlice())
       i = i + 1
     }
+    // Each module's text is the engine's from here: a large bundle's is not kept twice.
+    self.modules = List<Defined>.make()
     run app.entry(self.name.asSlice(), self.source.asSlice())
+    self.source = List<u8>.make()
+    app.quietTraced = (run environmentVariable("SILK_UI_TRACE_JS")).isSome()
     // The entry's first turn: its imports and top-level code run before the first frame.
     run app.turn(0.0)
     if tracing { StderrWriter.print("silkui: bundle ready\n", &()) }
