@@ -2205,6 +2205,8 @@ export class Svg extends Node {
     super("icon");
     this.kind = "svg";
     this.namespaceURI = SVG_NAMESPACE;
+    // Page selectors such as `button svg` and preflight's `svg { display: block }` name it.
+    native.attribute(this.nodeId, "element", "svg");
     svgChanged(this);
   }
 

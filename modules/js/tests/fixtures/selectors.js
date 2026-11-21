@@ -1,5 +1,5 @@
 // matches, closest, querySelector and querySelectorAll through the tree's selector matcher.
-import { createBox, createText, mount } from "@silkui/core";
+import { createBox, createSvgElement, createText, mount } from "@silkui/core";
 
 const check = (label, got, want) => {
   if (got !== want) throw new Error(label + ": got '" + got + "', want '" + want + "'");
@@ -20,6 +20,19 @@ const inner = createBox();
 inner.className = "badge";
 items[2].appendChild(inner);
 mount(root);
+
+// As lucide icons in a button: `[&_svg:not([class*='size-'])]:size-4`.
+const button = createBox();
+button.className = "btn";
+const icon = createSvgElement("svg");
+icon.setAttribute("class", "lucide lucide-paperclip translate-y-px");
+icon.setAttribute("width", "24");
+icon.setAttribute("viewBox", "0 0 24 24");
+button.appendChild(icon);
+root.appendChild(button);
+check("an svg matches its tag", icon.matches("svg"), true);
+check("an svg matches a class substring", icon.matches("[class*='paperclip']"), true);
+check("an svg without a size class", icon.matches(".btn svg:not([class*='size-'])"), true);
 
 check("matches a class", items[1].matches(".row.odd"), true);
 check("webkitMatchesSelector", items[0].webkitMatchesSelector(".odd"), false);
